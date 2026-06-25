@@ -190,6 +190,9 @@ def _enrich_batch(batch: list[BeatStub], context: str, llm) -> dict[int, str]:
             "BAD: 'Romero defends with passion.'\n"
             "GOOD: 'Romero's line-stepping lets Argentina defend 15 yards higher, "
             "creating turnovers in dangerous zones.'\n\n"
+            "IMPORTANT: Only reference players, events, and facts already present in "
+            "each beat. Do not introduce matches, tournaments, scorelines, or players "
+            "not mentioned in the beat text.\n\n"
             f"Beats:\n[\n{beat_lines}\n]\n\n"
             'Return: [{"index": 0, "tactical_sentence": "..."}, ...]'
         )},
@@ -245,6 +248,9 @@ def _make_conflict_stub(context: str, llm, index: int) -> tuple[BeatStub, str] |
             f"CONTEXT:\n{context[:1200]}\n\n"
             "Write 2-3 sentences of voiceover identifying ONE genuine weakness, risk, or "
             "challenge for this squad. Be specific and factual. Conversational, not academic.\n\n"
+            "IMPORTANT: Only reference players, events, and challenges present in the CONTEXT "
+            "above. Do not introduce matches, tournaments, scorelines, or players not mentioned "
+            "in the context.\n\n"
             "Also write a visual_direction (max 12 words) that an editor can use to source footage. "
             "Start with a player's full name if one is relevant.\n\n"
             '{"vo_script": "...", "visual_direction": "..."}'
