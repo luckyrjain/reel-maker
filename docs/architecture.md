@@ -94,7 +94,7 @@ The browser never fetches JSON. All API responses to the browser are HTML fragme
 | File | Responsibility |
 |---|---|
 | `celery_app.py` | Celery instance; `task_acks_late=True`, `visibility_timeout=7200`, beat schedule, split queues |
-| `tasks/enrich_context.py` | `enrich_context(job_id)` — idempotency guard → `evaluate_context()` → optional `llm_enrich()` → stores `reel.enriched_context` → creates + enqueues generate job |
+| `tasks/enrich_context.py` | `enrich_context(job_id)` — idempotency guard → `evaluate_context()` → `_is_structured_script()` guard → optional `llm_enrich()` (skipped for structured scripts) → stores `reel.enriched_context` → creates + enqueues generate job |
 | `tasks/generate.py` | `generate_guide(job_id)` — idempotency guard → `effective_context = enriched_context or context` → structured/standard path → closed-loop eval retry → DB writes |
 | `tasks/render.py` | `render_cut(job_id)` — idempotency guard → heartbeat → `resolve_or_reuse()` per beat → `synth_to_budget()` → TTS-accurate timecodes → atomic MP4 |
 | `tasks/noop.py` | `noop_job(job_id)` — smoke test |
@@ -112,7 +112,7 @@ The browser never fetches JSON. All API responses to the browser are HTML fragme
 |---|---|
 | `guide_schema.py` | `Beat`, `PlatformGuide`, `MasterGuide` Pydantic models; `coerce_beat_type` validator |
 | `llm.py` | `LLMProvider` + `OllamaProvider`; `get_llm_provider()`, `get_enrichment_provider()`, `is_nvidia_generation()` |
-| `prompt.py` | `build_messages(prior_feedback=)` — accepts prior failure issues for closed-loop retry; `build_visuals_messages()` |
+| `prompt.py` | `build_messages(prior_feedback=)` — accepts prior failure issues for closed-loop retry; `build_visuals_messages()` — system prompt anchors LLM to per-beat VO only, preventing drift to global context |
 | `script_parser.py` | `parse(context)` — detects ≥3 ALL-CAPS headers, splits on `PlayerName: text`, returns `list[BeatStub]` or `None`; `calc_duration()`, `derive_on_screen()` public helpers |
 | `context_enricher.py` | `evaluate_context()` — 5-axis rule scorer (0–100); `llm_enrich()` — single LLM call to add specificity, stakes, hook angle; `ENRICH_THRESHOLD = 60` |
 | `evaluator.py` | `score_guide()` — 17-axis rule scorer; see `docs/evaluation.md` |
@@ -126,19 +126,19 @@ The browser never fetches JSON. All API responses to the browser are HTML fragme
 | `asset_sourcer.py` | `PexelsVideoSource` + `WikipediaImageSource` (including `extmetadata` license fetch); `resolve_or_reuse()` — pins assets per beat, reuses without API call when fingerprint matches; `resolve_beat_assets()` for raw resolution |
 | `tts.py` | `EdgeTTSProvider.synthesize(rate=)` + `.synth_to_budget(target_s)` — adjusts speaking rate ±25% to hit duration budget; `_audio_duration()` via ffprobe |
 | `captions.py` | `transcribe_audio()` — Whisper word-level timestamps → `list[CaptionSegment]`; no-op if whisper not installed |
-| `compositor.py` | `composite_cut()` — MoviePy stage (video + audio) + FFmpeg drawtext stage (text overlays); `_build_text_filter()` uses Whisper timestamps when available, proportional fallback otherwise; atomic `os.replace()` for final output |
+| `compositor.py` | `composite_cut()` — MoviePy stage (video + audio) + FFmpeg drawtext stage (text overlays); 120ms `audio_fadein`/`audio_fadeout` per beat for smooth narration transitions; `_build_text_filter()` uses Whisper timestamps when available, proportional fallback otherwise; atomic `os.replace()` for final output |
 
 ### `tests/`
 
 | File | Coverage |
 |---|---|
-| `test_evaluator.py` | 16 tests — all 17 evaluator axes + helpers |
-| `test_script_parser.py` | 12 tests — parse routing, player splitting, `derive_on_screen`, `calc_duration` |
+| `test_evaluator.py` | 28 tests — all 17 evaluator axes + helpers |
+| `test_script_parser.py` | 11 tests — parse routing, player splitting, `derive_on_screen`, `calc_duration` |
 | `test_state.py` | 11 tests — valid/invalid transitions for both state machines including `enriching` |
-| `test_enrichment.py` | 9 tests — `coerce_beat_type`, `_enrich_batch` response shapes (list, single dict, malformed JSON) |
-| `test_audio_text_sync.py` | ~18 tests — `clean_guide()` regeneration, `_build_text_filter()` proportional timing, PATCH on-screen re-derivation |
+| `test_enrichment.py` | 15 tests — `coerce_beat_type`, `_enrich_batch` response shapes, topic fence assertions |
+| `test_audio_text_sync.py` | 10 tests — `clean_guide()` regeneration, `_build_text_filter()` proportional timing, visual direction anchoring |
 | `test_context_enricher.py` | 13 tests — all 5 evaluator axes at boundary values, combined score, `llm_enrich` |
-| `test_enrich_context_task.py` | 6 tests — idempotency guard, enrichment gating, LLM failure fallback, generate always enqueued |
+| `test_enrich_context_task.py` | 9 tests — idempotency guard, enrichment gating, LLM failure fallback, structured script guard |
 
 ---
 
@@ -151,9 +151,11 @@ Before generation begins, `enrich_context` runs a rule-based quality check on th
 ```
 reel.context
   └── evaluate_context()   →  (score, issues)   [5 axes × 20 pts = 100 max]
-        ├── if score < 60:
-        │     llm_enrich()   →  enriched text stored in reel.enriched_context
-        │     record_stage("context_enrich")
+        └── _is_structured_script()  →  bool (≥3 ALL-CAPS section headers)
+              ├── if score < 60 AND NOT structured:
+              │     llm_enrich()   →  enriched text stored in reel.enriched_context
+              │     record_stage("context_enrich")
+              └── if structured: skip enrichment (context topic is already locked in)
         └── create Job(generate) + enqueue generate_guide
 
 generate_guide:
@@ -162,6 +164,8 @@ generate_guide:
 ```
 
 **5 scoring axes:** Length (word count) · Specificity (named entities + numbers) · Stakes/tension (conflict vocabulary) · Narrative arc (discourse connectors) · Hook potential (question / direct address / bold claim in first sentence). Score < 60 triggers enrichment; original context always preserved.
+
+**Structured script guard:** `_is_structured_script()` in `enrich_context.py` detects ≥3 ALL-CAPS section headers. When True, `llm_enrich()` is skipped entirely — the script's topic is already locked in and enrichment would cause context drift. `job.meta["enrich_skipped"]` records the reason (`"structured_script"` or `"score_above_threshold"`).
 
 ---
 
@@ -337,6 +341,7 @@ For each beat:
     video → scale/crop 1080×1920, loop if too short, trim
 
   concatenate sub-clips → beat_clip
+  VO audio: AudioFileClip → subclip if too long → audio_fadein(0.12).audio_fadeout(0.12) → .with_start(t)
 
 After all beats:
   concatenate beats → final video

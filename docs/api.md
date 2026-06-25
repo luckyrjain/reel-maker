@@ -85,6 +85,7 @@ Accepts `multipart/form-data`:
 |---|---|---|
 | `caption` | string | Replacement caption |
 | `hashtags_raw` | string | Comma-separated hashtag list (no `#`) |
+| `beat_{i}_duration_s` | float | Duration override for beat `i` in seconds (min 1, max 30); step 0.5 |
 | `beat_{i}_visual_direction` | string | New stock footage search query for beat `i` |
 | `beat_{i}_vo_script` | string | New voiceover script for beat `i` |
 | `beat_{i}_on_screen_text` | string | Newline-separated text overlay lines for beat `i` (max 5) |

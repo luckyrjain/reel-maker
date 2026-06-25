@@ -14,6 +14,7 @@ Status as of 2026-06-25.
 | 3 | ✅ Done | Review / edit loop |
 | 3.5 | ✅ Done | Hardening (reliability, observability, security) |
 | 3.6 | ✅ Done | Pre-generation context evaluation & enrichment |
+| 3.7 | ✅ Done | Generation quality fixes (context drift, audio gaps, prompt fences) |
 | 4 | 🔲 Next | Publishing |
 | 5 | 🔲 Planned | Analytics and polish |
 
@@ -103,6 +104,35 @@ Status as of 2026-06-25.
 **UI changes**: reel-level polling via `GET /api/reels/{id}/active-job-fragment` tracks enrich → generate transition seamlessly; `pipeline_status.html` shows "context prep" badge → "standard LLM" badge as jobs chain
 
 **`generate_guide` change**: `effective_context = reel.enriched_context or reel.context` — all generation, scoring, and evaluation use the enriched context when available
+
+**Evaluator Axis 9 (Audio Delivery) hardened**:
+- `MAX_WPS_HOOK = 3.0` — separate tighter WPS cap for hook beats (vs 4.0 for body/CTA)
+- Hook pacing violations cost 4 pts each; body violations cost 2 pts each
+- Axis 9 max deduction raised from 5 to 10 pts — a rushed hook now fails the quality gate
+
+**Beat duration editor** — `duration_s` field in the cut editor UI (number input, step 0.5, range 1–30); `PATCH /api/cuts/{id}` parses `beat_{i}_duration_s` and saves it to the guide
+
+### Phase 3.7 — Generation quality fixes
+
+**Structured script enrichment guard** (`worker/tasks/enrich_context.py`):
+- `_is_structured_script()` detects ≥3 ALL-CAPS section headers; skips `llm_enrich()` when True even if score < 60
+- Fixes: enricher was transforming squad-review scripts into World Cup Final narratives by "adding stakes"
+- `job.meta["enrich_skipped"]` records reason (`"structured_script"` or `"score_above_threshold"`)
+
+**Topic fence on insight + conflict prompts** (`worker/tasks/generate.py`):
+- `_enrich_batch()` and `_make_conflict_stub()` now include: "Do not introduce matches, tournaments, scorelines, or players not mentioned in the beat/context"
+- Fixes: enrichment LLM was inserting off-topic events into structured-script beats
+
+**Audio crossfade** (`engine/render/compositor.py`):
+- 120ms `audio_fadein` / `audio_fadeout` applied per beat clip before `with_start(t)`
+- Fixes: hard-cut audio gaps at beat boundaries made narration feel disconnected
+- Also fixed pre-existing bug: `with_start(t)` was called twice on the long-clip branch
+
+**Visual direction anchoring** (`engine/generation/prompt.py`):
+- `build_visuals_messages()` system message now anchors the LLM to per-beat VO content only: "Do not use the global context or topic to infer additional visual content beyond what the VO explicitly mentions"
+- Fixes: visual directions drifting to match enriched/global context instead of the actual beat
+
+**Tests**: 97 total across 7 files (+6 new tests: 3 enrichment guard, 2 topic fence, 1 visual anchoring)
 
 ---
 
