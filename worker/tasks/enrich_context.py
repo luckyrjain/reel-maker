@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import datetime, timezone
 
 from api import models
@@ -12,6 +13,13 @@ from worker.celery_app import celery_app
 from worker.tasks.generate import generate_guide
 
 _log = logging.getLogger(__name__)
+
+_CAPS_HEADER = re.compile(r'^[A-Z][A-Z\s:\-]{2,}$')
+
+
+def _is_structured_script(text: str) -> bool:
+    """Return True when text contains ≥3 ALL-CAPS section headers (structured script)."""
+    return sum(1 for line in text.splitlines() if _CAPS_HEADER.match(line.strip())) >= 3
 
 
 def _heartbeat(db, job, progress: int) -> None:
@@ -44,8 +52,9 @@ def enrich_context(self, job_id: int):
         job.meta = {**(job.meta or {}), "context_score": score, "context_issues": issues}
         _heartbeat(db, job, 30)
 
-        # ── Step 2: Enrich if below threshold ────────────────────────────────
-        if score < ENRICH_THRESHOLD:
+        # ── Step 2: Enrich if below threshold (skip for structured scripts) ────
+        is_structured = _is_structured_script(reel.context)
+        if score < ENRICH_THRESHOLD and not is_structured:
             _heartbeat(db, job, 40)
             llm = get_enrichment_provider()
             enrich_provider = "nvidia" if settings.nvidia_api_key else "ollama"
@@ -65,8 +74,12 @@ def enrich_context(self, job_id: int):
                     reel.id, score,
                 )
         else:
-            job.meta = {**(job.meta or {}), "enriched": False}
-            _log.info("reel_id=%s: context score %d >= threshold, skipping enrichment", reel.id, score)
+            skipped_reason = "structured_script" if is_structured else "score_above_threshold"
+            job.meta = {**(job.meta or {}), "enriched": False, "enrich_skipped": skipped_reason}
+            _log.info(
+                "reel_id=%s: skipping enrichment (%s, score=%d)",
+                reel.id, skipped_reason, score,
+            )
 
         _heartbeat(db, job, 80)
 

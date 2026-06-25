@@ -137,3 +137,42 @@ def test_llm_failure_is_nonfatal_and_generate_still_enqueued():
 
     assert reel.enriched_context is None
     mock_gen.delay.assert_called_once()
+
+
+# ── structured script guard ───────────────────────────────────────────────
+
+
+def test_is_structured_script_detects_three_caps_headers():
+    from worker.tasks.enrich_context import _is_structured_script
+    text = "GOALKEEPER\nMartinez is world class.\nDEFENSE\nRomero leads the line.\nMIDFIELD\nDe Paul is the engine."
+    assert _is_structured_script(text) is True
+
+
+def test_is_structured_script_rejects_free_text():
+    from worker.tasks.enrich_context import _is_structured_script
+    text = "Argentina are the best team in the world. Messi is the greatest. The squad looks strong."
+    assert _is_structured_script(text) is False
+
+
+def test_enrichment_skipped_for_structured_script_even_below_threshold():
+    """llm_enrich must not be called when context has ≥3 ALL-CAPS headers, even when score < 60."""
+    from worker.tasks.enrich_context import enrich_context
+    structured_ctx = "GOALKEEPER\nMartinez saves penalties.\nDEFENSE\nRomero leads.\nMIDFIELD\nDe Paul runs."
+    job = _make_job()
+    reel = _make_reel(context=structured_ctx)
+    db = MagicMock()
+    db.get.side_effect = lambda model, id_: job if id_ == 1 else reel
+
+    with (
+        patch("worker.tasks.enrich_context.SessionLocal", return_value=db),
+        patch("worker.tasks.enrich_context.evaluate_context", return_value=(25, ["too_short"])),
+        patch("worker.tasks.enrich_context.llm_enrich") as mock_enrich,
+        patch("worker.tasks.enrich_context.get_enrichment_provider", return_value=MagicMock()),
+        patch("worker.tasks.enrich_context.generate_guide"),
+        patch("worker.tasks.enrich_context.transition"),
+        patch("worker.tasks.enrich_context.record_stage"),
+    ):
+        enrich_context(1)
+
+    mock_enrich.assert_not_called()
+    assert reel.enriched_context is None
