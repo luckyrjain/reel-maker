@@ -1,0 +1,69 @@
+{% set status = job.status.value %}
+{% set job_type = job.type.value %}
+{% set reel_done = reel.status.value in ("guide_ready", "failed") %}
+{% set is_final = reel_done or (status == "failed") %}
+
+<div
+  {% if not is_final %}
+    hx-get="{{ poll_url }}"
+    hx-trigger="load delay:2s"
+    hx-swap="outerHTML"
+  {% endif %}
+  class="job-status"
+>
+    <span class="badge badge-{{ status }}">{{ status }}</span>
+
+    {% if job_type == "enrich" %}
+    <span class="badge badge-ok" title="Evaluating and enriching input context">context prep</span>
+    {% elif job_type == "generate" %}
+        {% set path = job.meta.path if job.meta and job.meta.path else None %}
+        {% if path == "structured" %}
+        <span class="badge badge-ok" title="Structured-script path — fast (~60–120 s)">structured · {{ job.meta.stub_count if job.meta else "?" }} beats</span>
+        {% elif path == "standard" %}
+        <span class="badge badge-warn" title="Standard LLM path — ~2–5 min, up to 3 retries">standard LLM</span>
+        {% endif %}
+    {% endif %}
+
+    {% if status != "pending" %}
+    <div class="progress-bar">
+        <div class="progress-fill{% if status == 'running' %} progress-fill--animated{% endif %}" style="width: {{ job.progress }}%"></div>
+    </div>
+    <span class="progress-label">{{ job.progress }}%</span>
+    {% endif %}
+
+    {% if status == "running" %}
+    <p class="progress-hint">
+        {% if job_type == "enrich" %}
+            {% if job.progress <= 30 %}Analysing context quality…
+            {% else %}Enriching context with AI…
+            {% endif %}
+        {% else %}
+            {% if job.progress <= 20 %}Generating guide with AI — takes 1–3 min…
+            {% elif job.progress <= 50 %}Retrying AI generation…
+            {% else %}Saving guide…
+            {% endif %}
+        {% endif %}
+    </p>
+    {% endif %}
+
+    {% if job_type == "enrich" and status == "done" %}
+    <p class="progress-hint">Context ready — starting guide generation…</p>
+    {% endif %}
+
+    {% if job.error and status == "failed" %}
+    <p class="error">{{ job.error }}</p>
+    {% endif %}
+
+    {% if job_type == "generate" and status == "done" and job.reel_id %}
+    <p class="success">
+        Guide ready
+        {% if job.meta and job.meta.quality_score %}
+            <span style="color:#6b7280;font-weight:400;"> · quality score {{ job.meta.quality_score }}/100</span>
+        {% endif %}
+        {% if job.meta and job.meta.context_score is defined %}
+            <span style="color:#6b7280;font-weight:400;"> · context score {{ job.meta.context_score }}/100</span>
+        {% endif %}
+        — <a href="/api/reels/{{ job.reel_id }}" style="color:#065f46;font-weight:600;">View guide →</a>
+    </p>
+    {% endif %}
+</div>
