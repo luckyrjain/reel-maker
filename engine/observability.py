@@ -64,6 +64,12 @@ def paid_call_count(db, reel_id: int) -> int:
 
     Local Ollama calls are free and don't count — see Settings.max_paid_llm_calls_per_reel,
     which uses this to stop a stuck retry loop from running up an unbounded bill.
+
+    This is a lifetime count for the reel, not scoped to one job or attempt — there
+    is currently no "regenerate this reel's guide" flow that would create a second
+    generate Job, so that's not reachable today. If one is added later, a reel that
+    already hit the cap would need an explicit reset (not just raising the global
+    setting) to be regenerated again.
     """
     return (
         db.query(models.StageEvent)

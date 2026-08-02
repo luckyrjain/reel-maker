@@ -67,3 +67,40 @@ def test_estimate_ignores_reels_on_a_different_path(db_session):
     est = estimate_generation(db, _FREE_TEXT_CTX, "auto")  # resolves to "standard"
     assert est.avg_cost_usd is None
     assert est.sample_size == 0
+
+
+def test_estimate_excludes_structured_fallback_reels_from_standard_bucket(db_session):
+    """A reel that tried structured first and fell through to standard pays for
+    both attempts. Its job.meta["path"] ends up "standard", but counting its full
+    cost as a plain "standard" sample would inflate the estimate for reels that
+    went straight to standard — see engine/generation/estimate.py's docstring.
+    """
+    db = db_session
+
+    # A genuine straight-to-standard reel.
+    clean_reel = models.Reel(context="clean", status=models.ReelStatus.guide_ready)
+    db.add(clean_reel)
+    db.flush()
+    db.add(models.Job(
+        type=models.JobType.generate, reel_id=clean_reel.id,
+        status=models.JobStatus.done, meta={"path": "standard"},
+    ))
+    db.add(models.StageEvent(reel_id=clean_reel.id, stage="generate", cost_usd=0.02, ok=True))
+
+    # A reel that tried structured, failed the quality gate, and fell through —
+    # its StageEvents include the wasted structured-attempt cost too.
+    fallback_reel = models.Reel(context="fallback", status=models.ReelStatus.guide_ready)
+    db.add(fallback_reel)
+    db.flush()
+    db.add(models.Job(
+        type=models.JobType.generate, reel_id=fallback_reel.id,
+        status=models.JobStatus.done,
+        meta={"path": "standard", "structured_score": 40, "structured_fallback": True},
+    ))
+    db.add(models.StageEvent(reel_id=fallback_reel.id, stage="enrich", cost_usd=0.05, ok=True))
+    db.add(models.StageEvent(reel_id=fallback_reel.id, stage="generate", cost_usd=0.02, ok=True))
+    db.commit()
+
+    est = estimate_generation(db, _FREE_TEXT_CTX, "auto")  # resolves to "standard"
+    assert est.sample_size == 1
+    assert round(est.avg_cost_usd, 3) == 0.02

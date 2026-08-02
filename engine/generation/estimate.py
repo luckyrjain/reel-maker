@@ -49,6 +49,15 @@ def _historical_avg_cost(db, path: str) -> tuple[float | None, int]:
 
     Returns (avg_cost_usd, sample_size). avg_cost_usd is None when there is no
     completed history yet for this path.
+
+    Reels where the structured path was tried first and fell through on a low
+    quality score (job.meta["structured_fallback"]) are excluded from the
+    "standard" bucket: their final path is "standard", but their StageEvent
+    cost also includes the failed structured attempt, which would inflate the
+    average for reels that go straight to standard. is_structured() means a
+    future estimate for a structured-looking context is quoted from the
+    "structured" bucket anyway, so this exclusion only keeps "standard" honest
+    for reels that actually went straight there.
     """
     done_generate_jobs = (
         db.query(models.Job)
@@ -58,7 +67,10 @@ def _historical_avg_cost(db, path: str) -> tuple[float | None, int]:
         )
         .all()
     )
-    reel_ids = {j.reel_id for j in done_generate_jobs if (j.meta or {}).get("path") == path}
+    reel_ids = {
+        j.reel_id for j in done_generate_jobs
+        if (j.meta or {}).get("path") == path and not (j.meta or {}).get("structured_fallback")
+    }
     if not reel_ids:
         return None, 0
 
