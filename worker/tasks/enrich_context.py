@@ -32,6 +32,8 @@ def enrich_context(self, job_id: int):
             return
 
         reel = db.get(models.Reel, job.reel_id)
+        if reel is None:
+            raise ValueError(f"Reel {job.reel_id} no longer exists")
 
         job.status = models.JobStatus.running
         job.started_at = datetime.now(timezone.utc)

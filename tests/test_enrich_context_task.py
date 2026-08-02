@@ -176,3 +176,24 @@ def test_enrichment_skipped_for_structured_script_even_below_threshold():
 
     mock_enrich.assert_not_called()
     assert reel.enriched_context is None
+
+
+# ── missing row guard ─────────────────────────────────────────────────────
+
+
+def test_missing_reel_fails_job_with_actionable_message():
+    """A deleted reel must produce an operator-readable error, not an AttributeError."""
+    from api import models
+    from worker.tasks.enrich_context import enrich_context
+
+    job = _make_job()
+    job.reel_id = 42
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else None
+
+    with patch("worker.tasks.enrich_context.SessionLocal", return_value=db):
+        with pytest.raises(ValueError, match="Reel 42 no longer exists"):
+            enrich_context(1)
+
+    assert job.status == models.JobStatus.failed
+    assert "Reel 42 no longer exists" in job.error
