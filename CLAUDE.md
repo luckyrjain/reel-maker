@@ -45,7 +45,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 109 tests across 9 files
+.venv/bin/pytest                            # 144 tests across 14 files
 .venv/bin/pytest tests/test_foo.py::bar -s
 
 # New migration after changing models.py
@@ -60,6 +60,8 @@ The pipeline: context entry → guide generation (LLM or script parser + enrichm
 **Core principle:** everything slow runs as a Celery background job. Nothing slow happens inside a request. The browser gets HTML fragments (Jinja2) and polls for updates via HTMX — no JSON to the browser, no React.
 
 **Job pipeline:** `POST /api/reels` creates `Reel` + `Cut` rows + `Job` row → enqueues Celery task → returns HTML fragment that polls `GET /api/jobs/{id}/fragment` every 2 s → worker updates `job.status` + `job.progress` + `job.heartbeat_at` → fragment shows result.
+
+**Context enrichment stage:** `POST /api/reels` does not enqueue generation directly. It creates the `Reel` + `Cut` rows and an `enrich` job, and enqueues `enrich_context`. That task scores the raw context with `evaluate_context()` (5 axes × 20 pts), calls `llm_enrich()` when the score is below 60 — skipped entirely for structured scripts, where enrichment would cause topic drift — stores the result on `reel.enriched_context`, transitions the reel to `generating`, then creates and enqueues the `generate_guide` job. `generate_guide` reads `reel.enriched_context or reel.context`.
 
 **State machines** (`api/state.py`) — `REEL_TRANSITIONS` and `CUT_TRANSITIONS` dicts are the single source of truth. Always call `transition(obj, new_status, map)` — it raises `ValueError` on invalid moves. Never set `.status` directly.
 
@@ -87,8 +89,9 @@ In both paths, `postprocess.py` strips section-label prefixes from `vo_script` a
 **Reliability features:**
 - `task_acks_late=True` — broker acks only after task returns; a killed worker requeues rather than silently loses.
 - `task_reject_on_worker_lost=True` — task requeued when worker is SIGKILLed.
+- **Transient-failure retry** — `generate_guide` and `render_cut` retry up to twice with 30 s/60 s backoff when `worker/tasks/common.py::should_retry()` classifies the exception as transient (httpx transport errors, timeouts, HTTP 429/5xx). Deterministic failures — bad LLM JSON, quality-below-threshold, a missing row, ffmpeg's non-zero exit — fail once, unchanged. The retry branch resets `job.status` to `pending` before calling `self.retry()`: the idempotency guard rejects `running`, so a retry that left the status alone would be a silent no-op. It must **not** bump `job.attempts` — task entry already does. `enrich_context` stays `max_retries=0` on purpose.
 - **Idempotency guard** at task entry: tasks with `status in (done, running)` return immediately (redelivery no-op).
-- **Heartbeat** — tasks write `job.heartbeat_at` at every milestone. `reap_stuck_jobs` (Celery beat, every 60 s) fails any `running` job without a heartbeat update in the last 5 minutes, **and** any `pending` job older than 30 minutes (broker was down when `.delay()` ran, or no worker consumes the queue). Both roll back the owning reel (`enriching` or `generating`) / cut.
+- **Heartbeat** — tasks write `job.heartbeat_at` at every milestone. `reap_stuck_jobs` (Celery beat, every 60 s) fails any `running` job without a heartbeat update in the last 5 minutes, **and** any `pending` job whose `updated_at` is older than 30 minutes (broker was down when `.delay()` ran, or no worker consumes the queue). The pending branch keys on `updated_at`, not `created_at`, so a job sitting in retry backoff is not reaped for being old. Both roll back the owning reel (`enriching` or `generating`) / cut.
 - **Atomic MP4 write** — FFmpeg writes to `.tmp.mp4`, then `os.replace()` to the final path; a killed process never leaves a servable half-written file.
 
 ## Module layout
@@ -110,6 +113,7 @@ api/
 worker/
   celery_app.py       Celery instance; acks_late=True, beat schedule, split queues
   tasks/
+    common.py         should_retry() / is_transient_error() — retry classification
     generate.py       generate_guide(job_id) — idempotency guard, heartbeat, enrichment,
                       conflict injection, visuals LLM, closed-loop eval retry, observability
     render.py         render_cut(job_id) — idempotency guard, heartbeat, resolve_or_reuse,
@@ -152,9 +156,14 @@ tests/
   test_enrichment.py          15 tests — coerce_beat_type, _enrich_batch response parsing, topic fence
   test_audio_text_sync.py     11 tests — clean_guide() regeneration, _build_text_filter() proportional timing + whisper fallback, PATCH re-derivation, visual direction anchoring
   test_context_enricher.py    13 tests — evaluate_context axes, llm_enrich
-  test_enrich_context_task.py  9 tests — idempotency, enrichment guard, structured script detection
-  test_maintenance.py          6 tests — reaper: stale running jobs, never-picked-up pending jobs, owner rollback
-  test_tts.py                  4 tests — provider selection, unknown-provider fallback, SilentProvider shared file
+  test_enrich_context_task.py 10 tests — idempotency, enrichment guard, structured script detection, missing reel
+  test_maintenance.py          7 tests — reaper: stale running jobs, never-picked-up pending jobs, owner rollback, updated_at keying
+  test_tts.py                  8 tests — provider selection, unknown-provider fallback, SilentProvider shared file, synth_to_budget clamp
+  test_common.py              16 tests — transient-error classification, retry budget
+  test_generate_task.py        3 tests — missing reel, transient retry, deterministic failure
+  test_render_task.py          3 tests — missing cut, transient retry, success clears stale error
+  test_asset_sourcer.py        4 tests — resolve_or_reuse pin, reuse, re-pin, beat isolation
+  test_llm_judge.py            3 tests — neutral-score fallback on raise, garbage, out-of-range
 
 ui/templates/
   index.html          Context-entry form; target_length + voiceover_mode + generation_path selects
