@@ -1,0 +1,49 @@
+{% set status = job.status.value %}
+{% set done = status in ("done", "failed") %}
+
+<div
+  {% if not done %}
+    hx-get="/api/jobs/{{ job.id }}/fragment"
+    hx-trigger="load delay:2s"
+    hx-swap="outerHTML"
+  {% endif %}
+  class="job-status"
+>
+    <span class="badge badge-{{ status }}">{{ status }}</span>
+    {% set path = job.meta.path if job.meta and job.meta.path else ("structured" if (is_structured is defined and is_structured) else ("standard" if (is_structured is defined and not is_structured) else None)) %}
+    {% if path == "structured" %}
+    <span class="badge badge-ok" title="Structured-script path — fast (~60–120 s)">structured · {{ job.meta.stub_count if job.meta else "?" }} beats</span>
+    {% elif path == "standard" %}
+    <span class="badge badge-warn" title="Standard LLM path — ~2–5 min, up to 3 retries">standard LLM</span>
+    {% endif %}
+
+    {% if status != "pending" %}
+    <div class="progress-bar">
+        <div class="progress-fill{% if status == 'running' %} progress-fill--animated{% endif %}" style="width: {{ job.progress }}%"></div>
+    </div>
+    <span class="progress-label">{{ job.progress }}%</span>
+    {% endif %}
+
+    {% if status == "running" %}
+    <p class="progress-hint">
+        {% if job.progress <= 20 %}Generating guide with AI — takes 1–3 min…
+        {% elif job.progress <= 50 %}Retrying AI generation…
+        {% else %}Saving guide…
+        {% endif %}
+    </p>
+    {% endif %}
+
+    {% if job.error and status == "failed" %}
+    <p class="error">{{ job.error }}</p>
+    {% endif %}
+
+    {% if status == "done" and job.reel_id %}
+    <p class="success">
+        Guide ready
+        {% if job.meta and job.meta.quality_score %}
+            <span style="color:#6b7280;font-weight:400;"> · quality score {{ job.meta.quality_score }}/100</span>
+        {% endif %}
+        — <a href="/api/reels/{{ job.reel_id }}" style="color:#065f46;font-weight:600;">View guide →</a>
+    </p>
+    {% endif %}
+</div>

@@ -1,0 +1,42 @@
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    database_url: str = "postgresql://reelmaker:reelmaker@localhost:5432/reelmaker"
+    redis_url: str = "redis://localhost:6379/0"
+
+    llm_base_url: str = "http://localhost:11434/v1"
+    llm_model: str = "qwen3:14b"
+    # Enrichment/judge calls use this model — defaults to local qwen3:14b.
+    # Set NVIDIA_API_KEY to route these calls to NVIDIA NIM instead.
+    llm_enrichment_model: str = "qwen3:14b"
+
+    # NVIDIA NIM — if set, enrichment + judge calls use the hosted API.
+    # Get a key at build.nvidia.com. Leave blank to use local Ollama.
+    nvidia_api_key: str = ""
+    nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
+    nvidia_enrichment_model: str = "qwen/qwen3-next-80b-a3b-instruct"
+    # Set to route main guide generation through NVIDIA NIM instead of local Ollama.
+    # Recommended: same model as enrichment, or a capable alternative.
+    nvidia_generation_model: str = "qwen/qwen3-next-80b-a3b-instruct"
+    use_nvidia_for_generation: bool = False
+
+    tts_provider: str = "chatterbox"
+    asset_store_dir: str = "./data/assets"
+    video_store_dir: str = "./data/videos"
+
+    pexels_api_key: str = ""
+    pixabay_api_key: str = ""
+    huggingface_api_key: str = ""
+    huggingface_image_model: str = "black-forest-labs/FLUX.1-schnell"
+    huggingface_video_model: str = "Lightricks/LTX-Video"
+
+    # 32-byte URL-safe base64 key for Fernet credential encryption.
+    # Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # Leave blank in dev — tokens are stored as plaintext with a warning.
+    credentials_key: str = ""
+
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+
+
+settings = Settings()

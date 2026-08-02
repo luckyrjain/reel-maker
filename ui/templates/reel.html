@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reel — {{ reel.context[:60] }}</title>
+    <script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"></script>
+    <link rel="stylesheet" href="/static/main.css">
+</head>
+<body>
+<main>
+    <a href="/" class="back">← New reel</a>
+
+    <h1>{{ reel.context[:80] }}{% if reel.context|length > 80 %}…{% endif %}</h1>
+    <div class="meta">
+        <span class="badge badge-{{ reel.status.value }}">{{ reel.status.value }}</span>
+        <span>niche: {{ reel.niche or "—" }}</span>
+        <span>·</span>
+        <span>{{ reel.voiceover_mode }}</span>
+    </div>
+
+    <div class="cuts">
+        {% for cut in cuts %}
+        {% include "fragments/cut_card.html" %}
+        {% endfor %}
+    </div>
+</main>
+</body>
+</html>

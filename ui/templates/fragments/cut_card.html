@@ -1,0 +1,196 @@
+{# Reusable cut card. Expects `cut` in context.
+   Returned by PATCH /api/cuts/{id} and POST /api/cuts/{id}/approve so the
+   whole card can be swapped in-place without a full page reload. #}
+
+{% set st = cut.status.value %}
+{% set editable = st == "in_review" %}
+
+<div id="cut-card-{{ cut.id }}" class="cut-card">
+
+  {# ── Header ── #}
+  <div class="cut-header">
+    <span class="platform-badge">{{ cut.platform.value.replace("_", " ") }}</span>
+    <span class="badge badge-{{ st }}">{{ st }}</span>
+    {% if cut.guide %}
+    <span style="color:#6b7280;font-size:0.8rem;">
+      {{ cut.guide.beats | length }} beats · {{ cut.guide.target_length_s }}s target
+    </span>
+    {% endif %}
+  </div>
+
+  {# ── Caption + hashtags + beats (editable in in_review, read-only otherwise) ── #}
+
+  {% if editable %}
+  <form
+    hx-patch="/api/cuts/{{ cut.id }}"
+    hx-target="#cut-card-{{ cut.id }}"
+    hx-swap="outerHTML"
+    style="display:flex;flex-direction:column;gap:14px;"
+  >
+    <label class="field-label">
+      Caption
+      <textarea name="caption" rows="2" class="field-input">{{ cut.caption or '' }}</textarea>
+    </label>
+
+    <label class="field-label">
+      Hashtags <span class="field-hint">(comma-separated, no #)</span>
+      <input name="hashtags_raw" class="field-input"
+             value="{{ cut.hashtags | join(', ') if cut.hashtags else '' }}">
+    </label>
+
+    {% if cut.guide and cut.guide.beats %}
+    <div>
+      <h3 style="margin-bottom:8px;">Edit beats</h3>
+      <table class="beat-table">
+        <thead>
+          <tr>
+            <th>#</th><th>Type</th><th>Dur. (s)</th>
+            <th>Voiceover script</th>
+            <th>Visual direction <span class="field-hint">(footage search)</span></th>
+            <th>On-screen text <span class="field-hint">(one line each)</span></th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for beat in cut.guide.beats %}
+        <tr>
+          <td>{{ loop.index }}</td>
+          <td><span class="beat-type beat-{{ beat.type }}">{{ beat.type }}</span></td>
+          <td>
+            <input name="beat_{{ loop.index0 }}_duration_s"
+                   type="number" step="0.5" min="1" max="30"
+                   class="field-input field-sm" style="width:60px;"
+                   value="{{ beat.duration_s }}">
+          </td>
+          <td>
+            <textarea name="beat_{{ loop.index0 }}_vo_script"
+                      rows="3" class="field-input field-sm">{{ beat.vo_script }}</textarea>
+          </td>
+          <td>
+            <input name="beat_{{ loop.index0 }}_visual_direction"
+                   class="field-input field-sm" value="{{ beat.visual_direction }}">
+          </td>
+          <td>
+            <textarea name="beat_{{ loop.index0 }}_on_screen_text"
+                      rows="3" class="field-input field-sm"
+                      placeholder="One line per row (max 3)">{{ beat.on_screen_text | join('\n') }}</textarea>
+          </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+
+    <div>
+      <button type="submit" class="btn-save">Save changes</button>
+    </div>
+  </form>
+
+  {% else %}
+  {# ── Read-only caption / hashtags / beats ── #}
+
+  {% if cut.caption %}
+  <div class="caption-box">{{ cut.caption }}</div>
+  {% endif %}
+
+  {% if cut.hashtags %}
+  <div class="hashtags">
+    {% for tag in cut.hashtags %}<span class="hashtag">#{{ tag }}</span>{% endfor %}
+  </div>
+  {% endif %}
+
+  {% if cut.guide and cut.guide.beats %}
+  <h3>Production guide</h3>
+  <table class="beat-table">
+    <thead>
+      <tr>
+        <th>#</th><th>Type</th><th>Dur.</th>
+        <th>Voiceover</th><th>Visual direction</th><th>On-screen text</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for beat in cut.guide.beats %}
+    <tr>
+      <td>{{ loop.index }}</td>
+      <td><span class="beat-type beat-{{ beat.type }}">{{ beat.type }}</span></td>
+      <td style="white-space:nowrap;">{{ beat.duration_s }}s</td>
+      <td class="vo">{{ beat.vo_script or "—" }}</td>
+      <td class="visual">{{ beat.visual_direction }}</td>
+      <td>
+        <ul class="overlay-list">
+        {% for line in beat.on_screen_text %}<li>{{ line }}</li>{% endfor %}
+        </ul>
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+  {% endif %} {# end editable / read-only #}
+
+  {# ── Render / approve section ── #}
+  <div class="render-section">
+
+    {% if st in ("in_review", "approved", "publishing", "published") and cut.video_path %}
+    <video
+      src="/api/cuts/{{ cut.id }}/video"
+      controls playsinline loop
+      style="width:100%;max-width:280px;border-radius:10px;display:block;"
+    ></video>
+    <p style="font-size:0.8rem;color:#6b7280;margin-top:6px;">
+      {{ "%.1f" | format(cut.duration_s or 0) }}s ·
+      <a href="/api/cuts/{{ cut.id }}/video" download style="color:#6366f1;">Download MP4</a>
+    </p>
+    {% endif %}
+
+    {% if st == "in_review" %}
+    <div id="render-section-{{ cut.id }}" style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;align-items:center;">
+      <button class="btn-render"
+          hx-post="/api/cuts/{{ cut.id }}/render"
+          hx-target="#render-section-{{ cut.id }}"
+          hx-swap="innerHTML">
+        Re-render
+      </button>
+      <button class="btn-approve"
+          hx-post="/api/cuts/{{ cut.id }}/approve"
+          hx-target="#cut-card-{{ cut.id }}"
+          hx-swap="outerHTML">
+        Approve ✓
+      </button>
+    </div>
+
+    {% elif st == "approved" %}
+    <p class="success" style="margin-top:10px;">Approved ✓ — ready to publish.</p>
+
+    {% elif st == "rendering" %}
+    <p style="color:#92400e;font-size:0.85rem;margin-top:10px;">
+      Rendering in progress — refresh to update.
+    </p>
+
+    {% elif st == "failed" %}
+    <div id="render-section-{{ cut.id }}" style="margin-top:10px;">
+      <p class="error" style="margin-bottom:8px;">Render failed.</p>
+      <button class="btn-render"
+          hx-post="/api/cuts/{{ cut.id }}/render"
+          hx-target="#render-section-{{ cut.id }}"
+          hx-swap="innerHTML">
+        Retry render
+      </button>
+    </div>
+
+    {% elif cut.guide %}
+    <div id="render-section-{{ cut.id }}" style="margin-top:12px;">
+      <button class="btn-render"
+          hx-post="/api/cuts/{{ cut.id }}/render"
+          hx-target="#render-section-{{ cut.id }}"
+          hx-swap="innerHTML">
+        Render
+      </button>
+    </div>
+
+    {% else %}
+    <p style="color:#9ca3af;font-size:0.85rem;margin-top:10px;">Generate a guide first.</p>
+    {% endif %}
+
+  </div>
+</div>

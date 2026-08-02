@@ -1,0 +1,61 @@
+{% set jstatus = job.status.value %}
+{% set done = jstatus in ("done", "failed") %}
+
+<div
+  id="render-status-{{ cut.id }}"
+  {% if not done %}
+    hx-get="/api/cuts/{{ cut.id }}/render-status?job_id={{ job.id }}"
+    hx-trigger="load delay:3s"
+    hx-swap="outerHTML"
+  {% endif %}
+>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+        <span class="badge badge-{{ jstatus }}">{{ jstatus }}</span>
+        {% if jstatus != "pending" %}
+        <div class="progress-bar" style="max-width:220px;">
+            <div class="progress-fill{% if jstatus == 'running' %} progress-fill--animated{% endif %}" style="width:{{ job.progress }}%;"></div>
+        </div>
+        <span class="progress-label">{{ job.progress }}%</span>
+        {% endif %}
+    </div>
+
+    {% if jstatus == "running" %}
+    <p class="progress-hint">
+        {% if job.progress < 70 %}Fetching footage & synthesising audio…
+        {% else %}Compositing video — takes 3–6 min…
+        {% endif %}
+    </p>
+    {% endif %}
+
+    {% if job.error %}
+    <p class="error" style="margin-bottom:8px;">{{ job.error }}</p>
+    {% endif %}
+
+    {% if jstatus == "done" and cut.video_path %}
+    <video
+        src="/api/cuts/{{ cut.id }}/video"
+        controls
+        playsinline
+        loop
+        style="width:100%;max-width:280px;border-radius:10px;display:block;"
+    ></video>
+    <p style="font-size:0.8rem;color:#6b7280;margin-top:6px;">
+        {{ "%.1f"|format(cut.duration_s or 0) }}s ·
+        <a href="/api/cuts/{{ cut.id }}/video" download style="color:#6366f1;">Download MP4</a>
+    </p>
+    <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
+        <button class="btn-render"
+            hx-post="/api/cuts/{{ cut.id }}/render"
+            hx-target="#render-section-{{ cut.id }}"
+            hx-swap="innerHTML">
+            Re-render
+        </button>
+        <button class="btn-approve"
+            hx-post="/api/cuts/{{ cut.id }}/approve"
+            hx-target="#cut-card-{{ cut.id }}"
+            hx-swap="outerHTML">
+            Approve ✓
+        </button>
+    </div>
+    {% endif %}
+</div>

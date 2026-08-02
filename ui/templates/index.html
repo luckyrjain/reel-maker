@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reel Maker</title>
+    <script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"></script>
+    <link rel="stylesheet" href="/static/main.css">
+</head>
+<body>
+    <main>
+        <h1>Reel Maker</h1>
+
+        <form hx-post="/api/reels"
+              hx-target="#result"
+              hx-swap="innerHTML"
+              hx-indicator="#spinner">
+
+            <label>
+                Context
+                <textarea name="context" rows="14"
+                          placeholder="HOOK
+Start with a question, conflict, or surprising stat that grabs attention immediately.
+[Visual: Specific shot — include a full player/subject name for auto photo sourcing]
+
+SECTION NAME (repeat for each topic / player / angle)
+Write the key insight in 2–3 sentences. Explain WHY, not just what. Include stats or causal language (because, which means, forces).
+[Visual: Full Name specific action or moment]
+
+CONFLICT / WEAKNESS
+One genuine risk or counter-argument. Use: but, however, vulnerability, exposed.
+[Visual: Full Name under pressure or defensive moment]
+
+CALL TO ACTION
+Punchy closing line. Subscribe / comment / share prompt.
+[Visual: Team or subject celebration]"
+                          required></textarea>
+            </label>
+            <p class="form-hint">
+                3+ ALL-CAPS section headers → fast structured path (~60–120 s).
+                Unstructured text → standard LLM path (~2–5 min, up to 3 retries).
+                Include full subject names so player photos are auto-sourced.
+            </p>
+
+            <label>
+                Niche
+                <input name="niche" placeholder="e.g. football, personal finance, fitness">
+            </label>
+
+            <div style="display:flex;gap:16px;flex-wrap:wrap;">
+                <label style="flex:1;min-width:160px;">
+                    Voiceover mode
+                    <select name="voiceover_mode">
+                        <option value="voiceover">Voiceover</option>
+                        <option value="music_only">Music only</option>
+                        <option value="silent">Silent</option>
+                    </select>
+                </label>
+
+                <label style="flex:1;min-width:160px;">
+                    Target length
+                    <select name="target_length_s">
+                        <option value="30">30s</option>
+                        <option value="45" selected>45s</option>
+                        <option value="60">60s</option>
+                        <option value="75">75s</option>
+                        <option value="90">90s</option>
+                    </select>
+                </label>
+
+                <label style="flex:1;min-width:160px;">
+                    Generation path
+                    <select name="generation_path">
+                        <option value="auto" selected>Auto-detect</option>
+                        <option value="structured">I wrote a script (fast, ~90s)</option>
+                        <option value="standard">Generate from topic (full LLM)</option>
+                    </select>
+                </label>
+            </div>
+
+            <button type="submit">Generate guide</button>
+            <span id="spinner" class="htmx-indicator">Generating…</span>
+        </form>
+
+        <div id="result" style="margin-top: 28px;"></div>
+    </main>
+</body>
+</html>

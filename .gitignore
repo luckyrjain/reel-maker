@@ -1,0 +1,16 @@
+# Secrets
+.env
+
+# Virtualenv
+.venv/
+
+# Generated media (renders, cached footage, TTS audio)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# macOS
+.DS_Store
