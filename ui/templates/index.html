@@ -9,6 +9,7 @@
 </head>
 <body>
     <main>
+        <div class="page-nav"><a href="/api/reels">All reels →</a></div>
         <h1>Reel Maker</h1>
 
         <form hx-post="/api/reels"
@@ -19,6 +20,11 @@
             <label>
                 Context
                 <textarea name="context" rows="14"
+                          hx-post="/api/reels/estimate"
+                          hx-trigger="load, keyup delay:500ms changed, change"
+                          hx-target="#cost-estimate"
+                          hx-swap="outerHTML"
+                          hx-include="closest form"
                           placeholder="HOOK
 Start with a question, conflict, or surprising stat that grabs attention immediately.
 [Visual: Specific shot — include a full player/subject name for auto photo sourcing]
@@ -70,13 +76,20 @@ Punchy closing line. Subscribe / comment / share prompt.
 
                 <label style="flex:1;min-width:160px;">
                     Generation path
-                    <select name="generation_path">
+                    <select name="generation_path"
+                            hx-post="/api/reels/estimate"
+                            hx-trigger="change"
+                            hx-target="#cost-estimate"
+                            hx-swap="outerHTML"
+                            hx-include="closest form">
                         <option value="auto" selected>Auto-detect</option>
                         <option value="structured">I wrote a script (fast, ~90s)</option>
                         <option value="standard">Generate from topic (full LLM)</option>
                     </select>
                 </label>
             </div>
+
+            <div id="cost-estimate" class="cost-estimate"></div>
 
             <button type="submit">Generate guide</button>
             <span id="spinner" class="htmx-indicator">Generating…</span>

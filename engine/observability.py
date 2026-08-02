@@ -57,3 +57,16 @@ def record_stage(
             db.commit()
         except Exception:
             db.rollback()
+
+
+def paid_call_count(db, reel_id: int) -> int:
+    """Count StageEvent rows for a reel that hit a metered (NVIDIA NIM) provider.
+
+    Local Ollama calls are free and don't count — see Settings.max_paid_llm_calls_per_reel,
+    which uses this to stop a stuck retry loop from running up an unbounded bill.
+    """
+    return (
+        db.query(models.StageEvent)
+        .filter(models.StageEvent.reel_id == reel_id, models.StageEvent.provider == "nvidia")
+        .count()
+    )

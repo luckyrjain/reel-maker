@@ -1,16 +1,19 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, Form
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from typing import Annotated, Optional
 
 from api.db import get_db
 from api import models
 from api.state import transition, REEL_TRANSITIONS
+from engine.generation.estimate import estimate_generation
 from worker.tasks.enrich_context import enrich_context
 
 router = APIRouter()
 templates = Jinja2Templates(directory="ui/templates")
+
+REEL_LIST_PAGE_SIZE = 50
 
 
 @router.post("/reels", response_class=HTMLResponse)
@@ -63,6 +66,50 @@ def create_reel(
     )
 
 
+@router.post("/reels/estimate", response_class=HTMLResponse)
+def estimate_reel(
+    request: Request,
+    context: Annotated[str, Form()] = "",
+    generation_path: Annotated[str, Form()] = "auto",
+    db: Session = Depends(get_db),
+):
+    estimate = estimate_generation(db, context, generation_path)
+    return templates.TemplateResponse(
+        request, "fragments/cost_estimate.html", {"estimate": estimate},
+    )
+
+
+@router.get("/reels", response_class=HTMLResponse)
+def list_reels(
+    request: Request,
+    page: int = 1,
+    db: Session = Depends(get_db),
+):
+    page = max(page, 1)
+    offset = (page - 1) * REEL_LIST_PAGE_SIZE
+
+    total = db.query(models.Reel).count()
+    reels = (
+        db.query(models.Reel)
+        .options(joinedload(models.Reel.cuts))
+        .order_by(models.Reel.created_at.desc())
+        .offset(offset)
+        .limit(REEL_LIST_PAGE_SIZE)
+        .all()
+    )
+
+    return templates.TemplateResponse(
+        request, "reels_list.html",
+        {
+            "reels": reels,
+            "page": page,
+            "has_next": offset + REEL_LIST_PAGE_SIZE < total,
+            "has_prev": page > 1,
+            "total": total,
+        },
+    )
+
+
 @router.get("/reels/{reel_id}/active-job-fragment", response_class=HTMLResponse)
 def active_job_fragment(reel_id: int, request: Request, db: Session = Depends(get_db)):
     reel = db.get(models.Reel, reel_id)
@@ -95,13 +142,65 @@ def active_job_fragment(reel_id: int, request: Request, db: Session = Depends(ge
     )
 
 
+def _pipeline_summary(db: Session, reel_id: int) -> dict:
+    """Aggregate StageEvent + Job rows for a reel into cost/latency/quality figures.
+
+    Kept as a plain function (not baked into the route) so it can be unit tested
+    without spinning up the HTTP layer.
+    """
+    jobs = (
+        db.query(models.Job)
+        .filter(models.Job.reel_id == reel_id)
+        .order_by(models.Job.created_at)
+        .all()
+    )
+    stage_events = (
+        db.query(models.StageEvent)
+        .filter(models.StageEvent.reel_id == reel_id)
+        .order_by(models.StageEvent.created_at)
+        .all()
+    )
+
+    total_cost = sum(e.cost_usd or 0.0 for e in stage_events)
+    total_latency_ms = sum(e.latency_ms or 0 for e in stage_events)
+    quality_score = next(
+        (
+            j.meta.get("quality_score")
+            for j in reversed(jobs)
+            if j.meta and j.meta.get("quality_score") is not None
+        ),
+        None,
+    )
+
+    stage_summary: dict[str, dict] = {}
+    for e in stage_events:
+        s = stage_summary.setdefault(
+            e.stage, {"count": 0, "latency_ms": 0, "cost_usd": 0.0, "failures": 0}
+        )
+        s["count"] += 1
+        s["latency_ms"] += e.latency_ms or 0
+        s["cost_usd"] += e.cost_usd or 0.0
+        if not e.ok:
+            s["failures"] += 1
+
+    return {
+        "jobs": jobs,
+        "stage_events": stage_events,
+        "stage_summary": stage_summary,
+        "total_cost": total_cost,
+        "total_latency_ms": total_latency_ms,
+        "quality_score": quality_score,
+    }
+
+
 @router.get("/reels/{reel_id}", response_class=HTMLResponse)
 def reel_detail(reel_id: int, request: Request, db: Session = Depends(get_db)):
     reel = db.get(models.Reel, reel_id)
     if not reel:
         raise HTTPException(status_code=404, detail="Reel not found")
     cuts = db.query(models.Cut).filter(models.Cut.reel_id == reel_id).all()
+    pipeline = _pipeline_summary(db, reel_id)
     return templates.TemplateResponse(
         request, "reel.html",
-        {"reel": reel, "cuts": cuts},
+        {"reel": reel, "cuts": cuts, **pipeline},
     )

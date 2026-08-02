@@ -68,6 +68,7 @@ def test_transient_failure_retries_and_resets_status_to_pending():
 
     with (
         patch("worker.tasks.generate.SessionLocal", return_value=db),
+        patch("worker.tasks.generate.paid_call_count", return_value=0),
         patch("worker.tasks.generate.get_llm_provider",
               side_effect=httpx.ConnectTimeout("LLM unreachable")),
         patch.object(generate_guide, "retry", side_effect=Retry()) as mock_retry,
@@ -78,6 +79,27 @@ def test_transient_failure_retries_and_resets_status_to_pending():
     mock_retry.assert_called_once()
     assert job.status == models.JobStatus.pending
     assert job.attempts == 1, "entry already incremented attempts; the retry branch must not"
+
+
+def test_paid_call_budget_exceeded_fails_without_retry():
+    """A reel that already hit its paid-call cap must fail cleanly, not retry."""
+    from worker.tasks.generate import generate_guide
+
+    job = _job()
+    reel = _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
+
+    with (
+        patch("worker.tasks.generate.SessionLocal", return_value=db),
+        patch("worker.tasks.generate.paid_call_count", return_value=20),
+        patch.object(generate_guide, "retry", side_effect=Retry()) as mock_retry,
+    ):
+        with pytest.raises(ValueError, match="Paid LLM call budget exceeded"):
+            generate_guide(1)
+
+    mock_retry.assert_not_called()
+    assert job.status == models.JobStatus.failed
 
 
 def test_deterministic_failure_does_not_retry():
@@ -92,6 +114,7 @@ def test_deterministic_failure_does_not_retry():
 
     with (
         patch("worker.tasks.generate.SessionLocal", return_value=db),
+        patch("worker.tasks.generate.paid_call_count", return_value=0),
         patch("worker.tasks.generate.get_llm_provider",
               side_effect=ValueError("model not found")),
         patch.object(generate_guide, "retry", side_effect=Retry()) as mock_retry,

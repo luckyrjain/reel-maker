@@ -19,6 +19,42 @@
         <span>{{ reel.voiceover_mode }}</span>
     </div>
 
+    {% if stage_events %}
+    <section class="pipeline-panel">
+        <h3>Pipeline</h3>
+        <div class="pipeline-stats">
+            <div class="stat-box">
+                <span class="stat-value">${{ "%.4f"|format(total_cost) }}</span>
+                <span class="stat-label">total cost</span>
+            </div>
+            <div class="stat-box">
+                <span class="stat-value">{{ "%.1f"|format(total_latency_ms / 1000) }}s</span>
+                <span class="stat-label">total LLM time</span>
+            </div>
+            <div class="stat-box">
+                <span class="stat-value">{{ quality_score if quality_score is not none else "—" }}</span>
+                <span class="stat-label">quality score</span>
+            </div>
+        </div>
+        <table class="stage-table">
+            <thead>
+                <tr><th>Stage</th><th>Calls</th><th>Time</th><th>Cost</th><th>Failures</th></tr>
+            </thead>
+            <tbody>
+                {% for stage, s in stage_summary.items() %}
+                <tr>
+                    <td class="mono">{{ stage }}</td>
+                    <td>{{ s.count }}</td>
+                    <td>{{ "%.1f"|format(s.latency_ms / 1000) }}s</td>
+                    <td>${{ "%.4f"|format(s.cost_usd) }}</td>
+                    <td>{% if s.failures %}<span class="stage-fail">{{ s.failures }}</span>{% else %}0{% endif %}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </section>
+    {% endif %}
+
     <div class="cuts">
         {% for cut in cuts %}
         {% include "fragments/cut_card.html" %}

@@ -7,6 +7,7 @@ from api.db import SessionLocal
 from api.state import REEL_TRANSITIONS, transition
 from engine.generation.context_enricher import evaluate_context, llm_enrich, ENRICH_THRESHOLD
 from engine.generation.llm import get_enrichment_provider
+from engine.generation.pricing import llm_cost_usd
 from engine.generation.script_parser import is_structured as _is_structured_script
 from engine.observability import record_stage
 from worker.celery_app import celery_app
@@ -52,6 +53,10 @@ def enrich_context(self, job_id: int):
                 enriched = llm_enrich(reel.context, reel.niche or "", llm)
                 ev.detail["score_before"] = score
                 ev.detail["issues"] = issues
+                usage = getattr(llm, "last_usage", {})
+                ev.tokens_in = usage.get("prompt_tokens")
+                ev.tokens_out = usage.get("completion_tokens")
+                ev.cost_usd = llm_cost_usd(enrich_provider, ev.tokens_in, ev.tokens_out)
 
             if enriched:
                 reel.enriched_context = enriched

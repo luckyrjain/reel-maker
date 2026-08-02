@@ -32,6 +32,19 @@ class Settings(BaseSettings):
     huggingface_image_model: str = "black-forest-labs/FLUX.1-schnell"
     huggingface_video_model: str = "Lightricks/LTX-Video"
 
+    # Hard ceiling on paid (NVIDIA NIM) LLM calls per reel. A single successful run
+    # already makes up to ~16 (structured path falling through to standard, worst
+    # case); this exists to stop a stuck Celery retry loop or a pathological prompt
+    # from compounding that across repeated task attempts with no limit at all.
+    max_paid_llm_calls_per_reel: int = 20
+
+    # Cost estimation for StageEvent.cost_usd — USD per 1M tokens for NVIDIA NIM calls.
+    # NIM rates vary by model and billing plan and change over time, so we don't ship a
+    # guessed number here: both default to 0 (cost tracking inert) until set from your
+    # actual NVIDIA billing plan. Local Ollama calls are always free (self-hosted).
+    nvidia_price_per_1m_input_tokens: float = 0.0
+    nvidia_price_per_1m_output_tokens: float = 0.0
+
     # 32-byte URL-safe base64 key for Fernet credential encryption.
     # Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
     # Leave blank in dev — tokens are stored as plaintext with a warning.
