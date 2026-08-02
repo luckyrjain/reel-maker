@@ -15,10 +15,10 @@ class Settings(BaseSettings):
     # Get a key at build.nvidia.com. Leave blank to use local Ollama.
     nvidia_api_key: str = ""
     nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
-    nvidia_enrichment_model: str = "qwen/qwen3-next-80b-a3b-instruct"
+    nvidia_enrichment_model: str = "nvidia/nemotron-3-super-120b-a12b"
     # Set to route main guide generation through NVIDIA NIM instead of local Ollama.
     # Recommended: same model as enrichment, or a capable alternative.
-    nvidia_generation_model: str = "qwen/qwen3-next-80b-a3b-instruct"
+    nvidia_generation_model: str = "nvidia/nemotron-3-super-120b-a12b"
     use_nvidia_for_generation: bool = False
 
     # "edge" (edge-tts, default) | "kokoro" (Python <3.13) | "silent" (no audio)

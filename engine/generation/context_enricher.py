@@ -162,7 +162,9 @@ def llm_enrich(context: str, niche: str, llm) -> str | None:
         },
     ]
     try:
-        result = llm.complete(messages)
+        # Free-text output, not JSON — models that strictly honor json_mode's
+        # default would wrap this prose as {"text": "..."} instead of returning it.
+        result = llm.complete(messages, json_mode=False)
         if result and result.strip():
             return result.strip()
         return None

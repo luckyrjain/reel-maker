@@ -1,6 +1,6 @@
 """Tests for context_enricher — evaluate_context axis scoring."""
 import pytest
-from engine.generation.context_enricher import evaluate_context
+from engine.generation.context_enricher import evaluate_context, llm_enrich
 
 LONG_NEUTRAL = " ".join(["the team played and worked together"] * 8)
 
@@ -93,3 +93,22 @@ def test_discourse_connectors_help_narrative_axis():
     )
     _, issues = evaluate_context(text)
     assert "weak_narrative_structure" not in issues
+
+
+# ── llm_enrich json_mode contract ─────────────────────────────────────────────
+
+
+def test_llm_enrich_requests_free_text_not_json():
+    """llm_enrich wants prose back — a model that strictly honors the default
+    json_mode=True would wrap the response as {"text": "..."} instead of
+    returning it, corrupting reel.enriched_context with literal JSON syntax."""
+    captured = {}
+
+    class RecordingLLM:
+        def complete(self, messages, json_mode=True):
+            captured["json_mode"] = json_mode
+            return "Enriched prose context."
+
+    result = llm_enrich("Some context.", "football", RecordingLLM())
+    assert captured["json_mode"] is False
+    assert result == "Enriched prose context."

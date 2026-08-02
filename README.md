@@ -201,8 +201,8 @@ All values are read from `.env` (or environment variables):
 | `LLM_MODEL` | `qwen3:14b` | Model name passed to the LLM endpoint |
 | `LLM_ENRICHMENT_MODEL` | `qwen3:14b` | Local model for enrichment + quality judge |
 | `NVIDIA_API_KEY` | *(empty)* | When set, enrichment + judge calls route to NVIDIA NIM |
-| `NVIDIA_ENRICHMENT_MODEL` | `qwen/qwen3-next-80b-a3b-instruct` | Hosted enrichment/judge model |
-| `NVIDIA_GENERATION_MODEL` | `qwen/qwen3-next-80b-a3b-instruct` | Hosted generation model |
+| `NVIDIA_ENRICHMENT_MODEL` | `nvidia/nemotron-3-super-120b-a12b` | Hosted enrichment/judge model |
+| `NVIDIA_GENERATION_MODEL` | `nvidia/nemotron-3-super-120b-a12b` | Hosted generation model |
 | `USE_NVIDIA_FOR_GENERATION` | `false` | Route main guide generation to NVIDIA NIM too |
 | `TTS_PROVIDER` | `edge` | `edge` (needs `edge-tts`), `kokoro` (Python < 3.13), or `silent` |
 | `PEXELS_API_KEY` | *(empty)* | Required for stock footage; falls back to black frames |
