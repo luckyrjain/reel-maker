@@ -142,7 +142,7 @@ engine/
     tts.py            EdgeTTSProvider.synthesize() + .synth_to_budget(); _audio_duration() helper
     captions.py       transcribe_audio() — Whisper word-level timestamps; no-op if not installed
     compositor.py     composite_cut() — MoviePy stage + FFmpeg drawtext stage;
-                      120ms audio_fadein/audio_fadeout per beat for smooth narration transitions;
+                      120ms audio fade in/out per beat (moviepy.audio.fx.AudioFadeIn/AudioFadeOut via .with_effects()) for smooth narration transitions;
                       _build_text_filter() uses Whisper timestamps when available, proportional fallback;
                       atomic final write via os.replace()
 
@@ -221,7 +221,7 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 - **`_generate_caption_hashtags()`** in `generate.py` — structured path generates captions/hashtags via enrichment LLM from actual VO content; falls back to hardcoded template on failure.
 - **Evaluator thresholds**: `MAX_WPS=4.0` (body/CTA beats), `MAX_WPS_HOOK=3.0` (hook beats — tighter cap; hook violation costs 4 pts vs 2 pts for body; Axis 9 max deduction 10 pts total), `MAX_OPENER_WORDS=16`. Narrative insight tactical sub-axis gives 2/4 baseline to non-tactical reels so they aren't penalised for missing football jargon.
 - **Structured script enrichment guard**: `enrich_context.py` imports `script_parser.is_structured()` (≥3 labelled sections — the exact test `parse()` applies). Single source of truth: never add a second header regex, or the guard and the parser will disagree about the same input. When True, `llm_enrich()` is skipped even if score < 60 — the script's topic is already locked in; enrichment would cause context drift. `job.meta["enrich_skipped"]` records the reason (`"structured_script"` or `"score_above_threshold"`).
-- **Audio fade in compositor**: `composite_cut()` applies `audio_fadein(0.12).audio_fadeout(0.12)` to each beat's `AudioFileClip`. Order: subclip if too long → fade → `.with_start(t)`. Fade before `with_start` is required — fades compute against the clip's own timeline, not the composite.
+- **Audio fade in compositor**: `composite_cut()` applies `.with_effects([AudioFadeIn(0.12), AudioFadeOut(0.12)])` to each beat's `AudioFileClip`. Order: subclip if too long → fade → `.with_start(t)`. Fade before `with_start` is required — fades compute against the clip's own timeline, not the composite. `AudioFileClip` has no `.audio_fadein()`/`.audio_fadeout()` methods in MoviePy 2.x — fades are effects, not chainable methods. The exception from calling the non-existent methods was caught by a bare `except Exception: pass` around the VO track builder, so this shipped for months rendering every video with zero audio before a live end-to-end run caught it; the handler now logs via `_log.exception()` instead of swallowing silently.
 - **Topic fence in enrichment prompts**: `_enrich_batch()` and `_make_conflict_stub()` include an explicit "Do not introduce matches, tournaments, scorelines, or players not mentioned in the beat/context" constraint. Prevents LLM from drifting into unrelated events.
 - **Visual direction prompt anchoring**: `build_visuals_messages()` system prompt instructs the LLM to derive `visual_direction` ONLY from the specific players, actions, and events named in that beat's VO — not from the global context.
 - **Video streaming path guard**: `stream_video` validates `cut.video_path` is under `VIDEO_STORE_DIR` via `Path.resolve().is_relative_to()` before serving — never bypass this.

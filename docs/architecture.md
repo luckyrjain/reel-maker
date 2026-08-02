@@ -128,7 +128,7 @@ The browser never fetches JSON. All API responses to the browser are HTML fragme
 | `asset_sourcer.py` | `PexelsVideoSource` + `WikipediaImageSource` (including `extmetadata` license fetch) + `HuggingFaceVideoSource` + `HuggingFaceImageSource`; fallback chain Wikipedia → Pexels → HF video → HF image → black frame; `resolve_or_reuse()` — pins assets per beat, reuses without API call when fingerprint matches; all downloads go through `_atomic_write()` |
 | `tts.py` | `EdgeTTSProvider.synthesize(rate=)` + `.synth_to_budget(target_s)` — adjusts speaking rate ±25% to hit duration budget; `_audio_duration()` via ffprobe |
 | `captions.py` | `transcribe_audio()` — Whisper word-level timestamps → `list[CaptionSegment]`; model cached per process via `@lru_cache`; no-op if whisper not installed |
-| `compositor.py` | `composite_cut()` — MoviePy stage (video + audio) + FFmpeg drawtext stage (text overlays); 120ms `audio_fadein`/`audio_fadeout` per beat for smooth narration transitions; `_build_text_filter()` uses Whisper timestamps when available, proportional fallback otherwise; atomic `os.replace()` for final output |
+| `compositor.py` | `composite_cut()` — MoviePy stage (video + audio) + FFmpeg drawtext stage (text overlays); 120ms audio fade in/out per beat (`AudioFadeIn`/`AudioFadeOut` via `.with_effects()`) for smooth narration transitions; `_build_text_filter()` uses Whisper timestamps when available, proportional fallback otherwise; atomic `os.replace()` for final output |
 
 ### `tests/`
 
@@ -378,7 +378,7 @@ For each beat:
     video → scale/crop 1080×1920, loop if too short, trim
 
   concatenate sub-clips → beat_clip
-  VO audio: AudioFileClip → subclip if too long → audio_fadein(0.12).audio_fadeout(0.12) → .with_start(t)
+  VO audio: AudioFileClip → subclip if too long → .with_effects([AudioFadeIn(0.12), AudioFadeOut(0.12)]) → .with_start(t)
 
 After all beats:
   concatenate beats → final video

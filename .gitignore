@@ -14,3 +14,4 @@ __pycache__/
 
 # macOS
 .DS_Store
+celerybeat-schedule*

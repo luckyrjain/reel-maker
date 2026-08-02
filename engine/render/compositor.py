@@ -7,6 +7,7 @@ Pipeline:
      Each on_screen_text segment is shown for its proportional slice of the beat's
      duration so text tracks the voice rather than being a static block.
 """
+import logging
 import math
 import os
 import re
@@ -22,7 +23,10 @@ from moviepy import (
     VideoFileClip,
     concatenate_videoclips,
 )
+from moviepy.audio.fx import AudioFadeIn, AudioFadeOut
 from PIL import Image, ImageDraw, ImageFont
+
+_log = logging.getLogger(__name__)
 
 TARGET_W = 1080
 TARGET_H = 1920
@@ -320,10 +324,12 @@ def composite_cut(
                 track = AudioFileClip(str(vo_path))
                 if track.duration > duration:
                     track = track.subclipped(0, duration)
-                track = track.audio_fadein(0.12).audio_fadeout(0.12).with_start(t)
+                track = track.with_effects(
+                    [AudioFadeIn(0.12), AudioFadeOut(0.12)]
+                ).with_start(t)
                 vo_tracks.append(track)
             except Exception:
-                pass
+                _log.exception("Failed to load VO track %s for beat at t=%.2fs — beat will be silent", vo_path, t)
 
         t += duration
 

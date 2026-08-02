@@ -125,7 +125,7 @@ Status as of 2026-08-02.
 - Fixes: enrichment LLM was inserting off-topic events into structured-script beats
 
 **Audio crossfade** (`engine/render/compositor.py`):
-- 120ms `audio_fadein` / `audio_fadeout` applied per beat clip before `with_start(t)`
+- 120ms audio fade in/out (`AudioFadeIn`/`AudioFadeOut` via `.with_effects()`) applied per beat clip before `with_start(t)`
 - Fixes: hard-cut audio gaps at beat boundaries made narration feel disconnected
 - Also fixed pre-existing bug: `with_start(t)` was called twice on the long-clip branch
 
@@ -160,8 +160,23 @@ Spec: `docs/superpowers/specs/2026-08-02-retry-and-task-cleanup-design.md`
 - Deleted dead code: `noop` task, `GET /api/jobs/{id}/fragment`, `job_status.html`, `resolve_beat_asset()`, unused schemas
 - Tests 97 → 144 across 14 files
 
-**Not verified against real infrastructure.** Every test is a mocked session or in-memory SQLite;
-no end-to-end run with Postgres, Redis, a live worker, and ffmpeg has been performed.
+**Live end-to-end run performed 2026-08-02** (Postgres, Redis, both workers, real
+Ollama-cloud generation, real Pexels/Wikipedia footage, real Edge TTS audio, real ffmpeg
+render) — found and fixed one severe bug the mocked suite could not catch:
+
+- **Every rendered video had zero audio, silently, since the fade-in/out feature shipped.**
+  `composite_cut()` called `AudioFileClip.audio_fadein()`/`.audio_fadeout()` — methods that
+  do not exist in MoviePy 2.x (fades are effects: `.with_effects([AudioFadeIn(d), AudioFadeOut(d)])`).
+  TTS synthesis succeeded, the files were real, but loading them into the composite raised
+  `AttributeError`, caught by a bare `except Exception: pass`, so every beat rendered silent
+  while the job still reported `done`. Fixed; the handler now logs via `_log.exception()`;
+  added `tests/test_compositor.py` — the first real (non-mocked) MoviePy/ffmpeg integration
+  test in the suite, which fails against the old code and passes against the fix.
+
+This is the exact class of gap the mocked test suite cannot see. Everything else — enrich,
+structured/standard generation path selection, the transient-retry mechanism (fired for
+real against a genuine Ollama timeout and recovered correctly), Wikipedia photo sourcing,
+Edge TTS synthesis, and the final MP4/thumbnail — worked as designed.
 
 ---
 
