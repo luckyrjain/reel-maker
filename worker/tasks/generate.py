@@ -1,6 +1,5 @@
 import json
 import logging
-import re as _re
 from datetime import datetime, timezone
 
 from pydantic import ValidationError
@@ -9,14 +8,25 @@ from api import models
 from api.config import settings
 from api.db import SessionLocal
 from api.state import REEL_TRANSITIONS, transition
+from engine.generation.beat_enrichment import (
+    _enrich_with_insight,
+    _has_conflict_beat,
+    _is_shallow_beat,
+    _make_conflict_stub,
+)
 from engine.generation.evaluator import score_guide
 from engine.generation.guide_schema import Beat, MasterGuide, PlatformGuide
 from engine.generation.llm import get_llm_provider, get_enrichment_provider, is_nvidia_generation
 from engine.generation.llm_judge import judge_guide
 from engine.generation.postprocess import clean_guide, _derive_on_screen as _postprocess_derive_on_screen
 from engine.generation.prompt import build_messages, build_visuals_messages
-from engine.generation.script_parser import BeatStub, calc_duration, derive_on_screen
+from engine.generation.script_parser import BeatStub
 from engine.generation import script_parser
+from engine.generation.visual_fallback import (
+    _fallback_visual,
+    _first_person,
+    _is_degenerate_visual,
+)
 from engine.observability import record_stage
 from worker.celery_app import celery_app
 from worker.tasks.common import should_retry
@@ -27,102 +37,6 @@ QUALITY_THRESHOLD = 80
 QUALITY_THRESHOLD_LOCAL = 65  # lower bar for local Ollama models
 _JUDGE_RULE_MIN = 55
 
-
-_SECTION_FALLBACK_VISUALS: dict[str, str] = {
-    "": "national team players celebrating trophy lift",
-    "GOALKEEPER": "goalkeeper penalty save dramatic dive crowd reaction",
-    "DEFENSE": "defender last-ditch tackle aerial duel clearance",
-    "MIDFIELD": "midfielder pressing recovery run through-ball vision",
-    "ATTACK": "striker one-on-one goal celebration sprint",
-    "SECRET": "team tactical huddle training ground session",
-    "ENDING": "team trophy lift celebration fans stadium",
-}
-
-_VO_TO_SHOT: list[tuple[str, str]] = [
-    ("penalt",      "penalty save dramatic dive"),
-    ("save",        "reflex save goalkeeper fingertip"),
-    ("tackle",      "crunching tackle last-ditch clearance"),
-    ("press",       "high press recovery run intense"),
-    ("intercept",   "interception reading play anticipation"),
-    ("dribble",     "dribbling skill beat defender"),
-    ("assist",      "key pass through-ball assist"),
-    ("pass",        "vision through-ball creative passing"),
-    ("goal",        "goal celebration strike finish"),
-    ("finish",      "clinical finish one-on-one goal"),
-    ("shoot",       "long-range strike shot on goal"),
-    ("header",      "aerial header dominant set piece"),
-    ("cross",       "cross delivery wide position"),
-    ("sprint",      "explosive sprint pace recovery run"),
-    ("defend",      "defensive positioning block clearance"),
-    ("width",       "overlapping run wide position attack"),
-    ("overlap",     "overlapping run cross delivery"),
-    ("engine",      "box-to-box run defensive work rate"),
-    ("architect",   "vision creative passing midfield"),
-    ("glue",        "link play pressing combination midfield"),
-    ("balance",     "defensive cover positioning wide"),
-    ("iq",          "positional awareness anticipation reading game"),
-    ("intelligent", "positional awareness anticipation reading game"),
-    ("striker",     "striker movement clinical finish"),
-    ("forward",     "forward run in behind goal"),
-    ("winger",      "winger dribbling wide attack"),
-    ("greatest",    "iconic career best moments highlight reel"),
-    ("scar",        "decisive pressure match moment"),
-    ("terrif",      "unstoppable attacking run danger"),
-    ("depend",      "team relying on player decisive moment"),
-    ("elevat",      "player raising teammates performance"),
-    ("deadli",      "clinical striker finishing goal"),
-    ("captain",     "captain armband leading team"),
-    ("trophy",      "trophy lift celebration winners medal"),
-]
-
-
-def _fallback_visual(stub: BeatStub) -> str:
-    if stub.player:
-        vo_lower = stub.vo_script.lower() if stub.vo_script else ""
-        for keyword, shot in _VO_TO_SHOT:
-            if keyword in vo_lower:
-                return f"{stub.player} {shot}"
-        return f"{stub.player} match action highlight"
-    return _SECTION_FALLBACK_VISUALS.get(
-        stub.section.upper(),
-        f"football match {stub.section.lower()} intense action",
-    )
-
-
-_VO_NAME_RE = _re.compile(
-    r'\b([A-ZÁÉÍÓÚÑ][a-záéíóúñ]{2,}(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]{2,})+)\b'
-)
-_NON_PERSON = {"South American", "Premier League", "Copa America", "World Cup",
-               "Champions League", "North American", "West European"}
-_NON_PERSON_PREFIXES = _re.compile(
-    r'\b(South|North|West|East|Premier|Copa|Champions|United|Real|Inter)\b'
-)
-
-
-def _first_person(vo: str, existing: str) -> str:
-    """Return the first plausible person name in `vo`, or `existing` if already known."""
-    if existing:
-        return existing
-    for m in _VO_NAME_RE.finditer(vo):
-        name = m.group(1)
-        if name not in _NON_PERSON and not _NON_PERSON_PREFIXES.search(name):
-            return name
-    return ""
-
-
-_DEGENERATE_SUFFIXES = (" footage", " highlights", " action shot", " close-up action shot")
-_DEGENERATE_PHRASES = ("playing football", "playing soccer", "show footage", "show highlights")
-
-
-def _is_degenerate_visual(v: str) -> bool:
-    vl = v.strip().lower()
-    if not vl or len(vl) < 10:
-        return True
-    if any(vl.endswith(s) for s in _DEGENERATE_SUFFIXES):
-        return True
-    if any(p in vl for p in _DEGENERATE_PHRASES):
-        return True
-    return False
 
 
 def _combined_score(
@@ -152,126 +66,6 @@ def _combined_score(
     return combined, rule_issues + llm_issues
 
 
-_TACTICAL_MARKERS = _re.compile(
-    r"\b(allows?|enables?|because|which means|forces?|creates?|"
-    r"press(?:ing)?|transition|high line|formation|shape|space|channel|"
-    r"recover|position|structure|movement|role|system)\b",
-    _re.IGNORECASE,
-)
-
-
-def _is_shallow_beat(stub: BeatStub) -> bool:
-    return (
-        stub.beat_type == "body"
-        and bool(stub.player)
-        and (
-            len(stub.vo_script.split()) < 25
-            or not _TACTICAL_MARKERS.search(stub.vo_script)
-        )
-    )
-
-
-_ENRICH_BATCH = 3
-
-
-def _enrich_batch(batch: list[BeatStub], context: str, llm) -> dict[int, str]:
-    beat_lines = "\n".join(
-        f'  {{"index": {s.index}, "player": "{s.player}", "vo": "{s.vo_script[:100]}"}}'
-        for s in batch
-    )
-    messages = [
-        {"role": "system", "content":
-            "You are a football tactical analyst. "
-            "Return ONLY valid JSON — a list, one object per beat, "
-            "each with 'index' (int) and 'tactical_sentence' (string)."},
-        {"role": "user", "content": (
-            f"CONTEXT:\n{context[:800]}\n\n"
-            "For each beat write ONE sentence: what the player ENABLES tactically, "
-            "not how they feel. Use specific mechanisms.\n\n"
-            "BAD: 'Romero defends with passion.'\n"
-            "GOOD: 'Romero's line-stepping lets Argentina defend 15 yards higher, "
-            "creating turnovers in dangerous zones.'\n\n"
-            "IMPORTANT: Only reference players, events, and facts already present in "
-            "each beat. Do not introduce matches, tournaments, scorelines, or players "
-            "not mentioned in the beat text.\n\n"
-            f"Beats:\n[\n{beat_lines}\n]\n\n"
-            'Return: [{"index": 0, "tactical_sentence": "..."}, ...]'
-        )},
-    ]
-    try:
-        raw = llm.complete(messages, json_mode=True)
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            items = [data] if "index" in data else next(
-                (v for v in data.values() if isinstance(v, list)), []
-            )
-        else:
-            items = data
-        return {item["index"]: item.get("tactical_sentence", "").strip() for item in items
-                if isinstance(item, dict)}
-    except Exception:
-        return {}
-
-
-def _enrich_with_insight(stubs: list[BeatStub], context: str, llm) -> None:
-    shallow = [s for s in stubs if _is_shallow_beat(s)]
-    if not shallow:
-        return
-    stub_map = {s.index: s for s in shallow}
-    for i in range(0, len(shallow), _ENRICH_BATCH):
-        batch = shallow[i:i + _ENRICH_BATCH]
-        sentences = _enrich_batch(batch, context, llm)
-        for idx, sentence in sentences.items():
-            stub = stub_map.get(idx)
-            if stub and sentence and len(sentence.split()) >= 5:
-                stub.vo_script = stub.vo_script.rstrip(" .") + ". " + sentence
-                words = len(stub.vo_script.split())
-                stub.duration_s = round(max(3.0, min(20.0, words / 2.3 + 1.0)), 1)
-
-
-_CONFLICT_RE = _re.compile(
-    r"\b(but|however|weakness|problem|concern|risk|challenge|"
-    r"fragile|exposed|vulnerable|despite|worry|danger|question)\b",
-    _re.IGNORECASE,
-)
-
-
-def _has_conflict_beat(stubs: list[BeatStub]) -> bool:
-    return any(_CONFLICT_RE.search(s.vo_script) for s in stubs if s.beat_type == "body")
-
-
-def _make_conflict_stub(context: str, llm, index: int) -> tuple[BeatStub, str] | None:
-    messages = [
-        {"role": "system", "content":
-            "You are writing voiceover for a sports video. "
-            "Return ONLY valid JSON with keys 'vo_script' and 'visual_direction'."},
-        {"role": "user", "content": (
-            f"CONTEXT:\n{context[:1200]}\n\n"
-            "Write 2-3 sentences of voiceover identifying ONE genuine weakness, risk, or "
-            "challenge for this squad. Be specific and factual. Conversational, not academic.\n\n"
-            "IMPORTANT: Only reference players, events, and challenges present in the CONTEXT "
-            "above. Do not introduce matches, tournaments, scorelines, or players not mentioned "
-            "in the context.\n\n"
-            "Also write a visual_direction (max 12 words) that an editor can use to source footage. "
-            "Start with a player's full name if one is relevant.\n\n"
-            '{"vo_script": "...", "visual_direction": "..."}'
-        )},
-    ]
-    try:
-        raw = llm.complete(messages, json_mode=True)
-        data = json.loads(raw)
-        vo = data.get("vo_script", "").strip()
-        visual = data.get("visual_direction", "").strip()
-        if not vo:
-            return None
-        stub = BeatStub(
-            index=index, beat_type="body", section="CONFLICT",
-            player="", vo_script=vo, duration_s=calc_duration(vo),
-            on_screen_text=derive_on_screen(vo),
-        )
-        return stub, visual
-    except Exception:
-        return None
 
 
 def _stubs_to_platform_guide(

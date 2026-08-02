@@ -123,7 +123,7 @@ def test_enrich_handles_nested_list_in_dict():
 
 def test_enrich_batch_prompt_has_topic_fence():
     """_enrich_batch must include the 'Do not introduce' constraint in the user message."""
-    from worker.tasks.generate import _enrich_batch
+    from engine.generation.beat_enrichment import _enrich_batch
     from engine.generation.script_parser import BeatStub
 
     captured = []
@@ -145,7 +145,7 @@ def test_enrich_batch_prompt_has_topic_fence():
 
 def test_make_conflict_stub_prompt_has_topic_fence():
     """_make_conflict_stub must include the 'Do not introduce' constraint in the user message."""
-    from worker.tasks.generate import _make_conflict_stub
+    from engine.generation.beat_enrichment import _make_conflict_stub
 
     captured = []
 
