@@ -2,6 +2,11 @@
 
 Status as of 2026-08-02.
 
+**Product-level gap analysis and forward roadmap (Phase 4a onward):**
+[`docs/product-gap-analysis-and-roadmap-2026-08.md`](product-gap-analysis-and-roadmap-2026-08.md).
+This file below is the build log (what shipped, phase by phase); that one is the
+"what's missing and what to build next" strategic view.
+
 ---
 
 ## Phase status
