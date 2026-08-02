@@ -11,13 +11,7 @@ from engine.render.asset_sourcer import get_asset_sourcer, get_hf_sourcer, get_h
 from engine.render.compositor import composite_cut
 from engine.render.tts import SilentProvider, _audio_duration, get_tts_provider
 from worker.celery_app import celery_app
-from worker.tasks.common import should_retry
-
-
-def _heartbeat(db, job, progress: int) -> None:
-    job.progress = progress
-    job.heartbeat_at = datetime.now(timezone.utc)
-    db.commit()
+from worker.tasks.common import heartbeat, should_retry
 
 
 @celery_app.task(bind=True, max_retries=2)
@@ -89,9 +83,9 @@ def render_cut(self, job_id: int):
                 vo_path = None
             beat_vo_paths.append(vo_path)
 
-            _heartbeat(db, job, 10 + int(55 * (i + 1) / n))
+            heartbeat(db, job, 10 + int(55 * (i + 1) / n))
 
-        _heartbeat(db, job, 70)
+        heartbeat(db, job, 70)
 
         # Override duration_s with actual TTS audio length so beat clips match speech.
         # SilentProvider returns the same 1 s placeholder for every beat, so measuring

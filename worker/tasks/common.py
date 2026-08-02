@@ -5,6 +5,7 @@ attempt. Kept as pure functions (no Celery, no db) so the decision is
 unit-testable without a broker or a task context.
 """
 import subprocess
+from datetime import datetime, timezone
 
 import httpx
 
@@ -29,3 +30,14 @@ def is_transient_error(exc: BaseException) -> bool:
 def should_retry(exc: BaseException, retries: int, max_retries: int) -> bool:
     """Retry decision, split out from the Celery glue so it is unit-testable."""
     return retries < max_retries and is_transient_error(exc)
+
+
+def heartbeat(db, job, progress: int) -> None:
+    """Record progress and prove the worker is alive.
+
+    reap_stuck_jobs fails any running job whose heartbeat_at goes stale for
+    more than STALE_MINUTES, so every long task must call this at each milestone.
+    """
+    job.progress = progress
+    job.heartbeat_at = datetime.now(timezone.utc)
+    db.commit()

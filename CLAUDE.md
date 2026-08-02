@@ -113,7 +113,7 @@ api/
 worker/
   celery_app.py       Celery instance; acks_late=True, beat schedule, split queues
   tasks/
-    common.py         should_retry() / is_transient_error() — retry classification
+    common.py         should_retry() / is_transient_error() / heartbeat() — shared task helpers
     generate.py       generate_guide(job_id) — idempotency guard, heartbeat, enrichment,
                       conflict injection, visuals LLM, closed-loop eval retry, observability
     render.py         render_cut(job_id) — idempotency guard, heartbeat, resolve_or_reuse,
@@ -127,7 +127,9 @@ engine/
     llm.py            LLMProvider + OllamaProvider; get_llm_provider(), get_enrichment_provider(),
                       is_nvidia_generation() — True when main LLM routes to NVIDIA NIM
     prompt.py         build_messages(prior_feedback=) + build_visuals_messages() — visuals system prompt anchors LLM to per-beat VO only
-    script_parser.py  BeatStub + parse() — structured-script extractor
+    script_parser.py  BeatStub + parse() + is_structured() — structured-script extractor
+    visual_fallback.py  Fallback visual_direction synthesis — section/VO keyword tables
+    beat_enrichment.py  Tactical insight enrichment + conflict-beat synthesis (topic-fenced)
     evaluator.py      score_guide() — 17-axis rule scorer (0–100); see docs/evaluation.md
     llm_judge.py      judge_guide() — LLM semantic judge; 5 dims × 0–20 = 100 pts
     postprocess.py    clean_guide() — strips label prefixes; derives up to 5 on_screen_text segments
@@ -205,6 +207,7 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 - **Wikipedia licensing**: always check `asset.safe_to_publish` before publishing. Wikipedia images are often CC-BY-SA (requires attribution) or non-free. Pexels assets hardcode `safe_to_publish=True`.
 - **TTS caching**: `EdgeTTSProvider.synthesize(text, rate="+0%")` is idempotent. Cache key includes voice + rate + normalized text. `synth_to_budget()` may produce a second file at an adjusted rate. Clearing `ASSET_STORE_DIR/tts/` forces re-synthesis.
 - **Observability**: wrap slow/paid call sites with `record_stage(db, reel_id, "stage_name")`. The context manager writes a `StageEvent` row on exit (success or failure). Do not instrument trivial DB operations.
+- **`heartbeat()` lives in `worker/tasks/common.py`** — never redefine it per task file. Three copies previously drifted apart; the reaper depends on all tasks writing `heartbeat_at` the same way.
 - **Never skip the state machine**: use `transition(obj, new_status, MAP)` for all status changes.
 - **Beat types are coerced**: `guide_schema.py` maps unknown strings ("closing", "outro", "tactical_analysis") to "cta" or "body". Safe to add new aliases.
 - **on_screen_text**: `_derive_on_screen()` generates up to 5 segments (one per sentence, 7 words each). `clean_guide()` preserves all 5 (`deduped[:5]`). The PATCH endpoint also preserves 5 (`lines[:5]`). The compositor reads `[:5]` in `_build_text_filter()`.

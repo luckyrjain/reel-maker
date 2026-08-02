@@ -10,15 +10,10 @@ from engine.generation.llm import get_enrichment_provider
 from engine.generation.script_parser import is_structured as _is_structured_script
 from engine.observability import record_stage
 from worker.celery_app import celery_app
+from worker.tasks.common import heartbeat
 from worker.tasks.generate import generate_guide
 
 _log = logging.getLogger(__name__)
-
-
-def _heartbeat(db, job, progress: int) -> None:
-    job.progress = progress
-    job.heartbeat_at = datetime.now(timezone.utc)
-    db.commit()
 
 
 @celery_app.task(bind=True, max_retries=0)
@@ -45,12 +40,12 @@ def enrich_context(self, job_id: int):
         # ── Step 1: Evaluate context quality ─────────────────────────────────
         score, issues = evaluate_context(reel.context)
         job.meta = {**(job.meta or {}), "context_score": score, "context_issues": issues}
-        _heartbeat(db, job, 30)
+        heartbeat(db, job, 30)
 
         # ── Step 2: Enrich if below threshold (skip for structured scripts) ────
         is_structured = _is_structured_script(reel.context)
         if score < ENRICH_THRESHOLD and not is_structured:
-            _heartbeat(db, job, 40)
+            heartbeat(db, job, 40)
             llm = get_enrichment_provider()
             enrich_provider = "nvidia" if settings.nvidia_api_key else "ollama"
             with record_stage(db, reel.id, "context_enrich", provider=enrich_provider) as ev:
@@ -76,7 +71,7 @@ def enrich_context(self, job_id: int):
                 reel.id, skipped_reason, score,
             )
 
-        _heartbeat(db, job, 80)
+        heartbeat(db, job, 80)
 
         # ── Step 3: Transition reel + create and enqueue generate job ─────────
         transition(reel, "generating", REEL_TRANSITIONS)

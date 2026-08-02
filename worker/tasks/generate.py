@@ -29,7 +29,7 @@ from engine.generation.visual_fallback import (
 )
 from engine.observability import record_stage
 from worker.celery_app import celery_app
-from worker.tasks.common import should_retry
+from worker.tasks.common import heartbeat, should_retry
 
 _log = logging.getLogger(__name__)
 
@@ -257,12 +257,6 @@ def _enrich_standard_path_guide(guide: MasterGuide, context: str) -> None:
                 beat.on_screen_text = _postprocess_derive_on_screen(stub.vo_script, max_lines=5)
 
 
-def _heartbeat(db, job, progress: int) -> None:
-    job.progress = progress
-    job.heartbeat_at = datetime.now(timezone.utc)
-    db.commit()
-
-
 @celery_app.task(bind=True, max_retries=2)
 def generate_guide(self, job_id: int):
     db = SessionLocal()
@@ -311,7 +305,7 @@ def generate_guide(self, job_id: int):
             use_structured = stubs is not None
 
         if use_structured:
-            _heartbeat(db, job, 20)
+            heartbeat(db, job, 20)
             try:
                 guide = _generate_from_structured_script(
                     reel, cuts, llm, db, target_lengths, stubs, context=effective_context
@@ -344,7 +338,7 @@ def generate_guide(self, job_id: int):
             best_score = 0
 
             for attempt in range(3):
-                _heartbeat(db, job, 20 + attempt * 20)
+                heartbeat(db, job, 20 + attempt * 20)
 
                 messages = build_messages(
                     context=effective_context,
@@ -411,7 +405,7 @@ def generate_guide(self, job_id: int):
                 f"below {quality_threshold}. Issues: {'; '.join(last_issues)}"
             )
 
-        _heartbeat(db, job, 80)
+        heartbeat(db, job, 80)
 
         for platform_guide in guide.cuts:
             cut = next(
