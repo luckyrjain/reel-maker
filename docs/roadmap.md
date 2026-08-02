@@ -1,6 +1,6 @@
 # Roadmap
 
-Status as of 2026-06-25.
+Status as of 2026-08-02.
 
 ---
 
@@ -15,6 +15,7 @@ Status as of 2026-06-25.
 | 3.5 | ✅ Done | Hardening (reliability, observability, security) |
 | 3.6 | ✅ Done | Pre-generation context evaluation & enrichment |
 | 3.7 | ✅ Done | Generation quality fixes (context drift, audio gaps, prompt fences) |
+| 3.8 | ✅ Done | Repo hygiene, render-path fixes, retry semantics, task-module split |
 | 4 | 🔲 Next | Publishing |
 | 5 | 🔲 Planned | Analytics and polish |
 
@@ -57,7 +58,7 @@ Status as of 2026-06-25.
 **Reliability**
 - `task_acks_late=True`, `task_reject_on_worker_lost=True`, `visibility_timeout=7200 s`
 - Idempotency guards in both tasks (`done|running` → return)
-- `_heartbeat()` at every milestone; `reap_stuck_jobs` Celery beat (60 s) fails stale jobs
+- Heartbeat at every milestone; `reap_stuck_jobs` Celery beat (60 s) fails stale jobs (shared `heartbeat()` since Phase 3.8)
 
 **Asset pinning**
 - `resolve_or_reuse()`: fingerprints `visual_direction` per beat; reuses pinned `CutAsset` rows without API call when unchanged; unique constraint `(cut_id, beat_index, order_in_beat)` enforces one binding per slot
@@ -115,7 +116,7 @@ Status as of 2026-06-25.
 ### Phase 3.7 — Generation quality fixes
 
 **Structured script enrichment guard** (`worker/tasks/enrich_context.py`):
-- `_is_structured_script()` detects ≥3 ALL-CAPS section headers; skips `llm_enrich()` when True even if score < 60
+- Structured-script detection skips `llm_enrich()` even when score < 60 (since Phase 3.8 this is `script_parser.is_structured()`, shared with the parser)
 - Fixes: enricher was transforming squad-review scripts into World Cup Final narratives by "adding stakes"
 - `job.meta["enrich_skipped"]` records reason (`"structured_script"` or `"score_above_threshold"`)
 
@@ -133,6 +134,34 @@ Status as of 2026-06-25.
 - Fixes: visual directions drifting to match enriched/global context instead of the actual beat
 
 **Tests**: 97 total across 7 files (+6 new tests: 3 enrichment guard, 2 topic fence, 1 visual anchoring)
+
+---
+
+### Phase 3.8 — Repo hygiene, render fixes, retry semantics
+
+Spec: `docs/superpowers/specs/2026-08-02-retry-and-task-cleanup-design.md`
+
+**Repo hygiene**
+- Added `.gitignore`; tracked the ~58 source files that had never been committed
+- `.env`, `.venv/` (355 MB) and `data/` (1.2 GB) were untracked but unignored — one `git add -A` from committing secrets
+
+**Render path**
+- `TTS_PROVIDER` default `chatterbox` → `edge`. The old default matched no implementation, fell through to `SilentProvider`, and — because `render_cut` overwrites each beat's duration with the measured audio length — collapsed every reel to ~1 s per beat, silent, while still reporting `done`
+- Wikipedia and both HuggingFace sourcers now write atomically; a killed download used to poison the cache permanently
+- Whisper model cached per process (was reloaded once per beat); caption timing falls back to proportional when a transcript has fewer words than the beat has text lines
+
+**Reliability**
+- `max_retries=2` made real via `worker/tasks/common.py::should_retry()` — transient failures only, 30 s/60 s backoff. The retry branch resets `job.status` to `pending` first, or redelivery would hit the task's own idempotency guard and no-op
+- Reaper now also fails `pending` jobs never picked up (keyed on `updated_at`, so retry backoff survives), and rolls back reels stuck in `enriching`
+- Missing reel/cut rows raise a named error instead of `AttributeError`
+
+**Cleanup**
+- `generate.py` 652 → 452 lines: `visual_fallback.py` and `beat_enrichment.py` extracted; `heartbeat()` shared instead of three copies
+- Deleted dead code: `noop` task, `GET /api/jobs/{id}/fragment`, `job_status.html`, `resolve_beat_asset()`, unused schemas
+- Tests 97 → 144 across 14 files
+
+**Not verified against real infrastructure.** Every test is a mocked session or in-memory SQLite;
+no end-to-end run with Postgres, Redis, a live worker, and ffmpeg has been performed.
 
 ---
 
@@ -212,12 +241,16 @@ Whisper is wired in for on-screen text timing, but a separate SRT/VTT caption fi
 | Issue | Severity | Notes |
 |---|---|---|
 | No multi-image collage in one frame | Low | Currently cycles sequentially; side-by-side layout not implemented |
-| `its` → `it's` regex fires on possessive "its" | Low | Lookahead `(?=\s)` is too broad; needs a smarter possessive detector |
+| MoviePy video readers leak until worker recycle | Low | `_build_media_sub_clip` opens `VideoFileClip`s that only `worker_max_tasks_per_child=10` reclaims; marked with a `ponytail:` comment |
+| `asset_sourcer` degrades silently to black frames | Medium | Every sourcer swallows its own exceptions and returns `None`, so a Pexels/Wikipedia outage produces a black-frame reel that reports success — and never reaches the retry branch |
+| `record_stage()` commits the caller's session | Low | Benign today (all call sites sit on a commit boundary) and documented in `observability.py`, but it will bite whoever wraps a half-applied mutation |
+| `_escape_drawtext` escapes only `\ : % '` | Low | A newline or exotic character in `on_screen_text` could break the FFmpeg filter chain; not observed in practice |
+| Wikipedia licence lookup uses a percent-encoded filename | Low | `_fetch_license()` passes the raw URL segment, so accented/spaced filenames return "unknown" and default to `safe_to_publish=False`. Matters at Phase 4 publish time |
+| Cut page does not poll while rendering | Low | `cut_card.html` shows "refresh to update" instead of an auto-refreshing fragment |
 | LLM judge 60% weight can swing combined score | Low | Log per-attempt rule/judge split from `StageEvent`; tune once data accumulates |
 | Whisper `base` model is slow on CPU | Low | Switch to `faster-whisper` with `base` model for 3-4× speedup on same hardware |
 | No OAuth refresh token rotation | Medium | Credential encrypted but no auto-refresh; expired tokens silently fail at publish |
 | Standard LLM path caption/hashtags not content-aware | Low | Generated from niche only, not actual beat content; structured path uses `_generate_caption_hashtags()` from actual VO — standard path could do the same |
-| `TTS_PROVIDER=chatterbox` default has no implementation | Medium | Config defaults to "chatterbox" but `ChatterboxProvider` doesn't exist; falls through to `SilentProvider` (no audio). Must set `TTS_PROVIDER=edge` in `.env`. |
 | `PIXABAY_API_KEY` config field is unused | Low | Added to config in anticipation of Pixabay music/video integration (Phase 5c); no provider wired yet |
 
 ---

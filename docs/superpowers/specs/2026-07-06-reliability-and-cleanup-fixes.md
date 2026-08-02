@@ -1,5 +1,11 @@
 # Reliability, Arch Cleanup, and Doc-Drift Fixes — Design Spec
 
+> **⚠️ SUPERSEDED (2026-08-02)** — do not implement. Fixes 1 and 5 have shipped; Fix 2 does not
+> work as written (the proposed retry hits the task's own idempotency guard and silently no-ops).
+> The remaining work is re-scoped in
+> [`2026-08-02-retry-and-task-cleanup-design.md`](2026-08-02-retry-and-task-cleanup-design.md),
+> which shipped in full. Kept for history only.
+
 **Date:** 2026-07-06
 
 ---

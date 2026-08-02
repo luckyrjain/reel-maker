@@ -8,7 +8,7 @@ All endpoints are prefixed with `/api`. The browser receives HTML fragments (Jin
 
 ### `POST /api/reels`
 
-Create a reel and enqueue guide generation. Accepts `multipart/form-data`.
+Create a reel and enqueue **context enrichment** (which in turn enqueues guide generation). Accepts `multipart/form-data`.
 
 **Form fields:**
 
@@ -171,4 +171,5 @@ The HTML fragments use `.badge-{status}` classes for color coding:
 - Render exceptions are caught in `render_cut` and stored similarly
 - The job fragment displays `job.error` when status is `failed`
 - HTTP 4xx/5xx responses from Pexels, Wikipedia, Edge TTS, or the LLM surface as job failures (not HTTP errors to the browser)
+- Transient failures (connection errors, timeouts, HTTP 429/5xx) are retried twice with 30 s/60 s backoff before the job is failed. During backoff the job sits at `pending` with `error` set to `"transient failure, retry N: ..."`; the message is cleared if a later attempt succeeds
 - Wikimedia CDN 429 rate-limits are handled silently (retry + thumbnail fallback) and do not fail the job; the beat falls back to Pexels stock footage

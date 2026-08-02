@@ -5,7 +5,8 @@ Local-first, single-operator tool that turns a topic into a publishable faceless
 ## How it works
 
 ```
-Context entry → LLM guide generation → Stock footage + TTS → MoviePy render → Review → Publish
+Context entry → context scoring/enrichment → LLM guide generation → quality evaluation
+             → stock footage + Wikipedia photos + TTS → MoviePy render → Review → Publish
 ```
 
 Everything slow runs in a background Celery worker. The browser UI polls for progress and shows results without a page reload.
@@ -19,8 +20,9 @@ Everything slow runs in a background Celery worker. The browser UI polls for pro
 | Python | ≥ 3.11 | |
 | Docker | any recent | Postgres + Redis via `docker compose` |
 | FFmpeg | any recent | Required by MoviePy for encoding |
-| Ollama | latest | Serves the local LLM |
+| Ollama | latest | Serves the local LLM. Optional if you use NVIDIA NIM instead |
 | Pexels API key | — | Free at pexels.com/api — for stock footage |
+| NVIDIA NIM key | — | Optional but recommended. Free at build.nvidia.com — used for enrichment, the quality judge, and (optionally) generation |
 
 Install FFmpeg on macOS: `brew install ffmpeg`
 
@@ -35,7 +37,8 @@ git clone <repo-url> reel-maker
 cd reel-maker
 
 python3 -m venv .venv
-.venv/bin/pip install -e "."
+.venv/bin/pip install -e ".[dev]"     # [dev] adds pytest
+.venv/bin/pip install edge-tts        # voiceover — see TTS note below
 ```
 
 ### 2. Configure environment
@@ -48,6 +51,7 @@ Open `.env` and fill in at minimum:
 
 ```env
 PEXELS_API_KEY=your_key_here
+NVIDIA_API_KEY=your_key_here   # optional; falls back to local Ollama when blank
 ```
 
 Everything else has working defaults for local dev.
@@ -76,19 +80,30 @@ A smaller model works if VRAM is tight — change `LLM_MODEL` in `.env`.
 
 ## Running the app
 
-Open **three terminal tabs** from the project root:
+Tasks are routed to two named queues, so a worker started without `-Q` consumes
+**nothing**. Open **four terminal tabs** from the project root (five with local Ollama):
 
 **Tab 1 — API server**
 ```bash
 .venv/bin/uvicorn api.main:app --reload
 ```
 
-**Tab 2 — Background worker**
+**Tab 2 — Generation worker** (LLM calls, I/O-bound)
 ```bash
-.venv/bin/celery -A worker.celery_app worker -l info
+.venv/bin/celery -A worker.celery_app worker -Q generation -c 4 -l info
 ```
 
-**Tab 3 — LLM (if not already running)**
+**Tab 3 — Render worker** (ffmpeg, CPU-bound — keep concurrency at 1)
+```bash
+.venv/bin/celery -A worker.celery_app worker -Q rendering --concurrency=1 -l info
+```
+
+**Tab 4 — Beat scheduler** (stuck-job reaper, every 60 s)
+```bash
+.venv/bin/celery -A worker.celery_app beat -l info
+```
+
+**Tab 5 — LLM** (skip if using NVIDIA NIM)
 ```bash
 ollama serve
 ```
@@ -104,8 +119,11 @@ Open `http://localhost:8000` in your browser.
 1. Enter a **context** — what the reel is about. Be specific: *"5 money habits that helped me save $10k in one year"* beats *"saving money"*.
 2. Set a **niche** (e.g. `personal finance`).
 3. Choose **voiceover mode**: `Voiceover` (AI voice), `Music only`, or `Silent`.
-4. Choose a **target length**: 30s, 45s, or 60s.
-5. Click **Generate guide**.
+4. Choose a **target length**: 30s, 45s, 60s, 75s, or 90s.
+5. Choose a **generation path**: `Auto-detect`, `I wrote a script` (fast structured path, ~90 s), or `Generate from topic` (full LLM, 2–5 min).
+6. Click **Generate guide**.
+
+The input is first scored for engagement potential (0–100) and enriched by an LLM if it scores below 60 — skipped automatically when you supply a structured script, since enrichment would drift off topic.
 
 The page polls in the background. When the job completes, a "View guide →" link appears.
 
@@ -133,23 +151,28 @@ Renders can be triggered again from the `in_review` state — click **Re-render*
 
 ---
 
-## Optional: Voiceover with Kokoro TTS
+## Voiceover
 
-By default, renders produce silent voiceover (a 1-second silence stub per beat). To enable real AI voiceover:
+`TTS_PROVIDER` defaults to `edge` — Microsoft Edge neural voices, free, no GPU, Python 3.14 compatible:
 
 ```bash
-# Kokoro requires PyTorch — install CPU build first if you don't have a GPU:
+.venv/bin/pip install edge-tts
+```
+
+If `edge-tts` is not installed the provider falls back to `SilentProvider`, which emits a
+1-second silence stub per beat and logs a warning. Renders still complete, but with no audio.
+
+Synthesized audio is cached by `sha256(voice + rate + text)`. `synth_to_budget()` re-synthesizes
+at an adjusted speaking rate (clamped ±25%) when a beat's measured duration drifts more than 15%
+from its target.
+
+**Kokoro** (`TTS_PROVIDER=kokoro`) is an alternative local neural TTS with higher quality, but
+requires **Python < 3.13**:
+
+```bash
 .venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
 .venv/bin/pip install -e ".[tts]"
 ```
-
-Then set in `.env`:
-
-```env
-TTS_PROVIDER=kokoro
-```
-
-Kokoro downloads model weights on first use (~500 MB). Subsequent synths for the same text are cached by hash.
 
 ---
 
@@ -160,7 +183,9 @@ Kokoro downloads model weights on first use (~500 MB). Subsequent synths for the
 # ffmpeg must be on PATH
 ```
 
-Whisper is installed but not yet wired into the compositor (Phase 2 deliverable). The `engine/render/captions.py` module is ready to call — use `transcribe_audio(path, beat_offset_s)` to get `CaptionSegment` objects with word-level timestamps.
+When installed, the compositor transcribes each beat's audio and drives on-screen text timing from
+word-level timestamps instead of proportional word-count estimates. Without it, timing falls back to
+proportional automatically — no configuration needed either way.
 
 ---
 
@@ -174,9 +199,16 @@ All values are read from `.env` (or environment variables):
 | `REDIS_URL` | `redis://localhost:6379/0` | Celery broker and result backend |
 | `LLM_BASE_URL` | `http://localhost:11434/v1` | OpenAI-compatible LLM endpoint (Ollama) |
 | `LLM_MODEL` | `qwen3:14b` | Model name passed to the LLM endpoint |
-| `TTS_PROVIDER` | `silent` | `silent` (no deps) or `kokoro` |
+| `LLM_ENRICHMENT_MODEL` | `qwen3:14b` | Local model for enrichment + quality judge |
+| `NVIDIA_API_KEY` | *(empty)* | When set, enrichment + judge calls route to NVIDIA NIM |
+| `NVIDIA_ENRICHMENT_MODEL` | `qwen/qwen3-next-80b-a3b-instruct` | Hosted enrichment/judge model |
+| `NVIDIA_GENERATION_MODEL` | `qwen/qwen3-next-80b-a3b-instruct` | Hosted generation model |
+| `USE_NVIDIA_FOR_GENERATION` | `false` | Route main guide generation to NVIDIA NIM too |
+| `TTS_PROVIDER` | `edge` | `edge` (needs `edge-tts`), `kokoro` (Python < 3.13), or `silent` |
 | `PEXELS_API_KEY` | *(empty)* | Required for stock footage; falls back to black frames |
+| `HUGGINGFACE_API_KEY` | *(empty)* | Generates footage/images when Pexels and Wikipedia find nothing |
 | `PIXABAY_API_KEY` | *(empty)* | Alternative footage source (not yet wired in) |
+| `CREDENTIALS_KEY` | *(empty)* | Fernet key encrypting `credentials.token_blob`; plaintext with a warning when blank |
 | `ASSET_STORE_DIR` | `./data/assets` | Where footage clips and TTS cache are stored |
 | `VIDEO_STORE_DIR` | `./data/videos` | Where rendered MP4s and thumbnails are stored |
 

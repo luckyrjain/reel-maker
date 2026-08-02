@@ -1,5 +1,10 @@
 # Reliability, Arch Cleanup, and Doc-Drift Fixes Implementation Plan
 
+> **⚠️ SUPERSEDED (2026-08-02)** — do not execute. Its 10 tasks target a spec that has been
+> replaced; several are already done and Task 2's retry design is broken. Use
+> [`2026-08-02-retry-and-task-cleanup.md`](2026-08-02-retry-and-task-cleanup.md) instead,
+> which has been fully implemented. Kept for history only.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Fix a stuck-reel reaper gap, wire real Celery retry for transient failures, null-guard deleted-row lookups, split an oversized task file into focused modules, correct stale docs, and backfill four untested-but-fragile code paths — per `docs/superpowers/specs/2026-07-06-reliability-and-cleanup-fixes.md`.

@@ -15,6 +15,12 @@ The final score is stored in `job.meta["quality_score"]` and shown in the UI. `j
 
 ## Scoring axes
 
+Beat-level axes de-duplicate beats across `guide.cuts` by `(index, vo_script, visual_direction)`.
+Both platform guides normally carry identical beats, and counting them twice inflates the capped
+axes (insight density, comparatives) and pairs every beat against its own clone in the repetition
+axis. Per-cut axes — duration fit, caption, hashtags — deliberately deduct once per platform,
+because each platform cut is separately publishable.
+
 Max deductions exceed 100; final score is clamped to 0–100.
 
 | # | Axis | Max deduction | What it measures |

@@ -86,7 +86,7 @@ The browser never fetches JSON. All API responses to the browser are HTML fragme
 | `schemas.py` | `JobResponse` — the one JSON endpoint's response shape |
 | `state.py` | `REEL_TRANSITIONS`, `CUT_TRANSITIONS` dicts + `transition()` guard |
 | `routers/reels.py` | `POST /api/reels` — creates reel, enqueues `enrich_context`; `GET /api/reels/{id}/active-job-fragment` — reel-level polling; `GET /api/reels/{id}` |
-| `routers/jobs.py` | `GET /api/jobs/{id}` (JSON), `GET /api/jobs/{id}/fragment` (HTML poll) |
+| `routers/jobs.py` | `GET /api/jobs/{id}` (JSON) — the only JSON endpoint |
 | `routers/cuts.py` | `POST /api/cuts/{id}/render`, `PATCH /api/cuts/{id}`, `POST /api/cuts/{id}/approve`, render-status, video stream |
 
 ### `worker/`
@@ -94,9 +94,10 @@ The browser never fetches JSON. All API responses to the browser are HTML fragme
 | File | Responsibility |
 |---|---|
 | `celery_app.py` | Celery instance; `task_acks_late=True`, `visibility_timeout=7200`, beat schedule, split queues |
+| `tasks/common.py` | `is_transient_error()` / `should_retry()` — retry classification; `heartbeat()` — shared progress + liveness write |
 | `tasks/enrich_context.py` | `enrich_context(job_id)` — idempotency guard → `evaluate_context()` → `script_parser.is_structured()` guard → optional `llm_enrich()` (skipped for structured scripts) → stores `reel.enriched_context` → creates + enqueues generate job |
-| `tasks/generate.py` | `generate_guide(job_id)` — idempotency guard → `effective_context = enriched_context or context` → structured/standard path → closed-loop eval retry → DB writes |
-| `tasks/render.py` | `render_cut(job_id)` — idempotency guard → heartbeat → `resolve_or_reuse()` per beat → `synth_to_budget()` → TTS-accurate timecodes → atomic MP4 |
+| `tasks/generate.py` | `generate_guide(job_id)` — idempotency guard → missing-row guard → `effective_context = enriched_context or context` → structured/standard path → closed-loop eval retry → DB writes; retries transient failures twice |
+| `tasks/render.py` | `render_cut(job_id)` — idempotency guard → missing-row guards → heartbeat → `resolve_or_reuse()` per beat → `synth_to_budget()` → TTS-accurate timecodes → atomic MP4; retries transient failures twice |
 | `tasks/maintenance.py` | `reap_stuck_jobs()` — Celery beat, every 60 s; fails `running` jobs with stale heartbeat (> 5 min) and `pending` jobs never picked up (> 30 min) |
 
 ### `engine/`
@@ -112,32 +113,43 @@ The browser never fetches JSON. All API responses to the browser are HTML fragme
 | `guide_schema.py` | `Beat`, `PlatformGuide`, `MasterGuide` Pydantic models; `coerce_beat_type` validator |
 | `llm.py` | `LLMProvider` + `OllamaProvider`; `get_llm_provider()`, `get_enrichment_provider()`, `is_nvidia_generation()` |
 | `prompt.py` | `build_messages(prior_feedback=)` — accepts prior failure issues for closed-loop retry; `build_visuals_messages()` — system prompt anchors LLM to per-beat VO only, preventing drift to global context |
-| `script_parser.py` | `parse(context)` — detects ≥3 ALL-CAPS headers, splits on `PlayerName: text`, returns `list[BeatStub]` or `None`; `calc_duration()`, `derive_on_screen()` public helpers |
+| `script_parser.py` | `parse(context)` — splits on `PlayerName: text`, returns `list[BeatStub]` or `None`; `is_structured(context)` — the single ≥3-labelled-sections test, also used by the enrichment guard; `calc_duration()`, `derive_on_screen()` public helpers |
 | `context_enricher.py` | `evaluate_context()` — 5-axis rule scorer (0–100); `llm_enrich()` — single LLM call to add specificity, stakes, hook angle; `ENRICH_THRESHOLD = 60` |
 | `evaluator.py` | `score_guide()` — 17-axis rule scorer; see `docs/evaluation.md` |
 | `llm_judge.py` | `judge_guide()` — LLM semantic judge; 5 dimensions × 0–20; fallback to (50, [warning]) on failure |
 | `postprocess.py` | `clean_guide()` — strips label prefixes; derives up to 5 on_screen_text segments |
+| `visual_fallback.py` | `_fallback_visual()`, `_first_person()`, `_is_degenerate_visual()` — synthesizes a usable `visual_direction` when the LLM returns a degenerate one |
+| `beat_enrichment.py` | `_enrich_with_insight()`, `_make_conflict_stub()`, `_has_conflict_beat()` — topic-fenced beat enrichment and conflict-beat synthesis |
 
 #### `engine/render/`
 
 | File | Responsibility |
 |---|---|
-| `asset_sourcer.py` | `PexelsVideoSource` + `WikipediaImageSource` (including `extmetadata` license fetch); `resolve_or_reuse()` — pins assets per beat, reuses without API call when fingerprint matches; `resolve_beat_assets()` for raw resolution |
+| `asset_sourcer.py` | `PexelsVideoSource` + `WikipediaImageSource` (including `extmetadata` license fetch) + `HuggingFaceVideoSource` + `HuggingFaceImageSource`; fallback chain Wikipedia → Pexels → HF video → HF image → black frame; `resolve_or_reuse()` — pins assets per beat, reuses without API call when fingerprint matches; all downloads go through `_atomic_write()` |
 | `tts.py` | `EdgeTTSProvider.synthesize(rate=)` + `.synth_to_budget(target_s)` — adjusts speaking rate ±25% to hit duration budget; `_audio_duration()` via ffprobe |
-| `captions.py` | `transcribe_audio()` — Whisper word-level timestamps → `list[CaptionSegment]`; no-op if whisper not installed |
+| `captions.py` | `transcribe_audio()` — Whisper word-level timestamps → `list[CaptionSegment]`; model cached per process via `@lru_cache`; no-op if whisper not installed |
 | `compositor.py` | `composite_cut()` — MoviePy stage (video + audio) + FFmpeg drawtext stage (text overlays); 120ms `audio_fadein`/`audio_fadeout` per beat for smooth narration transitions; `_build_text_filter()` uses Whisper timestamps when available, proportional fallback otherwise; atomic `os.replace()` for final output |
 
 ### `tests/`
 
 | File | Coverage |
 |---|---|
-| `test_evaluator.py` | 28 tests — all 17 evaluator axes + helpers |
+| `test_evaluator.py` | 29 tests — all 17 evaluator axes + helpers, multi-platform de-duplication |
 | `test_script_parser.py` | 11 tests — parse routing, player splitting, `derive_on_screen`, `calc_duration` |
 | `test_state.py` | 11 tests — valid/invalid transitions for both state machines including `enriching` |
 | `test_enrichment.py` | 15 tests — `coerce_beat_type`, `_enrich_batch` response shapes, topic fence assertions |
-| `test_audio_text_sync.py` | 10 tests — `clean_guide()` regeneration, `_build_text_filter()` proportional timing, visual direction anchoring |
+| `test_audio_text_sync.py` | 11 tests — `clean_guide()` regeneration, `_build_text_filter()` proportional timing + Whisper fallback, visual direction anchoring |
 | `test_context_enricher.py` | 13 tests — all 5 evaluator axes at boundary values, combined score, `llm_enrich` |
-| `test_enrich_context_task.py` | 9 tests — idempotency guard, enrichment gating, LLM failure fallback, structured script guard |
+| `test_enrich_context_task.py` | 10 tests — idempotency guard, enrichment gating, LLM failure fallback, structured script guard, missing reel |
+| `test_common.py` | 16 tests — transient-error classification, retry budget boundary |
+| `test_generate_task.py` | 3 tests — missing reel, transient retry resets to pending, deterministic failure does not retry |
+| `test_render_task.py` | 3 tests — missing cut, transient retry, success clears stale error |
+| `test_maintenance.py` | 7 tests — reaper: stale running jobs, never-picked-up pending jobs, owner rollback, `updated_at` keying |
+| `test_asset_sourcer.py` | 4 tests — `resolve_or_reuse` pin, reuse-without-API-call, re-pin, per-beat isolation |
+| `test_llm_judge.py` | 3 tests — neutral-score fallback on provider raise, garbage JSON, out-of-range dimension |
+| `test_tts.py` | 8 tests — provider selection, unknown-provider fallback, `SilentProvider` shared file, `synth_to_budget` clamp |
+
+**144 tests across 14 files.**
 
 ---
 
@@ -150,7 +162,7 @@ Before generation begins, `enrich_context` runs a rule-based quality check on th
 ```
 reel.context
   └── evaluate_context()   →  (score, issues)   [5 axes × 20 pts = 100 max]
-        └── _is_structured_script()  →  bool (≥3 ALL-CAPS section headers)
+        └── script_parser.is_structured()  →  bool (≥3 labelled sections)
               ├── if score < 60 AND NOT structured:
               │     llm_enrich()   →  enriched text stored in reel.enriched_context
               │     record_stage("context_enrich")
@@ -164,7 +176,7 @@ generate_guide:
 
 **5 scoring axes:** Length (word count) · Specificity (named entities + numbers) · Stakes/tension (conflict vocabulary) · Narrative arc (discourse connectors) · Hook potential (question / direct address / bold claim in first sentence). Score < 60 triggers enrichment; original context always preserved.
 
-**Structured script guard:** `_is_structured_script()` in `enrich_context.py` detects ≥3 ALL-CAPS section headers. When True, `llm_enrich()` is skipped entirely — the script's topic is already locked in and enrichment would cause context drift. `job.meta["enrich_skipped"]` records the reason (`"structured_script"` or `"score_above_threshold"`).
+**Structured script guard:** `enrich_context.py` imports `script_parser.is_structured()` — the same ≥3-labelled-sections test `parse()` applies, so the guard and the parser can never disagree about the same input. When True, `llm_enrich()` is skipped entirely — the script's topic is already locked in and enrichment would cause context drift. `job.meta["enrich_skipped"]` records the reason (`"structured_script"` or `"score_above_threshold"`).
 
 ---
 
@@ -210,8 +222,8 @@ context + prior_feedback (if retry)
                     └── score_guide() + judge_guide()   # two-tier eval
                           ├── record_stage("generate")
                           ├── record_stage("judge")
-                          ├── combined ≥ 80 → accept
-                          ├── combined < 80 → feedback = issues; retry (up to 3×)
+                          ├── combined ≥ threshold → accept   (80 NVIDIA / 65 local Ollama)
+                          ├── combined < threshold → feedback = issues; retry (up to 3×)
                           └── if all 3 fail → accept best-of-3
 ```
 
@@ -220,7 +232,7 @@ context + prior_feedback (if retry)
 ### Two-tier quality evaluation
 
 ```
-score_guide()     deterministic, 13 axes:
+score_guide()     deterministic, 17 axes (max deductions exceed 100; score clamped 0–100):
   Retention Architecture  20 pts   (hook strength + open loops + momentum shifts)
   Narrative Quality       15 pts   (HOOK→CONTEXT→ANALYSIS→CONFLICT→CONCLUSION arc)
   Context Coverage        10 pts   (≥50% of source sentences echoed in VO)
@@ -228,12 +240,22 @@ score_guide()     deterministic, 13 axes:
   Script↔Visual Align     20 pts   (entity + action + context match)
   Clip Availability       10 pts   (visual_direction describes sourceable footage)
   Visual Editability      10 pts   (specific enough for automation)
-  Emotional Impact        10 pts   (positive + negative emotional vocabulary)
-  Audio Delivery           5 pts   (WPS range 0.8–3.0 + sentence rhythm variety)
+  Emotional Impact        13 pts   (density 10 + distribution across beats 3)
+  Audio Delivery          10 pts   (WPS range, hook capped tighter + sentence length + rhythm)
   Visual Variety           5 pts   (mix of shot types across beats)
-  Duration Fit             5 pts   (beat durations within ±30% of target)
-  Caption & Hashtag        5 pts   (caption ≥30 chars, ≥10 hashtags)
-  CTA Action               3 pts   (CTA beat contains subscriber-action phrase)
+  Duration Fit             5 pts   (beat durations within ±30% of target, per cut)
+  Caption & Hashtag        5 pts   (caption ≥30 chars, ≥10 hashtags, per cut)
+  CTA Action               3 pts   (quality-weighted: prediction/opinion > passive follow)
+  Conversational Tone     10 pts   (penalise encyclopaedic phrasing; reward direct address)
+  Hook-CTA Throughline     5 pts   (CTA references the hook's tension or player)
+  Per-Beat Specificity     5 pts   (each body beat makes a falsifiable claim)
+  Repetition               5 pts   (body beats use distinct vocabulary)
+
+  Beat-level axes de-duplicate beats across guide.cuts by
+  (index, vo_script, visual_direction) — both platform guides normally hold
+  identical beats, and counting them twice inflates the capped axes and pairs
+  each beat against its own clone. Per-cut axes (duration, caption, hashtags)
+  deliberately deduct once per platform.
 
   if rule ≥ 55:
     judge_guide()  LLM semantic, 5 dimensions × 0–20:
@@ -256,18 +278,32 @@ combined = int(rule × 0.4 + llm × 0.6)   threshold 80 (NVIDIA) / 65 (local Oll
 | `visibility_timeout` | 7200 s | > worst-case render; prevents duplicate runs on slow tasks |
 | `worker_prefetch_multiplier` | 1 | No worker hoards multiple long tasks |
 | `worker_max_tasks_per_child` | 10 | Respawn render workers to reclaim MoviePy/ffmpeg memory |
+| `max_retries` | 2 | Real, via `should_retry()` — 30 s/60 s backoff on transient failures only; `enrich_context` stays at 0 |
 
 ### Idempotency
 
-Both tasks guard at entry: `if job.status in (done, running): return`. This makes redelivered tasks safe — a completed job becomes a no-op, and a live sibling is detected by status.
+All three tasks guard at entry: `if job.status in (done, running): return`. This makes redelivered tasks safe — a completed job becomes a no-op, and a live sibling is detected by status.
+
+This is also why the retry branch resets `job.status` to `pending` before calling `self.retry()`: a retry that left the status at `running` would hit this guard on redelivery and return immediately, making every retry a silent no-op.
 
 ### Heartbeat + stuck-job reaper
 
-Tasks call `_heartbeat(db, job, progress)` at every milestone, writing `job.heartbeat_at`. `reap_stuck_jobs` (Celery beat, 60 s interval) fails any job with `status=running` and `heartbeat_at` older than 5 minutes, then rolls the owning reel/cut back to a retryable state.
+Tasks call `heartbeat(db, job, progress)` — from `worker/tasks/common.py`, never redefined per task — at every milestone, writing `job.heartbeat_at`.
+
+`reap_stuck_jobs` (Celery beat, 60 s interval) fails two kinds of stalled job:
+
+- `status=running` with `heartbeat_at` older than 5 minutes — worker killed mid-task.
+- `status=pending` with `updated_at` older than 30 minutes — never picked up at all (broker down when `.delay()` ran, or no worker consuming the queue). Keyed on `updated_at`, not `created_at`, so a job sitting in retry backoff is not reaped for being old.
+
+Both then roll the owning reel (`enriching` or `generating`) or cut back to a retryable state.
 
 ### Atomic file writes
 
 The compositor writes FFmpeg output to `{out}.tmp.mp4`, then `os.replace()` to the final path. A killed process never leaves a servable half-written video.
+
+The same rule applies to every asset download. Pexels streams to `.tmp`; Wikipedia and both HuggingFace sources go through `_atomic_write()`. Each sourcer caches by `if path.exists()`, so a truncated file would otherwise be reused on every later render.
+
+**TTS duration override caveat:** `render_cut` replaces each beat's `duration_s` with the measured audio length, but skips this when the active provider is `SilentProvider` — that provider returns the same 1-second placeholder for every beat, so measuring it would collapse the whole reel to ~1 s per beat.
 
 ---
 
@@ -282,7 +318,9 @@ with record_stage(db, reel_id, "judge", provider="nvidia", model=MODEL, attempt=
     ev.detail["reasons"] = reasons
 ```
 
-Wired at: `enrich`, `generate` (each retry), `judge` (each retry), `composite`.
+Wired at: `context_enrich`, `enrich`, `generate` (each retry), `judge` (each retry), `composite`.
+
+`record_stage()` commits the session it is given, so every call site must sit on a commit boundary — never wrap a half-applied mutation in it.
 
 `StageEvent` fields: `stage`, `provider`, `model_name`, `latency_ms`, `tokens_in`, `tokens_out`, `cost_usd` (not yet computed), `attempt`, `score`, `ok`, `detail` (JSON), `created_at`.
 
@@ -389,7 +427,7 @@ Font: 60px white, black shadow, centered at 73% of frame height. Up to 5 segment
 
 ### TTS audio
 
-`tts_provider` config (default `"chatterbox"`, not yet implemented — falls back to `SilentProvider`). Set `TTS_PROVIDER=edge` in `.env` for functional audio.
+`tts_provider` config defaults to `"edge"`. Valid values are `edge`, `kokoro`, and `silent`; anything else logs a warning and falls back to `SilentProvider` (no audio).
 
 `EdgeTTSProvider` (activated by `TTS_PROVIDER=edge`):
 - `_normalize_for_tts()`: contraction restoration → acronym expansion → diacritic stripping
@@ -404,8 +442,14 @@ Font: 60px white, black shadow, centered at 73% of frame height. Up to 5 segment
 ## LLM provider routing
 
 ```python
-get_llm_provider()          →  OllamaProvider(LLM_BASE_URL, LLM_MODEL)
-                               default: qwen3:14b @ localhost:11434/v1
+get_llm_provider()
+  if NVIDIA_API_KEY set
+  and USE_NVIDIA_FOR_GENERATION: →  OllamaProvider(NVIDIA_BASE_URL, NVIDIA_GENERATION_MODEL, api_key=key)
+  else:                          →  OllamaProvider(LLM_BASE_URL, LLM_MODEL)
+                                    default: qwen3:14b @ localhost:11434/v1
+
+is_nvidia_generation()      →  True when the above routed to NVIDIA; selects the
+                               quality threshold (80 vs 65) and StageEvent provider label
 
 get_enrichment_provider()
   if NVIDIA_API_KEY set:    →  OllamaProvider(NVIDIA_BASE_URL, NVIDIA_ENRICHMENT_MODEL, api_key=key)

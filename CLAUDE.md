@@ -59,7 +59,7 @@ The pipeline: context entry → guide generation (LLM or script parser + enrichm
 
 **Core principle:** everything slow runs as a Celery background job. Nothing slow happens inside a request. The browser gets HTML fragments (Jinja2) and polls for updates via HTMX — no JSON to the browser, no React.
 
-**Job pipeline:** `POST /api/reels` creates `Reel` + `Cut` rows + `Job` row → enqueues Celery task → returns HTML fragment that polls `GET /api/jobs/{id}/fragment` every 2 s → worker updates `job.status` + `job.progress` + `job.heartbeat_at` → fragment shows result.
+**Job pipeline:** `POST /api/reels` creates `Reel` + `Cut` rows + an enrich `Job` row → enqueues `enrich_context` → returns an HTML fragment that polls `GET /api/reels/{id}/active-job-fragment` every 2 s → each worker updates `job.status` + `job.progress` + `job.heartbeat_at` → the fragment follows the enrich → generate job chain without a URL change.
 
 **Context enrichment stage:** `POST /api/reels` does not enqueue generation directly. It creates the `Reel` + `Cut` rows and an `enrich` job, and enqueues `enrich_context`. That task scores the raw context with `evaluate_context()` (5 axes × 20 pts), calls `llm_enrich()` when the score is below 60 — skipped entirely for structured scripts, where enrichment would cause topic drift — stores the result on `reel.enriched_context`, transitions the reel to `generating`, then creates and enqueues the `generate_guide` job. `generate_guide` reads `reel.enriched_context or reel.context`.
 
@@ -200,7 +200,7 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 ## Key conventions
 
 - **Routers return HTML, not JSON** (except `GET /api/jobs/{id}`). Use `response_class=HTMLResponse` and `templates.TemplateResponse(...)`.
-- **Every Celery task** receives a `job_id`, starts with an idempotency guard, calls `_heartbeat()` at every milestone, and always sets final `job.status = done|failed` before returning.
+- **Every Celery task** receives a `job_id`, starts with an idempotency guard, calls `heartbeat()` (from `worker/tasks/common.py`) at every milestone, and always sets final `job.status = done|failed` before returning.
 - **Idempotency guard**: at task entry check `if job.status in (JobStatus.done, JobStatus.running): return`. Done = redelivery no-op. Running = live sibling (reaper handles dead ones via heartbeat).
 - **Asset pinning**: use `resolve_or_reuse()` (not `resolve_beat_assets()`) from render tasks. It reuses pinned assets when `visual_direction` fingerprint matches; re-resolves and re-pins only changed beats. This makes re-renders fast and deterministic.
 - **CutAsset timing**: `start_s`/`end_s` are written after TTS duration measurement (in the second loop), not during asset resolution. They reflect actual rendered timecodes.
@@ -232,7 +232,7 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 - **Phase 1** ✅ — Generation: LLM guide, context-entry UI, structured-script parser, two-tier quality evaluator, enrichment + conflict injection; closed-loop eval retry with feedback; best-of-3 acceptance; explicit generation path selection
 - **Phase 2** ✅ — Render: Pexels footage + Wikipedia player photos (with license metadata), Edge TTS with rate-budget control, MoviePy compositor with Ken Burns, Whisper word-level timing (with proportional fallback), atomic MP4 writes
 - **Phase 3** ✅ — Review/edit loop: editable beats, editable caption/hashtags, approve
-- **Phase 3.5** ✅ — Hardening: acks_late reliability, idempotency guards, heartbeat + stuck-job reaper, per-beat asset pinning (deterministic re-render), observability (StageEvent), credential encryption, 109 tests across 9 files; evaluator upgraded to 17 axes (conversational tone, hook-CTA throughline, per-beat specificity, repetition)
+- **Phase 3.5** ✅ — Hardening: acks_late reliability, idempotency guards, heartbeat + stuck-job reaper, per-beat asset pinning (deterministic re-render), observability (StageEvent), credential encryption, a substantially expanded test suite; evaluator upgraded to 17 axes (conversational tone, hook-CTA throughline, per-beat specificity, repetition)
 - **Phase 4** 🔲 — Publishing: YouTube Data API + Instagram Graph API; safe_to_publish gate; attribution block in captions
 - **Phase 5** 🔲 — Analytics: post-publish metrics pull-back, cost-per-reel reporting from stage_events, music mixing
 
