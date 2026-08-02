@@ -11,6 +11,7 @@ from engine.render.asset_sourcer import get_asset_sourcer, get_hf_sourcer, get_h
 from engine.render.compositor import composite_cut
 from engine.render.tts import SilentProvider, _audio_duration, get_tts_provider
 from worker.celery_app import celery_app
+from worker.tasks.common import should_retry
 
 
 def _heartbeat(db, job, progress: int) -> None:
@@ -31,7 +32,11 @@ def render_cut(self, job_id: int):
             return
 
         cut = db.get(models.Cut, job.cut_id)
+        if cut is None:
+            raise ValueError(f"Cut {job.cut_id} no longer exists")
         reel = db.get(models.Reel, cut.reel_id)
+        if reel is None:
+            raise ValueError(f"Reel {cut.reel_id} no longer exists")
 
         job.status = models.JobStatus.running
         job.started_at = datetime.now(timezone.utc)
@@ -133,10 +138,20 @@ def render_cut(self, job_id: int):
         job.progress = 100
         job.heartbeat_at = datetime.now(timezone.utc)
         job.status = models.JobStatus.done
+        job.error = None   # clear any message left by a retried attempt
         db.commit()
 
     except Exception as exc:
         db.rollback()
+        if should_retry(exc, self.request.retries, self.max_retries):
+            job = db.get(models.Job, job_id)
+            if job:
+                # Reset to pending: the idempotency guard rejects `running`, so a
+                # retry that left the status alone would be a silent no-op.
+                job.status = models.JobStatus.pending
+                job.error = f"transient failure, retry {self.request.retries + 1}: {exc}"[:2000]
+                db.commit()
+            raise self.retry(exc=exc, countdown=30 * 2 ** self.request.retries)
         job = db.get(models.Job, job_id)
         if job:
             job.status = models.JobStatus.failed
