@@ -19,6 +19,7 @@ from engine.generation.script_parser import BeatStub, calc_duration, derive_on_s
 from engine.generation import script_parser
 from engine.observability import record_stage
 from worker.celery_app import celery_app
+from worker.tasks.common import should_retry
 
 _log = logging.getLogger(__name__)
 
@@ -480,6 +481,8 @@ def generate_guide(self, job_id: int):
             return
 
         reel = db.get(models.Reel, job.reel_id)
+        if reel is None:
+            raise ValueError(f"Reel {job.reel_id} no longer exists")
         effective_context = reel.enriched_context or reel.context
 
         job.status = models.JobStatus.running
@@ -636,6 +639,15 @@ def generate_guide(self, job_id: int):
 
     except Exception as exc:
         db.rollback()
+        if should_retry(exc, self.request.retries, self.max_retries):
+            job = db.get(models.Job, job_id)
+            if job:
+                # Reset to pending: the idempotency guard rejects `running`, so a
+                # retry that left the status alone would be a silent no-op.
+                job.status = models.JobStatus.pending
+                job.error = f"transient failure, retry {self.request.retries + 1}: {exc}"[:2000]
+                db.commit()
+            raise self.retry(exc=exc, countdown=30 * 2 ** self.request.retries)
         job = db.get(models.Job, job_id)
         if job:
             job.status = models.JobStatus.failed
