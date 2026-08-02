@@ -3,8 +3,10 @@ Periodic maintenance tasks run by Celery beat.
 
 reap_stuck_jobs fails two kinds of stalled Job:
   - `running` with no heartbeat update for STALE_MINUTES — worker killed mid-task.
-  - `pending` older than PENDING_STALE_MINUTES — never picked up at all
+  - `pending` with no update for PENDING_STALE_MINUTES — never picked up at all
     (broker down when .delay() was called, or no worker consuming the queue).
+    Keyed on updated_at, not created_at, so a job sitting in retry backoff is
+    not reaped for being old.
 
 Without the second case the owning reel sits in `enriching`/`generating` forever
 and the UI polls it every 2 s until the tab is closed.
@@ -39,7 +41,7 @@ def reap_stuck_jobs():
             db.query(models.Job)
             .filter(
                 models.Job.status == models.JobStatus.pending,
-                models.Job.created_at < pending_cutoff,
+                models.Job.updated_at < pending_cutoff,
             )
             .all()
         )

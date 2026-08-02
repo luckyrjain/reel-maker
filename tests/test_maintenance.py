@@ -80,3 +80,22 @@ def test_reaps_pending_job_that_was_never_picked_up():
 def test_healthy_queue_reaps_nothing():
     mock_transition = _run_reaper()
     mock_transition.assert_not_called()
+
+
+def test_pending_branch_filters_on_updated_at_not_created_at():
+    """A job that went back to pending for a retry must not be reaped mid-backoff.
+
+    Filtering on created_at would reap an old long-running job the moment it
+    entered retry backoff, because created_at never moves.
+    """
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.side_effect = [[], []]
+
+    with patch("worker.tasks.maintenance.SessionLocal", return_value=db):
+        reap_stuck_jobs()
+
+    filter_calls = db.query.return_value.filter.call_args_list
+    assert len(filter_calls) == 2, "expected one running query and one pending query"
+    pending_clause = str(filter_calls[1][0][1])
+    assert "updated_at" in pending_clause
+    assert "created_at" not in pending_clause
