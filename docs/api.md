@@ -65,14 +65,6 @@ Quality score and context score on success are in `job.meta.quality_score` and `
 
 ---
 
-### `GET /api/jobs/{job_id}/fragment`
-
-HTMX polling endpoint. Returns the job status as an HTML badge + progress bar. When status is `done` or `failed`, the polling trigger is removed.
-
-**Response:** `text/html` — `fragments/job_status.html`
-
----
-
 ## Cuts
 
 ### `PATCH /api/cuts/{cut_id}`

@@ -213,4 +213,10 @@ def get_tts_provider(cache_dir: Path) -> "EdgeTTSProvider | KokoroProvider | Sil
                 "edge-tts not installed — falling back to SilentProvider (no audio). "
                 "Run: pip install edge-tts"
             )
+    elif provider != "silent":
+        _log.warning(
+            "Unknown TTS_PROVIDER=%r — falling back to SilentProvider (no audio). "
+            "Valid values: edge, kokoro, silent.",
+            settings.tts_provider,
+        )
     return SilentProvider(cache_dir)

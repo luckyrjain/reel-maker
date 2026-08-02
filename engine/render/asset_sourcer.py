@@ -33,6 +33,21 @@ def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text).strip()
 
 
+def _atomic_write(path: Path, data: bytes) -> None:
+    """Write bytes via a temp file + os.replace.
+
+    Every sourcer caches by `if path.exists()`, so a process killed mid-write
+    would otherwise leave a truncated file that is reused on every later render.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 class WikipediaImageSource:
     _SEARCH = "https://en.wikipedia.org/w/api.php"
     _SUMMARY = "https://en.wikipedia.org/api/rest_v1/page/summary"
@@ -126,7 +141,7 @@ class WikipediaImageSource:
                 if r.status_code == 429:
                     continue
                 r.raise_for_status()
-                lp.write_bytes(r.content)
+                _atomic_write(lp, r.content)
                 local_path = lp
                 break
             except Exception:
@@ -278,7 +293,7 @@ class HuggingFaceImageSource:
                 content_type = resp.headers.get("content-type", "")
                 if not content_type.startswith("image/"):
                     return None
-                local_path.write_bytes(resp.content)
+                _atomic_write(local_path, resp.content)
             except Exception:
                 return None
 
@@ -333,7 +348,7 @@ class HuggingFaceVideoSource:
                 content_type = resp.headers.get("content-type", "video/mp4")
                 ext = "gif" if "gif" in content_type else "mp4"
                 local_path = self.store_dir / f"hfvid_{fp}.{ext}"
-                local_path.write_bytes(resp.content)
+                _atomic_write(local_path, resp.content)
             except Exception:
                 return None
 
@@ -405,18 +420,6 @@ def _cache_asset(db, result: SourcedAsset, asset_type: str) -> tuple["models.Ass
     db.add(asset)
     db.flush()
     return asset, result.local_path
-
-
-def resolve_beat_asset(
-    db,
-    query: str,
-    min_duration_s: float,
-    sourcer: PexelsVideoSource,
-    wiki: WikipediaImageSource | None = None,
-) -> tuple["models.Asset | None", "Path | None"]:
-    """Single-asset version — returns the first asset found (Wikipedia or Pexels)."""
-    results = resolve_beat_assets(db, query, min_duration_s, sourcer, wiki)
-    return results[0]
 
 
 def resolve_beat_assets(

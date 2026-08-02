@@ -691,3 +691,38 @@ def test_person_names_extracts_correctly():
 def test_person_names_excludes_non_persons():
     names = _person_names("World Cup and Premier League are tournaments. Real Madrid won.")
     assert not any(n.lower() in {"world cup", "premier league", "real madrid"} for n in names)
+
+
+# ── multi-platform de-duplication ─────────────────────────────────────────────
+
+def test_identical_platform_cuts_score_the_same_as_one():
+    """Both platform guides normally hold the same beats — scoring must not count them twice.
+
+    Duplicated beats inflate the capped per-beat axes (insight, comparatives) and
+    pair every beat against its own clone in the repetition axis. Per-cut axes
+    (caption, hashtags, duration fit) are deliberately scored once per platform,
+    so this guide is built to pass all of them.
+    """
+    beats = [
+        _beat(0, "hook", 5, "Could one position cost Argentina the World Cup?", "Argentina training"),
+        _beat(1, "body", 10, "Romero's press allows Argentina to defend 15 yards higher.", "Romero tackle"),
+        _beat(2, "body", 10, "But the left-back is exposed, which means teams attack that channel.", "Tagliafico defending"),
+        _beat(3, "cta", 5, "So could that position cost them everything? Drop your prediction below.", "Argentina squad"),
+    ]
+
+    def _cut(platform):
+        return PlatformGuide(
+            platform=platform,
+            target_length_s=30,   # beats sum to exactly 30 → duration axis clean
+            caption="Argentina's one weak spot could decide the whole tournament.",
+            hashtags=["football"] * 12,
+            beats=list(beats),
+        )
+
+    one_cut = MasterGuide(title="Test", niche="football", cuts=[_cut("youtube_shorts")])
+    two_cuts = MasterGuide(
+        title="Test", niche="football",
+        cuts=[_cut("youtube_shorts"), _cut("instagram_reels")],
+    )
+
+    assert score_guide(_CTX, two_cuts, 30)[0] == score_guide(_CTX, one_cut, 30)[0]

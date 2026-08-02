@@ -27,7 +27,12 @@ def record_stage(
     attempt: int | None = None,
     **detail,
 ):
-    """Context manager that writes a StageEvent row on exit (success or failure)."""
+    """Context manager that writes a StageEvent row on exit (success or failure).
+
+    Note: this commits `db`, so any uncommitted ORM state the caller happens to
+    be holding is flushed too. Every current call site sits on a commit boundary.
+    Keep it that way — do not wrap a half-applied mutation in record_stage.
+    """
     t0 = time.perf_counter()
     ev = models.StageEvent(
         reel_id=reel_id,

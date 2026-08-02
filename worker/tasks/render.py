@@ -1,5 +1,3 @@
-import json
-import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -11,25 +9,8 @@ from engine.generation.guide_schema import PlatformGuide
 from engine.observability import record_stage
 from engine.render.asset_sourcer import get_asset_sourcer, get_hf_sourcer, get_hf_video_sourcer, get_wiki_sourcer, resolve_or_reuse
 from engine.render.compositor import composite_cut
-from engine.render.tts import get_tts_provider
+from engine.render.tts import SilentProvider, _audio_duration, get_tts_provider
 from worker.celery_app import celery_app
-
-
-def _tts_duration(vo_path: Path) -> float | None:
-    """Return actual audio duration via ffprobe (fast, no decoding required)."""
-    try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json",
-             "-show_streams", str(vo_path)],
-            capture_output=True, text=True, timeout=5,
-        )
-        data = json.loads(result.stdout)
-        for stream in data.get("streams", []):
-            if stream.get("codec_type") == "audio":
-                return float(stream["duration"])
-        return None
-    except Exception:
-        return None
 
 
 def _heartbeat(db, job, progress: int) -> None:
@@ -108,11 +89,14 @@ def render_cut(self, job_id: int):
         _heartbeat(db, job, 70)
 
         # Override duration_s with actual TTS audio length so beat clips match speech.
+        # SilentProvider returns the same 1 s placeholder for every beat, so measuring
+        # it would collapse the whole reel to ~1 s per beat — keep the planned durations.
+        has_speech = not isinstance(tts, SilentProvider)
         beat_dicts = []
         for beat, vo_path in zip(beats, beat_vo_paths):
             d = beat.model_dump()
-            if vo_path and vo_path.exists():
-                actual = _tts_duration(vo_path)
+            if has_speech and vo_path and vo_path.exists():
+                actual = _audio_duration(vo_path)
                 if actual is not None:
                     d["duration_s"] = round(actual + 0.1, 2)
             beat_dicts.append(d)

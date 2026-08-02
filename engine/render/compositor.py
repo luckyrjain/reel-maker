@@ -135,6 +135,7 @@ def _build_media_sub_clip(media_path: Path | None, duration_s: float):
             raw = VideoFileClip(str(media_path), audio=False)
             if raw.duration < duration_s:
                 loops = math.ceil(duration_s / raw.duration) + 1
+                raw.close()   # probe clip — the loop copies below replace it
                 raw = concatenate_videoclips(
                     [VideoFileClip(str(media_path), audio=False) for _ in range(loops)]
                 )
@@ -178,6 +179,10 @@ def _whisper_timestamps(
 
     Divides the Whisper word stream proportionally across the N lines,
     producing absolute (start, end) times anchored to beat_start.
+
+    Requires len(segments) >= len(lines): with fewer words than lines the
+    slice arithmetic wraps to segments[-1] and lines overlap on screen.
+    The caller checks this and falls back to proportional timing.
     """
     n = len(lines)
     m = len(segments)
@@ -223,7 +228,7 @@ def _build_text_filter(
                        if beat_transcripts and bi < len(beat_transcripts)
                        else None)
 
-        if transcripts:
+        if transcripts and len(transcripts) >= n:
             timed = _whisper_timestamps(lines, transcripts, t_start, duration)
         else:
             # Word-count proportional: longer sentences stay on screen longer.
@@ -374,5 +379,19 @@ def composite_cut(
         os.replace(tmp_path, output_path)
     finally:
         notxt_path.unlink(missing_ok=True)
+        # Each AudioFileClip holds an open ffmpeg reader; without this a long
+        # reel leaks one process per beat until the worker recycles.
+        # ponytail: video readers opened inside _build_media_sub_clip are still
+        # only reclaimed by worker_max_tasks_per_child — thread the clips back
+        # out of the builder if fd pressure shows up in practice.
+        for track in vo_tracks:
+            try:
+                track.close()
+            except Exception:
+                pass
+        try:
+            final.close()
+        except Exception:
+            pass
 
     return total_duration

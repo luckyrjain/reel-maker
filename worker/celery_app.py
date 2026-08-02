@@ -6,7 +6,6 @@ celery_app = Celery(
     broker=settings.redis_url,
     backend=settings.redis_url,
     include=[
-        "worker.tasks.noop",
         "worker.tasks.enrich_context",
         "worker.tasks.generate",
         "worker.tasks.render",
@@ -41,7 +40,6 @@ celery_app.conf.update(
     task_routes={
         "worker.tasks.render.render_cut":                   {"queue": "rendering"},
         "worker.tasks.generate.generate_guide":             {"queue": "generation"},
-        "worker.tasks.noop.noop_job":                       {"queue": "generation"},
         "worker.tasks.enrich_context.enrich_context":       {"queue": "generation"},
     },
 

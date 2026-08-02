@@ -21,7 +21,8 @@ class Settings(BaseSettings):
     nvidia_generation_model: str = "qwen/qwen3-next-80b-a3b-instruct"
     use_nvidia_for_generation: bool = False
 
-    tts_provider: str = "chatterbox"
+    # "edge" (edge-tts, default) | "kokoro" (Python <3.13) | "silent" (no audio)
+    tts_provider: str = "edge"
     asset_store_dir: str = "./data/assets"
     video_store_dir: str = "./data/videos"
 

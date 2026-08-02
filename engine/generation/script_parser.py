@@ -205,6 +205,16 @@ def _section_to_beats(label: str, body: str, start_index: int) -> list[BeatStub]
     return beats
 
 
+def is_structured(context: str) -> bool:
+    """True when context has ≥3 labelled sections — the same test parse() applies.
+
+    Single source of truth: callers that only need the yes/no answer (the
+    enrichment guard) must use this rather than their own header regex, or the
+    two can disagree about the same input.
+    """
+    return len([s for s in _split_sections(context) if s[0]]) >= 3
+
+
 def parse(context: str) -> list[BeatStub] | None:
     """
     Return a list of BeatStubs if context is a structured labelled script,
@@ -212,10 +222,9 @@ def parse(context: str) -> list[BeatStub] | None:
 
     Requires at least 3 distinct section headers to be treated as structured.
     """
-    sections = _split_sections(context)
-    labelled = [s for s in sections if s[0]]  # skip the intro '' label for counting
-    if len(labelled) < 3:
+    if not is_structured(context):
         return None
+    sections = _split_sections(context)
 
     beats: list[BeatStub] = []
 

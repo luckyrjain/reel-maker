@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -9,17 +10,24 @@ class CaptionSegment:
     end_s: float
 
 
+@lru_cache(maxsize=1)
+def _load_model(name: str):
+    """Load (and keep) the Whisper model — transcribe_audio runs once per beat."""
+    import whisper
+    return whisper.load_model(name)
+
+
 def transcribe_audio(audio_path: Path, beat_offset_s: float = 0.0) -> list[CaptionSegment]:
     """
     Use Whisper word-level timestamps to produce caption segments.
     Returns an empty list if openai-whisper is not installed.
     """
     try:
-        import whisper
+        import whisper  # noqa: F401
     except ImportError:
         return []
 
-    model = whisper.load_model("base")
+    model = _load_model("base")
     result = model.transcribe(str(audio_path), word_timestamps=True, fp16=False)
 
     segments: list[CaptionSegment] = []

@@ -17,10 +17,10 @@ All-Python: FastAPI + Celery/Redis + PostgreSQL + SQLAlchemy/Alembic + MoviePy/F
 - **NVIDIA NIM** — set `NVIDIA_API_KEY` in `.env` to route enrichment, conflict-beat generation, and LLM judge calls to `https://integrate.api.nvidia.com/v1`. The `NVIDIA_ENRICHMENT_MODEL` defaults to `qwen/qwen3-next-80b-a3b-instruct`. Leave blank to use local Ollama.
 - **HuggingFace asset generation** — set `HUGGINGFACE_API_KEY` in `.env`. `HuggingFaceVideoSource` (LTX-Video, `HUGGINGFACE_VIDEO_MODEL`) generates short clips when Pexels finds nothing; `HuggingFaceImageSource` (FLUX.1-schnell, `HUGGINGFACE_IMAGE_MODEL`) generates static images as a further fallback. Asset fallback chain: Wikipedia → Pexels → HF Video → HF Image → black frame. Both cache locally by prompt fingerprint. HF image `generate()` checks `content-type` starts with `image/` before writing — JSON error bodies (200 OK "model loading") are rejected. HF video cache checks both `.mp4` and `.gif` extensions.
 - **Credential encryption** — `crypto.py` `open_()` raises `ValueError` on decryption failure (e.g. rotated key) rather than silently returning the raw ciphertext.
-- **TTS** — `tts_provider` in config defaults to `"chatterbox"` (not yet implemented — falls back to `SilentProvider`). Set `TTS_PROVIDER=edge` in `.env` for functional audio. `edge-tts` uses Microsoft Edge neural voices (free, Python 3.14 compatible) and must be installed separately (`pip install edge-tts`). Kokoro TTS (`TTS_PROVIDER=kokoro`) requires Python < 3.13. Default Edge voice: `en-GB-RyanNeural`.
+- **TTS** — `tts_provider` in config defaults to `"edge"`. Valid values: `edge`, `kokoro`, `silent`; anything else logs a warning and falls back to `SilentProvider`. `SilentProvider` returns one shared 1 s file for every beat, so `render_cut` skips the "measure TTS length" duration override when it is active — measuring it would collapse the whole reel to ~1 s per beat. `edge-tts` uses Microsoft Edge neural voices (free, Python 3.14 compatible) and must be installed separately (`pip install edge-tts`). Kokoro TTS (`TTS_PROVIDER=kokoro`) requires Python < 3.13. Default Edge voice: `en-GB-RyanNeural`.
 - **TTS text normalization** — `_normalize_for_tts()` in `tts.py` runs three passes: (1) restores missing apostrophes in contractions (isnt → isn't, doesnt → doesn't — LLMs frequently omit them), (2) expands short words that get spelled as acronyms (`Emi` → `Emmy`), (3) strips Unicode diacritics so accented names (Martínez, Álvarez) are pronounced naturally by an English neural voice.
 - **TTS budget control** — `EdgeTTSProvider.synth_to_budget(text, target_s)` re-synthesizes with an adjusted speaking rate (edge-tts prosody `rate`, clamped ±25%) if measured duration drifts more than 15% from `target_s`. Positive rate = faster. Rate key is `voice + rate + text` so the adjusted file has a distinct cache key.
-- **Whisper caption timing** — `composite_cut()` attempts Whisper transcription of each beat's `.mp3` via `captions.py`. If Whisper is installed, word-level timestamps drive the FFmpeg drawtext timing instead of proportional word-count estimates. Falls back to proportional if Whisper is not installed or transcription returns empty. Install with `pip install -e ".[captions]"`.
+- **Whisper caption timing** — `composite_cut()` attempts Whisper transcription of each beat's `.mp3` via `captions.py`. If Whisper is installed, word-level timestamps drive the FFmpeg drawtext timing instead of proportional word-count estimates. Falls back to proportional if Whisper is not installed, transcription returns empty, or the transcript has fewer words than the beat has `on_screen_text` lines (the line→word slice arithmetic needs ≥1 word per line). The model is loaded once per process via `@lru_cache` in `captions.py` — `transcribe_audio()` runs once per beat.
 - **Footage resolution** — `asset_sourcer.py` caps downloads at FHD (≤1920 px height). Pexels returns 4K files by default.
 - **Wikipedia image sourcing** — `WikipediaImageSource` in `asset_sourcer.py` fetches player headshots when a player name is detected in `visual_direction`. Also fetches license metadata via the `imageinfo` API (`extmetadata`) — `license`, `license_url`, `attribution`, `safe_to_publish` are stored on the `Asset` row. Wikimedia CDN rate-limits rapid downloads; the sourcer uses a 0.5 s inter-player delay, 2 s retry on 429.
 - **Credential encryption** — `Credential.token_blob` uses `Encrypted` (Fernet TypeDecorator from `api/crypto.py`). Set `CREDENTIALS_KEY` in `.env` to a Fernet key (`python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`). If unset, values are stored as plaintext with a warning — safe for dev, not for production.
@@ -35,7 +35,7 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/pip install -e ".[captions]"
 cp .env.example .env              # fill in PEXELS_API_KEY + NVIDIA_API_KEY at minimum; set TTS_PROVIDER=edge for audio
 docker compose up -d              # starts postgres:5432 + redis:6379
-.venv/bin/alembic upgrade head    # run migrations (0001 + 0002)
+.venv/bin/alembic upgrade head    # run migrations (0001–0003)
 
 # Daily dev — five terminals (Ollama only needed if not using NVIDIA NIM)
 .venv/bin/uvicorn api.main:app --reload                                                      # API at :8000
@@ -45,7 +45,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 68 tests across 5 files
+.venv/bin/pytest                            # 109 tests across 9 files
 .venv/bin/pytest tests/test_foo.py::bar -s
 
 # New migration after changing models.py
@@ -88,7 +88,7 @@ In both paths, `postprocess.py` strips section-label prefixes from `vo_script` a
 - `task_acks_late=True` — broker acks only after task returns; a killed worker requeues rather than silently loses.
 - `task_reject_on_worker_lost=True` — task requeued when worker is SIGKILLed.
 - **Idempotency guard** at task entry: tasks with `status in (done, running)` return immediately (redelivery no-op).
-- **Heartbeat** — tasks write `job.heartbeat_at` at every milestone. `reap_stuck_jobs` (Celery beat, every 60 s) fails any job without a heartbeat update in the last 5 minutes and rolls back the owning reel/cut.
+- **Heartbeat** — tasks write `job.heartbeat_at` at every milestone. `reap_stuck_jobs` (Celery beat, every 60 s) fails any `running` job without a heartbeat update in the last 5 minutes, **and** any `pending` job older than 30 minutes (broker was down when `.delay()` ran, or no worker consumes the queue). Both roll back the owning reel (`enriching` or `generating`) / cut.
 - **Atomic MP4 write** — FFmpeg writes to `.tmp.mp4`, then `os.replace()` to the final path; a killed process never leaves a servable half-written file.
 
 ## Module layout
@@ -114,8 +114,7 @@ worker/
                       conflict injection, visuals LLM, closed-loop eval retry, observability
     render.py         render_cut(job_id) — idempotency guard, heartbeat, resolve_or_reuse,
                       synth_to_budget, TTS-accurate timecodes, atomic MP4, observability
-    noop.py           noop_job(job_id) — smoke test only
-    maintenance.py    reap_stuck_jobs() — Celery beat task; fails stale running jobs
+    maintenance.py    reap_stuck_jobs() — Celery beat task; fails stale running + pending jobs
 
 engine/
   observability.py    record_stage() context manager — writes StageEvent rows on exit
@@ -147,21 +146,21 @@ migrations/
     0002_improvements.py  Job heartbeat/meta, CutAsset pinning, Asset licensing, StageEvent table
 
 tests/
-  test_evaluator.py           28 tests — all 17 evaluator axes + helpers
+  test_evaluator.py           29 tests — all 17 evaluator axes + helpers, multi-platform dedupe
   test_script_parser.py       11 tests — parse() routing, beat splitting, _derive_on_screen
   test_state.py               11 tests — REEL_TRANSITIONS, CUT_TRANSITIONS, invalid moves
   test_enrichment.py          15 tests — coerce_beat_type, _enrich_batch response parsing, topic fence
-  test_audio_text_sync.py     10 tests — clean_guide() regeneration, _build_text_filter() proportional timing, PATCH re-derivation, visual direction anchoring
+  test_audio_text_sync.py     11 tests — clean_guide() regeneration, _build_text_filter() proportional timing + whisper fallback, PATCH re-derivation, visual direction anchoring
   test_context_enricher.py    13 tests — evaluate_context axes, llm_enrich
   test_enrich_context_task.py  9 tests — idempotency, enrichment guard, structured script detection
+  test_maintenance.py          6 tests — reaper: stale running jobs, never-picked-up pending jobs, owner rollback
+  test_tts.py                  4 tests — provider selection, unknown-provider fallback, SilentProvider shared file
 
 ui/templates/
   index.html          Context-entry form; target_length + voiceover_mode + generation_path selects
   reel.html           Page shell — loops cuts, includes cut_card.html
   fragments/
     cut_card.html     Full cut card; read-only or editable (in_review)
-    job_status.html   Polling fragment; shows path badge (structured/standard + beat count),
-                      shimmer progress bar, quality score on done
     render_status.html  Polling fragment; video + Approve/Re-render when done
 ui/static/main.css    Styles: badges, progress bar shimmer, beat table, edit fields
 
@@ -202,14 +201,14 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 - **on_screen_text**: `_derive_on_screen()` generates up to 5 segments (one per sentence, 7 words each). `clean_guide()` preserves all 5 (`deduped[:5]`). The PATCH endpoint also preserves 5 (`lines[:5]`). The compositor reads `[:5]` in `_build_text_filter()`.
 - **Closed-loop eval retry**: `build_messages()` accepts `prior_feedback: list[str] | None`. Pass `last_issues` from the previous attempt. The LLM receives the issues as a second user message. Best-of-3 is returned if nothing clears the 80/100 threshold — do not raise an error when a valid guide exists.
 - **Enrichment provider**: always use `get_enrichment_provider()` (not `get_llm_provider()`) for enrichment, conflict generation, and judging. It auto-routes to NVIDIA NIM when `NVIDIA_API_KEY` is set.
-- **Atomic file writes**: compositor writes FFmpeg output to `.tmp.mp4` then `os.replace()`. Never stream-write the final video path — a killed process must not leave a servable partial file. Pexels downloads also use `.tmp` + `os.replace()` — same rule applies to all new asset sourcer writes.
+- **Atomic file writes**: compositor writes FFmpeg output to `.tmp.mp4` then `os.replace()`. Never stream-write the final video path — a killed process must not leave a servable partial file. All asset sourcer downloads (Pexels, Wikipedia, both HuggingFace sources) go through `_atomic_write()` or a streamed `.tmp` + `os.replace()`. This is not optional: every sourcer caches by `if path.exists()`, so a truncated file is reused on every later render.
 - **Celery workers don't auto-reload**: always `pkill -f "celery.*worker"` and restart after code changes. The API server (`--reload`) hot-reloads but workers do not.
-- **`score_guide()` signature**: takes `(context: str, guide: MasterGuide, target_length_s: float)` — requires a full `MasterGuide`, not a `PlatformGuide`. Wrap with `MasterGuide(title="", niche="", cuts=[pg])` when scoring a single platform guide in scripts/tests.
+- **`score_guide()` signature**: takes `(context: str, guide: MasterGuide, target_length_s: float)` — requires a full `MasterGuide`, not a `PlatformGuide`. Wrap with `MasterGuide(title="", niche="", cuts=[pg])` when scoring a single platform guide in scripts/tests. Beat-level axes de-duplicate beats across `guide.cuts` by `(index, vo_script, visual_direction)` — both platform guides normally hold identical beats. Per-cut axes (duration fit, caption, hashtags) still deduct once per platform, by design.
 - **Beat field is `b.type`** (not `b.beat_type`) — the Pydantic `Beat` model uses `type` as the field name.
 - **`is_nvidia_generation()`** in `llm.py` — returns `True` when main LLM routes to NVIDIA. Used by `generate_guide` to select quality threshold and label StageEvents correctly.
 - **`_generate_caption_hashtags()`** in `generate.py` — structured path generates captions/hashtags via enrichment LLM from actual VO content; falls back to hardcoded template on failure.
 - **Evaluator thresholds**: `MAX_WPS=4.0` (body/CTA beats), `MAX_WPS_HOOK=3.0` (hook beats — tighter cap; hook violation costs 4 pts vs 2 pts for body; Axis 9 max deduction 10 pts total), `MAX_OPENER_WORDS=16`. Narrative insight tactical sub-axis gives 2/4 baseline to non-tactical reels so they aren't penalised for missing football jargon.
-- **Structured script enrichment guard**: `_is_structured_script()` in `enrich_context.py` detects ≥3 ALL-CAPS section headers. When True, `llm_enrich()` is skipped even if score < 60 — the script's topic is already locked in; enrichment would cause context drift. `job.meta["enrich_skipped"]` records the reason (`"structured_script"` or `"score_above_threshold"`).
+- **Structured script enrichment guard**: `enrich_context.py` imports `script_parser.is_structured()` (≥3 labelled sections — the exact test `parse()` applies). Single source of truth: never add a second header regex, or the guard and the parser will disagree about the same input. When True, `llm_enrich()` is skipped even if score < 60 — the script's topic is already locked in; enrichment would cause context drift. `job.meta["enrich_skipped"]` records the reason (`"structured_script"` or `"score_above_threshold"`).
 - **Audio fade in compositor**: `composite_cut()` applies `audio_fadein(0.12).audio_fadeout(0.12)` to each beat's `AudioFileClip`. Order: subclip if too long → fade → `.with_start(t)`. Fade before `with_start` is required — fades compute against the clip's own timeline, not the composite.
 - **Topic fence in enrichment prompts**: `_enrich_batch()` and `_make_conflict_stub()` include an explicit "Do not introduce matches, tournaments, scorelines, or players not mentioned in the beat/context" constraint. Prevents LLM from drifting into unrelated events.
 - **Visual direction prompt anchoring**: `build_visuals_messages()` system prompt instructs the LLM to derive `visual_direction` ONLY from the specific players, actions, and events named in that beat's VO — not from the global context.
@@ -221,13 +220,13 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 - **Phase 1** ✅ — Generation: LLM guide, context-entry UI, structured-script parser, two-tier quality evaluator, enrichment + conflict injection; closed-loop eval retry with feedback; best-of-3 acceptance; explicit generation path selection
 - **Phase 2** ✅ — Render: Pexels footage + Wikipedia player photos (with license metadata), Edge TTS with rate-budget control, MoviePy compositor with Ken Burns, Whisper word-level timing (with proportional fallback), atomic MP4 writes
 - **Phase 3** ✅ — Review/edit loop: editable beats, editable caption/hashtags, approve
-- **Phase 3.5** ✅ — Hardening: acks_late reliability, idempotency guards, heartbeat + stuck-job reaper, per-beat asset pinning (deterministic re-render), observability (StageEvent), credential encryption, 68 tests across 5 files; evaluator upgraded to 17 axes (conversational tone, hook-CTA throughline, per-beat specificity, repetition)
+- **Phase 3.5** ✅ — Hardening: acks_late reliability, idempotency guards, heartbeat + stuck-job reaper, per-beat asset pinning (deterministic re-render), observability (StageEvent), credential encryption, 109 tests across 9 files; evaluator upgraded to 17 axes (conversational tone, hook-CTA throughline, per-beat specificity, repetition)
 - **Phase 4** 🔲 — Publishing: YouTube Data API + Instagram Graph API; safe_to_publish gate; attribution block in captions
 - **Phase 5** 🔲 — Analytics: post-publish metrics pull-back, cost-per-reel reporting from stage_events, music mixing
 
 ## Worker queues
 
-- **`generation` queue** — `generate_guide`, `noop_job`. I/O-bound. Run with `--concurrency=4`.
+- **`generation` queue** — `generate_guide`, `enrich_context`. I/O-bound. Run with `--concurrency=4`.
 - **`rendering` queue** — `render_cut`. CPU-bound. Run with `--concurrency=1`. Restarts after 10 tasks (`worker_max_tasks_per_child=10`) to prevent ffmpeg handle leaks.
 - **Celery beat** — runs `reap_stuck_jobs` every 60 s. Start with `celery -A worker.celery_app beat`.
 
@@ -240,7 +239,6 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 - Multi-image collage within a single beat — currently cycles sequentially; no side-by-side layout
 - Cost calculation in `StageEvent.cost_usd` — `latency_ms` and `tokens_in/out` fields exist but pricing lookup is not implemented
 - `PIXABAY_API_KEY` (`pixabay_api_key` in config) — field exists for a planned Pixabay music/video source; no `PixabayProvider` implemented yet
-- `TTS_PROVIDER=chatterbox` — config default; `ChatterboxProvider` not yet implemented. Falls back to `SilentProvider` (no audio). Set `TTS_PROVIDER=edge` to get actual audio.
 
 ## Docs
 

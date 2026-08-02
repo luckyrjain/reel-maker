@@ -1,5 +1,4 @@
 import logging
-import re
 from datetime import datetime, timezone
 
 from api import models
@@ -8,18 +7,12 @@ from api.db import SessionLocal
 from api.state import REEL_TRANSITIONS, transition
 from engine.generation.context_enricher import evaluate_context, llm_enrich, ENRICH_THRESHOLD
 from engine.generation.llm import get_enrichment_provider
+from engine.generation.script_parser import is_structured as _is_structured_script
 from engine.observability import record_stage
 from worker.celery_app import celery_app
 from worker.tasks.generate import generate_guide
 
 _log = logging.getLogger(__name__)
-
-_CAPS_HEADER = re.compile(r'^[A-Z][A-Z\s:\-]{2,}$')
-
-
-def _is_structured_script(text: str) -> bool:
-    """Return True when text contains ≥3 ALL-CAPS section headers (structured script)."""
-    return sum(1 for line in text.splitlines() if _CAPS_HEADER.match(line.strip())) >= 3
 
 
 def _heartbeat(db, job, progress: int) -> None:

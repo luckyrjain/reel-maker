@@ -322,7 +322,20 @@ def score_guide(context: str, guide: MasterGuide, target_length_s: float) -> tup
     score = 100
     deductions: dict[str, int] = {}
 
-    all_beats = [b for cut in guide.cuts for b in cut.beats]
+    # Both platform guides usually carry identical beats (the structured path
+    # builds them from one stub list). Counting each beat twice inflates the
+    # capped per-beat axes and pairs every beat against its own clone in the
+    # repetition axis, so dedupe by content. Per-cut axes below still iterate
+    # guide.cuts directly.
+    _seen: set[tuple[int, str, str]] = set()
+    all_beats = []
+    for _cut in guide.cuts:
+        for _b in _cut.beats:
+            _key = (_b.index, _b.vo_script, _b.visual_direction)
+            if _key in _seen:
+                continue
+            _seen.add(_key)
+            all_beats.append(_b)
     all_vo = " ".join(b.vo_script for b in all_beats)
     all_vo_words = _word_set(all_vo)
     total_beats = len(all_beats)

@@ -83,7 +83,7 @@ The browser never fetches JSON. All API responses to the browser are HTML fragme
 | `crypto.py` | Fernet `seal()`/`open_()` helpers + `Encrypted` SQLAlchemy TypeDecorator for encrypted columns |
 | `db.py` | SQLAlchemy engine, `SessionLocal`, `get_db()` FastAPI dependency |
 | `models.py` | All ORM models and status enums; includes `StageEvent` |
-| `schemas.py` | Pydantic request/response schemas for JSON endpoints |
+| `schemas.py` | `JobResponse` — the one JSON endpoint's response shape |
 | `state.py` | `REEL_TRANSITIONS`, `CUT_TRANSITIONS` dicts + `transition()` guard |
 | `routers/reels.py` | `POST /api/reels` — creates reel, enqueues `enrich_context`; `GET /api/reels/{id}/active-job-fragment` — reel-level polling; `GET /api/reels/{id}` |
 | `routers/jobs.py` | `GET /api/jobs/{id}` (JSON), `GET /api/jobs/{id}/fragment` (HTML poll) |
@@ -94,11 +94,10 @@ The browser never fetches JSON. All API responses to the browser are HTML fragme
 | File | Responsibility |
 |---|---|
 | `celery_app.py` | Celery instance; `task_acks_late=True`, `visibility_timeout=7200`, beat schedule, split queues |
-| `tasks/enrich_context.py` | `enrich_context(job_id)` — idempotency guard → `evaluate_context()` → `_is_structured_script()` guard → optional `llm_enrich()` (skipped for structured scripts) → stores `reel.enriched_context` → creates + enqueues generate job |
+| `tasks/enrich_context.py` | `enrich_context(job_id)` — idempotency guard → `evaluate_context()` → `script_parser.is_structured()` guard → optional `llm_enrich()` (skipped for structured scripts) → stores `reel.enriched_context` → creates + enqueues generate job |
 | `tasks/generate.py` | `generate_guide(job_id)` — idempotency guard → `effective_context = enriched_context or context` → structured/standard path → closed-loop eval retry → DB writes |
 | `tasks/render.py` | `render_cut(job_id)` — idempotency guard → heartbeat → `resolve_or_reuse()` per beat → `synth_to_budget()` → TTS-accurate timecodes → atomic MP4 |
-| `tasks/noop.py` | `noop_job(job_id)` — smoke test |
-| `tasks/maintenance.py` | `reap_stuck_jobs()` — Celery beat, every 60 s; fails jobs with stale heartbeat (> 5 min) |
+| `tasks/maintenance.py` | `reap_stuck_jobs()` — Celery beat, every 60 s; fails `running` jobs with stale heartbeat (> 5 min) and `pending` jobs never picked up (> 30 min) |
 
 ### `engine/`
 

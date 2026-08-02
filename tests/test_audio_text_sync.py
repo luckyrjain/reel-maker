@@ -209,3 +209,39 @@ def test_build_visuals_system_message_anchors_to_beat_vo():
     system_msg = next(m['content'] for m in messages if m['role'] == 'system')
     assert 'ONLY' in system_msg
     assert 'explicitly' in system_msg
+
+
+# ── whisper timing fallback ───────────────────────────────────────────────
+
+def test_whisper_timing_falls_back_when_fewer_words_than_lines():
+    """Whisper transcripts shorter than the line list must not drive the timing.
+
+    _whisper_timestamps slices the word stream by `i * m // n`; when m < n the
+    end index wraps to segments[-1], so several lines get identical windows and
+    render stacked on top of each other. The caller must use proportional
+    timing instead.
+    """
+    from dataclasses import dataclass
+
+    @dataclass
+    class _Seg:
+        text: str
+        start_s: float
+        end_s: float
+
+    beat = {
+        "vo_script": "One. Two. Three. Four. Five.",
+        "on_screen_text": ["One", "Two", "Three", "Four", "Five"],
+        "duration_s": 5.0,
+    }
+    two_words = [_Seg("one", 0.0, 0.5), _Seg("two", 0.5, 1.0)]
+
+    chain = _build_text_filter([beat], [5.0], [two_words])
+    windows = re.findall(r"between\(t,([\d.]+),([\d.]+)\)", chain)
+
+    assert len(windows) == 5
+    starts = [float(s) for s, _ in windows]
+    assert starts == sorted(starts), "segments must not overlap or run backwards"
+    assert len(set(starts)) == 5, "each line needs its own window, not a shared one"
+    # Proportional timing fills the beat; the truncated whisper stream would stop at 1.0s
+    assert float(windows[-1][1]) == pytest.approx(5.0)
