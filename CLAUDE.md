@@ -185,13 +185,18 @@ engine/
     attribution.py    build_attribution_block() — formats Wikipedia asset attribution/license into
                       a caption suffix; build_published_caption() appends it to cut.caption without
                       mutating the DB-stored value
-    metrics.py        EngagementMetrics dataclass + MetricsFetcher base; YouTubeMetricsFetcher
-                      (videos.list?part=statistics — stable, high confidence); InstagramMetricsFetcher
-                      (Graph API /insights?metric=plays,likes,comments — lower confidence, Meta has
-                      renamed Reels Insights metrics before); both use Authorization: Bearer headers,
-                      never a token in params (leaks into httpx.HTTPStatusError.__str__() → job.error/logs)
-    youtube.py        YouTubePublisher — resumable upload (init POST + PUT), refreshes an
-                      expired access token via the stored refresh_token first
+    metrics.py        EngagementMetrics dataclass + MetricsFetcher base (fetch() takes db, not just
+                      cut+credential, so a fetcher can refresh+persist an expired token);
+                      YouTubeMetricsFetcher (videos.list?part=statistics — stable, high confidence;
+                      refreshes via youtube.py::get_valid_access_token() before every call, since
+                      pull_publish_metrics runs every 6h and Google tokens expire in ~1h);
+                      InstagramMetricsFetcher (Graph API /insights?metric=plays,likes,comments —
+                      lower confidence, Meta has renamed Reels Insights metrics before); both use
+                      Authorization: Bearer headers, never a token in params (leaks into
+                      httpx.HTTPStatusError.__str__() → job.error/logs)
+    youtube.py        YouTubePublisher — resumable upload (init POST + PUT); get_valid_access_token()
+                      (module-level, shared with YouTubeMetricsFetcher) refreshes an expired access
+                      token via the stored refresh_token first
     instagram.py      InstagramPublisher — container create/poll/publish (Reels). Requires
                       settings.public_base_url to be a real public HTTPS URL — Instagram
                       fetches the video itself, it does not accept an upload body
@@ -324,7 +329,7 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 - **No Pixabay Music API**: Pixabay's public REST API has never documented a Music search endpoint (only Images/Video), so `music_cue` matching is deliberately local — `LocalMusicSource` keyword-matches against files the operator drops in `Settings.music_library_dir`. `PIXABAY_API_KEY` stays unwired for the reason above, not for lack of time.
 - **Music mixing is silent-by-default**: `LocalMusicSource.find()` returns `None` (no music mixed in, current behavior preserved) when the library directory is missing, empty, or nothing overlaps the cue — never an error. `_build_ffmpeg_args()` always adds `atrim=duration={total_duration}` to the looped (`-stream_loop -1`) music input; omitting it fills the render output volume with an infinite stream and previously produced a "no space left on device" ffmpeg error.
 - **Metrics fetchers are best-effort**: `get_metrics_fetcher(platform)` returns `None` (not a raise) for a platform with no fetcher (e.g. tiktok) or in general — `pull_publish_metrics()` skips that cut rather than failing the whole task. A per-cut fetch exception is caught, logged, and skipped too; one bad cut never blocks metrics for the rest.
-- **Token-in-URL is a logging/DB leak, not just a security nicety**: any `httpx.get(url, params={"access_token": ...})` embeds the token in `httpx.HTTPStatusError.__str__()` on a failed call, and that string can land in `job.error` (persisted, shown in the UI) or an exception log. Every call site added in Phase 5 (and two pre-existing ones fixed alongside it — `api/oauth.py::discover_account()`, `engine/publish/instagram.py::_wait_until_ready()`) puts the token in an `Authorization: Bearer` header instead.
+- **Token-in-URL is a logging/DB leak, not just a security nicety**: any `httpx.get(url, params={"access_token": ...})` embeds the token in `httpx.HTTPStatusError.__str__()` on a failed call, and that string can land in `job.error` (persisted, shown in the UI) or an exception log — or, for a route that surfaces the exception message directly (`api/routers/credentials.py`), in the HTTP response body itself. Every call site added in Phase 5 (and pre-existing ones fixed alongside it — `api/oauth.py::discover_account()`, `InstagramOAuth.exchange_code()`/`exchange_long_lived_token()`, `engine/publish/instagram.py::_wait_until_ready()`) puts the credential in an `Authorization: Bearer` header (bearer tokens) or a POST body (`client_secret` — RFC 6749 §3.2 requires every OAuth2 token endpoint to support POST for exactly this reason) instead of URL query params.
 
 ## Build phase status
 

@@ -104,6 +104,43 @@ def test_paid_call_budget_exceeded_fails_without_retry():
     assert job.status == models.JobStatus.failed
 
 
+def test_structured_path_skipped_when_parse_disagrees_with_is_structured():
+    """resolve_generation_path()'s "auto" branch decides via is_structured()
+    alone (it has no stubs to check — it's shared with the pre-generation cost
+    estimate endpoint, which never parses anything). parse() runs the same
+    is_structured() check first but can still return None afterward. If those
+    two ever disagree, generate_guide must not call
+    _generate_from_structured_script with stubs=None — it must fall straight
+    to the standard path instead of wasting an attempt on a guaranteed
+    TypeError that then gets silently swallowed."""
+    from worker.tasks.generate import generate_guide
+
+    job = _job()
+    reel = _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
+    db.query.return_value.filter.return_value.all.return_value = [_cut()]
+
+    with (
+        patch("worker.tasks.generate.SessionLocal", return_value=db),
+        patch("worker.tasks.generate.paid_call_count", return_value=0),
+        patch("worker.tasks.generate.script_parser.parse", return_value=None),
+        patch("worker.tasks.generate.resolve_generation_path", return_value="structured"),
+        patch("worker.tasks.generate._generate_from_structured_script") as mock_structured,
+        # get_llm_provider() is called unconditionally before either path is
+        # selected — let it succeed, and fail the standard path itself
+        # instead, right after it records job.meta["path"] = "standard".
+        patch("worker.tasks.generate.build_messages",
+              side_effect=ValueError("standard path reached")),
+        patch.object(generate_guide, "retry", side_effect=Retry()),
+    ):
+        with pytest.raises(ValueError, match="standard path reached"):
+            generate_guide(1)
+
+    mock_structured.assert_not_called()
+    assert job.meta.get("path") == "standard"
+
+
 def test_deterministic_failure_does_not_retry():
     """A bad-guide ValueError must fail once, exactly as before."""
     from worker.tasks.generate import generate_guide

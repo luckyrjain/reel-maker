@@ -50,7 +50,7 @@ def _pull_one(db, cut: "models.Cut") -> None:
         return
 
     try:
-        result = fetcher.fetch(cut, credential)
+        result = fetcher.fetch(cut, credential, db)
     except Exception:
         _log.exception(
             "Failed to pull metrics for cut_id=%s platform=%s", cut.id, cut.platform.value

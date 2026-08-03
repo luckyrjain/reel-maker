@@ -357,7 +357,19 @@ def generate_guide(self, job_id: int):
         # ── Structured-script fast path ──────────────────────────────────────
         forced_path = (job.meta or {}).get("generation_path", "auto")
         stubs = script_parser.parse(effective_context)
-        use_structured = resolve_generation_path(effective_context, forced_path) == "structured"
+        # resolve_generation_path() (shared with the pre-generation cost
+        # estimate, which has no stubs to check) decides via is_structured()
+        # alone. is_structured() is a cheaper header-count check that parse()
+        # itself starts with — but parse() can still return None even when
+        # is_structured() is True, if every detected section's body is empty
+        # after stripping labels/player prefixes. Require stubs is not None
+        # here so that disagreement falls straight through to the standard
+        # path instead of calling _generate_from_structured_script(stubs=None)
+        # and wasting an attempt on a guaranteed TypeError.
+        use_structured = (
+            resolve_generation_path(effective_context, forced_path) == "structured"
+            and stubs is not None
+        )
 
         if use_structured:
             heartbeat(db, job, 20)

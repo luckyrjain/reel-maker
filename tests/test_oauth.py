@@ -72,19 +72,42 @@ def test_instagram_authorize_url_contains_required_params():
     assert "state=state456" in url
 
 
+def test_instagram_exchange_code_posts_client_secret_not_in_url():
+    oauth = InstagramOAuth("app-id", "secret", "https://example.com/cb")
+    fake_resp = MagicMock()
+    fake_resp.raise_for_status.return_value = None
+    fake_resp.json.return_value = {"access_token": "short-lived-tok"}
+
+    with patch("api.oauth.httpx.post", return_value=fake_resp) as mock_post:
+        result = oauth.exchange_code("auth-code")
+
+    assert result["access_token"] == "short-lived-tok"
+    # client_secret must go in the POST body, not query params — a params
+    # secret leaks into httpx.HTTPStatusError's __str__ on any failed call,
+    # which api/routers/credentials.py surfaces verbatim in an HTTPException.
+    _, kwargs = mock_post.call_args
+    assert kwargs["data"]["client_secret"] == "secret"
+    assert kwargs["data"]["code"] == "auth-code"
+    assert "params" not in kwargs or not kwargs["params"]
+
+
 def test_instagram_exchange_long_lived_token_requests_fb_exchange_grant():
     oauth = InstagramOAuth("app-id", "secret", "https://example.com/cb")
     fake_resp = MagicMock()
     fake_resp.raise_for_status.return_value = None
     fake_resp.json.return_value = {"access_token": "long-lived-tok", "expires_in": 5_183_944}
 
-    with patch("api.oauth.httpx.get", return_value=fake_resp) as mock_get:
+    with patch("api.oauth.httpx.post", return_value=fake_resp) as mock_post:
         result = oauth.exchange_long_lived_token("short-lived-tok")
 
     assert result["access_token"] == "long-lived-tok"
-    _, kwargs = mock_get.call_args
-    assert kwargs["params"]["grant_type"] == "fb_exchange_token"
-    assert kwargs["params"]["fb_exchange_token"] == "short-lived-tok"
+    # Same leak as exchange_code() — grant_type/client_secret/fb_exchange_token
+    # (itself a token) must all go in the POST body, not query params.
+    _, kwargs = mock_post.call_args
+    assert kwargs["data"]["grant_type"] == "fb_exchange_token"
+    assert kwargs["data"]["fb_exchange_token"] == "short-lived-tok"
+    assert kwargs["data"]["client_secret"] == "secret"
+    assert "params" not in kwargs or not kwargs["params"]
 
 
 def test_instagram_discover_account_finds_linked_ig_business_account():

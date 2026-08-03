@@ -107,7 +107,7 @@ def test_one_cuts_fetch_failure_does_not_abort_the_batch(db_session):
     db.commit()
 
     fake_fetcher = MagicMock()
-    def _fetch(cut, credential):
+    def _fetch(cut, credential, db):
         if cut.platform_post_id == "post-fail":
             raise RuntimeError("API down")
         return EngagementMetrics(views=50)

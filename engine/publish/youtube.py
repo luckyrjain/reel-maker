@@ -17,9 +17,32 @@ from engine.publish.base import Publisher, PublishResult
 _UPLOAD_URL = "https://www.googleapis.com/upload/youtube/v3/videos"
 
 
+def get_valid_access_token(credential, db) -> str:
+    """Return a usable YouTube access token, refreshing it first if it has
+    expired. Shared by YouTubePublisher (upload) and YouTubeMetricsFetcher
+    (read-back) — Google access tokens expire in ~1h, so any caller that
+    holds onto the raw token_blob without this check will start 401ing."""
+    now = datetime.now(timezone.utc)
+    if credential.expires_at and credential.expires_at <= now:
+        if not credential.refresh_token_blob:
+            raise ValueError(
+                "YouTube access token expired and no refresh token is stored — "
+                "reconnect the account at /api/credentials"
+            )
+        oauth = get_oauth_provider("youtube")
+        tokens = oauth.refresh(credential.refresh_token_blob)
+        credential.token_blob = tokens["access_token"]
+        expires_in = tokens.get("expires_in")
+        credential.expires_at = (
+            now + timedelta(seconds=int(expires_in)) if expires_in else None
+        )
+        db.commit()
+    return credential.token_blob
+
+
 class YouTubePublisher(Publisher):
     def publish(self, cut, credential, db, caption: str) -> PublishResult:
-        access_token = self._access_token(credential, db)
+        access_token = get_valid_access_token(credential, db)
         video_path = Path(cut.video_path)
         video_size = video_path.stat().st_size
 
@@ -73,22 +96,3 @@ class YouTubePublisher(Publisher):
             platform_post_id=video_id,
             url=f"https://youtube.com/shorts/{video_id}",
         )
-
-    def _access_token(self, credential, db) -> str:
-        """Return a usable access token, refreshing it first if it has expired."""
-        now = datetime.now(timezone.utc)
-        if credential.expires_at and credential.expires_at <= now:
-            if not credential.refresh_token_blob:
-                raise ValueError(
-                    "YouTube access token expired and no refresh token is stored — "
-                    "reconnect the account at /api/credentials"
-                )
-            oauth = get_oauth_provider("youtube")
-            tokens = oauth.refresh(credential.refresh_token_blob)
-            credential.token_blob = tokens["access_token"]
-            expires_in = tokens.get("expires_in")
-            credential.expires_at = (
-                now + timedelta(seconds=int(expires_in)) if expires_in else None
-            )
-            db.commit()
-        return credential.token_blob

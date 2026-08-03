@@ -127,7 +127,14 @@ class InstagramOAuth(OAuthProvider):
         return f"{self.authorize_url}?{params}"
 
     def exchange_code(self, code: str) -> dict:
-        resp = httpx.get(self.token_url, params={
+        # POST with a form body, not GET with query params — RFC 6749 §3.2
+        # requires every OAuth2 token endpoint to support POST specifically so
+        # client_secret never has to ride in a URL (query strings land in
+        # server/proxy logs and, via httpx.HTTPStatusError's __str__() on any
+        # failed call, in job.error / HTTPException responses — the same class
+        # of leak fixed elsewhere in this module for bearer tokens). Matches
+        # YouTubeOAuth.exchange_code()'s pattern in this same file.
+        resp = httpx.post(self.token_url, data={
             "client_id": self.client_id,
             "client_secret": self.client_secret,
             "redirect_uri": self.redirect_uri,
@@ -146,7 +153,9 @@ class InstagramOAuth(OAuthProvider):
         derived from. Skipping this step would leave a connected account
         needing re-authorization every 1-2 hours instead of ~60 days.
         """
-        resp = httpx.get(self.token_url, params={
+        # POST body, not GET params — see exchange_code()'s comment; the same
+        # leak applies here to both client_secret and the short-lived token.
+        resp = httpx.post(self.token_url, data={
             "grant_type": "fb_exchange_token",
             "client_id": self.client_id,
             "client_secret": self.client_secret,
