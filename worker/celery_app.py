@@ -9,6 +9,7 @@ celery_app = Celery(
         "worker.tasks.enrich_context",
         "worker.tasks.generate",
         "worker.tasks.render",
+        "worker.tasks.publish",
         "worker.tasks.maintenance",
     ],
 )
@@ -41,6 +42,8 @@ celery_app.conf.update(
         "worker.tasks.render.render_cut":                   {"queue": "rendering"},
         "worker.tasks.generate.generate_guide":             {"queue": "generation"},
         "worker.tasks.enrich_context.enrich_context":       {"queue": "generation"},
+        # I/O-bound (network upload), not CPU-bound — belongs with generation, not rendering.
+        "worker.tasks.publish.publish_cut":                 {"queue": "generation"},
     },
 
     # Celery beat schedule for periodic maintenance.

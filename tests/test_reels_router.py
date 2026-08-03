@@ -1,4 +1,6 @@
 """Tests for the reel list/detail HTML routes in api/routers/reels.py."""
+from unittest.mock import patch
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -49,6 +51,7 @@ def _make_reel(session_factory, **overrides):
             platform=models.CutPlatform.youtube_shorts,
             target_length_s=45.0,
             status=overrides.get("cut_status", models.CutStatus.draft),
+            video_path=overrides.get("video_path"),
         )
         db.add(cut)
         db.commit()
@@ -89,6 +92,34 @@ def test_reel_detail_links_back_to_list(client):
     reel_id = _make_reel(client._session_factory)
     resp = client.get(f"/api/reels/{reel_id}")
     assert resp.status_code == 200
+
+
+def test_failed_cut_card_has_no_duplicate_ids_and_valid_hx_targets(client):
+    """Regression test: a "Retry publish" button once targeted #cut-card-{id}
+    with outerHTML while the endpoint actually returns the small publish_status
+    fragment — silently destroying the card on retry. Every hx-target here must
+    resolve to an id that actually exists in the same render, and no id may be
+    duplicated (htmx swaps get undefined/wrong-element behavior otherwise).
+    """
+    import re
+
+    reel_id = _make_reel(
+        client._session_factory,
+        cut_status=models.CutStatus.failed,
+        video_path="/data/videos/1/youtube_shorts.mp4",
+    )
+    resp = client.get(f"/api/reels/{reel_id}")
+    assert resp.status_code == 200
+    html = resp.text
+
+    ids = re.findall(r'id="([^"]+)"', html)
+    duplicates = {i for i in ids if ids.count(i) > 1}
+    assert not duplicates, f"duplicate DOM ids: {duplicates}"
+
+    targets = re.findall(r'hx-target="#([^"]+)"', html)
+    assert "publish-section-" in "".join(targets)  # sanity: the retry-publish button is present
+    for target in targets:
+        assert target in ids, f"hx-target=#{target} has no matching id=\"{target}\" in the page"
 
 
 def test_reel_detail_404_for_missing_reel(client):
@@ -161,6 +192,58 @@ def test_estimate_endpoint_returns_fragment_for_unstructured_context(client):
     assert resp.status_code == 200
     assert "standard path" in resp.text
     assert "paid LLM calls" in resp.text
+
+
+def test_create_reel_defaults_to_youtube_and_instagram(client):
+    with patch("api.routers.reels.enrich_context") as mock_enrich:
+        resp = client.post(
+            "/api/reels",
+            data={"context": "A" * 60, "generation_path": "structured"},
+        )
+    assert resp.status_code == 200
+    mock_enrich.delay.assert_called_once()
+    db = client._session_factory()
+    reel = db.query(models.Reel).order_by(models.Reel.id.desc()).first()
+    platforms = {c.platform.value for c in reel.cuts}
+    assert platforms == {"youtube_shorts", "instagram_reels"}
+    db.close()
+
+
+def test_create_reel_honors_explicit_platform_selection(client):
+    with patch("api.routers.reels.enrich_context"):
+        resp = client.post(
+            "/api/reels",
+            data={
+                "context": "A" * 60,
+                "generation_path": "structured",
+                "platforms": ["youtube_shorts", "tiktok"],
+            },
+        )
+    assert resp.status_code == 200
+    db = client._session_factory()
+    reel = db.query(models.Reel).order_by(models.Reel.id.desc()).first()
+    platforms = {c.platform.value for c in reel.cuts}
+    assert platforms == {"youtube_shorts", "tiktok"}
+    db.close()
+
+
+def test_create_reel_ignores_unknown_platform_values(client):
+    with patch("api.routers.reels.enrich_context"):
+        resp = client.post(
+            "/api/reels",
+            data={
+                "context": "A" * 60,
+                "generation_path": "structured",
+                "platforms": ["not_a_real_platform"],
+            },
+        )
+    assert resp.status_code == 200
+    db = client._session_factory()
+    reel = db.query(models.Reel).order_by(models.Reel.id.desc()).first()
+    # Falls back to the default pair since nothing valid was submitted.
+    platforms = {c.platform.value for c in reel.cuts}
+    assert platforms == {"youtube_shorts", "instagram_reels"}
+    db.close()
 
 
 def test_estimate_endpoint_detects_structured_script(client):

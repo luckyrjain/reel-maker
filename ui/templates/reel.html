@@ -9,7 +9,11 @@
 </head>
 <body>
 <main>
-    <a href="/" class="back">← New reel</a>
+    <div class="page-nav">
+        <a href="/" class="back" style="margin-bottom:0;">← New reel</a>
+        <a href="/api/reels">All reels</a>
+        <a href="/api/credentials">Connected accounts</a>
+    </div>
 
     <h1>{{ reel.context[:80] }}{% if reel.context|length > 80 %}…{% endif %}</h1>
     <div class="meta">

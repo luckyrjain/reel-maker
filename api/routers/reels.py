@@ -14,6 +14,7 @@ router = APIRouter()
 templates = Jinja2Templates(directory="ui/templates")
 
 REEL_LIST_PAGE_SIZE = 50
+_DEFAULT_PLATFORMS = [models.CutPlatform.youtube_shorts, models.CutPlatform.instagram_reels]
 
 
 @router.post("/reels", response_class=HTMLResponse)
@@ -24,6 +25,7 @@ def create_reel(
     voiceover_mode: Annotated[str, Form()] = "voiceover",
     target_length_s: Annotated[float, Form()] = 45.0,
     generation_path: Annotated[str, Form()] = "auto",
+    platforms: Annotated[list[str] | None, Form()] = None,
     db: Session = Depends(get_db),
 ):
     reel = models.Reel(
@@ -37,7 +39,13 @@ def create_reel(
 
     transition(reel, "enriching", REEL_TRANSITIONS)
 
-    for platform in [models.CutPlatform.youtube_shorts, models.CutPlatform.instagram_reels]:
+    # Unrecognized values are dropped rather than raising 422 — a stray/renamed
+    # checkbox value shouldn't fail the whole submission. Falls back to the
+    # original two-platform default if nothing valid was submitted.
+    selected = [p for p in (platforms or []) if p in models.CutPlatform.__members__]
+    cut_platforms = [models.CutPlatform[p] for p in selected] or _DEFAULT_PLATFORMS
+
+    for platform in cut_platforms:
         cut = models.Cut(
             reel_id=reel.id,
             platform=platform,

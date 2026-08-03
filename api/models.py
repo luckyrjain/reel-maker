@@ -29,6 +29,7 @@ class ReelStatus(str, enum.Enum):
 class CutPlatform(str, enum.Enum):
     youtube_shorts = "youtube_shorts"
     instagram_reels = "instagram_reels"
+    tiktok = "tiktok"
 
 
 class CutStatus(str, enum.Enum):
@@ -178,5 +179,10 @@ class Credential(Base):
     provider = Column(String(100), nullable=False)
     account_label = Column(String(255))
     token_blob = Column(Encrypted)
+    refresh_token_blob = Column(Encrypted)
+    # Provider-specific ID discovered during OAuth that isn't a scope — e.g. the
+    # Instagram Business Account ID behind a connected Facebook Page, or a
+    # YouTube channel ID. Publishers read this to know what to post to.
+    provider_account_id = Column(String(255))
     scopes = Column(JSON)
     expires_at = Column(DateTime(timezone=True))

@@ -10,6 +10,7 @@ from api.config import settings
 from api.db import get_db
 from api.state import CUT_TRANSITIONS, transition
 from engine.generation.postprocess import _derive_on_screen
+from worker.tasks.publish import publish_cut
 from worker.tasks.render import render_cut
 
 router = APIRouter()
@@ -137,6 +138,62 @@ def approve_cut(cut_id: int, request: Request, db: Session = Depends(get_db)):
     transition(cut, "approved", CUT_TRANSITIONS)
     db.commit()
     return _cut_card(request, cut)
+
+
+@router.post("/cuts/{cut_id}/publish", response_class=HTMLResponse)
+def trigger_publish(cut_id: int, request: Request, db: Session = Depends(get_db)):
+    cut = db.get(models.Cut, cut_id)
+    if not cut:
+        raise HTTPException(status_code=404, detail="Cut not found")
+
+    if not cut.video_path:
+        raise HTTPException(status_code=422, detail="No rendered video yet — render and approve first")
+
+    current = cut.status.value
+    if current == "publishing":
+        raise HTTPException(status_code=409, detail="Publish already in progress")
+    if current == "failed":
+        # A publish failure (bad credentials, network error) doesn't need a
+        # re-render — retry straight from "approved". A render failure is
+        # retried via /render instead, which reverts to "draft" itself.
+        transition(cut, "approved", CUT_TRANSITIONS)
+        current = "approved"
+    if current not in ("approved", "scheduled"):
+        raise HTTPException(status_code=409, detail=f"Cannot publish from status '{current}'")
+
+    transition(cut, "publishing", CUT_TRANSITIONS)
+
+    job = models.Job(
+        type=models.JobType.publish,
+        reel_id=cut.reel_id,
+        cut_id=cut_id,
+        status=models.JobStatus.pending,
+        progress=0,
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    publish_cut.delay(job.id)
+
+    return templates.TemplateResponse(
+        request, "fragments/publish_status.html",
+        {"job": job, "cut": cut},
+    )
+
+
+@router.get("/cuts/{cut_id}/publish-status", response_class=HTMLResponse)
+def publish_status_fragment(
+    cut_id: int, job_id: int, request: Request, db: Session = Depends(get_db)
+):
+    job = db.get(models.Job, job_id)
+    cut = db.get(models.Cut, cut_id)
+    if not job or not cut:
+        raise HTTPException(status_code=404)
+    return templates.TemplateResponse(
+        request, "fragments/publish_status.html",
+        {"job": job, "cut": cut},
+    )
 
 
 @router.get("/cuts/{cut_id}/video")

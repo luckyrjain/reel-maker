@@ -9,7 +9,10 @@
 </head>
 <body>
     <main>
-        <div class="page-nav"><a href="/api/reels">All reels →</a></div>
+        <div class="page-nav">
+            <a href="/api/reels">All reels →</a>
+            <a href="/api/credentials">Connected accounts →</a>
+        </div>
         <h1>Reel Maker</h1>
 
         <form hx-post="/api/reels"
@@ -52,6 +55,22 @@ Punchy closing line. Subscribe / comment / share prompt.
                 Niche
                 <input name="niche" placeholder="e.g. football, personal finance, fitness">
             </label>
+
+            <fieldset class="platform-picker">
+                <legend>Platforms</legend>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="platforms" value="youtube_shorts" checked>
+                    YouTube Shorts
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="platforms" value="instagram_reels" checked>
+                    Instagram Reels
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="platforms" value="tiktok">
+                    TikTok <span class="field-hint">(publishing not yet available — render/review only)</span>
+                </label>
+            </fieldset>
 
             <div style="display:flex;gap:16px;flex-wrap:wrap;">
                 <label style="flex:1;min-width:160px;">

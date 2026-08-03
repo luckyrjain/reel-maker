@@ -50,6 +50,26 @@ class Settings(BaseSettings):
     # Leave blank in dev — tokens are stored as plaintext with a warning.
     credentials_key: str = ""
 
+    # Publicly reachable base URL for this server — used to build the OAuth
+    # redirect_uri (must match a URI registered with each provider's app) and,
+    # for Instagram, the video URL the platform fetches from. Instagram's Graph
+    # API requires a real public HTTPS URL; localhost/NAT alone will not work
+    # for Instagram publishing even with valid credentials.
+    public_base_url: str = "http://localhost:8000"
+
+    # OAuth — YouTube Data API. Register an app at console.cloud.google.com,
+    # enable the YouTube Data API v3, and add {public_base_url}/api/credentials/
+    # youtube/callback as an authorized redirect URI.
+    youtube_oauth_client_id: str = ""
+    youtube_oauth_client_secret: str = ""
+
+    # OAuth — Instagram publishing via the Meta Graph API. Register an app at
+    # developers.facebook.com; requires a Facebook Page linked to an Instagram
+    # Business/Creator account, and add {public_base_url}/api/credentials/
+    # instagram/callback as a valid OAuth redirect URI.
+    meta_oauth_app_id: str = ""
+    meta_oauth_app_secret: str = ""
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 

@@ -493,7 +493,11 @@ MasterGuide:
 ## What is not yet built
 
 - **Music**: `music_cue` generated but not fetched or mixed. Intended: FFmpeg `amix` + `agate` sidechain
-- **Publishing**: YouTube Data API + Instagram Graph API; `credentials` table + `Encrypted` exist but no OAuth flow
-- **Scheduling**: `scheduled` cut status exists; no scheduler worker
-- **Cost tracking**: `StageEvent.cost_usd` field exists; pricing lookup not implemented
+- **TikTok publishing**: `CutPlatform.tiktok` exists (render/review works); `TikTokPublisher.publish()` raises `NotImplementedError` on purpose — the Content Posting API needs a separate audited app review, unlike YouTube/Instagram's self-serve OAuth
+- **Attribution block in captions**: `Asset.attribution`/`license_url` exist; nothing appends them to the published caption yet
+- **Scheduling**: `scheduled` cut status and `publish_cut` both handle a cut already sitting in `scheduled`; no UI/scheduler worker transitions a cut *into* it yet
+- **Asset-generation cost tracking**: `StageEvent.cost_usd` is implemented for LLM calls (NVIDIA) only — see `engine/generation/pricing.py`; Pexels/Wikipedia/HuggingFace asset sourcing isn't instrumented
 - **Multi-image collage**: cycles sequentially; no side-by-side layout within a beat
+
+YouTube + Instagram publishing (OAuth, `safe_to_publish` gate, upload flows) shipped
+in Phase 4b — see `engine/publish/`, `api/oauth.py`, `worker/tasks/publish.py`.

@@ -45,7 +45,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 144 tests across 14 files
+.venv/bin/pytest                            # 238 tests across 30+ files
 .venv/bin/pytest tests/test_foo.py::bar -s
 
 # New migration after changing models.py
@@ -99,33 +99,47 @@ In both paths, `postprocess.py` strips section-label prefixes from `vo_script` a
 ```
 api/
   main.py             FastAPI app factory; static files, Jinja2, all routers
-  config.py           pydantic-settings Settings; includes nvidia_api_key, nvidia_generation_model, use_nvidia_for_generation, pexels_api_key, huggingface_api_key, huggingface_image_model, huggingface_video_model, pixabay_api_key, credentials_key
+  config.py           pydantic-settings Settings; includes nvidia_api_key, nvidia_generation_model, use_nvidia_for_generation, pexels_api_key, huggingface_api_key, huggingface_image_model, huggingface_video_model, pixabay_api_key, credentials_key, max_paid_llm_calls_per_reel, nvidia_price_per_1m_input_tokens, nvidia_price_per_1m_output_tokens, public_base_url, youtube_oauth_client_id/secret, meta_oauth_app_id/secret
   crypto.py           Fernet seal/open_ + Encrypted SQLAlchemy TypeDecorator
   db.py               SQLAlchemy engine, SessionLocal, get_db() dependency
   models.py           All ORM models + enums; includes StageEvent
+  oauth.py            Generic OAuth2 authorization-code flow — YouTubeOAuth, InstagramOAuth,
+                      new_state()/consume_state() (process-local CSRF state, single-operator tool)
   schemas.py          Pydantic schemas for JSON endpoints
   state.py            REEL_TRANSITIONS, CUT_TRANSITIONS, transition()
   routers/
-    reels.py          POST /api/reels (accepts generation_path), GET /api/reels/{id}
+    reels.py          POST /api/reels (accepts generation_path + platforms), GET /api/reels (list),
+                      GET /api/reels/{id} (pipeline cost/latency/quality panel), POST /api/reels/estimate
     jobs.py           GET /api/jobs/{id} (JSON + HTML fragment)
-    cuts.py           POST /render, PATCH, POST /approve, render-status, video stream
+    cuts.py           POST /render, PATCH, POST /approve, POST /publish, render-status,
+                      publish-status, video stream
+    credentials.py    GET /api/credentials (connect/disconnect UI), GET /{provider}/authorize,
+                      GET /{provider}/callback, POST /{provider}/disconnect
 
 worker/
   celery_app.py       Celery instance; acks_late=True, beat schedule, split queues
   tasks/
     common.py         should_retry() / is_transient_error() / heartbeat() — shared task helpers
     generate.py       generate_guide(job_id) — idempotency guard, heartbeat, enrichment,
-                      conflict injection, visuals LLM, closed-loop eval retry, observability
+                      conflict injection, visuals LLM, closed-loop eval retry, observability,
+                      paid-call budget cap (_enforce_paid_call_budget)
     render.py         render_cut(job_id) — idempotency guard, heartbeat, resolve_or_reuse,
                       synth_to_budget, TTS-accurate timecodes, atomic MP4, observability
+    publish.py        publish_cut(job_id) — idempotency guard, heartbeat, safe_to_publish gate,
+                      dispatches to engine/publish/registry.py, records platform_post_id
     maintenance.py    reap_stuck_jobs() — Celery beat task; fails stale running + pending jobs
+                      (rolls back cuts stuck in "rendering" OR "publishing")
 
 engine/
-  observability.py    record_stage() context manager — writes StageEvent rows on exit
+  observability.py    record_stage() context manager — writes StageEvent rows on exit;
+                      paid_call_count() — counts nvidia-provider StageEvents for a reel (budget cap)
   generation/
-    guide_schema.py   Beat, PlatformGuide, MasterGuide Pydantic models
-    llm.py            LLMProvider + OllamaProvider; get_llm_provider(), get_enrichment_provider(),
-                      is_nvidia_generation() — True when main LLM routes to NVIDIA NIM
+    guide_schema.py   Beat, PlatformGuide, MasterGuide Pydantic models — platform Literal includes tiktok
+    llm.py            LLMProvider + OllamaProvider (captures last_usage/total_usage token counts);
+                      get_llm_provider(), get_enrichment_provider(), is_nvidia_generation()
+    pricing.py        llm_cost_usd() — NVIDIA per-token cost from Settings rates (0 until configured)
+    estimate.py       estimate_generation() — pre-generation call-count/time/cost estimate for the
+                      create-reel form, cost sourced from this operator's own StageEvent history
     prompt.py         build_messages(prior_feedback=) + build_visuals_messages() — visuals system prompt anchors LLM to per-beat VO only
     script_parser.py  BeatStub + parse() + is_structured() — structured-script extractor
     visual_fallback.py  Fallback visual_direction synthesis — section/VO keyword tables
@@ -145,11 +159,25 @@ engine/
                       120ms audio fade in/out per beat (moviepy.audio.fx.AudioFadeIn/AudioFadeOut via .with_effects()) for smooth narration transitions;
                       _build_text_filter() uses Whisper timestamps when available, proportional fallback;
                       atomic final write via os.replace()
+  publish/
+    base.py           Publisher interface + PublishResult dataclass
+    registry.py       get_publisher(platform) / credential_provider_for_platform(platform)
+    gate.py           assert_safe_to_publish() / unsafe_assets() — enforces Asset.safe_to_publish
+                      before any publish call; the one place that field is actually checked
+    youtube.py        YouTubePublisher — resumable upload (init POST + PUT), refreshes an
+                      expired access token via the stored refresh_token first
+    instagram.py      InstagramPublisher — container create/poll/publish (Reels). Requires
+                      settings.public_base_url to be a real public HTTPS URL — Instagram
+                      fetches the video itself, it does not accept an upload body
+    tiktok.py         TikTokPublisher — deliberately raises NotImplementedError; the Content
+                      Posting API needs a separate audited app review, unlike YouTube/Instagram
 
 migrations/
   versions/
     0001_initial.py   Original schema
     0002_improvements.py  Job heartbeat/meta, CutAsset pinning, Asset licensing, StageEvent table
+    0003_context_enrichment.py  enriched_context column; enriching/enrich enum values
+    0004_publishing.py  tiktok CutPlatform value; Credential.provider_account_id + refresh_token_blob
 
 tests/
   test_evaluator.py           29 tests — all 17 evaluator axes + helpers, multi-platform dedupe
@@ -166,14 +194,37 @@ tests/
   test_render_task.py          3 tests — missing cut, transient retry, success clears stale error
   test_asset_sourcer.py        4 tests — resolve_or_reuse pin, reuse, re-pin, beat isolation
   test_llm_judge.py            3 tests — neutral-score fallback on raise, garbage, out-of-range
+  test_reels_router.py        13 tests — reel list/detail routes, platform-selection form, pipeline panel, htmx id/target consistency
+  test_pricing.py              4 tests — llm_cost_usd() rate application, zero-rate default
+  test_llm_provider.py         4 tests — OllamaProvider last_usage/total_usage capture
+  test_estimate.py             8 tests — generation path resolution, historical cost averaging incl. structured-fallback exclusion
+  test_observability.py        3 tests — paid_call_count() scoping and filtering
+  test_publish_gate.py         3 tests — safe_to_publish enforcement
+  test_oauth.py               13 tests — OAuth state CSRF, YouTube/Instagram authorize+exchange, long-lived token swap
+  test_credentials_router.py   9 tests — connect/callback/disconnect routes
+  test_publish_task.py         7 tests — publish_cut idempotency, budget/safety gates, transient vs deterministic failure
+  test_publish_registry.py     4 tests — platform→publisher and platform→credential-provider mapping
+  test_cuts_publish_router.py  6 tests — POST /cuts/{id}/publish state-guard and enqueue
+  test_youtube_publisher.py    4 tests — resumable upload flow, token refresh
+  test_instagram_publisher.py  6 tests — container create/poll/publish flow, error paths
 
 ui/templates/
-  index.html          Context-entry form; target_length + voiceover_mode + generation_path selects
-  reel.html           Page shell — loops cuts, includes cut_card.html
+  index.html          Context-entry form; niche/platform picker + target_length + voiceover_mode +
+                      generation_path selects; live cost/time estimate (htmx → cost_estimate.html)
+  reels_list.html     Paginated reel list (GET /api/reels) — status badges, per-cut platform badges
+  reel.html           Page shell — pipeline cost/latency/quality panel, loops cuts, includes cut_card.html
+  credentials.html    Connected-accounts page — connect/disconnect per provider, TikTok shown as
+                      not-yet-available
   fragments/
-    cut_card.html     Full cut card; read-only or editable (in_review)
-    render_status.html  Polling fragment; video + Approve/Re-render when done
-ui/static/main.css    Styles: badges, progress bar shimmer, beat table, edit fields
+    cut_card.html     Full cut card; read-only or editable (in_review); render/approve/publish actions
+                      per CutStatus branch
+    render_status.html   Polling fragment; video + Approve/Re-render when done
+    publish_status.html  Polling fragment (id="publish-status-{cut.id}", distinct from its parent
+                      "publish-section-{cut.id}" target — do not reuse the parent's id, that
+                      creates nested duplicate DOM ids on swap)
+    cost_estimate.html   Pre-generation estimate fragment (POST /api/reels/estimate)
+ui/static/main.css    Styles: badges (Job + Reel/Cut status enums both), progress bar shimmer,
+                      beat table, edit fields, pipeline panel, credential cards, platform picker
 
 docs/
   architecture.md     System diagram, module breakdown, render pipeline
@@ -186,12 +237,12 @@ docs/
 ## Data model
 
 - `reels` — master concept; `status` tracks generation phase
-- `cuts` — one row per platform; holds `guide` (JSONB), `caption`, `hashtags`, `video_path`, `thumbnail_path`
+- `cuts` — one row per platform (`youtube_shorts`, `instagram_reels`, or `tiktok`); holds `guide` (JSONB), `caption`, `hashtags`, `video_path`, `thumbnail_path`, `platform_post_id`, `published_at`
 - `assets` — cached media files; deduplicated by `(source, source_ref)`; `source` is `pexels`, `wikipedia`, `huggingface`, or `huggingface_video`; `type` is `footage` or `photo`; includes `license_url`, `attribution`, `safe_to_publish`. HF-generated assets are `safe_to_publish=True`.
 - `cut_assets` — per-beat asset binding ledger; `beat_index` + `order_in_beat` identify position; `resolved_from` is `sha256(visual_direction)[:16]` for change detection; unique constraint on `(cut_id, beat_index, order_in_beat)`; `start_s`/`end_s` updated after TTS measurement
-- `jobs` — every async operation; includes `started_at`, `heartbeat_at`, `meta` (JSON — stores `generation_path`, `path`, `stub_count`, `quality_score` on success, and optionally `structured_score`/`structured_fallback` when structured path fell back to standard); `error` is `None` on success, set to exception message on failure only
-- `stage_events` — instrumentation: one row per pipeline stage (enrich, generate, judge, composite); stores `stage`, `provider`, `model_name`, `latency_ms`, `ok`, `detail`, `score`
-- `credentials` — OAuth tokens; `token_blob` column is encrypted at rest via `Encrypted` TypeDecorator
+- `jobs` — every async operation (`enrich`, `generate`, `render`, `publish`); includes `started_at`, `heartbeat_at`, `meta` (JSON — stores `generation_path`, `path`, `stub_count`, `quality_score` on success, and optionally `structured_score`/`structured_fallback` when structured path fell back to standard); `error` is `None` on success, set to exception message on failure only
+- `stage_events` — instrumentation: one row per pipeline stage (enrich, generate, judge, visuals, enrich_conflict, caption_hashtags, context_enrich, composite, publish); stores `stage`, `provider`, `model_name`, `latency_ms`, `tokens_in`, `tokens_out`, `cost_usd`, `ok`, `detail`, `score`. `provider == "nvidia"` StageEvents are what `paid_call_count()` counts toward the budget cap.
+- `credentials` — OAuth tokens for publish-target accounts; `token_blob` and `refresh_token_blob` are encrypted at rest via `Encrypted` TypeDecorator (auto-decrypted on read — code sees plain strings); `provider_account_id` holds a provider-specific ID discovered during OAuth (e.g. the Instagram Business Account ID behind a connected Facebook Page); `provider` is `"youtube"` or `"instagram"` (not the `CutPlatform` value — see `credential_provider_for_platform()`)
 
 Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_DIR/wiki/`; TTS audio in `ASSET_STORE_DIR/tts/`; DB stores paths only.
 
@@ -225,6 +276,14 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 - **Topic fence in enrichment prompts**: `_enrich_batch()` and `_make_conflict_stub()` include an explicit "Do not introduce matches, tournaments, scorelines, or players not mentioned in the beat/context" constraint. Prevents LLM from drifting into unrelated events.
 - **Visual direction prompt anchoring**: `build_visuals_messages()` system prompt instructs the LLM to derive `visual_direction` ONLY from the specific players, actions, and events named in that beat's VO — not from the global context.
 - **Video streaming path guard**: `stream_video` validates `cut.video_path` is under `VIDEO_STORE_DIR` via `Path.resolve().is_relative_to()` before serving — never bypass this.
+- **safe_to_publish is enforced exactly once**: `engine/publish/gate.py::assert_safe_to_publish()`, called at the top of `publish_cut`. Nowhere else checks it — computing the field (asset_sourcer.py) is not the same as enforcing it.
+- **Paid-call budget cap**: `_enforce_paid_call_budget()` in `generate.py` checks `paid_call_count(db, reel.id) < Settings.max_paid_llm_calls_per_reel` at task entry and before each standard-path retry attempt. It's a lifetime-per-reel count (no per-job scoping) — not exploitable today since nothing re-triggers a `generate` Job for a reel that already has one, but a future "regenerate guide" flow would need an explicit reset path, not just raising the global setting.
+- **Cost estimates come from real history, not guessed token counts**: `engine/generation/estimate.py::estimate_generation()` averages actual `StageEvent.cost_usd` from past reels on the same generation path — reels where the structured path fell through to standard (`job.meta["structured_fallback"]`) are excluded from the "standard" bucket so they don't inflate it with wasted structured-attempt cost. Reports "no history yet" rather than fabricating a number.
+- **Cut status "failed" is ambiguous by design**: it covers both a failed render and a failed publish. `CUT_TRANSITIONS["failed"]` allows both `"draft"` (retry render) and `"approved"` (retry publish) — which target applies is decided by which endpoint the operator hits (`/render` vs `/publish`), not tracked on the Cut itself.
+- **HTMX fragment IDs**: a fragment returned by a trigger endpoint (`render_status.html`, `publish_status.html`) must use a **different** `id` than the stable container it gets swapped into (`render-section-{id}` / `publish-section-{id}`) — reusing the parent's id creates nested duplicate DOM ids after the `innerHTML` swap. The fragment's own polling loop then self-swaps via `outerHTML` using that distinct id.
+- **`credential.token_blob` reads as plaintext**: the `Encrypted` TypeDecorator decrypts on load automatically — application code (publishers, `credentials.py`) never calls `crypto.open_()`/`seal()` directly, just assigns/reads the attribute.
+- **Instagram publishing needs a public URL**: `InstagramPublisher` builds a `video_url` from `Settings.public_base_url` pointing at `GET /api/cuts/{id}/video` — Instagram's Graph API fetches the file itself rather than accepting an upload body, so this does not work behind `localhost`/NAT alone.
+- **TikTok publishing is not implemented on purpose**: `TikTokPublisher.publish()` raises `NotImplementedError` — the Content Posting API requires a separate audited app review, unlike YouTube/Instagram's self-serve OAuth. TikTok is still a selectable `CutPlatform` for render/review.
 
 ## Build phase status
 
@@ -233,23 +292,25 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 - **Phase 2** ✅ — Render: Pexels footage + Wikipedia player photos (with license metadata), Edge TTS with rate-budget control, MoviePy compositor with Ken Burns, Whisper word-level timing (with proportional fallback), atomic MP4 writes
 - **Phase 3** ✅ — Review/edit loop: editable beats, editable caption/hashtags, approve
 - **Phase 3.5** ✅ — Hardening: acks_late reliability, idempotency guards, heartbeat + stuck-job reaper, per-beat asset pinning (deterministic re-render), observability (StageEvent), credential encryption, a substantially expanded test suite; evaluator upgraded to 17 axes (conversational tone, hook-CTA throughline, per-beat specificity, repetition)
-- **Phase 4** 🔲 — Publishing: YouTube Data API + Instagram Graph API; safe_to_publish gate; attribution block in captions
-- **Phase 5** 🔲 — Analytics: post-publish metrics pull-back, cost-per-reel reporting from stage_events, music mixing
+- **Phase 4a** ✅ — Operator visibility: reel list page, per-reel cost/latency/quality panel sourced from `StageEvent`, `StageEvent.cost_usd` implemented for every LLM call site (NVIDIA rates only — HF asset-generation cost is not tracked), pre-generation cost/time estimate from real history, hard cap on paid LLM calls per reel
+- **Phase 4b** ✅ — Publishing: OAuth connect-account flow (YouTube Data API + Instagram Graph API), `safe_to_publish` hard gate enforced at publish time, TikTok added as a third `CutPlatform` for render/review (publishing itself deliberately not implemented — see Key conventions), `scheduled`/`publishing`/`published` cut states wired end-to-end. Not done: attribution block in captions, TikTok publishing, unpublish/re-publish flows.
+- **Phase 5** 🔲 — Analytics: post-publish metrics pull-back, correlating `quality_score` against real engagement, music mixing, HF asset-generation cost tracking
 
 ## Worker queues
 
-- **`generation` queue** — `generate_guide`, `enrich_context`. I/O-bound. Run with `--concurrency=4`.
+- **`generation` queue** — `generate_guide`, `enrich_context`, `publish_cut`. I/O-bound. Run with `--concurrency=4`.
 - **`rendering` queue** — `render_cut`. CPU-bound. Run with `--concurrency=1`. Restarts after 10 tasks (`worker_max_tasks_per_child=10`) to prevent ffmpeg handle leaks.
 - **Celery beat** — runs `reap_stuck_jobs` every 60 s. Start with `celery -A worker.celery_app beat`.
 
 ## What is not yet wired in
 
 - `music_cue` — generated by the LLM but no music file is fetched or mixed into renders. Intended approach: FFmpeg `amix` + `agate` sidechain for auto-ducking under VO.
-- `credentials` table — schema + encryption exist; no OAuth flow yet (Phase 4)
-- `scheduled` / `publishing` / `published` cut statuses — state machine entries only (Phase 4)
+- TikTok publishing — `TikTokPublisher.publish()` raises `NotImplementedError` on purpose (see Key conventions). Render/review works; only the upload call is missing.
+- Attribution block in captions — Wikipedia-sourced assets carry `attribution`/`license_url`, but nothing appends it to the published caption yet.
+- "Scheduled" has no trigger UI — the state machine and `publish_cut` both handle a cut already sitting in `scheduled`, but nothing currently transitions a cut *into* `scheduled` (no date/time picker, no Celery-beat-driven scheduled publish).
 - Insight enrichment for the **standard LLM path** — currently only applied to structured-script beats
 - Multi-image collage within a single beat — currently cycles sequentially; no side-by-side layout
-- Cost calculation in `StageEvent.cost_usd` — `latency_ms` and `tokens_in/out` fields exist but pricing lookup is not implemented
+- HuggingFace/asset-generation cost tracking — `StageEvent.cost_usd` is implemented for LLM calls (NVIDIA) only; Pexels/Wikipedia/HF asset sourcing isn't instrumented at all
 - `PIXABAY_API_KEY` (`pixabay_api_key` in config) — field exists for a planned Pixabay music/video source; no `PixabayProvider` implemented yet
 
 ## Docs

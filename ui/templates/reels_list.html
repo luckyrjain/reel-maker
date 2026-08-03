@@ -8,7 +8,10 @@
 </head>
 <body>
 <main class="main-wide">
-    <a href="/" class="back">← New reel</a>
+    <div class="page-nav">
+        <a href="/" class="back" style="margin-bottom:0;">← New reel</a>
+        <a href="/api/credentials">Connected accounts</a>
+    </div>
     <h1>All reels <span class="reel-count">({{ total }})</span></h1>
 
     {% if not reels %}

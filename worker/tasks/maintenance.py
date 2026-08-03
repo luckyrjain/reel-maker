@@ -71,7 +71,7 @@ def _revert_owner(db, job: models.Job) -> None:
                 pass
     if job.cut_id:
         cut = db.get(models.Cut, job.cut_id)
-        if cut and cut.status.value == "rendering":
+        if cut and cut.status.value in ("rendering", "publishing"):
             try:
                 transition(cut, "failed", CUT_TRANSITIONS)
             except ValueError:

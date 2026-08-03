@@ -166,7 +166,7 @@ h3 { font-size: 0.95rem; font-weight: 700; margin-bottom: 10px; color: #374151; 
 .back:hover { text-decoration: underline; }
 
 /* ── Nav / reel list ── */
-.page-nav { margin-bottom: 14px; font-size: 0.85rem; }
+.page-nav { margin-bottom: 14px; font-size: 0.85rem; display: flex; gap: 18px; flex-wrap: wrap; }
 .page-nav a { color: #6366f1; text-decoration: none; }
 .page-nav a:hover { text-decoration: underline; }
 .main-wide { max-width: 920px; margin: 48px auto; padding: 0 20px; }
@@ -196,6 +196,21 @@ h3 { font-size: 0.95rem; font-weight: 700; margin-bottom: 10px; color: #374151; 
 .stage-table td { padding: 6px 10px; border-bottom: 1px solid #f3f4f6; }
 .stage-fail { color: #991b1b; font-weight: 700; }
 .mono { font-family: monospace; }
+
+/* ── Connected accounts (credentials) page ── */
+.credential-list { display: flex; flex-direction: column; gap: 14px; margin-top: 24px; }
+.credential-card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px 20px; background: #fff; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
+.credential-card--disabled { opacity: 0.6; }
+.credential-info { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.credential-label { color: #6b7280; font-size: 0.85rem; }
+.credential-expiry { color: #9ca3af; font-size: 0.78rem; font-family: monospace; }
+.credential-actions form { display: inline; }
+
+/* ── Platform picker ── */
+.platform-picker { border: 1px solid #d1d5db; border-radius: 6px; padding: 10px 14px 14px; display: flex; gap: 18px; flex-wrap: wrap; }
+.platform-picker legend { font-size: 0.85rem; font-weight: 600; color: #374151; padding: 0 4px; }
+.checkbox-label { flex-direction: row !important; align-items: center; gap: 6px !important; font-weight: 400 !important; }
+.checkbox-label input { width: auto; }
 
 /* ── Pre-generation cost/time estimate ── */
 .cost-estimate { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 0.82rem; color: #374151; margin: -6px 0 4px; min-height: 20px; }
