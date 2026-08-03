@@ -98,10 +98,18 @@ def test_instagram_discover_account_finds_linked_ig_business_account():
     ig_resp.raise_for_status.return_value = None
     ig_resp.json.return_value = {"instagram_business_account": {"id": "ig123"}}
 
-    with patch("api.oauth.httpx.get", side_effect=[pages_resp, ig_resp]):
+    with patch("api.oauth.httpx.get", side_effect=[pages_resp, ig_resp]) as mock_get:
         account = oauth.discover_account("user-token")
 
     assert account == {"page_id": "page1", "page_access_token": "page-token", "ig_user_id": "ig123"}
+
+    # Tokens must go in the Authorization header, not query params — a params
+    # token leaks into httpx.HTTPStatusError's __str__ on any failed call.
+    first_call, second_call = mock_get.call_args_list
+    assert first_call.kwargs["headers"]["Authorization"] == "Bearer user-token"
+    assert "access_token" not in (first_call.kwargs.get("params") or {})
+    assert second_call.kwargs["headers"]["Authorization"] == "Bearer page-token"
+    assert "access_token" not in (second_call.kwargs.get("params") or {})
 
 
 def test_instagram_discover_account_raises_when_no_linked_account():

@@ -161,10 +161,16 @@ class InstagramOAuth(OAuthProvider):
         Returns {"page_id", "page_access_token", "ig_user_id"} for the first
         page with a linked Instagram Business/Creator account. Publish calls use
         the *page* access token, not the user token exchange_code() returned.
+
+        Tokens go in the Authorization header, not query params — Graph API
+        supports both, but httpx.HTTPStatusError's default __str__ includes the
+        full request URL, so a token passed via params would leak into any log
+        or error message a failed call bubbles up to (worker/tasks/*.py's
+        `job.error = str(exc)`, in particular).
         """
         resp = httpx.get(
             "https://graph.facebook.com/v19.0/me/accounts",
-            params={"access_token": user_access_token},
+            headers={"Authorization": f"Bearer {user_access_token}"},
             timeout=30.0,
         )
         resp.raise_for_status()
@@ -172,7 +178,8 @@ class InstagramOAuth(OAuthProvider):
             page_id, page_token = page["id"], page["access_token"]
             ig_resp = httpx.get(
                 f"https://graph.facebook.com/v19.0/{page_id}",
-                params={"fields": "instagram_business_account", "access_token": page_token},
+                params={"fields": "instagram_business_account"},
+                headers={"Authorization": f"Bearer {page_token}"},
                 timeout=30.0,
             )
             ig_resp.raise_for_status()

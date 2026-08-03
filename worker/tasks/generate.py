@@ -118,6 +118,14 @@ def _stubs_to_platform_guide(
             visual_direction=vd,
             on_screen_text=s.on_screen_text,
             vo_script=s.vo_script,
+            # Structured-script beats never carry an LLM-written music_cue (that's
+            # only produced by the standard path's full guide generation) — without
+            # this, render_cut would never find a cue to look up a music track for,
+            # and the structured path (the faster, more commonly recommended one)
+            # would silently never get background music. A single genre-neutral
+            # default on the hook beat is enough: render_cut uses the first
+            # non-empty cue across all beats for the whole cut's music track.
+            music_cue="upbeat energetic" if s.beat_type == "hook" else None,
         ))
     return PlatformGuide(
         platform=platform,

@@ -33,10 +33,10 @@ One row per platform per reel. All generated content for a platform lives here.
 |---|---|---|
 | `id` | integer PK | |
 | `reel_id` | FK → reels | |
-| `platform` | enum `CutPlatform` | `youtube_shorts` \| `instagram_reels` |
+| `platform` | enum `CutPlatform` | `youtube_shorts` \| `instagram_reels` \| `tiktok` |
 | `target_length_s` | float | Requested duration (30/45/60/75/90 s) |
 | `guide` | JSON | Full `PlatformGuide` dict — see guide schema below |
-| `caption` | text | Post caption |
+| `caption` | text | Post caption (DB-stored value; the published caption additionally gets an attribution suffix appended at publish time only, via `build_published_caption()` — this column is never mutated with it) |
 | `hashtags` | JSON array | List of strings, no `#` prefix |
 | `video_path` | varchar(500) | Absolute path to rendered MP4 on disk |
 | `thumbnail_path` | varchar(500) | Absolute path to thumbnail JPEG |
@@ -44,6 +44,10 @@ One row per platform per reel. All generated content for a platform lives here.
 | `status` | enum `CutStatus` | See state machine |
 | `published_at` | timestamptz | Set when publish completes |
 | `platform_post_id` | varchar(255) | YouTube video ID or IG media ID |
+| `views` | integer | Latest pull from `pull_publish_metrics()`; `null` until first pull |
+| `likes` | integer | Latest pull from `pull_publish_metrics()`; `null` until first pull |
+| `comments` | integer | Latest pull from `pull_publish_metrics()`; `null` until first pull |
+| `metrics_updated_at` | timestamptz | Timestamp of the last successful metrics pull; `null` until first pull |
 
 **CutStatus:** `draft` → `rendering` → `in_review` → `approved` → `publishing` → `published` (also `scheduled`, `failed`)
 

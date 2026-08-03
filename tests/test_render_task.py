@@ -25,6 +25,15 @@ _GUIDE = {
     ],
 }
 
+_GUIDE_WITH_MUSIC_CUE = {
+    **_GUIDE,
+    "beats": [
+        {**_GUIDE["beats"][0], "music_cue": "tense minimal"},
+        _GUIDE["beats"][1],
+        _GUIDE["beats"][2],
+    ],
+}
+
 
 def _job(job_id=1, cut_id=5, reel_id=10):
     job = MagicMock()
@@ -121,3 +130,69 @@ def test_successful_render_clears_stale_error():
 
     assert job.status == models.JobStatus.done
     assert job.error is None
+
+
+def test_matching_music_cue_is_passed_to_composite_cut():
+    """The hook beat's music_cue should resolve to a track and reach composite_cut."""
+    from worker.tasks.render import render_cut
+
+    job = _job()
+    cut = _cut()
+    cut.guide = _GUIDE_WITH_MUSIC_CUE
+    reel = _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else (
+        cut if model is models.Cut else reel
+    )
+
+    fake_track = MagicMock(name="fake_music_path")
+    fake_sourcer = MagicMock()
+    fake_sourcer.find.return_value = fake_track
+
+    with (
+        patch("worker.tasks.render.SessionLocal", return_value=db),
+        patch("worker.tasks.render.get_asset_sourcer"),
+        patch("worker.tasks.render.get_wiki_sourcer"),
+        patch("worker.tasks.render.get_hf_sourcer"),
+        patch("worker.tasks.render.get_hf_video_sourcer"),
+        patch("worker.tasks.render.get_tts_provider"),
+        patch("worker.tasks.render.get_music_sourcer", return_value=fake_sourcer),
+        patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
+        patch("worker.tasks.render.record_stage"),
+        patch("worker.tasks.render.composite_cut", return_value=18.0) as mock_composite,
+    ):
+        render_cut(1)
+
+    fake_sourcer.find.assert_called_once_with("tense minimal")
+    assert mock_composite.call_args.kwargs["music_path"] is fake_track
+
+
+def test_no_music_cue_passes_none_without_querying_sourcer():
+    from worker.tasks.render import render_cut
+
+    job = _job()
+    cut = _cut()  # _GUIDE — no beat has music_cue
+    reel = _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else (
+        cut if model is models.Cut else reel
+    )
+
+    fake_sourcer = MagicMock()
+
+    with (
+        patch("worker.tasks.render.SessionLocal", return_value=db),
+        patch("worker.tasks.render.get_asset_sourcer"),
+        patch("worker.tasks.render.get_wiki_sourcer"),
+        patch("worker.tasks.render.get_hf_sourcer"),
+        patch("worker.tasks.render.get_hf_video_sourcer"),
+        patch("worker.tasks.render.get_tts_provider"),
+        patch("worker.tasks.render.get_music_sourcer", return_value=fake_sourcer),
+        patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
+        patch("worker.tasks.render.record_stage"),
+        patch("worker.tasks.render.composite_cut", return_value=18.0) as mock_composite,
+    ):
+        render_cut(1)
+
+    fake_sourcer.find.assert_not_called()
+    assert mock_composite.call_args.kwargs["music_path"] is None

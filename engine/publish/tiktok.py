@@ -13,7 +13,7 @@ from engine.publish.base import Publisher, PublishResult
 
 
 class TikTokPublisher(Publisher):
-    def publish(self, cut, credential, db) -> PublishResult:
+    def publish(self, cut, credential, db, caption: str) -> PublishResult:
         raise NotImplementedError(
             "TikTok publishing isn't implemented — the Content Posting API requires "
             "a separate audited app review. Render and review TikTok cuts, then "

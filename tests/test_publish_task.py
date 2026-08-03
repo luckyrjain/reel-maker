@@ -189,3 +189,5 @@ def test_successful_publish_records_platform_post_id():
     assert job.status == models.JobStatus.done
     assert job.error is None
     mock_transition.assert_called_once_with(cut, "published", CUT_TRANSITIONS)
+    mock_get_publisher.return_value.publish.assert_called_once()
+    assert "caption" in mock_get_publisher.return_value.publish.call_args.kwargs

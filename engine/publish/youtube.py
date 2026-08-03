@@ -18,13 +18,16 @@ _UPLOAD_URL = "https://www.googleapis.com/upload/youtube/v3/videos"
 
 
 class YouTubePublisher(Publisher):
-    def publish(self, cut, credential, db) -> PublishResult:
+    def publish(self, cut, credential, db, caption: str) -> PublishResult:
         access_token = self._access_token(credential, db)
         video_path = Path(cut.video_path)
         video_size = video_path.stat().st_size
 
-        title = (cut.caption or "Reel").strip()[:100] or "Reel"
-        description = cut.caption or ""
+        # "".splitlines() is [] — a whitespace-only caption would otherwise
+        # IndexError on [0]. Fall back to "Reel" before splitting, not after.
+        stripped_caption = (caption or "").strip() or "Reel"
+        title = stripped_caption.splitlines()[0][:100]
+        description = caption or ""
         if cut.hashtags:
             description += "\n\n" + " ".join(f"#{h}" for h in cut.hashtags[:15])
 

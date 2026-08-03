@@ -27,10 +27,29 @@ class Settings(BaseSettings):
     video_store_dir: str = "./data/videos"
 
     pexels_api_key: str = ""
+    # Reserved for a future Pixabay source — Pixabay's public REST API has only
+    # ever documented Images and Video search endpoints, never Music/Audio, so
+    # there's nothing to safely wire this key up to yet. See music_library_dir
+    # for how background music is actually sourced today.
     pixabay_api_key: str = ""
     huggingface_api_key: str = ""
     huggingface_image_model: str = "black-forest-labs/FLUX.1-schnell"
     huggingface_video_model: str = "Lightricks/LTX-Video"
+
+    # Cost estimation for StageEvent.cost_usd — HuggingFace Inference API asset
+    # generation. HF billing varies by plan and hardware tier, not a fixed public
+    # rate, so — same policy as nvidia_price_per_1m_*_tokens above — these default
+    # to 0 (cost tracking inert) until set from your actual HF billing plan.
+    huggingface_price_per_image: float = 0.0
+    huggingface_price_per_video_second: float = 0.0
+
+    # Local royalty-free music library, matched against each beat's music_cue by
+    # filename keyword overlap (see engine/render/asset_sourcer.py::LocalMusicSource).
+    # Populate it yourself — e.g. tracks from Pixabay's website (pixabay.com/music,
+    # browser-only, no API), Free Music Archive, or your own library. Filenames
+    # should include mood words, e.g. "tense_minimal_01.mp3", "upbeat_energetic_02.mp3".
+    # Empty/missing directory means no music is mixed in — same as today.
+    music_library_dir: str = "./data/music"
 
     # Hard ceiling on paid (NVIDIA NIM) LLM calls per reel. A single successful run
     # already makes up to ~16 (structured path falling through to standard, worst

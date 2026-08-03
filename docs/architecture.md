@@ -318,11 +318,11 @@ with record_stage(db, reel_id, "judge", provider="nvidia", model=MODEL, attempt=
     ev.detail["reasons"] = reasons
 ```
 
-Wired at: `context_enrich`, `enrich`, `generate` (each retry), `judge` (each retry), `composite`.
+Wired at: `context_enrich`, `enrich`, `generate` (each retry), `judge` (each retry), `composite`, `asset_hf_video`, `asset_hf_image`, `publish`.
 
-`record_stage()` commits the session it is given, so every call site must sit on a commit boundary — never wrap a half-applied mutation in it.
+`record_stage()` commits the session it is given, so every call site must sit on a commit boundary — never wrap a half-applied mutation in it. This bit `resolve_or_reuse()` in `asset_sourcer.py`: it now resolves (which may commit mid-way via `record_stage`) *before* deleting stale `CutAsset` pins, not after — a crash mid-resolve leaves the old-but-valid pin in place rather than no pin at all.
 
-`StageEvent` fields: `stage`, `provider`, `model_name`, `latency_ms`, `tokens_in`, `tokens_out`, `cost_usd` (not yet computed), `attempt`, `score`, `ok`, `detail` (JSON), `created_at`.
+`StageEvent` fields: `stage`, `provider`, `model_name`, `latency_ms`, `tokens_in`, `tokens_out`, `cost_usd`, `attempt`, `score`, `ok`, `detail` (JSON), `created_at`. `cost_usd` is computed for NVIDIA LLM calls (`engine/generation/pricing.py`) and for HF asset generation (`engine/render/pricing.py`) — both `0.0` until the operator sets a real rate; `asset_hf_*` stages only charge `cost_usd` when the call actually generated an asset, not on a cache hit.
 
 ---
 
@@ -472,7 +472,7 @@ Beat:
   visual_direction: str            # must start with player FULL NAME to trigger Wikipedia
   on_screen_text: list[str]        # up to 5 items, max 7 words each; shown sequentially
   vo_script: str                   # TTS input; empty if music-only
-  music_cue: str | None            # mood keyword (not yet rendered)
+  music_cue: str | None            # mood keyword; matched to a local library track by LocalMusicSource
   transition: "cut" | "fade" | "slide"
 
 PlatformGuide:
@@ -492,12 +492,20 @@ MasterGuide:
 
 ## What is not yet built
 
-- **Music**: `music_cue` generated but not fetched or mixed. Intended: FFmpeg `amix` + `agate` sidechain
 - **TikTok publishing**: `CutPlatform.tiktok` exists (render/review works); `TikTokPublisher.publish()` raises `NotImplementedError` on purpose — the Content Posting API needs a separate audited app review, unlike YouTube/Instagram's self-serve OAuth
-- **Attribution block in captions**: `Asset.attribution`/`license_url` exist; nothing appends them to the published caption yet
 - **Scheduling**: `scheduled` cut status and `publish_cut` both handle a cut already sitting in `scheduled`; no UI/scheduler worker transitions a cut *into* it yet
-- **Asset-generation cost tracking**: `StageEvent.cost_usd` is implemented for LLM calls (NVIDIA) only — see `engine/generation/pricing.py`; Pexels/Wikipedia/HuggingFace asset sourcing isn't instrumented
 - **Multi-image collage**: cycles sequentially; no side-by-side layout within a beat
+- **Word-level caption export**: Whisper timing drives on-screen text, but no SRT/VTT file is generated for the platform uploader
+- **Metrics time series**: `cuts.views`/`likes`/`comments`/`metrics_updated_at` hold only the latest pull, not a history — see `docs/roadmap.md` Phase 5b
 
 YouTube + Instagram publishing (OAuth, `safe_to_publish` gate, upload flows) shipped
 in Phase 4b — see `engine/publish/`, `api/oauth.py`, `worker/tasks/publish.py`.
+
+Music mixing, HF asset-generation cost tracking, caption attribution, and
+post-publish metrics pull-back shipped in Phase 5 — see
+`engine/render/asset_sourcer.py::LocalMusicSource`,
+`engine/render/compositor.py::_build_ffmpeg_args()`,
+`engine/render/pricing.py`, `engine/publish/attribution.py`,
+`engine/publish/metrics.py`, `worker/tasks/metrics.py`, and
+`docs/roadmap.md` Phase 5 for the reasoning behind each deviation from the
+original plan.

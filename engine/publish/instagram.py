@@ -22,7 +22,7 @@ _MAX_POLLS = 36  # ~3 min total — generous for a short-form clip
 
 
 class InstagramPublisher(Publisher):
-    def publish(self, cut, credential, db) -> PublishResult:
+    def publish(self, cut, credential, db, caption: str) -> PublishResult:
         if not credential.provider_account_id:
             raise ValueError(
                 "Connected Instagram account has no linked Business Account ID — "
@@ -32,7 +32,7 @@ class InstagramPublisher(Publisher):
         ig_user_id = credential.provider_account_id
         video_url = f"{settings.public_base_url.rstrip('/')}/api/cuts/{cut.id}/video"
 
-        creation_id = self._create_container(ig_user_id, access_token, video_url, cut.caption or "")
+        creation_id = self._create_container(ig_user_id, access_token, video_url, caption or "")
         self._wait_until_ready(creation_id, access_token)
         media_id = self._publish_container(ig_user_id, access_token, creation_id)
 
@@ -65,9 +65,13 @@ class InstagramPublisher(Publisher):
         Celery retry would create a brand-new container from scratch anyway.
         """
         for _ in range(_MAX_POLLS):
+            # Token in the Authorization header, not params — see discover_account()'s
+            # docstring in api/oauth.py for why (leaks into httpx.HTTPStatusError's
+            # __str__, which flows into job.error, on any GET request that fails).
             resp = httpx.get(
                 f"{_GRAPH}/{creation_id}",
-                params={"fields": "status_code", "access_token": access_token},
+                params={"fields": "status_code"},
+                headers={"Authorization": f"Bearer {access_token}"},
                 timeout=30.0,
             )
             resp.raise_for_status()

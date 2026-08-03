@@ -16,5 +16,11 @@ class PublishResult:
 
 
 class Publisher:
-    def publish(self, cut, credential, db) -> PublishResult:
+    def publish(self, cut, credential, db, caption: str) -> PublishResult:
+        """`caption` is the exact text to publish — worker/tasks/publish.py
+        builds it from cut.caption plus any required attribution (see
+        engine/publish/attribution.py) before calling this. Implementations
+        must use this, not cut.caption directly, or attribution silently
+        never reaches the platform.
+        """
         raise NotImplementedError

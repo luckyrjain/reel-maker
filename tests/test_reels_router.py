@@ -1,4 +1,5 @@
 """Tests for the reel list/detail HTML routes in api/routers/reels.py."""
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pytest
@@ -88,6 +89,40 @@ def test_list_reels_pagination_flags(client):
     assert "Older" not in resp.text
 
 
+def test_list_reels_shows_quality_and_views_columns(client):
+    reel_id = _make_reel(client._session_factory, context="Reel with metrics")
+
+    db = client._session_factory()
+    try:
+        job = models.Job(
+            type=models.JobType.generate,
+            reel_id=reel_id,
+            status=models.JobStatus.done,
+            progress=100,
+            meta={"quality_score": 87},
+        )
+        db.add(job)
+        cut = db.query(models.Cut).filter(models.Cut.reel_id == reel_id).first()
+        cut.views = 4200
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.get("/api/reels")
+    assert resp.status_code == 200
+    assert "87" in resp.text
+    assert "4,200" in resp.text
+
+
+def test_list_reels_shows_dash_when_no_metrics_yet(client):
+    _make_reel(client._session_factory, context="Reel without metrics")
+
+    resp = client.get("/api/reels")
+    assert resp.status_code == 200
+    # Both the Quality and Views cells render a placeholder dash.
+    assert resp.text.count(">—<") >= 2
+
+
 def test_reel_detail_links_back_to_list(client):
     reel_id = _make_reel(client._session_factory)
     resp = client.get(f"/api/reels/{reel_id}")
@@ -120,6 +155,36 @@ def test_failed_cut_card_has_no_duplicate_ids_and_valid_hx_targets(client):
     assert "publish-section-" in "".join(targets)  # sanity: the retry-publish button is present
     for target in targets:
         assert target in ids, f"hx-target=#{target} has no matching id=\"{target}\" in the page"
+
+
+def test_published_cut_card_shows_engagement_stats(client):
+    reel_id = _make_reel(client._session_factory, cut_status=models.CutStatus.published)
+
+    db = client._session_factory()
+    try:
+        cut = db.query(models.Cut).filter(models.Cut.reel_id == reel_id).first()
+        cut.views = 1234
+        cut.likes = 56
+        cut.comments = 7
+        cut.metrics_updated_at = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.get(f"/api/reels/{reel_id}")
+    assert resp.status_code == 200
+    assert "1,234" in resp.text
+    assert "views" in resp.text
+    assert "56" in resp.text
+    assert "as of 2026-01-01 12:00 UTC" in resp.text
+
+
+def test_published_cut_card_shows_not_pulled_yet_before_first_metrics_pull(client):
+    reel_id = _make_reel(client._session_factory, cut_status=models.CutStatus.published)
+
+    resp = client.get(f"/api/reels/{reel_id}")
+    assert resp.status_code == 200
+    assert "not pulled yet" in resp.text
 
 
 def test_reel_detail_404_for_missing_reel(client):

@@ -184,6 +184,16 @@
       {% if cut.published_at %} — {{ cut.published_at.strftime("%Y-%m-%d %H:%M") }} UTC{% endif %}
       {% if cut.platform_post_id %}<span class="field-hint">({{ cut.platform_post_id }})</span>{% endif %}
     </p>
+    {% if cut.metrics_updated_at %}
+    <div class="engagement-stats">
+      <span><strong>{{ "{:,}".format(cut.views) if cut.views is not none else "—" }}</strong> views</span>
+      <span><strong>{{ "{:,}".format(cut.likes) if cut.likes is not none else "—" }}</strong> likes</span>
+      <span><strong>{{ "{:,}".format(cut.comments) if cut.comments is not none else "—" }}</strong> comments</span>
+      <span class="field-hint">as of {{ cut.metrics_updated_at.strftime("%Y-%m-%d %H:%M") }} UTC</span>
+    </div>
+    {% else %}
+    <p class="field-hint" style="margin-top:4px;">Engagement metrics not pulled yet — checked every 6h.</p>
+    {% endif %}
 
     {% elif st == "rendering" %}
     <p style="color:#92400e;font-size:0.85rem;margin-top:10px;">

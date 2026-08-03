@@ -2,7 +2,8 @@
 import pytest
 
 from engine.publish.instagram import InstagramPublisher
-from engine.publish.registry import credential_provider_for_platform, get_publisher
+from engine.publish.metrics import InstagramMetricsFetcher, YouTubeMetricsFetcher
+from engine.publish.registry import credential_provider_for_platform, get_metrics_fetcher, get_publisher
 from engine.publish.tiktok import TikTokPublisher
 from engine.publish.youtube import YouTubePublisher
 
@@ -26,4 +27,19 @@ def test_credential_provider_mapping():
 
 def test_tiktok_publisher_raises_clearly():
     with pytest.raises(NotImplementedError, match="audited app review"):
-        TikTokPublisher().publish(cut=None, credential=None, db=None)
+        TikTokPublisher().publish(cut=None, credential=None, db=None, caption="")
+
+
+def test_get_metrics_fetcher_returns_expected_types():
+    assert isinstance(get_metrics_fetcher("youtube_shorts"), YouTubeMetricsFetcher)
+    assert isinstance(get_metrics_fetcher("instagram_reels"), InstagramMetricsFetcher)
+
+
+def test_get_metrics_fetcher_returns_none_for_tiktok():
+    """Unlike get_publisher(), no fetcher for a platform is expected, not an error —
+    no cut ever reaches "published" with platform=tiktok in the first place."""
+    assert get_metrics_fetcher("tiktok") is None
+
+
+def test_get_metrics_fetcher_returns_none_for_unknown_platform():
+    assert get_metrics_fetcher("myspace_reels") is None

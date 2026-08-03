@@ -90,6 +90,14 @@ class Cut(Base):
     published_at = Column(DateTime(timezone=True))
     platform_post_id = Column(String(255))
 
+    # Latest known engagement snapshot — not a time series (see docs/roadmap.md
+    # Phase 5 for that). Populated by worker/tasks/metrics.py::pull_publish_metrics,
+    # a periodic beat task; None until that task has run at least once for this cut.
+    views = Column(Integer)
+    likes = Column(Integer)
+    comments = Column(Integer)
+    metrics_updated_at = Column(DateTime(timezone=True))
+
     reel = relationship("Reel", back_populates="cuts")
     cut_assets = relationship("CutAsset", back_populates="cut", cascade="all, delete-orphan")
 

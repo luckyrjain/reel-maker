@@ -87,6 +87,35 @@ def estimate_reel(
     )
 
 
+def _reel_list_metrics(db: Session, reels: list[models.Reel]) -> dict[int, dict]:
+    """Per-reel 'Quality' (latest job's quality_score) and 'Views' (max across
+    the reel's cuts) for the reel-list table — quality-vs-engagement at a glance,
+    no separate dashboard needed."""
+    reel_ids = [r.id for r in reels]
+    if not reel_ids:
+        return {}
+
+    jobs = (
+        db.query(models.Job)
+        .filter(models.Job.reel_id.in_(reel_ids))
+        .order_by(models.Job.created_at)
+        .all()
+    )
+    quality_by_reel: dict[int, int] = {}
+    for j in jobs:
+        if j.meta and j.meta.get("quality_score") is not None:
+            quality_by_reel[j.reel_id] = j.meta["quality_score"]  # last write wins (asc order)
+
+    metrics = {}
+    for r in reels:
+        views = [c.views for c in r.cuts if c.views is not None]
+        metrics[r.id] = {
+            "quality_score": quality_by_reel.get(r.id),
+            "views": max(views) if views else None,
+        }
+    return metrics
+
+
 @router.get("/reels", response_class=HTMLResponse)
 def list_reels(
     request: Request,
@@ -105,11 +134,13 @@ def list_reels(
         .limit(REEL_LIST_PAGE_SIZE)
         .all()
     )
+    metrics = _reel_list_metrics(db, reels)
 
     return templates.TemplateResponse(
         request, "reels_list.html",
         {
             "reels": reels,
+            "metrics": metrics,
             "page": page,
             "has_next": offset + REEL_LIST_PAGE_SIZE < total,
             "has_prev": page > 1,

@@ -6,6 +6,8 @@ import pytest
 from celery.exceptions import Retry
 
 from api import models
+from engine.generation.script_parser import BeatStub
+from worker.tasks.generate import _stubs_to_platform_guide
 
 
 def _job(job_id=1, reel_id=10):
@@ -124,3 +126,39 @@ def test_deterministic_failure_does_not_retry():
 
     mock_retry.assert_not_called()
     assert job.status == models.JobStatus.failed
+
+
+# ── _stubs_to_platform_guide — music_cue defaulting ──────────────────────────
+
+def _stub(index, beat_type, vo="Some voiceover line here."):
+    return BeatStub(
+        index=index, beat_type=beat_type, section="", player="",
+        vo_script=vo, duration_s=5.0, on_screen_text=["Text"],
+    )
+
+
+def test_structured_path_hook_beat_gets_a_default_music_cue():
+    """Structured-script beats never carry an LLM-written music_cue — without a
+    default, render_cut would never find a cue to look up a music track for and
+    the structured path would silently never get background music.
+    """
+    stubs = [_stub(0, "hook"), _stub(1, "body"), _stub(2, "cta")]
+    guide = _stubs_to_platform_guide(
+        stubs, visuals={}, platform="youtube_shorts", target_length_s=30.0,
+        caption="Caption", hashtags=["tag"] * 6,
+    )
+    assert guide.beats[0].type == "hook"
+    assert guide.beats[0].music_cue == "upbeat energetic"
+
+
+def test_structured_path_non_hook_beats_have_no_music_cue():
+    """Only one cue is needed — render_cut picks the first non-empty cue across
+    all beats for the whole cut's music track, so body/cta beats stay None.
+    """
+    stubs = [_stub(0, "hook"), _stub(1, "body"), _stub(2, "cta")]
+    guide = _stubs_to_platform_guide(
+        stubs, visuals={}, platform="youtube_shorts", target_length_s=30.0,
+        caption="Caption", hashtags=["tag"] * 6,
+    )
+    assert guide.beats[1].music_cue is None
+    assert guide.beats[2].music_cue is None

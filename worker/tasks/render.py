@@ -7,7 +7,7 @@ from api.db import SessionLocal
 from api.state import CUT_TRANSITIONS, transition
 from engine.generation.guide_schema import PlatformGuide
 from engine.observability import record_stage
-from engine.render.asset_sourcer import get_asset_sourcer, get_hf_sourcer, get_hf_video_sourcer, get_wiki_sourcer, resolve_or_reuse
+from engine.render.asset_sourcer import get_asset_sourcer, get_hf_sourcer, get_hf_video_sourcer, get_music_sourcer, get_wiki_sourcer, resolve_or_reuse
 from engine.render.compositor import composite_cut
 from engine.render.tts import SilentProvider, _audio_duration, get_tts_provider
 from worker.celery_app import celery_app
@@ -114,6 +114,12 @@ def render_cut(self, job_id: int):
         out_path = video_store / str(reel.id) / f"{cut.platform.value}.mp4"
         thumb_path = video_store / str(reel.id) / f"{cut.platform.value}_thumb.jpg"
 
+        # One music track for the whole cut, matched against whichever beat's
+        # music_cue is set first (typically the hook) — track-switching mid-cut
+        # would be jarring for a <90s video. None if no local library track matches.
+        music_cue = next((bd.get("music_cue") for bd in beat_dicts if bd.get("music_cue")), None)
+        music_path = get_music_sourcer().find(music_cue) if music_cue else None
+
         with record_stage(db, reel.id, "composite", cut_id=cut.id) as ev:
             duration = composite_cut(
                 beats=beat_dicts,
@@ -121,8 +127,11 @@ def render_cut(self, job_id: int):
                 beat_vo_paths=beat_vo_paths,
                 output_path=out_path,
                 thumbnail_path=thumb_path,
+                music_path=music_path,
             )
             ev.detail["duration_s"] = duration
+            ev.detail["music_cue"] = music_cue
+            ev.detail["music_track"] = music_path.name if music_path else None
 
         cut.video_path = str(out_path)
         cut.thumbnail_path = str(thumb_path)

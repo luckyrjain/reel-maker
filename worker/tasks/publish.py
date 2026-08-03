@@ -4,6 +4,7 @@ from api import models
 from api.db import SessionLocal
 from api.state import CUT_TRANSITIONS, transition
 from engine.observability import record_stage
+from engine.publish.attribution import build_published_caption
 from engine.publish.gate import assert_safe_to_publish
 from engine.publish.registry import credential_provider_for_platform, get_publisher
 from worker.celery_app import celery_app
@@ -58,8 +59,9 @@ def publish_cut(self, job_id: int):
         heartbeat(db, job, 35)
 
         publisher = get_publisher(cut.platform.value)
+        caption = build_published_caption(db, cut)
         with record_stage(db, cut.reel_id, "publish", cut_id=cut.id, provider=cut.platform.value) as ev:
-            result = publisher.publish(cut, credential, db)
+            result = publisher.publish(cut, credential, db, caption=caption)
             ev.detail["platform_post_id"] = result.platform_post_id
 
         cut.platform_post_id = result.platform_post_id

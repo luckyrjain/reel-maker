@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import os
 import re
 import time
@@ -10,6 +11,10 @@ import httpx
 
 from api import models
 from api.config import settings
+from engine.observability import record_stage
+from engine.render.pricing import hf_image_cost_usd, hf_video_cost_usd
+
+_log = logging.getLogger(__name__)
 
 
 _NAME_RE = re.compile(r'\b[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)+\b')
@@ -271,8 +276,13 @@ class HuggingFaceImageSource:
         self.model = model
         self.store_dir = store_dir
         store_dir.mkdir(parents=True, exist_ok=True)
+        # Set by generate() on every call — False on a cache hit (no real API
+        # call, no cost) or a failed/skipped call. Callers check this before
+        # charging StageEvent.cost_usd, so a cached re-render isn't billed twice.
+        self.last_call_was_generated = False
 
     def generate(self, prompt: str) -> "SourcedAsset | None":
+        self.last_call_was_generated = False
         if not self.api_key:
             return None
 
@@ -294,7 +304,9 @@ class HuggingFaceImageSource:
                 if not content_type.startswith("image/"):
                     return None
                 _atomic_write(local_path, resp.content)
+                self.last_call_was_generated = True
             except Exception:
+                _log.exception("HuggingFace image generation failed for model %s", self.model)
                 return None
 
         return SourcedAsset(
@@ -323,8 +335,13 @@ class HuggingFaceVideoSource:
         self.model = model
         self.store_dir = store_dir
         store_dir.mkdir(parents=True, exist_ok=True)
+        # Set by generate() on every call — False on a cache hit (no real API
+        # call, no cost) or a failed/skipped call. Callers check this before
+        # charging StageEvent.cost_usd, so a cached re-render isn't billed twice.
+        self.last_call_was_generated = False
 
     def generate(self, prompt: str) -> "SourcedAsset | None":
+        self.last_call_was_generated = False
         if not self.api_key:
             return None
 
@@ -349,7 +366,9 @@ class HuggingFaceVideoSource:
                 ext = "gif" if "gif" in content_type else "mp4"
                 local_path = self.store_dir / f"hfvid_{fp}.{ext}"
                 _atomic_write(local_path, resp.content)
+                self.last_call_was_generated = True
             except Exception:
+                _log.exception("HuggingFace video generation failed for model %s", self.model)
                 return None
 
         return SourcedAsset(
@@ -391,6 +410,53 @@ def get_hf_video_sourcer(store_dir: Path) -> HuggingFaceVideoSource:
     )
 
 
+_MUSIC_EXTS = {".mp3", ".m4a", ".wav", ".ogg", ".flac"}
+
+
+class LocalMusicSource:
+    """Matches a beat's music_cue against a local library of royalty-free tracks.
+
+    No external API — Pixabay's public REST API has never documented a Music
+    search endpoint (only Images/Video), so this deliberately isn't another
+    hosted source. Settings.music_library_dir is a directory the operator
+    populates themselves; filenames are treated as mood keyword bags, e.g.
+    "tense_minimal_01.mp3" matches a music_cue containing "tense" or "minimal".
+    Returns None (no music mixed in) when the library is empty, missing, or
+    nothing overlaps — that's the same as today's behavior, never an error.
+    """
+
+    def __init__(self, library_dir: Path):
+        self.library_dir = library_dir
+
+    def find(self, music_cue: str | None) -> Path | None:
+        if not music_cue or not music_cue.strip():
+            return None
+        if not self.library_dir.is_dir():
+            return None
+
+        cue_words = self._keywords(music_cue)
+        if not cue_words:
+            return None
+
+        best_path, best_score = None, 0
+        for path in sorted(self.library_dir.iterdir()):
+            if not path.is_file() or path.suffix.lower() not in _MUSIC_EXTS:
+                continue
+            score = len(cue_words & self._keywords(path.stem))
+            if score > best_score:
+                best_score, best_path = score, path
+        return best_path
+
+    @staticmethod
+    def _keywords(text: str) -> set[str]:
+        words = re.split(r"[^a-zA-Z]+", text.lower())
+        return {w for w in words if len(w) > 2}
+
+
+def get_music_sourcer() -> LocalMusicSource:
+    return LocalMusicSource(Path(settings.music_library_dir))
+
+
 def _cache_asset(db, result: SourcedAsset, asset_type: str) -> tuple["models.Asset", Path]:
     existing = (
         db.query(models.Asset)
@@ -430,10 +496,17 @@ def resolve_beat_assets(
     wiki: WikipediaImageSource | None = None,
     hf_video: "HuggingFaceVideoSource | None" = None,
     hf: "HuggingFaceImageSource | None" = None,
+    reel_id: int | None = None,
 ) -> list[tuple["models.Asset | None", "Path | None"]]:
     """Return one (Asset, Path) per named person found via Wikipedia.
 
     Fallback chain: Wikipedia → Pexels → HF Video → HF Image → None.
+
+    reel_id is optional (this function is documented as usable outside the
+    pinned resolve_or_reuse() path, where a reel isn't always at hand) — HF
+    generation cost is only recorded as a StageEvent when it's provided, and
+    only for calls that actually hit the API (cache hits cost nothing; see
+    HuggingFace*Source.last_call_was_generated).
     """
     if wiki:
         names = _extract_all_person_names(query)
@@ -452,12 +525,31 @@ def resolve_beat_assets(
         return [_cache_asset(db, result, "footage")]
 
     if hf_video:
-        hf_vid_result = hf_video.generate(query)
+        # generate() is a guaranteed no-op without an api_key (never makes a
+        # network call) — skip record_stage entirely rather than writing a
+        # StageEvent for a call that was never attempted. hf_video/hf are
+        # always constructed by render_cut regardless of whether the key is
+        # set, so this check can't be pushed onto the caller.
+        if reel_id is not None and hf_video.api_key:
+            with record_stage(db, reel_id, "asset_hf_video", provider="huggingface") as ev:
+                hf_vid_result = hf_video.generate(query)
+                ev.detail["cache_hit"] = hf_vid_result is not None and not hf_video.last_call_was_generated
+                if hf_video.last_call_was_generated:
+                    ev.cost_usd = hf_video_cost_usd(hf_vid_result.duration_s if hf_vid_result else 0.0)
+        else:
+            hf_vid_result = hf_video.generate(query)
         if hf_vid_result:
             return [_cache_asset(db, hf_vid_result, "footage")]
 
     if hf:
-        hf_result = hf.generate(query)
+        if reel_id is not None and hf.api_key:
+            with record_stage(db, reel_id, "asset_hf_image", provider="huggingface") as ev:
+                hf_result = hf.generate(query)
+                ev.detail["cache_hit"] = hf_result is not None and not hf.last_call_was_generated
+                if hf.last_call_was_generated:
+                    ev.cost_usd = hf_image_cost_usd()
+        else:
+            hf_result = hf.generate(query)
         if hf_result:
             return [_cache_asset(db, hf_result, "photo")]
 
@@ -507,14 +599,22 @@ def resolve_or_reuse(
         if results:
             return results
 
-    # Direction changed (or first render) — re-resolve and re-pin
+    # Direction changed (or first render) — re-resolve, then delete stale pins
+    # and re-pin. Resolve first, delete second: resolve_beat_assets may call
+    # record_stage() for an HF generation call, which commits the session — if
+    # the stale-pin delete ran first, that commit would land between the
+    # delete and the new pin insert below, leaving a beat with no pin at all
+    # if the process died in that window. Resolving first means a crash mid-
+    # resolve just leaves the old (stale but valid) pin in place.
+    results = resolve_beat_assets(
+        db, visual_direction, min_duration_s, sourcer, wiki, hf_video, hf, reel_id=cut.reel_id,
+    )
+
     # Remove stale pins for this specific beat only
     db.query(models.CutAsset).filter(
         models.CutAsset.cut_id == cut.id,
         models.CutAsset.beat_index == beat_index,
     ).delete()
-
-    results = resolve_beat_assets(db, visual_direction, min_duration_s, sourcer, wiki, hf_video, hf)
 
     for order, (asset, _) in enumerate(results):
         if asset:
