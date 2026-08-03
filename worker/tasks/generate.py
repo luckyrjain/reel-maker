@@ -14,11 +14,13 @@ from engine.generation.beat_enrichment import (
     _is_shallow_beat,
     _make_conflict_stub,
 )
+from engine.generation.estimate import resolve_generation_path
 from engine.generation.evaluator import score_guide
 from engine.generation.guide_schema import Beat, MasterGuide, PlatformGuide
 from engine.generation.llm import get_llm_provider, get_enrichment_provider, is_nvidia_generation
 from engine.generation.llm_judge import judge_guide
 from engine.generation.postprocess import clean_guide, _derive_on_screen as _postprocess_derive_on_screen
+from engine.generation.pricing import llm_cost_usd
 from engine.generation.prompt import build_messages, build_visuals_messages
 from engine.generation.script_parser import BeatStub
 from engine.generation import script_parser
@@ -27,7 +29,7 @@ from engine.generation.visual_fallback import (
     _first_person,
     _is_degenerate_visual,
 )
-from engine.observability import record_stage
+from engine.observability import paid_call_count, record_stage
 from worker.celery_app import celery_app
 from worker.tasks.common import heartbeat, should_retry
 
@@ -36,6 +38,23 @@ _log = logging.getLogger(__name__)
 QUALITY_THRESHOLD = 80
 QUALITY_THRESHOLD_LOCAL = 65  # lower bar for local Ollama models
 _JUDGE_RULE_MIN = 55
+
+
+def _enforce_paid_call_budget(db, reel_id: int) -> None:
+    """Raise a deterministic (non-retried) error once a reel hits its paid-call cap.
+
+    Checked at task entry (catches a stuck Celery retry re-running the whole task)
+    and again before each standard-path attempt (catches a single run's own
+    generate/enrich/judge loop). A no-op when NVIDIA isn't configured, since local
+    Ollama calls are free and never count toward the cap.
+    """
+    count = paid_call_count(db, reel_id)
+    if count >= settings.max_paid_llm_calls_per_reel:
+        raise ValueError(
+            f"Paid LLM call budget exceeded for this reel ({count}/"
+            f"{settings.max_paid_llm_calls_per_reel} calls) — see the reel's pipeline "
+            "panel for cost history, or raise MAX_PAID_LLM_CALLS_PER_REEL in .env."
+        )
 
 
 
@@ -60,6 +79,10 @@ def _combined_score(
             llm_score, llm_issues = judge_guide(context, guide, enrichment_llm)
             ev.score = llm_score
             ev.detail["reasons"] = llm_issues
+            usage = getattr(enrichment_llm, "last_usage", {})
+            ev.tokens_in = usage.get("prompt_tokens")
+            ev.tokens_out = usage.get("completion_tokens")
+            ev.cost_usd = llm_cost_usd(judge_provider, ev.tokens_in, ev.tokens_out)
     else:
         llm_score, llm_issues = judge_guide(context, guide, enrichment_llm)
     combined = int(rule * 0.4 + llm_score * 0.6)
@@ -95,6 +118,14 @@ def _stubs_to_platform_guide(
             visual_direction=vd,
             on_screen_text=s.on_screen_text,
             vo_script=s.vo_script,
+            # Structured-script beats never carry an LLM-written music_cue (that's
+            # only produced by the standard path's full guide generation) — without
+            # this, render_cut would never find a cue to look up a music track for,
+            # and the structured path (the faster, more commonly recommended one)
+            # would silently never get background music. A single genre-neutral
+            # default on the hook beat is enough: render_cut uses the first
+            # non-empty cue across all beats for the whole cut's music track.
+            music_cue="upbeat energetic" if s.beat_type == "hook" else None,
         ))
     return PlatformGuide(
         platform=platform,
@@ -139,16 +170,27 @@ def _generate_from_structured_script(
     reel, cuts, llm, db, target_lengths: dict, stubs: list[BeatStub], context: str
 ) -> MasterGuide:
     enrichment_llm = get_enrichment_provider()
+    enrich_provider = "nvidia" if settings.nvidia_api_key else "ollama"
 
-    with record_stage(db, reel.id, "enrich") as ev:
+    with record_stage(db, reel.id, "enrich", provider=enrich_provider) as ev:
+        usage_before = dict(getattr(enrichment_llm, "total_usage", {}))
         shallow_before = sum(1 for s in stubs if _is_shallow_beat(s))
         _enrich_with_insight(stubs, context, enrichment_llm)
         ev.detail["shallow_beats"] = shallow_before
         ev.detail["enriched_beats"] = shallow_before - sum(1 for s in stubs if _is_shallow_beat(s))
+        usage_after = getattr(enrichment_llm, "total_usage", {})
+        ev.tokens_in = usage_after.get("prompt_tokens", 0) - usage_before.get("prompt_tokens", 0)
+        ev.tokens_out = usage_after.get("completion_tokens", 0) - usage_before.get("completion_tokens", 0)
+        ev.cost_usd = llm_cost_usd(enrich_provider, ev.tokens_in, ev.tokens_out)
 
     conflict_visual: dict[int, str] = {}
     if not _has_conflict_beat(stubs):
-        result = _make_conflict_stub(context, enrichment_llm, index=len(stubs) - 1)
+        with record_stage(db, reel.id, "enrich_conflict", provider=enrich_provider) as ev:
+            result = _make_conflict_stub(context, enrichment_llm, index=len(stubs) - 1)
+            usage = getattr(enrichment_llm, "last_usage", {})
+            ev.tokens_in = usage.get("prompt_tokens")
+            ev.tokens_out = usage.get("completion_tokens")
+            ev.cost_usd = llm_cost_usd(enrich_provider, ev.tokens_in, ev.tokens_out)
         if result:
             conflict_stub, cv = result
             stubs.insert(-1, conflict_stub)
@@ -171,23 +213,33 @@ def _generate_from_structured_script(
     visuals_messages = build_visuals_messages(beat_dicts, reel.niche or "")
 
     visuals: dict[int, str] = {}
-    for attempt in range(3):
-        raw = llm.complete(visuals_messages, json_mode=True)
-        try:
-            parsed = json.loads(raw)
-            # Handle LLMs that wrap the array in a dict {"items": [...]} etc.
-            if isinstance(parsed, dict):
-                parsed = next((v for v in parsed.values() if isinstance(v, list)), [])
-            if isinstance(parsed, list):
-                for item in parsed:
-                    idx = item.get("index")
-                    vd = item.get("visual_direction", "")
-                    if idx is not None and vd:
-                        visuals[idx] = vd
-                if visuals:
-                    break
-        except Exception:
-            continue
+    generate_provider = "nvidia" if is_nvidia_generation() else "ollama"
+    with record_stage(db, reel.id, "visuals", provider=generate_provider) as ev:
+        usage_before = dict(getattr(llm, "total_usage", {}))
+        attempts_made = 0
+        for attempt in range(3):
+            attempts_made += 1
+            raw = llm.complete(visuals_messages, json_mode=True)
+            try:
+                parsed = json.loads(raw)
+                # Handle LLMs that wrap the array in a dict {"items": [...]} etc.
+                if isinstance(parsed, dict):
+                    parsed = next((v for v in parsed.values() if isinstance(v, list)), [])
+                if isinstance(parsed, list):
+                    for item in parsed:
+                        idx = item.get("index")
+                        vd = item.get("visual_direction", "")
+                        if idx is not None and vd:
+                            visuals[idx] = vd
+                    if visuals:
+                        break
+            except Exception:
+                continue
+        ev.detail["attempts"] = attempts_made
+        usage_after = getattr(llm, "total_usage", {})
+        ev.tokens_in = usage_after.get("prompt_tokens", 0) - usage_before.get("prompt_tokens", 0)
+        ev.tokens_out = usage_after.get("completion_tokens", 0) - usage_before.get("completion_tokens", 0)
+        ev.cost_usd = llm_cost_usd(generate_provider, ev.tokens_in, ev.tokens_out)
     if not visuals:
         _log.warning("reel_id=%s: all 3 visuals attempts failed — using fallback visuals", reel.id)
 
@@ -197,7 +249,12 @@ def _generate_from_structured_script(
 
     niche = reel.niche or "general"
     niche_tag = niche.replace(" ", "").lower()
-    caption, hashtags = _generate_caption_hashtags(stubs, niche, enrichment_llm)
+    with record_stage(db, reel.id, "caption_hashtags", provider=enrich_provider) as ev:
+        caption, hashtags = _generate_caption_hashtags(stubs, niche, enrichment_llm)
+        usage = getattr(enrichment_llm, "last_usage", {})
+        ev.tokens_in = usage.get("prompt_tokens")
+        ev.tokens_out = usage.get("completion_tokens")
+        ev.cost_usd = llm_cost_usd(enrich_provider, ev.tokens_in, ev.tokens_out)
     if not caption:
         caption = f"{niche.title()} breakdown — who makes the cut? #football #{niche_tag}"
         hashtags = [
@@ -226,14 +283,16 @@ def _generate_from_structured_script(
     )
 
 
-def _enrich_standard_path_guide(guide: MasterGuide, context: str) -> None:
+def _enrich_standard_path_guide(guide: MasterGuide, context: str, enrichment_llm) -> None:
     """Apply tactical insight enrichment to shallow body beats in a standard-path guide.
 
     Converts each platform guide's beats to BeatStubs, runs _enrich_with_insight,
     then writes enriched VO + recalculated duration + re-derived on_screen_text back.
     Each platform is enriched independently because beat sets may differ by platform.
+
+    Takes enrichment_llm from the caller (rather than creating its own) so the caller
+    can read cumulative token usage off the same instance for cost tracking.
     """
-    enrichment_llm = get_enrichment_provider()
     for pg in guide.cuts:
         stubs = [
             BeatStub(
@@ -273,6 +332,8 @@ def generate_guide(self, job_id: int):
             raise ValueError(f"Reel {job.reel_id} no longer exists")
         effective_context = reel.enriched_context or reel.context
 
+        _enforce_paid_call_budget(db, reel.id)
+
         job.status = models.JobStatus.running
         job.started_at = datetime.now(timezone.utc)
         job.heartbeat_at = job.started_at
@@ -296,13 +357,19 @@ def generate_guide(self, job_id: int):
         # ── Structured-script fast path ──────────────────────────────────────
         forced_path = (job.meta or {}).get("generation_path", "auto")
         stubs = script_parser.parse(effective_context)
-
-        if forced_path == "standard":
-            use_structured = False
-        elif forced_path == "structured":
-            use_structured = True
-        else:  # auto
-            use_structured = stubs is not None
+        # resolve_generation_path() (shared with the pre-generation cost
+        # estimate, which has no stubs to check) decides via is_structured()
+        # alone. is_structured() is a cheaper header-count check that parse()
+        # itself starts with — but parse() can still return None even when
+        # is_structured() is True, if every detected section's body is empty
+        # after stripping labels/player prefixes. Require stubs is not None
+        # here so that disagreement falls straight through to the standard
+        # path instead of calling _generate_from_structured_script(stubs=None)
+        # and wasting an attempt on a guaranteed TypeError.
+        use_structured = (
+            resolve_generation_path(effective_context, forced_path) == "structured"
+            and stubs is not None
+        )
 
         if use_structured:
             heartbeat(db, job, 20)
@@ -338,6 +405,7 @@ def generate_guide(self, job_id: int):
             best_score = 0
 
             for attempt in range(3):
+                _enforce_paid_call_budget(db, reel.id)
                 heartbeat(db, job, 20 + attempt * 20)
 
                 messages = build_messages(
@@ -353,6 +421,10 @@ def generate_guide(self, job_id: int):
                                   provider=generate_provider, attempt=attempt + 1) as ev:
                     raw = llm.complete(messages, json_mode=True)
                     ev.detail["raw_len"] = len(raw)
+                    usage = getattr(llm, "last_usage", {})
+                    ev.tokens_in = usage.get("prompt_tokens")
+                    ev.tokens_out = usage.get("completion_tokens")
+                    ev.cost_usd = llm_cost_usd(generate_provider, ev.tokens_in, ev.tokens_out)
 
                 try:
                     candidate = MasterGuide.model_validate_json(raw)
@@ -361,16 +433,23 @@ def generate_guide(self, job_id: int):
                     continue
 
                 clean_guide(candidate, voiceover_mode)
+                enrich_provider = "nvidia" if settings.nvidia_api_key else "ollama"
+                enrichment_llm = get_enrichment_provider()
                 with record_stage(db, reel.id, "enrich",
-                                  provider="nvidia" if settings.nvidia_api_key else "ollama",
+                                  provider=enrich_provider,
                                   attempt=attempt + 1) as ev:
+                    usage_before = dict(getattr(enrichment_llm, "total_usage", {}))
                     shallow_before = sum(
                         1 for pg in candidate.cuts for b in pg.beats
                         if b.type == "body" and b.vo_script
                         and len(b.vo_script.split()) < 25
                     )
-                    _enrich_standard_path_guide(candidate, effective_context)
+                    _enrich_standard_path_guide(candidate, effective_context, enrichment_llm)
                     ev.detail["shallow_beats"] = shallow_before
+                    usage_after = getattr(enrichment_llm, "total_usage", {})
+                    ev.tokens_in = usage_after.get("prompt_tokens", 0) - usage_before.get("prompt_tokens", 0)
+                    ev.tokens_out = usage_after.get("completion_tokens", 0) - usage_before.get("completion_tokens", 0)
+                    ev.cost_usd = llm_cost_usd(enrich_provider, ev.tokens_in, ev.tokens_out)
 
                 rule_s, rule_i = score_guide(effective_context, candidate, max_target)
                 last_score, last_issues = _combined_score(

@@ -46,7 +46,7 @@ class Beat(BaseModel):
 
 
 class PlatformGuide(BaseModel):
-    platform: Literal["youtube_shorts", "instagram_reels"]
+    platform: Literal["youtube_shorts", "instagram_reels", "tiktok"]
     target_length_s: float
     beats: list[Beat] = Field(
         min_length=3,

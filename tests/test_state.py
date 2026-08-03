@@ -49,6 +49,31 @@ def test_cut_failed_reverts_to_draft():
     assert obj.status == "draft"
 
 
+def test_cut_failed_publish_can_retry_from_approved():
+    """A publish failure (bad credentials, network error) shouldn't force a re-render."""
+    obj = _FakeObj("failed")
+    transition(obj, "approved", CUT_TRANSITIONS)
+    assert obj.status == "approved"
+
+
+def test_cut_approved_can_go_to_publishing():
+    obj = _FakeObj("approved")
+    transition(obj, "publishing", CUT_TRANSITIONS)
+    assert obj.status == "publishing"
+
+
+def test_cut_publishing_can_fail():
+    obj = _FakeObj("publishing")
+    transition(obj, "failed", CUT_TRANSITIONS)
+    assert obj.status == "failed"
+
+
+def test_cut_publishing_can_succeed():
+    obj = _FakeObj("publishing")
+    transition(obj, "published", CUT_TRANSITIONS)
+    assert obj.status == "published"
+
+
 def test_reel_failed_reverts_to_draft():
     obj = _FakeObj("failed")
     transition(obj, "draft", REEL_TRANSITIONS)

@@ -1,0 +1,53 @@
+{% set jstatus = job.status.value %}
+{% set done = jstatus in ("done", "failed") %}
+
+<div
+  id="publish-status-{{ cut.id }}"
+  {% if not done %}
+    hx-get="/api/cuts/{{ cut.id }}/publish-status?job_id={{ job.id }}"
+    hx-trigger="load delay:3s"
+    hx-swap="outerHTML"
+  {% endif %}
+>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+        <span class="badge badge-{{ jstatus }}">{{ jstatus }}</span>
+        {% if jstatus != "pending" %}
+        <div class="progress-bar" style="max-width:220px;">
+            <div class="progress-fill{% if jstatus == 'running' %} progress-fill--animated{% endif %}" style="width:{{ job.progress }}%;"></div>
+        </div>
+        <span class="progress-label">{{ job.progress }}%</span>
+        {% endif %}
+    </div>
+
+    {% if jstatus == "running" %}
+    <p class="progress-hint">Uploading to {{ cut.platform.value.replace("_", " ") }}…</p>
+    {% endif %}
+
+    {% if jstatus == "pending" and job.error %}
+    {# A transient failure resets status to "pending" and retries automatically —
+       job.error is set but this is not a terminal state. Showing the "Retry
+       publish" button here would 409 (cut.status is still "publishing"), since
+       htmx doesn't swap on a non-2xx response the click would silently do
+       nothing. Only offer the button once jstatus == "failed" (below). #}
+    <p class="progress-hint">Transient failure — retrying automatically…</p>
+    {% endif %}
+
+    {% if jstatus == "failed" and job.error %}
+    <p class="error" style="margin-bottom:8px;">{{ job.error }}</p>
+    {% if cut.video_path %}
+    <button class="btn-approve"
+        hx-post="/api/cuts/{{ cut.id }}/publish"
+        hx-target="#publish-section-{{ cut.id }}"
+        hx-swap="innerHTML">
+      Retry publish
+    </button>
+    {% endif %}
+    {% endif %}
+
+    {% if jstatus == "done" %}
+    <p class="success">
+        Published ✓
+        {% if cut.platform_post_id %}<span class="field-hint">({{ cut.platform_post_id }})</span>{% endif %}
+    </p>
+    {% endif %}
+</div>

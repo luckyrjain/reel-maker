@@ -160,7 +160,40 @@
     </div>
 
     {% elif st == "approved" %}
-    <p class="success" style="margin-top:10px;">Approved ✓ — ready to publish.</p>
+    <div id="publish-section-{{ cut.id }}" style="margin-top:10px;">
+      <p class="success" style="margin-bottom:8px;">Approved ✓ — ready to publish.</p>
+      <button class="btn-approve"
+          hx-post="/api/cuts/{{ cut.id }}/publish"
+          hx-target="#publish-section-{{ cut.id }}"
+          hx-swap="innerHTML">
+        Publish
+      </button>
+    </div>
+
+    {% elif st == "scheduled" %}
+    <p style="color:#5b21b6;font-size:0.85rem;margin-top:10px;">Scheduled for publishing.</p>
+
+    {% elif st == "publishing" %}
+    <p style="color:#92400e;font-size:0.85rem;margin-top:10px;">
+      Publishing in progress — refresh to update.
+    </p>
+
+    {% elif st == "published" %}
+    <p class="success" style="margin-top:10px;">
+      Published ✓
+      {% if cut.published_at %} — {{ cut.published_at.strftime("%Y-%m-%d %H:%M") }} UTC{% endif %}
+      {% if cut.platform_post_id %}<span class="field-hint">({{ cut.platform_post_id }})</span>{% endif %}
+    </p>
+    {% if cut.metrics_updated_at %}
+    <div class="engagement-stats">
+      <span><strong>{{ "{:,}".format(cut.views) if cut.views is not none else "—" }}</strong> views</span>
+      <span><strong>{{ "{:,}".format(cut.likes) if cut.likes is not none else "—" }}</strong> likes</span>
+      <span><strong>{{ "{:,}".format(cut.comments) if cut.comments is not none else "—" }}</strong> comments</span>
+      <span class="field-hint">as of {{ cut.metrics_updated_at.strftime("%Y-%m-%d %H:%M") }} UTC</span>
+    </div>
+    {% else %}
+    <p class="field-hint" style="margin-top:4px;">Engagement metrics not pulled yet — checked every 6h.</p>
+    {% endif %}
 
     {% elif st == "rendering" %}
     <p style="color:#92400e;font-size:0.85rem;margin-top:10px;">
@@ -168,14 +201,34 @@
     </p>
 
     {% elif st == "failed" %}
-    <div id="render-section-{{ cut.id }}" style="margin-top:10px;">
-      <p class="error" style="margin-bottom:8px;">Render failed.</p>
-      <button class="btn-render"
-          hx-post="/api/cuts/{{ cut.id }}/render"
-          hx-target="#render-section-{{ cut.id }}"
-          hx-swap="innerHTML">
-        Retry render
-      </button>
+    <p class="error" style="margin-top:10px;margin-bottom:8px;">
+      Failed. Retry render if the guide or footage needs regenerating, or retry
+      publish directly if the rendered video is fine.
+      {% if cut.video_path %}
+      <span class="field-hint">"Retry publish" ships the last successfully
+      rendered video — if you edited the guide since then and a re-render just
+      failed, that video won't reflect those edits.</span>
+      {% endif %}
+    </p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+      <div id="render-section-{{ cut.id }}">
+        <button class="btn-render"
+            hx-post="/api/cuts/{{ cut.id }}/render"
+            hx-target="#render-section-{{ cut.id }}"
+            hx-swap="innerHTML">
+          Retry render
+        </button>
+      </div>
+      {% if cut.video_path %}
+      <div id="publish-section-{{ cut.id }}">
+        <button class="btn-approve"
+            hx-post="/api/cuts/{{ cut.id }}/publish"
+            hx-target="#publish-section-{{ cut.id }}"
+            hx-swap="innerHTML">
+          Retry publish
+        </button>
+      </div>
+      {% endif %}
     </div>
 
     {% elif cut.guide %}

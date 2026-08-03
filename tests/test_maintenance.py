@@ -2,7 +2,7 @@
 from unittest.mock import MagicMock, patch
 
 from api import models
-from worker.tasks.maintenance import REEL_TRANSITIONS, _revert_owner, reap_stuck_jobs
+from worker.tasks.maintenance import CUT_TRANSITIONS, REEL_TRANSITIONS, _revert_owner, reap_stuck_jobs
 
 
 def _job(reel_id=None, cut_id=None):
@@ -16,6 +16,12 @@ def _reel(status):
     reel = MagicMock()
     reel.status.value = status
     return reel
+
+
+def _cut(status):
+    cut = MagicMock()
+    cut.status.value = status
+    return cut
 
 
 # ── _revert_owner ─────────────────────────────────────────────────────────────
@@ -42,6 +48,31 @@ def test_revert_owner_leaves_finished_reel_alone():
     db.get.return_value = _reel("guide_ready")
     with patch("worker.tasks.maintenance.transition") as mock_transition:
         _revert_owner(db, _job(reel_id=5))
+    mock_transition.assert_not_called()
+
+
+def test_revert_owner_fails_rendering_cut():
+    db = MagicMock()
+    db.get.return_value = _cut("rendering")
+    with patch("worker.tasks.maintenance.transition") as mock_transition:
+        _revert_owner(db, _job(cut_id=9))
+    mock_transition.assert_called_once_with(db.get.return_value, "failed", CUT_TRANSITIONS)
+
+
+def test_revert_owner_fails_publishing_cut():
+    """A publish worker killed mid-upload must not leave the cut stuck forever."""
+    db = MagicMock()
+    db.get.return_value = _cut("publishing")
+    with patch("worker.tasks.maintenance.transition") as mock_transition:
+        _revert_owner(db, _job(cut_id=9))
+    mock_transition.assert_called_once_with(db.get.return_value, "failed", CUT_TRANSITIONS)
+
+
+def test_revert_owner_leaves_finished_cut_alone():
+    db = MagicMock()
+    db.get.return_value = _cut("published")
+    with patch("worker.tasks.maintenance.transition") as mock_transition:
+        _revert_owner(db, _job(cut_id=9))
     mock_transition.assert_not_called()
 
 

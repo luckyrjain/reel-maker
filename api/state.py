@@ -13,7 +13,12 @@ CUT_TRANSITIONS: dict[str, set[str]] = {
     "approved": {"publishing", "scheduled"},
     "scheduled": {"publishing"},
     "publishing": {"published", "failed"},
-    "failed": {"draft"},
+    # "failed" can mean a render failed (needs a full re-render, back to "draft")
+    # or a publish attempt failed (missing credentials, network error, safe_to_publish
+    # gate — none of which need re-rendering, so "approved" lets the operator retry
+    # publish directly). Which target applies is decided by which action the
+    # operator retries (trigger_render vs trigger_publish), not tracked on the Cut.
+    "failed": {"draft", "approved"},
 }
 
 

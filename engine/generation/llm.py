@@ -15,8 +15,17 @@ class OllamaProvider:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self._headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        # Usage from the most recent complete() call (cleared before each call, so a
+        # failed call never leaks a prior call's tokens into cost accounting).
+        self.last_usage: dict = {}
+        # Cumulative usage across every successful complete() call this instance has
+        # made. Callers that wrap several complete() calls in one StageEvent (e.g. a
+        # multi-batch enrichment pass) read this before/after and diff it, since
+        # last_usage alone would only reflect the final call in the batch.
+        self.total_usage: dict = {"prompt_tokens": 0, "completion_tokens": 0}
 
     def complete(self, messages: list[dict], json_mode: bool = True) -> str:
+        self.last_usage = {}
         payload: dict = {
             "model": self.model,
             "messages": messages,
@@ -32,7 +41,12 @@ class OllamaProvider:
             timeout=360.0,
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        data = resp.json()
+        usage = data.get("usage") or {}
+        self.last_usage = usage
+        self.total_usage["prompt_tokens"] += usage.get("prompt_tokens") or 0
+        self.total_usage["completion_tokens"] += usage.get("completion_tokens") or 0
+        return data["choices"][0]["message"]["content"]
 
 
 def get_llm_provider() -> LLMProvider:

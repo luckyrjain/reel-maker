@@ -9,6 +9,10 @@
 </head>
 <body>
     <main>
+        <div class="page-nav">
+            <a href="/api/reels">All reels →</a>
+            <a href="/api/credentials">Connected accounts →</a>
+        </div>
         <h1>Reel Maker</h1>
 
         <form hx-post="/api/reels"
@@ -19,6 +23,11 @@
             <label>
                 Context
                 <textarea name="context" rows="14"
+                          hx-post="/api/reels/estimate"
+                          hx-trigger="load, keyup delay:500ms changed, change"
+                          hx-target="#cost-estimate"
+                          hx-swap="outerHTML"
+                          hx-include="closest form"
                           placeholder="HOOK
 Start with a question, conflict, or surprising stat that grabs attention immediately.
 [Visual: Specific shot — include a full player/subject name for auto photo sourcing]
@@ -47,6 +56,22 @@ Punchy closing line. Subscribe / comment / share prompt.
                 <input name="niche" placeholder="e.g. football, personal finance, fitness">
             </label>
 
+            <fieldset class="platform-picker">
+                <legend>Platforms</legend>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="platforms" value="youtube_shorts" checked>
+                    YouTube Shorts
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="platforms" value="instagram_reels" checked>
+                    Instagram Reels
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="platforms" value="tiktok">
+                    TikTok <span class="field-hint">(publishing not yet available — render/review only)</span>
+                </label>
+            </fieldset>
+
             <div style="display:flex;gap:16px;flex-wrap:wrap;">
                 <label style="flex:1;min-width:160px;">
                     Voiceover mode
@@ -70,13 +95,20 @@ Punchy closing line. Subscribe / comment / share prompt.
 
                 <label style="flex:1;min-width:160px;">
                     Generation path
-                    <select name="generation_path">
+                    <select name="generation_path"
+                            hx-post="/api/reels/estimate"
+                            hx-trigger="change"
+                            hx-target="#cost-estimate"
+                            hx-swap="outerHTML"
+                            hx-include="closest form">
                         <option value="auto" selected>Auto-detect</option>
                         <option value="structured">I wrote a script (fast, ~90s)</option>
                         <option value="standard">Generate from topic (full LLM)</option>
                     </select>
                 </label>
             </div>
+
+            <div id="cost-estimate" class="cost-estimate"></div>
 
             <button type="submit">Generate guide</button>
             <span id="spinner" class="htmx-indicator">Generating…</span>

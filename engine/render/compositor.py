@@ -293,12 +293,79 @@ def _build_beat_clip(
     return concatenate_videoclips(sub_clips) if len(sub_clips) > 1 else sub_clips[0]
 
 
+_MUSIC_VOLUME = 0.18       # music level under narration, once ducked further by sidechaincompress
+_MUSIC_ONLY_VOLUME = 0.7   # music level when there's no VO to duck against
+
+
+def _build_ffmpeg_args(
+    notxt_path: Path,
+    tmp_path: Path,
+    text_filter: str,
+    music_path: Path | None,
+    has_vo_audio: bool,
+    total_duration: float = 0.0,
+) -> list[str]:
+    """Build the ffmpeg drawtext (+ optional music mixing) command.
+
+    Kept as a pure function (no subprocess execution) so the filter graph is
+    unit-testable without needing a real ffmpeg binary.
+    """
+    if music_path is None:
+        return [
+            "ffmpeg", "-y", "-i", str(notxt_path),
+            "-vf", text_filter,
+            "-c:a", "copy",
+            "-c:v", "libx264",
+            str(tmp_path),
+        ]
+
+    # The music input is looped indefinitely (-stream_loop -1 below) — atrim
+    # gives ffmpeg an explicit, unambiguous stop point for it. Relying on
+    # -shortest alone is not enough: without a bound in the filtergraph itself,
+    # an infinite input into a filter chain with no other duration reference
+    # (the has_vo_audio=False case has no [0:a] at all) can make ffmpeg's
+    # internal filter buffering misbehave — reproduced in testing as a bogus
+    # "No space left on device" filtering error with plenty of real disk free.
+    trim = f"atrim=duration={total_duration:.3f},"
+
+    if has_vo_audio:
+        # Duck music under the VO via sidechaincompress — smooth, proportional
+        # volume reduction driven by the VO's envelope. (CLAUDE.md's roadmap
+        # notes mention "agate" as the planned approach; sidechaincompress is
+        # used instead — agate is a hard on/off noise gate, not the smooth
+        # ducking a narrated video actually wants. normalize=0 on amix keeps
+        # the VO at its original level; without it amix halves both inputs'
+        # volume to prevent clipping, which would quietly undercut the VO.)
+        filter_complex = (
+            f"[0:v]{text_filter}[vout];"
+            f"[1:a]{trim}volume={_MUSIC_VOLUME}[music];"
+            f"[music][0:a]sidechaincompress=threshold=0.05:ratio=8:attack=5:release=300[ducked];"
+            f"[0:a][ducked]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
+        )
+    else:
+        # No VO to duck against (music_only/silent voiceover_mode) — just mix
+        # the looped/trimmed music track in at a normal listening level.
+        filter_complex = f"[0:v]{text_filter}[vout];[1:a]{trim}volume={_MUSIC_ONLY_VOLUME}[aout]"
+
+    return [
+        "ffmpeg", "-y",
+        "-i", str(notxt_path),
+        "-stream_loop", "-1", "-i", str(music_path),
+        "-filter_complex", filter_complex,
+        "-map", "[vout]", "-map", "[aout]",
+        "-c:v", "libx264", "-c:a", "aac",
+        "-shortest",  # music is looped indefinitely (-stream_loop -1) — must be capped
+        str(tmp_path),
+    ]
+
+
 def composite_cut(
     beats: list[dict],
     beat_video_paths: list[list[Path | None]],
     beat_vo_paths: list[Path | None],
     output_path: Path,
     thumbnail_path: Path,
+    music_path: Path | None = None,
 ) -> float:
     """
     Assemble beats into a single 9:16 MP4.
@@ -366,20 +433,16 @@ def composite_cut(
         # Write to a temp path first; atomic replace so a killed process never
         # leaves a half-written servable file.
         tmp_path = output_path.with_suffix(".tmp.mp4")
-        result = subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", str(notxt_path),
-                "-vf", text_filter,
-                "-c:a", "copy",
-                "-c:v", "libx264",
-                str(tmp_path),
-            ],
-            capture_output=True,
+        ffmpeg_args = _build_ffmpeg_args(
+            notxt_path, tmp_path, text_filter,
+            music_path=music_path, has_vo_audio=bool(vo_tracks),
+            total_duration=total_duration,
         )
+        result = subprocess.run(ffmpeg_args, capture_output=True)
         if result.returncode != 0:
             tmp_path.unlink(missing_ok=True)
             raise RuntimeError(
-                f"FFmpeg drawtext failed (exit {result.returncode}):\n"
+                f"FFmpeg text/audio pass failed (exit {result.returncode}):\n"
                 + result.stderr.decode(errors="replace")
             )
         os.replace(tmp_path, output_path)

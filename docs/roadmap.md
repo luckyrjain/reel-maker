@@ -21,7 +21,8 @@ This file below is the build log (what shipped, phase by phase); that one is the
 | 3.6 | ✅ Done | Pre-generation context evaluation & enrichment |
 | 3.7 | ✅ Done | Generation quality fixes (context drift, audio gaps, prompt fences) |
 | 3.8 | ✅ Done | Repo hygiene, render-path fixes, retry semantics, task-module split |
-| 4 | 🔲 Next | Publishing |
+| 4a | ✅ Done | Operator visibility (cost, latency, quality, budget cap) |
+| 4b | ✅ Done | Publishing (OAuth, safe_to_publish gate, YouTube + Instagram uploaders, TikTok platform) |
 | 5 | 🔲 Planned | Analytics and polish |
 
 ---
@@ -185,64 +186,155 @@ Edge TTS synthesis, and the final MP4/thumbnail — worked as designed.
 
 ---
 
-## Phase 4 — Publishing (next)
+## Phase 4a — Operator visibility (done)
 
-### 4a. YouTube Shorts upload
+Shipped ahead of the original Phase 5a plan below, once the product-gap-analysis
+review (2026-08-02) flagged "operator can't see or find their own work" as the
+single most-felt daily gap and the prerequisite for everything downstream of it.
 
-**Prerequisites:**
-- `CREDENTIALS_KEY` set and a `Credential` row for the `youtube` provider
-- `safe_to_publish == True` for all assets in the cut (gate in publish worker)
+- Reel list page (`GET /api/reels`, paginated) and a per-reel pipeline panel
+  (`GET /api/reels/{id}`) — cost, latency, quality score, per-stage breakdown,
+  sourced from `StageEvent`
+- `StageEvent.cost_usd`/`tokens_in`/`tokens_out` implemented for every LLM call
+  site (`engine/generation/pricing.py::llm_cost_usd()`, NVIDIA-only — rates are
+  operator-configured via `NVIDIA_PRICE_PER_1M_*`, default 0 rather than a
+  guessed number). Several previously-uninstrumented call sites (conflict-stub
+  generation, caption/hashtag generation, structured-path visuals) got their
+  own `record_stage()` wrap as part of this, not just the ones that already had one.
+- Pre-generation cost/time estimate on the create-reel form
+  (`engine/generation/estimate.py`), sourced from this operator's own
+  historical `StageEvent` averages per generation path — not a guessed
+  per-token figure. Excludes reels where the structured path fell through to
+  standard from the "standard" bucket, since those pay for both attempts and
+  would otherwise inflate the estimate.
+- `Settings.max_paid_llm_calls_per_reel` — a hard ceiling on NVIDIA-provider
+  `StageEvent` count per reel, checked at `generate_guide` task entry and
+  before each standard-path retry attempt, so a stuck Celery retry loop can't
+  run up an unbounded bill.
 
-**Work:**
-1. OAuth 2.0 flow: `/auth/youtube` redirect → callback → `Credential` row (token encrypted)
-2. `worker/tasks/publish.py`: `publish_cut(job_id)` — upload `.mp4` via YouTube Data API v3 (`videos.insert`), set title/description/hashtags, return `platform_post_id`
-3. Attribution block: assemble Wikipedia attribution strings from `cut_assets → assets.attribution` and append to caption before upload
-4. State transitions: `approved → publishing → published` (or `failed`)
-5. `published_at` and `platform_post_id` set on the cut row
-
-**Migration needed:** none — all columns exist (`platform_post_id`, `published_at`, `Credential`)
-
-### 4b. Instagram Reels upload
-
-Same pattern as YouTube. Instagram Graph API requires a two-step flow (create container → publish). Separate `Credential` row for `instagram` provider.
-
-### 4c. Publish gate UI
-
-- Approve button should be blocked (or warn) when any beat's asset has `safe_to_publish == False`
-- Show attribution preview in the cut card before approving
+Not done: HuggingFace/asset-generation cost tracking (only LLM calls are
+instrumented); per-stage latency breakdown exists but nothing calls out which
+stage dominates beyond the raw table.
 
 ---
 
-## Phase 5 — Analytics and polish
+## Phase 4b — Publishing (done)
+
+Built on top of Phase 4a's cost/observability plumbing. Deviates from the
+original plan below in a few ways, noted inline.
+
+**OAuth + credentials** (`api/oauth.py`, `api/routers/credentials.py`,
+`ui/templates/credentials.html`)
+- Generic OAuth2 authorization-code flow — connect/disconnect UI at
+  `/api/credentials`, `GET /{provider}/authorize` → `GET /{provider}/callback`.
+  Endpoint paths differ from the original `/auth/youtube` sketch.
+- Instagram publishing rides on a Facebook Page's access token, not the
+  user's own token — the callback does an extra long-lived-token exchange,
+  then discovers the linked Instagram Business Account via the user's
+  Facebook Pages (`InstagramOAuth.discover_account()`). Not anticipated in
+  the original plan.
+- Migration 0004 adds `Credential.provider_account_id` (the discovered IG
+  Business Account ID) and `refresh_token_blob`.
+
+**Publish task** (`worker/tasks/publish.py`, `api/routers/cuts.py::trigger_publish`)
+- `publish_cut(job_id)` follows the same idempotency-guard/heartbeat/transient-retry
+  pattern as `generate_guide`/`render_cut`. Gates on `assert_safe_to_publish()`
+  (`engine/publish/gate.py`) before ever calling a platform API — the first
+  place `Asset.safe_to_publish` is actually enforced, not just computed.
+- State transitions: `approved|scheduled → publishing → published` or `failed`,
+  matching the original plan. `CUT_TRANSITIONS["failed"]` was extended to also
+  allow `→ approved` (not just `→ draft`) since a failed *publish* shouldn't
+  force a full re-render — the operator's retry action (`/render` vs
+  `/publish`) decides which path is taken.
+- `reap_stuck_jobs` now also rolls back cuts stuck in `"publishing"`, not just
+  `"rendering"` — a killed publish worker would otherwise leave a cut stuck forever.
+
+**Uploaders** (`engine/publish/`)
+- `youtube.py` — resumable-upload flow (init POST + one PUT, reels are small
+  enough that true multi-chunk resuming isn't needed); refreshes an expired
+  access token via the stored refresh token first.
+- `instagram.py` — container-create → poll-until-FINISHED → publish flow via
+  the Graph API. Requires `PUBLIC_BASE_URL` to be a real public HTTPS
+  address — Instagram fetches the video itself from
+  `GET /api/cuts/{id}/video` rather than accepting an upload body. This is a
+  real external constraint, not a bug: publishing to Instagram will not work
+  behind localhost/NAT alone.
+- `tiktok.py` — deliberately raises `NotImplementedError`. TikTok's Content
+  Posting API requires a separate audited app review beyond self-serve OAuth;
+  shipping a guessed integration nobody could verify against a real audited
+  app seemed worse than an honest gap. TikTok is still selectable as a
+  render/review platform (`CutPlatform.tiktok`) — only publishing is gated.
+
+**Not done (at the time):** the attribution-block-in-caption step from the
+original 4c plan; a "schedule for later" UI (the `scheduled` cut status and
+the publish task both support it, but nothing currently transitions a cut
+*into* `scheduled`). The attribution item shipped in Phase 5 — see below.
+
+---
+
+## Phase 5 — Analytics and polish (done)
+
+Deviates from the original plan below in a few ways, noted inline.
 
 ### 5a. Cost tracking
 
-`StageEvent.tokens_in`, `tokens_out`, `cost_usd` are already columns; pricing lookup is not implemented.
+Superseded by Phase 4a for LLM costs. HuggingFace asset-generation cost
+tracking (the remaining open item there) shipped in this phase:
+`engine/render/pricing.py::hf_image_cost_usd()`/`hf_video_cost_usd()` are
+config-driven (`HUGGINGFACE_PRICE_PER_IMAGE`/`HUGGINGFACE_PRICE_PER_VIDEO_SECOND`,
+both `0.0` until the operator sets a real rate) and feed `"asset_hf_image"`/
+`"asset_hf_video"` `StageEvent`s in `asset_sourcer.py`. Cost is charged only
+when a call actually generates an asset — a cache hit (`last_call_was_generated
+== False`) records the stage with `cost_usd=0` so re-renders don't double-bill.
 
-**Work:**
-- Add `_price(model, tokens_in, tokens_out) → float` lookup table (NVIDIA NIM pricing)
-- Populate `cost_usd` in `record_stage()` after yield
-- Add per-reel cost line to the guide detail page: `Σ stage_events.cost_usd WHERE reel_id=N`
-- Add per-stage latency breakdown (which stage dominates?)
+### 5b. Post-publish metrics — done, schema differs from the original plan
 
-### 5b. Post-publish metrics
+Instead of a separate `metrics` table keyed by `(cut_id, fetched_at)` (which
+would let us keep a full time series), metrics live as four columns directly
+on `cuts`: `views`, `likes`, `comments`, `metrics_updated_at` (migration
+0005) — the latest pull overwrites the previous one. This matches the
+"sortable table, not a dashboard" philosophy: the reel list and cut card show
+current standing, not a trend line, and a real time-series table can be added
+later without disturbing this shape.
 
-- YouTube/IG API pull-back: views, watch time, shares at 24 h / 7 d
-- `metrics` table: `(cut_id, platform, fetched_at, views, watch_time_s, shares, ctr)`
-- Celery beat task: fetch metrics for all `published` cuts older than 24 h
-- Surface on guide page: spark line of view count over time
+- `engine/publish/metrics.py` — `YouTubeMetricsFetcher` (`videos.list?part=statistics`,
+  stable/documented) and `InstagramMetricsFetcher` (Graph API
+  `/insights?metric=plays,likes,comments` — flagged lower-confidence since
+  Meta has renamed Reels Insights metrics before). No TikTok fetcher (no
+  publisher either).
+- `worker/tasks/metrics.py::pull_publish_metrics()` — Celery beat task, every
+  6 h (not the originally sketched "24h+ only" gate — every published cut is
+  re-pulled each run). Missing fetcher/credential or a fetch exception skips
+  that cut and moves on; never fails the whole run.
+- Surfaced on `cut_card.html` (views/likes/comments + "as of" timestamp once
+  pulled, a "checked every 6h" hint before the first pull) and on
+  `reels_list.html` as a Quality/Views column pair per reel (latest job's
+  `quality_score`, max `views` across the reel's cuts) — visual
+  quality-vs-engagement correlation is left to the operator eyeballing the
+  table, no computed correlation coefficient.
 
-### 5c. Music mixing
+### 5c. Music mixing — done, source differs from the original plan
 
-`music_cue` field is generated by the LLM but no audio is fetched or mixed.
+`music_cue` is now mixed into every render that has a match. Sourcing is a
+**local library**, not the Pixabay music API sketched originally — Pixabay's
+public REST API has never documented a Music search endpoint (only
+Images/Video), so integrating against it would have meant guessing at an
+API that may not exist. `LocalMusicSource` (`engine/render/asset_sourcer.py`)
+keyword-matches a beat's `music_cue` against filenames in
+`Settings.music_library_dir`; no `Asset` row (no external fetch to cache).
 
-**Intended approach:**
-- Source royalty-free tracks by mood keyword (Pixabay music API or local library)
-- FFmpeg `amix` filter to layer music under VO
-- `agate` sidechain compressor: duck music -18 dB under VO, recover between beats
-- `Asset(type="music", source="pixabay")` row for caching
+- `engine/render/compositor.py::_build_ffmpeg_args()` — sidechain-ducked mix
+  (`sidechaincompress`) when the beat has VO audio, plain-volume mix
+  (`amix ... normalize=0`) when it doesn't; the looped music input
+  (`-stream_loop -1`) is always `atrim`'d to the render's total duration and
+  `-shortest` is kept as a safety net — an untrimmed infinite loop previously
+  produced a "no space left on device" ffmpeg error.
+- Structured-path beats now default `music_cue="upbeat energetic"` on the
+  hook beat (`worker/tasks/generate.py::_stubs_to_platform_guide()`) — they
+  previously never got a `music_cue` at all, so nothing was ever mixed in
+  for that path.
 
-### 5d. Word-level caption export
+### 5d. Word-level caption export — not done
 
 Whisper is wired in for on-screen text timing, but a separate SRT/VTT caption file for the platform uploader is not generated.
 
@@ -253,6 +345,18 @@ Whisper is wired in for on-screen text timing, but a separate SRT/VTT caption fi
 ### 5e. ~~Insight enrichment for standard LLM path~~ ✅ Done (Phase 3.6)
 
 `_enrich_standard_path_guide()` runs after `clean_guide()` in the standard path — converts beats to `BeatStub`-like objects, runs `_enrich_with_insight()`, writes enriched VO + recalculated duration + re-derived on_screen_text back.
+
+### 5f. Attribution block in captions — done
+
+`engine/publish/attribution.py::build_attribution_block()` joins `Asset` +
+`CutAsset` for the cut, filters to `source == "wikipedia"` assets with
+non-empty `attribution`, dedupes, and formats
+`"Image credit: {attribution} ({license}); ..."`.
+`build_published_caption()` appends it to `cut.caption` (or stands alone if
+the caption is empty) without mutating the DB-stored caption — the publish
+task passes the composed string through `Publisher.publish(..., caption=)`,
+a new required parameter every publisher now takes instead of reading
+`cut.caption` directly.
 
 ---
 
@@ -265,13 +369,17 @@ Whisper is wired in for on-screen text timing, but a separate SRT/VTT caption fi
 | `asset_sourcer` degrades silently to black frames | Medium | Every sourcer swallows its own exceptions and returns `None`, so a Pexels/Wikipedia outage produces a black-frame reel that reports success — and never reaches the retry branch |
 | `record_stage()` commits the caller's session | Low | Benign today (all call sites sit on a commit boundary) and documented in `observability.py`, but it will bite whoever wraps a half-applied mutation |
 | `_escape_drawtext` escapes only `\ : % '` | Low | A newline or exotic character in `on_screen_text` could break the FFmpeg filter chain; not observed in practice |
-| Wikipedia licence lookup uses a percent-encoded filename | Low | `_fetch_license()` passes the raw URL segment, so accented/spaced filenames return "unknown" and default to `safe_to_publish=False`. Matters at Phase 4 publish time |
-| Cut page does not poll while rendering | Low | `cut_card.html` shows "refresh to update" instead of an auto-refreshing fragment |
+| Wikipedia licence lookup uses a percent-encoded filename | Low | `_fetch_license()` passes the raw URL segment, so accented/spaced filenames return "unknown" and default to `safe_to_publish=False`. Now live: `assert_safe_to_publish()` blocks these cuts from publishing (Phase 4b), so this under-detection means some legitimately-safe Wikipedia assets get blocked rather than the reverse (a licensing false-negative, not a false-positive) |
+| Cut page does not poll while rendering | Low | `cut_card.html` shows "refresh to update" instead of an auto-refreshing fragment — same limitation for `"publishing"` status (Phase 4b) |
 | LLM judge 60% weight can swing combined score | Low | Log per-attempt rule/judge split from `StageEvent`; tune once data accumulates |
 | Whisper `base` model is slow on CPU | Low | Switch to `faster-whisper` with `base` model for 3-4× speedup on same hardware |
-| No OAuth refresh token rotation | Medium | Credential encrypted but no auto-refresh; expired tokens silently fail at publish |
+| Instagram Page token has no refresh path | Low | `InstagramPublisher` doesn't refresh the stored Page token — matches real Facebook Graph API behavior (a Page token derived from a long-lived ~60-day user token is effectively non-expiring under normal use), but if it ever does expire the operator has to reconnect manually rather than being auto-recovered. YouTube's token *is* refreshed automatically (`engine/publish/youtube.py::get_valid_access_token()`, shared by `YouTubePublisher.publish()` and `YouTubeMetricsFetcher.fetch()`) since Google's short-lived access tokens need it every ~1h. |
+| "Retry publish" on a `failed` cut can ship a stale pre-edit video | Low | `CUT_TRANSITIONS["failed"]` intentionally allows both `→ draft` and `→ approved` (see Key conventions in CLAUDE.md) so a failed *publish* doesn't force a full re-render. The same ambiguity also covers a failed *re-render*: if the operator edited the guide then re-rendered and that render failed, `cut.video_path` still points at the last successfully rendered (pre-edit) file, and "Retry publish" on the `failed` card will ship it. Partially mitigated today by an explicit warning in `cut_card.html`'s `failed` branch ("if you edited the guide since then... that video won't reflect those edits"); a full fix would need tracking whether `video_path` reflects the current guide (e.g. clearing it, or a `video_is_stale` flag) rather than just warning about it. |
 | Standard LLM path caption/hashtags not content-aware | Low | Generated from niche only, not actual beat content; structured path uses `_generate_caption_hashtags()` from actual VO — standard path could do the same |
-| `PIXABAY_API_KEY` config field is unused | Low | Added to config in anticipation of Pixabay music/video integration (Phase 5c); no provider wired yet |
+| `PIXABAY_API_KEY` config field is unused | Low | Pixabay's public REST API has never documented a Music endpoint (only Images/Video) — Phase 5c deliberately built `LocalMusicSource` instead of guessing at an API that may not exist. Field stays unwired by design, not for lack of time. |
+| `paid_call_count()` is a lifetime-per-reel counter | Low | No per-job scoping or reset path — not exploitable today since nothing re-triggers a `generate` Job for a reel that already has one, but a future "regenerate guide" flow would need an explicit reset, not just raising `MAX_PAID_LLM_CALLS_PER_REEL` |
+| `pull_publish_metrics()` overwrites rather than accumulates a time series | Low | `cuts.views`/`likes`/`comments` hold only the latest pull — see Phase 5b for the "sortable table, not a dashboard" reasoning. A trend line needs a separate metrics-history table later. |
+| Instagram Insights metric names may drift | Medium | `InstagramMetricsFetcher` requests `plays,likes,comments` — Meta has renamed Reels Insights metrics before (e.g. `plays` → `video_views` at points), so a future API change could silently return empty/zero metrics rather than erroring loudly |
 
 ---
 

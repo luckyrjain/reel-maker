@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>All reels — Reel Maker</title>
+    <link rel="stylesheet" href="/static/main.css">
+</head>
+<body>
+<main class="main-wide">
+    <div class="page-nav">
+        <a href="/" class="back" style="margin-bottom:0;">← New reel</a>
+        <a href="/api/credentials">Connected accounts</a>
+    </div>
+    <h1>All reels <span class="reel-count">({{ total }})</span></h1>
+
+    {% if not reels %}
+    <p class="empty-state">No reels yet. <a href="/">Create your first one</a>.</p>
+    {% else %}
+    <table class="reel-list">
+        <thead>
+            <tr>
+                <th>Context</th>
+                <th>Niche</th>
+                <th>Status</th>
+                <th>Cuts</th>
+                <th>Quality</th>
+                <th>Views</th>
+                <th>Created</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for reel in reels %}
+            {% set m = metrics[reel.id] %}
+            <tr onclick="window.location='/api/reels/{{ reel.id }}'" class="reel-row">
+                <td class="reel-context">{{ reel.context[:70] }}{% if reel.context|length > 70 %}…{% endif %}</td>
+                <td>{{ reel.niche or "—" }}</td>
+                <td><span class="badge badge-{{ reel.status.value }}">{{ reel.status.value }}</span></td>
+                <td class="reel-cuts">
+                    {% for cut in reel.cuts %}
+                    <span class="badge badge-{{ cut.status.value }}" title="{{ cut.platform.value }}">{{ cut.platform.value.split('_')[0] }}</span>
+                    {% endfor %}
+                </td>
+                <td class="mono">{{ m.quality_score if m.quality_score is not none else "—" }}</td>
+                <td class="mono">{{ "{:,}".format(m.views) if m.views is not none else "—" }}</td>
+                <td class="reel-date">{{ reel.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    <div class="pagination">
+        {% if has_prev %}<a href="/api/reels?page={{ page - 1 }}">← Newer</a>{% endif %}
+        {% if has_next %}<a href="/api/reels?page={{ page + 1 }}">Older →</a>{% endif %}
+    </div>
+    {% endif %}
+</main>
+</body>
+</html>

@@ -1,0 +1,14 @@
+<div id="cost-estimate" class="cost-estimate">
+    <span class="badge badge-{{ 'done' if estimate.path == 'structured' else 'warn' }}">{{ estimate.path }} path</span>
+    <span>~{{ estimate.calls_min }}–{{ estimate.calls_max }} paid LLM calls</span>
+    <span>·</span>
+    <span>~{{ estimate.time_min_s }}–{{ estimate.time_max_s }}s</span>
+    <span>·</span>
+    {% if estimate.avg_cost_usd is not none %}
+    <span>avg ${{ "%.4f"|format(estimate.avg_cost_usd) }} from {{ estimate.sample_size }} past {{ estimate.path }} reel{{ "s" if estimate.sample_size != 1 else "" }}</span>
+    {% elif estimate.pricing_configured %}
+    <span class="cost-estimate-hint">no cost history yet for this path</span>
+    {% else %}
+    <span class="cost-estimate-hint">cost tracking not configured — set NVIDIA pricing in .env</span>
+    {% endif %}
+</div>

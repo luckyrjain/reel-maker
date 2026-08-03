@@ -27,15 +27,67 @@ class Settings(BaseSettings):
     video_store_dir: str = "./data/videos"
 
     pexels_api_key: str = ""
+    # Reserved for a future Pixabay source — Pixabay's public REST API has only
+    # ever documented Images and Video search endpoints, never Music/Audio, so
+    # there's nothing to safely wire this key up to yet. See music_library_dir
+    # for how background music is actually sourced today.
     pixabay_api_key: str = ""
     huggingface_api_key: str = ""
     huggingface_image_model: str = "black-forest-labs/FLUX.1-schnell"
     huggingface_video_model: str = "Lightricks/LTX-Video"
 
+    # Cost estimation for StageEvent.cost_usd — HuggingFace Inference API asset
+    # generation. HF billing varies by plan and hardware tier, not a fixed public
+    # rate, so — same policy as nvidia_price_per_1m_*_tokens above — these default
+    # to 0 (cost tracking inert) until set from your actual HF billing plan.
+    huggingface_price_per_image: float = 0.0
+    huggingface_price_per_video_second: float = 0.0
+
+    # Local royalty-free music library, matched against each beat's music_cue by
+    # filename keyword overlap (see engine/render/asset_sourcer.py::LocalMusicSource).
+    # Populate it yourself — e.g. tracks from Pixabay's website (pixabay.com/music,
+    # browser-only, no API), Free Music Archive, or your own library. Filenames
+    # should include mood words, e.g. "tense_minimal_01.mp3", "upbeat_energetic_02.mp3".
+    # Empty/missing directory means no music is mixed in — same as today.
+    music_library_dir: str = "./data/music"
+
+    # Hard ceiling on paid (NVIDIA NIM) LLM calls per reel. A single successful run
+    # already makes up to ~16 (structured path falling through to standard, worst
+    # case); this exists to stop a stuck Celery retry loop or a pathological prompt
+    # from compounding that across repeated task attempts with no limit at all.
+    max_paid_llm_calls_per_reel: int = 20
+
+    # Cost estimation for StageEvent.cost_usd — USD per 1M tokens for NVIDIA NIM calls.
+    # NIM rates vary by model and billing plan and change over time, so we don't ship a
+    # guessed number here: both default to 0 (cost tracking inert) until set from your
+    # actual NVIDIA billing plan. Local Ollama calls are always free (self-hosted).
+    nvidia_price_per_1m_input_tokens: float = 0.0
+    nvidia_price_per_1m_output_tokens: float = 0.0
+
     # 32-byte URL-safe base64 key for Fernet credential encryption.
     # Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
     # Leave blank in dev — tokens are stored as plaintext with a warning.
     credentials_key: str = ""
+
+    # Publicly reachable base URL for this server — used to build the OAuth
+    # redirect_uri (must match a URI registered with each provider's app) and,
+    # for Instagram, the video URL the platform fetches from. Instagram's Graph
+    # API requires a real public HTTPS URL; localhost/NAT alone will not work
+    # for Instagram publishing even with valid credentials.
+    public_base_url: str = "http://localhost:8000"
+
+    # OAuth — YouTube Data API. Register an app at console.cloud.google.com,
+    # enable the YouTube Data API v3, and add {public_base_url}/api/credentials/
+    # youtube/callback as an authorized redirect URI.
+    youtube_oauth_client_id: str = ""
+    youtube_oauth_client_secret: str = ""
+
+    # OAuth — Instagram publishing via the Meta Graph API. Register an app at
+    # developers.facebook.com; requires a Facebook Page linked to an Instagram
+    # Business/Creator account, and add {public_base_url}/api/credentials/
+    # instagram/callback as a valid OAuth redirect URI.
+    meta_oauth_app_id: str = ""
+    meta_oauth_app_secret: str = ""
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
