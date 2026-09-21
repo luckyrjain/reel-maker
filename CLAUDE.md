@@ -45,7 +45,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 238 tests across 30+ files
+.venv/bin/pytest                            # 323 tests across 30+ files (4 test_compositor tests need ffmpeg on PATH)
 .venv/bin/pytest tests/test_foo.py::bar -s
 
 # New migration after changing models.py
@@ -89,7 +89,7 @@ In both paths, `postprocess.py` strips section-label prefixes from `vo_script` a
 **Reliability features:**
 - `task_acks_late=True` — broker acks only after task returns; a killed worker requeues rather than silently loses.
 - `task_reject_on_worker_lost=True` — task requeued when worker is SIGKILLed.
-- **Transient-failure retry** — `generate_guide` and `render_cut` retry up to twice with 30 s/60 s backoff when `worker/tasks/common.py::should_retry()` classifies the exception as transient (httpx transport errors, timeouts, HTTP 429/5xx). Deterministic failures — bad LLM JSON, quality-below-threshold, a missing row, ffmpeg's non-zero exit — fail once, unchanged. The retry branch resets `job.status` to `pending` before calling `self.retry()`: the idempotency guard rejects `running`, so a retry that left the status alone would be a silent no-op. It must **not** bump `job.attempts` — task entry already does. `enrich_context` stays `max_retries=0` on purpose.
+- **Transient-failure retry** — `generate_guide`, `render_cut` and `publish_cut` retry up to twice with 30 s/60 s backoff when `worker/tasks/common.py::should_retry()` classifies the exception as transient (httpx transport errors, timeouts, HTTP 429/5xx). Deterministic failures — bad LLM JSON, quality-below-threshold, a missing row, ffmpeg's non-zero exit — fail once, unchanged. The retry branch resets `job.status` to `pending` before calling `self.retry()`: the idempotency guard rejects `running`, so a retry that left the status alone would be a silent no-op. It must **not** bump `job.attempts` — task entry already does. `enrich_context` stays `max_retries=0` on purpose. All of this lives in `worker/tasks/common.py::job_task` — never re-implement it in a task.
 - **Idempotency guard** at task entry: tasks with `status in (done, running)` return immediately (redelivery no-op).
 - **Heartbeat** — tasks write `job.heartbeat_at` at every milestone. `reap_stuck_jobs` (Celery beat, every 60 s) fails any `running` job without a heartbeat update in the last 5 minutes, **and** any `pending` job whose `updated_at` is older than 30 minutes (broker was down when `.delay()` ran, or no worker consumes the queue). The pending branch keys on `updated_at`, not `created_at`, so a job sitting in retry backoff is not reaped for being old. Both roll back the owning reel (`enriching` or `generating`) / cut.
 - **Atomic MP4 write** — FFmpeg writes to `.tmp.mp4`, then `os.replace()` to the final path; a killed process never leaves a servable half-written file.
@@ -119,7 +119,10 @@ api/
 worker/
   celery_app.py       Celery instance; acks_late=True, beat schedule, split queues
   tasks/
-    common.py         should_retry() / is_transient_error() / heartbeat() — shared task helpers
+    common.py         job_task() — the shared Job lifecycle decorator (idempotency guard, running-stamp, atomic
+                      done-stamp, transient-retry reset, failure stamp + per-job-type owner rollback via
+                      api/state.py::JOB_IN_FLIGHT); rollback_owner(); should_retry() / is_transient_error() /
+                      heartbeat() — shared task helpers
     generate.py       generate_guide(job_id) — idempotency guard, heartbeat, enrichment,
                       conflict injection, visuals LLM, closed-loop eval retry, observability,
                       paid-call budget cap (_enforce_paid_call_budget)
@@ -222,6 +225,7 @@ tests/
   test_maintenance.py          7 tests — reaper: stale running jobs, never-picked-up pending jobs, owner rollback, updated_at keying
   test_tts.py                  8 tests — provider selection, unknown-provider fallback, SilentProvider shared file, synth_to_budget clamp
   test_common.py              16 tests — transient-error classification, retry budget
+  test_job_lifecycle.py       24 tests — job_task on dummy tasks (in-memory SQLite): guard, atomic done-stamp, prepare-before-stamp, retry/backoff, failure stamp, per-job-type owner rollback, after_commit, `.delay` signature regression, JOB_IN_FLIGHT table
   test_generate_task.py        6 tests — missing reel, transient retry, deterministic failure, structured-path music_cue default
   test_render_task.py          5 tests — missing cut, transient retry, success clears stale error, music wiring
   test_asset_sourcer.py        4 tests — resolve_or_reuse pin, reuse, re-pin, beat isolation
@@ -292,14 +296,19 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 ## Key conventions
 
 - **Routers return HTML, not JSON** (except `GET /api/jobs/{id}`). Use `response_class=HTMLResponse` and `templates.TemplateResponse(...)`.
-- **Every Celery task** receives a `job_id`, starts with an idempotency guard, calls `heartbeat()` (from `worker/tasks/common.py`) at every milestone, and always sets final `job.status = done|failed` before returning.
-- **Idempotency guard**: at task entry check `if job.status in (JobStatus.done, JobStatus.running): return`. Done = redelivery no-op. Running = live sibling (reaper handles dead ones via heartbeat).
+- **Every Celery task** is `@celery_app.task(bind=True, max_retries=n)` over `@job_task("<job type>", prepare=..., after_commit=...)` from `worker/tasks/common.py`, wrapping a body `(self, db, job, ctx)`. The decorator owns the idempotency guard, running-stamp, atomic done-stamp, retry-reset and failure stamp; the body calls `heartbeat()` at every milestone and raises to fail.
+  - `prepare(db, job) -> ctx` runs after the guard and **before** the running-stamp: row loads, `... no longer exists` guards and budget checks go here, so a failure there never bumps `attempts` or sets `started_at`.
+  - The body must **not commit after its last domain mutation** — the done-stamp commit lands it atomically with `status = done`. `record_stage()`/`heartbeat()` commit, so keep them before the final mutations.
+  - `after_commit(result)` runs after the done commit (used by `enrich_context` to enqueue `generate_guide`); it receives the body's return value, never a session, and never retries. Its failure additionally rolls back `after_commit_fail_owner`.
+  - The wrapper's signature is forced to `(self, job_id)`: `functools.wraps` alone exposes the body's signature and `.delay(job_id)` raises `TypeError`.
+  - Failure rolls back the owner via `api/state.py::JOB_IN_FLIGHT` — only the state that job type owns (a stale render job never flips a `publishing` cut). The reaper uses the union (`IN_FLIGHT_STATES`). `guide_ready`/`in_review` are deliberately absent.
+- **Idempotency guard**: `job_task` returns at entry if `job.status in (JobStatus.done, JobStatus.running)`. Done = redelivery no-op. Running = live sibling (reaper handles dead ones via heartbeat). Check-then-stamp has no row lock — known, out of scope.
 - **Asset pinning**: use `resolve_or_reuse()` (not `resolve_beat_assets()`) from render tasks. It reuses pinned assets when `visual_direction` fingerprint matches; re-resolves and re-pins only changed beats. This makes re-renders fast and deterministic.
 - **CutAsset timing**: `start_s`/`end_s` are written after TTS duration measurement (in the second loop), not during asset resolution. They reflect actual rendered timecodes.
 - **Wikipedia licensing**: always check `asset.safe_to_publish` before publishing. Wikipedia images are often CC-BY-SA (requires attribution) or non-free. Pexels assets hardcode `safe_to_publish=True`.
 - **TTS caching**: `EdgeTTSProvider.synthesize(text, rate="+0%")` is idempotent. Cache key includes voice + rate + normalized text. `synth_to_budget()` may produce a second file at an adjusted rate. Clearing `ASSET_STORE_DIR/tts/` forces re-synthesis.
 - **Observability**: wrap slow/paid call sites with `record_stage(db, reel_id, "stage_name")`. The context manager writes a `StageEvent` row on exit (success or failure). Do not instrument trivial DB operations.
-- **`heartbeat()` lives in `worker/tasks/common.py`** — never redefine it per task file. Three copies previously drifted apart; the reaper depends on all tasks writing `heartbeat_at` the same way.
+- **`heartbeat()` and `job_task` live in `worker/tasks/common.py`** — never redefine either per task file. Three `heartbeat()` copies previously drifted apart, and the guard/retry/failure stanza was later copied four times; the reaper depends on all tasks writing `heartbeat_at` the same way.
 - **Never skip the state machine**: use `transition(obj, new_status, MAP)` for all status changes.
 - **Beat types are coerced**: `guide_schema.py` maps unknown strings ("closing", "outro", "tactical_analysis") to "cta" or "body". Safe to add new aliases.
 - **on_screen_text**: `_derive_on_screen()` generates up to 5 segments (one per sentence, 7 words each). `clean_guide()` preserves all 5 (`deduped[:5]`). The PATCH endpoint also preserves 5 (`lines[:5]`). The compositor reads `[:5]` in `_build_text_filter()`.

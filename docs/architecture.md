@@ -94,7 +94,7 @@ The browser never fetches JSON. All API responses to the browser are HTML fragme
 | File | Responsibility |
 |---|---|
 | `celery_app.py` | Celery instance; `task_acks_late=True`, `visibility_timeout=7200`, beat schedule, split queues |
-| `tasks/common.py` | `is_transient_error()` / `should_retry()` — retry classification; `heartbeat()` — shared progress + liveness write |
+| `tasks/common.py` | `job_task()` — the shared Job lifecycle decorator every task body runs under (idempotency guard → `prepare` → running-stamp → body → atomic done-stamp → `after_commit`; on error, retry-reset or failure stamp + per-job-type owner rollback from `api/state.py::JOB_IN_FLIGHT`); `rollback_owner()`; `is_transient_error()` / `should_retry()` — retry classification; `heartbeat()` — shared progress + liveness write |
 | `tasks/enrich_context.py` | `enrich_context(job_id)` — idempotency guard → `evaluate_context()` → `script_parser.is_structured()` guard → optional `llm_enrich()` (skipped for structured scripts) → stores `reel.enriched_context` → creates + enqueues generate job |
 | `tasks/generate.py` | `generate_guide(job_id)` — idempotency guard → missing-row guard → `effective_context = enriched_context or context` → structured/standard path → closed-loop eval retry → DB writes; retries transient failures twice |
 | `tasks/render.py` | `render_cut(job_id)` — idempotency guard → missing-row guards → heartbeat → `resolve_or_reuse()` per beat → `synth_to_budget()` → TTS-accurate timecodes → atomic MP4; retries transient failures twice |
