@@ -1,12 +1,10 @@
 import json
 import logging
-from datetime import datetime, timezone
 
 from pydantic import ValidationError
 
 from api import models
 from api.config import settings
-from api.db import SessionLocal
 from api.state import REEL_TRANSITIONS, transition
 from engine.generation.beat_enrichment import (
     _enrich_with_insight,
@@ -31,7 +29,7 @@ from engine.generation.visual_fallback import (
 )
 from engine.observability import paid_call_count, record_stage
 from worker.celery_app import celery_app
-from worker.tasks.common import heartbeat, should_retry
+from worker.tasks.common import heartbeat, job_task
 
 _log = logging.getLogger(__name__)
 
@@ -316,216 +314,174 @@ def _enrich_standard_path_guide(guide: MasterGuide, context: str, enrichment_llm
                 beat.on_screen_text = _postprocess_derive_on_screen(stub.vo_script, max_lines=5)
 
 
+def _load_reel(db, job):
+    """Load the owning reel and enforce the paid-call budget before the job starts."""
+    reel = db.get(models.Reel, job.reel_id)
+    if reel is None:
+        raise ValueError(f"Reel {job.reel_id} no longer exists")
+    _enforce_paid_call_budget(db, reel.id)
+    return reel
+
+
 @celery_app.task(bind=True, max_retries=2)
-def generate_guide(self, job_id: int):
-    db = SessionLocal()
-    try:
-        job = db.get(models.Job, job_id)
-        if job is None:
-            return
-        # Idempotency guard: done = redelivery no-op; running = live sibling
-        if job.status in (models.JobStatus.done, models.JobStatus.running):
-            return
+@job_task("generate", prepare=_load_reel, start_progress=10)
+def generate_guide(self, db, job, reel):
+    effective_context = reel.enriched_context or reel.context
 
-        reel = db.get(models.Reel, job.reel_id)
-        if reel is None:
-            raise ValueError(f"Reel {job.reel_id} no longer exists")
-        effective_context = reel.enriched_context or reel.context
+    cuts = db.query(models.Cut).filter(models.Cut.reel_id == reel.id).all()
+    platforms = [c.platform.value for c in cuts]
+    target_lengths = {c.platform.value: c.target_length_s or 45.0 for c in cuts}
+    max_target = max(target_lengths.values())
+    voiceover_mode = reel.voiceover_mode or "voiceover"
 
-        _enforce_paid_call_budget(db, reel.id)
+    llm = get_llm_provider()
+    quality_threshold = QUALITY_THRESHOLD if is_nvidia_generation() else QUALITY_THRESHOLD_LOCAL
+    guide = None
+    last_exc: Exception | None = None
+    last_score = 0
+    last_issues: list[str] = []
 
-        job.status = models.JobStatus.running
-        job.started_at = datetime.now(timezone.utc)
-        job.heartbeat_at = job.started_at
-        job.attempts = (job.attempts or 0) + 1
-        job.progress = 10
+    # ── Structured-script fast path ──────────────────────────────────────
+    forced_path = (job.meta or {}).get("generation_path", "auto")
+    stubs = script_parser.parse(effective_context)
+    # resolve_generation_path() (shared with the pre-generation cost
+    # estimate, which has no stubs to check) decides via is_structured()
+    # alone. is_structured() is a cheaper header-count check that parse()
+    # itself starts with — but parse() can still return None even when
+    # is_structured() is True, if every detected section's body is empty
+    # after stripping labels/player prefixes. Require stubs is not None
+    # here so that disagreement falls straight through to the standard
+    # path instead of calling _generate_from_structured_script(stubs=None)
+    # and wasting an attempt on a guaranteed TypeError.
+    use_structured = (
+        resolve_generation_path(effective_context, forced_path) == "structured"
+        and stubs is not None
+    )
+
+    if use_structured:
+        heartbeat(db, job, 20)
+        try:
+            guide = _generate_from_structured_script(
+                reel, cuts, llm, db, target_lengths, stubs, context=effective_context
+            )
+            clean_guide(guide, voiceover_mode)
+            rule_s, rule_i = score_guide(effective_context, guide, max_target)
+            last_score, last_issues = _combined_score(
+                rule_s, rule_i, guide, effective_context,
+                db=db, reel_id=reel.id, attempt=1,
+            )
+            # Record path only after structured path succeeds
+            job.meta = {**(job.meta or {}), "path": "structured", "stub_count": len(stubs) if stubs else 0}
+            db.commit()
+            # Fall through to standard path if quality is too low
+            if last_score < quality_threshold:
+                job.meta = {**(job.meta or {}), "structured_score": last_score, "structured_fallback": True}
+                guide = None
+        except Exception as exc:
+            last_exc = exc
+            guide = None
+
+    # ── Standard LLM path (unstructured context or fallback) ─────────────
+    if guide is None:
+        last_exc = None  # structured-path exception must not pollute standard-path errors
+        job.meta = {**(job.meta or {}), "path": "standard", "stub_count": len(stubs) if stubs else 0}
         db.commit()
+        generate_provider = "nvidia" if is_nvidia_generation() else "ollama"
+        feedback: list[str] = []
+        best_guide: MasterGuide | None = None
+        best_score = 0
 
-        cuts = db.query(models.Cut).filter(models.Cut.reel_id == reel.id).all()
-        platforms = [c.platform.value for c in cuts]
-        target_lengths = {c.platform.value: c.target_length_s or 45.0 for c in cuts}
-        max_target = max(target_lengths.values())
-        voiceover_mode = reel.voiceover_mode or "voiceover"
+        for attempt in range(3):
+            _enforce_paid_call_budget(db, reel.id)
+            heartbeat(db, job, 20 + attempt * 20)
 
-        llm = get_llm_provider()
-        quality_threshold = QUALITY_THRESHOLD if is_nvidia_generation() else QUALITY_THRESHOLD_LOCAL
-        guide = None
-        last_exc: Exception | None = None
-        last_score = 0
-        last_issues: list[str] = []
+            messages = build_messages(
+                context=effective_context,
+                niche=reel.niche or "",
+                platforms=platforms,
+                voiceover_mode=voiceover_mode,
+                target_lengths=target_lengths,
+                prior_feedback=feedback or None,
+            )
 
-        # ── Structured-script fast path ──────────────────────────────────────
-        forced_path = (job.meta or {}).get("generation_path", "auto")
-        stubs = script_parser.parse(effective_context)
-        # resolve_generation_path() (shared with the pre-generation cost
-        # estimate, which has no stubs to check) decides via is_structured()
-        # alone. is_structured() is a cheaper header-count check that parse()
-        # itself starts with — but parse() can still return None even when
-        # is_structured() is True, if every detected section's body is empty
-        # after stripping labels/player prefixes. Require stubs is not None
-        # here so that disagreement falls straight through to the standard
-        # path instead of calling _generate_from_structured_script(stubs=None)
-        # and wasting an attempt on a guaranteed TypeError.
-        use_structured = (
-            resolve_generation_path(effective_context, forced_path) == "structured"
-            and stubs is not None
+            with record_stage(db, reel.id, "generate",
+                              provider=generate_provider, attempt=attempt + 1) as ev:
+                raw = llm.complete(messages, json_mode=True)
+                ev.detail["raw_len"] = len(raw)
+                usage = getattr(llm, "last_usage", {})
+                ev.tokens_in = usage.get("prompt_tokens")
+                ev.tokens_out = usage.get("completion_tokens")
+                ev.cost_usd = llm_cost_usd(generate_provider, ev.tokens_in, ev.tokens_out)
+
+            try:
+                candidate = MasterGuide.model_validate_json(raw)
+            except ValidationError as exc:
+                last_exc = exc
+                continue
+
+            clean_guide(candidate, voiceover_mode)
+            enrich_provider = "nvidia" if settings.nvidia_api_key else "ollama"
+            enrichment_llm = get_enrichment_provider()
+            with record_stage(db, reel.id, "enrich",
+                              provider=enrich_provider,
+                              attempt=attempt + 1) as ev:
+                usage_before = dict(getattr(enrichment_llm, "total_usage", {}))
+                shallow_before = sum(
+                    1 for pg in candidate.cuts for b in pg.beats
+                    if b.type == "body" and b.vo_script
+                    and len(b.vo_script.split()) < 25
+                )
+                _enrich_standard_path_guide(candidate, effective_context, enrichment_llm)
+                ev.detail["shallow_beats"] = shallow_before
+                usage_after = getattr(enrichment_llm, "total_usage", {})
+                ev.tokens_in = usage_after.get("prompt_tokens", 0) - usage_before.get("prompt_tokens", 0)
+                ev.tokens_out = usage_after.get("completion_tokens", 0) - usage_before.get("completion_tokens", 0)
+                ev.cost_usd = llm_cost_usd(enrich_provider, ev.tokens_in, ev.tokens_out)
+
+            rule_s, rule_i = score_guide(effective_context, candidate, max_target)
+            last_score, last_issues = _combined_score(
+                rule_s, rule_i, candidate, effective_context,
+                db=db, reel_id=reel.id, attempt=attempt + 1,
+            )
+
+            if last_score >= quality_threshold:
+                guide = candidate
+                break
+
+            # Track best-of-N so we can accept it if all retries fail
+            if last_score > best_score:
+                best_score = last_score
+                best_guide = candidate
+
+            feedback = [i for i in last_issues if not i.startswith("Score breakdown")]
+            last_exc = None
+
+        # Accept best-of-N rather than failing when nothing clears the threshold
+        if guide is None and best_guide is not None:
+            guide = best_guide
+            last_score = best_score
+
+    if guide is None:
+        if last_exc:
+            raise ValueError(
+                f"LLM returned invalid guide after 3 attempts: {last_exc}"
+            ) from last_exc
+        raise ValueError(
+            f"Guide quality score {last_score}/100 after 3 attempts — "
+            f"below {quality_threshold}. Issues: {'; '.join(last_issues)}"
         )
 
-        if use_structured:
-            heartbeat(db, job, 20)
-            try:
-                guide = _generate_from_structured_script(
-                    reel, cuts, llm, db, target_lengths, stubs, context=effective_context
-                )
-                clean_guide(guide, voiceover_mode)
-                rule_s, rule_i = score_guide(effective_context, guide, max_target)
-                last_score, last_issues = _combined_score(
-                    rule_s, rule_i, guide, effective_context,
-                    db=db, reel_id=reel.id, attempt=1,
-                )
-                # Record path only after structured path succeeds
-                job.meta = {**(job.meta or {}), "path": "structured", "stub_count": len(stubs) if stubs else 0}
-                db.commit()
-                # Fall through to standard path if quality is too low
-                if last_score < quality_threshold:
-                    job.meta = {**(job.meta or {}), "structured_score": last_score, "structured_fallback": True}
-                    guide = None
-            except Exception as exc:
-                last_exc = exc
-                guide = None
+    heartbeat(db, job, 80)
 
-        # ── Standard LLM path (unstructured context or fallback) ─────────────
-        if guide is None:
-            last_exc = None  # structured-path exception must not pollute standard-path errors
-            job.meta = {**(job.meta or {}), "path": "standard", "stub_count": len(stubs) if stubs else 0}
-            db.commit()
-            generate_provider = "nvidia" if is_nvidia_generation() else "ollama"
-            feedback: list[str] = []
-            best_guide: MasterGuide | None = None
-            best_score = 0
+    for platform_guide in guide.cuts:
+        cut = next(
+            (c for c in cuts if c.platform.value == platform_guide.platform), None
+        )
+        if cut is None:
+            continue
+        cut.guide = platform_guide.model_dump()
+        cut.caption = platform_guide.caption
+        cut.hashtags = platform_guide.hashtags
 
-            for attempt in range(3):
-                _enforce_paid_call_budget(db, reel.id)
-                heartbeat(db, job, 20 + attempt * 20)
-
-                messages = build_messages(
-                    context=effective_context,
-                    niche=reel.niche or "",
-                    platforms=platforms,
-                    voiceover_mode=voiceover_mode,
-                    target_lengths=target_lengths,
-                    prior_feedback=feedback or None,
-                )
-
-                with record_stage(db, reel.id, "generate",
-                                  provider=generate_provider, attempt=attempt + 1) as ev:
-                    raw = llm.complete(messages, json_mode=True)
-                    ev.detail["raw_len"] = len(raw)
-                    usage = getattr(llm, "last_usage", {})
-                    ev.tokens_in = usage.get("prompt_tokens")
-                    ev.tokens_out = usage.get("completion_tokens")
-                    ev.cost_usd = llm_cost_usd(generate_provider, ev.tokens_in, ev.tokens_out)
-
-                try:
-                    candidate = MasterGuide.model_validate_json(raw)
-                except ValidationError as exc:
-                    last_exc = exc
-                    continue
-
-                clean_guide(candidate, voiceover_mode)
-                enrich_provider = "nvidia" if settings.nvidia_api_key else "ollama"
-                enrichment_llm = get_enrichment_provider()
-                with record_stage(db, reel.id, "enrich",
-                                  provider=enrich_provider,
-                                  attempt=attempt + 1) as ev:
-                    usage_before = dict(getattr(enrichment_llm, "total_usage", {}))
-                    shallow_before = sum(
-                        1 for pg in candidate.cuts for b in pg.beats
-                        if b.type == "body" and b.vo_script
-                        and len(b.vo_script.split()) < 25
-                    )
-                    _enrich_standard_path_guide(candidate, effective_context, enrichment_llm)
-                    ev.detail["shallow_beats"] = shallow_before
-                    usage_after = getattr(enrichment_llm, "total_usage", {})
-                    ev.tokens_in = usage_after.get("prompt_tokens", 0) - usage_before.get("prompt_tokens", 0)
-                    ev.tokens_out = usage_after.get("completion_tokens", 0) - usage_before.get("completion_tokens", 0)
-                    ev.cost_usd = llm_cost_usd(enrich_provider, ev.tokens_in, ev.tokens_out)
-
-                rule_s, rule_i = score_guide(effective_context, candidate, max_target)
-                last_score, last_issues = _combined_score(
-                    rule_s, rule_i, candidate, effective_context,
-                    db=db, reel_id=reel.id, attempt=attempt + 1,
-                )
-
-                if last_score >= quality_threshold:
-                    guide = candidate
-                    break
-
-                # Track best-of-N so we can accept it if all retries fail
-                if last_score > best_score:
-                    best_score = last_score
-                    best_guide = candidate
-
-                feedback = [i for i in last_issues if not i.startswith("Score breakdown")]
-                last_exc = None
-
-            # Accept best-of-N rather than failing when nothing clears the threshold
-            if guide is None and best_guide is not None:
-                guide = best_guide
-                last_score = best_score
-
-        if guide is None:
-            if last_exc:
-                raise ValueError(
-                    f"LLM returned invalid guide after 3 attempts: {last_exc}"
-                ) from last_exc
-            raise ValueError(
-                f"Guide quality score {last_score}/100 after 3 attempts — "
-                f"below {quality_threshold}. Issues: {'; '.join(last_issues)}"
-            )
-
-        heartbeat(db, job, 80)
-
-        for platform_guide in guide.cuts:
-            cut = next(
-                (c for c in cuts if c.platform.value == platform_guide.platform), None
-            )
-            if cut is None:
-                continue
-            cut.guide = platform_guide.model_dump()
-            cut.caption = platform_guide.caption
-            cut.hashtags = platform_guide.hashtags
-
-        transition(reel, "guide_ready", REEL_TRANSITIONS)
-        job.progress = 100
-        job.heartbeat_at = datetime.now(timezone.utc)
-        job.status = models.JobStatus.done
-        job.error = None
-        job.meta = {**(job.meta or {}), "quality_score": last_score}
-        db.commit()
-
-    except Exception as exc:
-        db.rollback()
-        if should_retry(exc, self.request.retries, self.max_retries):
-            job = db.get(models.Job, job_id)
-            if job:
-                # Reset to pending: the idempotency guard rejects `running`, so a
-                # retry that left the status alone would be a silent no-op.
-                job.status = models.JobStatus.pending
-                job.error = f"transient failure, retry {self.request.retries + 1}: {exc}"[:2000]
-                db.commit()
-            raise self.retry(exc=exc, countdown=30 * 2 ** self.request.retries)
-        job = db.get(models.Job, job_id)
-        if job:
-            job.status = models.JobStatus.failed
-            job.error = str(exc)[:2000]
-            reel = db.get(models.Reel, job.reel_id) if job.reel_id else None
-            if reel and reel.status.value == "generating":
-                try:
-                    transition(reel, "failed", REEL_TRANSITIONS)
-                except ValueError:
-                    pass
-            db.commit()
-        raise
-    finally:
-        db.close()
+    transition(reel, "guide_ready", REEL_TRANSITIONS)
+    job.meta = {**(job.meta or {}), "quality_score": last_score}
