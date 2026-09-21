@@ -57,6 +57,29 @@ def test_missing_reel_fails_job_with_actionable_message():
     assert "AttributeError" not in job.error
 
 
+def test_reel_rolled_back_to_failed_is_not_generated():
+    """enrich_context rolls the reel back when it could not confirm the enqueue; a message that
+    still reached the broker must not spend paid LLM calls on a failed reel."""
+    from worker.tasks.generate import generate_guide
+
+    job = _job()
+    reel = _reel()
+    reel.status.value = "failed"
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.generate.paid_call_count", return_value=0),
+        patch("worker.tasks.generate.get_llm_provider") as mock_llm,
+    ):
+        with pytest.raises(ValueError, match="not 'generating'"):
+            generate_guide(1)
+
+    mock_llm.assert_not_called()
+    assert job.status == models.JobStatus.failed
+
+
 def test_paid_call_budget_exceeded_fails_without_retry():
     """A reel that already hit its paid-call cap must fail cleanly, not retry."""
     from worker.tasks.generate import generate_guide

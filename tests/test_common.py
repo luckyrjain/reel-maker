@@ -47,3 +47,16 @@ def test_should_retry_false_at_retry_limit():
 
 def test_should_retry_false_for_deterministic_error():
     assert should_retry(ValueError("bad guide"), retries=0, max_retries=2) is False
+
+
+def test_database_connection_errors_are_transient():
+    """A failover or idle-timeout must retry, not fail a job that never ran."""
+    from sqlalchemy import exc as sa_exc
+    assert is_transient_error(sa_exc.OperationalError("SELECT 1", {}, Exception("server closed the connection")))
+    assert is_transient_error(sa_exc.InterfaceError("SELECT 1", {}, Exception("connection already closed")))
+
+
+def test_database_logic_errors_are_not_transient():
+    from sqlalchemy import exc as sa_exc
+    assert not is_transient_error(sa_exc.IntegrityError("INSERT", {}, Exception("duplicate key")))
+    assert not is_transient_error(sa_exc.ProgrammingError("SELECT", {}, Exception("no such column")))

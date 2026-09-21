@@ -248,3 +248,38 @@ def test_enrichment_failure_rolls_the_reel_back_from_enriching():
             enrich_context(1)
 
     mock_rollback.assert_called_once_with(reel, "failed", REEL_TRANSITIONS)
+
+
+def test_abandon_generate_fails_the_orphan_job_and_only_touches_a_generating_reel():
+    """The generate Job row is committed with the enrich done-stamp; if the enqueue fails it
+    would otherwise sit pending, and the UI would show it as the reel's active job."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    from api import models
+    from worker.tasks.enrich_context import _abandon_generate
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    models.Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine, autoflush=False)()
+    reel = models.Reel(context="c", status=models.ReelStatus.generating)
+    db.add(reel)
+    db.flush()
+    enrich = models.Job(type=models.JobType.enrich, reel_id=reel.id, status=models.JobStatus.failed)
+    orphan = models.Job(type=models.JobType.generate, reel_id=reel.id, status=models.JobStatus.pending)
+    running = models.Job(type=models.JobType.generate, reel_id=reel.id, status=models.JobStatus.running)
+    db.add_all([enrich, orphan, running])
+    db.commit()
+
+    _abandon_generate(db, enrich, orphan.id)
+    db.commit()
+
+    assert db.get(models.Job, orphan.id).status == models.JobStatus.failed
+    assert "could not be enqueued" in db.get(models.Job, orphan.id).error
+    assert db.get(models.Reel, reel.id).status == models.ReelStatus.failed
+
+    # A job someone else already started is not the orphan's business.
+    _abandon_generate(db, enrich, running.id)
+    db.commit()
+    assert db.get(models.Job, running.id).status == models.JobStatus.running

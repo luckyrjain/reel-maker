@@ -314,17 +314,22 @@ def _enrich_standard_path_guide(guide: MasterGuide, context: str, enrichment_llm
                 beat.on_screen_text = _postprocess_derive_on_screen(stub.vo_script, max_lines=5)
 
 
-def _load_reel(db, job):
-    """Load the owning reel and enforce the paid-call budget before the job starts."""
+def _prepare_generate(db, job):
+    """Load the owning reel, refuse a reel that is no longer generating, enforce the budget."""
     reel = db.get(models.Reel, job.reel_id)
     if reel is None:
         raise ValueError(f"Reel {job.reel_id} no longer exists")
+    # enrich_context rolls the reel back to "failed" when it could not confirm this job was
+    # enqueued (a timeout can still leave the message on the broker). Running anyway would
+    # spend paid LLM calls and then fail on the reel's guide_ready transition.
+    if reel.status.value != "generating":
+        raise ValueError(f"Reel {reel.id} is '{reel.status.value}', not 'generating' — not running")
     _enforce_paid_call_budget(db, reel.id)
     return reel
 
 
 @celery_app.task(bind=True, max_retries=2)
-@job_task("generate", prepare=_load_reel, start_progress=10)
+@job_task("generate", prepare=_prepare_generate, start_progress=10)
 def generate_guide(self, db, job, reel):
     effective_context = reel.enriched_context or reel.context
 

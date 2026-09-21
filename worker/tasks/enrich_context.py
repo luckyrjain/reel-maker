@@ -9,7 +9,7 @@ from engine.generation.pricing import llm_cost_usd
 from engine.generation.script_parser import is_structured as _is_structured_script
 from engine.observability import record_stage
 from worker.celery_app import celery_app
-from worker.tasks.common import heartbeat, job_task
+from worker.tasks.common import heartbeat, job_task, rollback_owner
 from worker.tasks.generate import generate_guide
 
 _log = logging.getLogger(__name__)
@@ -26,16 +26,31 @@ def _enqueue_generate(generate_job_id):
     generate_guide.delay(generate_job_id)
 
 
-# max_retries=0 on purpose: enrichment falls back to the raw context, and a retry
-# would re-run a paid LLM call for no gain. If the follow-up enqueue fails after the
-# job is done, the reel is left in "generating" with no job for the reaper to catch,
-# so after_commit_fail_owner rolls it back for the operator to retry.
+def _abandon_generate(db, job, generate_job_id):
+    """The follow-up generate job could not be enqueued.
+
+    Fail the pending row that was committed with the done-stamp (otherwise the UI shows a
+    forever-pending job for a failed reel, and the reaper later rolls back whatever the
+    reel is doing by then), and roll the reel back from "generating" so the operator can retry.
+    """
+    db.query(models.Job).filter(
+        models.Job.id == generate_job_id, models.Job.status == models.JobStatus.pending,
+    ).update(
+        {"status": models.JobStatus.failed, "error": "generate_guide could not be enqueued"},
+        synchronize_session=False,
+    )
+    rollback_owner(db, job, "reel", {"generating"})
+
+
+# max_retries=0 on purpose: enrichment falls back to the raw context, and a retry would
+# re-run a paid LLM call for no gain. If the follow-up enqueue fails after the job is done,
+# _abandon_generate cleans up (the reaper would otherwise only notice after 30 minutes).
 @celery_app.task(bind=True, max_retries=0)
 @job_task(
     "enrich",
     prepare=_load_reel,
     after_commit=_enqueue_generate,
-    after_commit_fail_owner=("reel", "generating"),
+    after_commit_failed=_abandon_generate,
     start_progress=10,
 )
 def enrich_context(self, db, job, reel):

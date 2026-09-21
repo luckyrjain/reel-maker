@@ -15,11 +15,11 @@ from datetime import datetime, timedelta, timezone
 
 from api import models
 from api.db import SessionLocal
-from api.state import IN_FLIGHT_STATES
+from api.state import JOB_IN_FLIGHT
 from worker.celery_app import celery_app
 from worker.tasks.common import rollback_owner
 
-STALE_MINUTES = 5           # > the longest gap between heartbeat updates in any task
+STALE_MINUTES = 5           # job_task beats every HEARTBEAT_INTERVAL_S (30 s), so >> that
 PENDING_STALE_MINUTES = 30  # > the longest a job may legitimately queue behind a render
 
 
@@ -46,27 +46,46 @@ def reap_stuck_jobs():
             )
             .all()
         )
-        for job, reason in (
-            [(j, f"Worker stopped responding (no heartbeat for {STALE_MINUTES} min).") for j in stuck]
-            + [(j, f"Job was never picked up by a worker within {PENDING_STALE_MINUTES} min.") for j in never_started]
+        for job, reason, stale_clause in (
+            [(j, f"Worker stopped responding (no heartbeat for {STALE_MINUTES} min).",
+              models.Job.heartbeat_at < running_cutoff) for j in stuck]
+            + [(j, f"Job was never picked up by a worker within {PENDING_STALE_MINUTES} min.",
+                models.Job.updated_at < pending_cutoff) for j in never_started]
         ):
             try:
-                job.status = models.JobStatus.failed
-                job.error = reason
-                _revert_owner(db, job)
-                db.commit()
+                _reap_one(db, job, reason, stale_clause)
             except Exception:
                 db.rollback()
     finally:
         db.close()
 
 
+def _reap_one(db, job: models.Job, reason: str, stale_clause) -> bool:
+    """Fail one stalled job and roll its owner back. False if it is no longer stale.
+
+    The staleness is re-checked inside the UPDATE itself: the job may have finished, or
+    beaten, between the SELECT that found it and now. Losing that race means leave it alone.
+    """
+    claimed = (
+        db.query(models.Job)
+        .filter(models.Job.id == job.id, models.Job.status == job.status, stale_clause)
+        .update({"status": models.JobStatus.failed, "error": reason}, synchronize_session=False)
+    )
+    if claimed == 0:
+        db.rollback()
+        return False
+    job.status = models.JobStatus.failed
+    job.error = reason
+    _revert_owner(db, job)
+    db.commit()
+    return True
+
+
 def _revert_owner(db, job: models.Job) -> None:
     """Roll the reel/cut back to a state where the operator can retry.
 
-    A stalled job of any type may own either kind, so this rolls back the union
-    of every in-flight state. Each task's own failure path uses the narrower
-    per-job-type entry in JOB_IN_FLIGHT (see worker/tasks/common.py::job_task).
+    Only the state this job's type owns is rolled back (JOB_IN_FLIGHT), the same rule as
+    the task's own failure path — a stale job must never flip an owner that has moved on.
     """
-    for kind, states in IN_FLIGHT_STATES.items():
-        rollback_owner(db, job, kind, states)
+    kind, state = JOB_IN_FLIGHT[job.type.value]
+    rollback_owner(db, job, kind, {state})

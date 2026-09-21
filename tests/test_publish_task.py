@@ -26,6 +26,7 @@ def _cut():
     cut.id = 5
     cut.reel_id = 10
     cut.video_path = "/data/videos/10/youtube_shorts.mp4"
+    cut.platform_post_id = None   # not posted yet (a bare MagicMock would be truthy)
     cut.platform.value = "youtube_shorts"
     cut.status.value = "publishing"
     return cut
@@ -94,12 +95,15 @@ def test_unsafe_asset_blocks_publish():
 
     with (
         patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.publish.get_publisher") as mock_get_publisher,
         patch.object(publish_cut, "retry", side_effect=Retry()) as mock_retry,
     ):
         with pytest.raises(ValueError, match="not cleared for publishing"):
             publish_cut(1)
 
     mock_retry.assert_not_called()
+    mock_get_publisher.assert_not_called()
+    mock_get_publisher.return_value.publish.assert_not_called()
     assert job.status == models.JobStatus.failed
 
 
@@ -169,3 +173,87 @@ def test_successful_publish_records_platform_post_id():
     mock_transition.assert_called_once_with(cut, "published", CUT_TRANSITIONS)
     mock_get_publisher.return_value.publish.assert_called_once()
     assert "caption" in mock_get_publisher.return_value.publish.call_args.kwargs
+
+
+def test_a_transient_publisher_error_is_never_retried_automatically():
+    """A read timeout can arrive after the platform accepted the upload; retrying would post twice."""
+    import httpx
+    from worker.tasks.publish import publish_cut
+
+    assert publish_cut.max_retries == 0
+
+    job = _job()
+    cut = _cut()
+    db = _db_with(job, cut)
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.publish.get_publisher") as mock_get_publisher,
+        patch("worker.tasks.publish.record_stage"),
+        patch("worker.tasks.common.transition"),
+        patch.object(publish_cut, "retry", side_effect=Retry()) as mock_retry,
+    ):
+        mock_get_publisher.return_value.publish.side_effect = httpx.ReadTimeout("response lost")
+        with pytest.raises(httpx.ReadTimeout):
+            publish_cut(1)
+
+    mock_retry.assert_not_called()
+    assert job.status == models.JobStatus.failed
+
+
+def test_post_id_is_committed_before_the_done_stamp():
+    """The post is live and irreversible: its id must be durable even if the job is reaped later."""
+    from worker.tasks.publish import publish_cut
+
+    job = _job()
+    cut = _cut()
+    db = _db_with(job, cut)
+    order = []
+    db.commit.side_effect = lambda: order.append(("commit", cut.platform_post_id))
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.publish.get_publisher") as mock_get_publisher,
+        patch("worker.tasks.publish.record_stage"),
+        patch("worker.tasks.publish.transition"),
+    ):
+        mock_get_publisher.return_value.publish.return_value = PublishResult(
+            platform_post_id="yt-1", url="https://youtube.com/shorts/yt-1"
+        )
+        publish_cut(1)
+
+    assert ("commit", "yt-1") in order, "platform_post_id was never committed on its own"
+
+
+def test_an_already_posted_cut_is_finalized_without_uploading_again():
+    from worker.tasks.publish import publish_cut
+
+    job = _job()
+    cut = _cut()
+    cut.platform_post_id = "yt-earlier"
+    db = _db_with(job, cut)
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.publish.get_publisher") as mock_get_publisher,
+        patch("worker.tasks.publish.transition") as mock_transition,
+    ):
+        publish_cut(1)
+
+    mock_get_publisher.return_value.publish.assert_not_called()
+    assert cut.platform_post_id == "yt-earlier"
+    mock_transition.assert_called_once_with(cut, "published", CUT_TRANSITIONS)
+    assert job.status == models.JobStatus.done
+
+
+def test_an_already_posted_cut_still_passes_the_safety_gate():
+    """Finalizing must not become a way around assert_safe_to_publish."""
+    from worker.tasks.publish import publish_cut
+
+    job = _job()
+    cut = _cut()
+    cut.platform_post_id = "yt-earlier"
+    db = _db_with(job, cut, unsafe_rows=[_unsafe_row()])
+
+    with patch("worker.tasks.common.SessionLocal", return_value=db):
+        with pytest.raises(ValueError, match="not cleared for publishing"):
+            publish_cut(1)

@@ -46,6 +46,9 @@ celery_app.conf.update(
         # I/O-bound (network upload), not CPU-bound — belongs with generation, not rendering.
         "worker.tasks.publish.publish_cut":                 {"queue": "generation"},
         "worker.tasks.metrics.pull_publish_metrics":        {"queue": "generation"},
+        # Beat publishes this by name; without a route it lands on the default
+        # "celery" queue, which neither documented worker consumes.
+        "worker.tasks.maintenance.reap_stuck_jobs":         {"queue": "generation"},
     },
 
     # Celery beat schedule for periodic maintenance.

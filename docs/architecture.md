@@ -84,7 +84,7 @@ The browser never fetches JSON. All API responses to the browser are HTML fragme
 | `db.py` | SQLAlchemy engine, `SessionLocal`, `get_db()` FastAPI dependency |
 | `models.py` | All ORM models and status enums; includes `StageEvent` |
 | `schemas.py` | `JobResponse` — the one JSON endpoint's response shape |
-| `state.py` | `REEL_TRANSITIONS`, `CUT_TRANSITIONS` dicts + `transition()` guard |
+| `state.py` | `REEL_TRANSITIONS`, `CUT_TRANSITIONS` dicts + `transition()` guard; `JOB_IN_FLIGHT` — the owner state each job type rolls back to `failed` |
 | `routers/reels.py` | `POST /api/reels` — creates reel, enqueues `enrich_context`; `GET /api/reels/{id}/active-job-fragment` — reel-level polling; `GET /api/reels/{id}` |
 | `routers/jobs.py` | `GET /api/jobs/{id}` (JSON) — the only JSON endpoint |
 | `routers/cuts.py` | `POST /api/cuts/{id}/render`, `PATCH /api/cuts/{id}`, `POST /api/cuts/{id}/approve`, render-status, video stream |
@@ -94,11 +94,11 @@ The browser never fetches JSON. All API responses to the browser are HTML fragme
 | File | Responsibility |
 |---|---|
 | `celery_app.py` | Celery instance; `task_acks_late=True`, `visibility_timeout=7200`, beat schedule, split queues |
-| `tasks/common.py` | `job_task()` — the shared Job lifecycle decorator every task body runs under (idempotency guard → `prepare` → running-stamp → body → atomic done-stamp → `after_commit`; on error, retry-reset or failure stamp + per-job-type owner rollback from `api/state.py::JOB_IN_FLIGHT`); `rollback_owner()`; `is_transient_error()` / `should_retry()` — retry classification; `heartbeat()` — shared progress + liveness write |
-| `tasks/enrich_context.py` | `enrich_context(job_id)` — idempotency guard → `evaluate_context()` → `script_parser.is_structured()` guard → optional `llm_enrich()` (skipped for structured scripts) → stores `reel.enriched_context` → creates + enqueues generate job |
-| `tasks/generate.py` | `generate_guide(job_id)` — idempotency guard → missing-row guard → `effective_context = enriched_context or context` → structured/standard path → closed-loop eval retry → DB writes; retries transient failures twice |
-| `tasks/render.py` | `render_cut(job_id)` — idempotency guard → missing-row guards → heartbeat → `resolve_or_reuse()` per beat → `synth_to_budget()` → TTS-accurate timecodes → atomic MP4; retries transient failures twice |
-| `tasks/maintenance.py` | `reap_stuck_jobs()` — Celery beat, every 60 s; fails `running` jobs with stale heartbeat (> 5 min) and `pending` jobs never picked up (> 30 min) |
+| `tasks/common.py` | `job_task()` — the shared Job lifecycle decorator every task body runs under (only-`pending` guard → atomic claim → heartbeat thread → `prepare` → body → fenced done-stamp → `after_commit`; on error, retry-reset or failure stamp + per-job-type owner rollback from `api/state.py::JOB_IN_FLIGHT`, every write a compare-and-set); `rollback_owner()`; `is_transient_error()` / `should_retry()` — retry classification; `heartbeat()` — shared progress write |
+| `tasks/enrich_context.py` | `enrich_context(job_id)` — `evaluate_context()` → `script_parser.is_structured()` guard → optional `llm_enrich()` (skipped for structured scripts) → stores `reel.enriched_context` → creates + enqueues generate job |
+| `tasks/generate.py` | `generate_guide(job_id)` — `prepare` (missing-row guard, reel must be `generating`, paid-call budget) → `effective_context = enriched_context or context` → structured/standard path → closed-loop eval retry → DB writes; retries transient failures twice |
+| `tasks/render.py` | `render_cut(job_id)` — `prepare` (missing-row guards) → heartbeat → `resolve_or_reuse()` per beat → `synth_to_budget()` → TTS-accurate timecodes → atomic MP4; retries transient failures twice |
+| `tasks/maintenance.py` | `reap_stuck_jobs()` — Celery beat, every 60 s; fails `running` jobs with stale heartbeat (> 5 min) and `pending` jobs never picked up (> 30 min); routed to the `generation` queue; each reap is a compare-and-set that rolls back only the owner state the job's type owns |
 
 ### `engine/`
 
@@ -140,11 +140,12 @@ The browser never fetches JSON. All API responses to the browser are HTML fragme
 | `test_enrichment.py` | 15 tests — `coerce_beat_type`, `_enrich_batch` response shapes, topic fence assertions |
 | `test_audio_text_sync.py` | 11 tests — `clean_guide()` regeneration, `_build_text_filter()` proportional timing + Whisper fallback, visual direction anchoring |
 | `test_context_enricher.py` | 13 tests — all 5 evaluator axes at boundary values, combined score, `llm_enrich` |
-| `test_enrich_context_task.py` | 10 tests — idempotency guard, enrichment gating, LLM failure fallback, structured script guard, missing reel |
-| `test_common.py` | 16 tests — transient-error classification, retry budget boundary |
-| `test_generate_task.py` | 3 tests — missing reel, transient retry resets to pending, deterministic failure does not retry |
-| `test_render_task.py` | 3 tests — missing cut, transient retry, success clears stale error |
-| `test_maintenance.py` | 7 tests — reaper: stale running jobs, never-picked-up pending jobs, owner rollback, `updated_at` keying |
+| `test_enrich_context_task.py` | 13 tests — enrichment gating, LLM failure fallback, structured script guard, missing reel, owner rollback wiring, orphan generate-job cleanup |
+| `test_job_lifecycle.py` | 40 tests — `job_task` on dummy tasks: atomic claim, fenced done-stamp, heartbeat thread, retry/failure/owner rollback, `.delay` signature regression, per-task wiring, beat routing |
+| `test_common.py` | 18 tests — transient-error classification (incl. DB connection errors), retry budget boundary |
+| `test_generate_task.py` | 6 tests — missing reel, reel not generating, paid-call budget, structured-path fallback, `music_cue` default |
+| `test_render_task.py` | 4 tests — missing cut, success clears stale error, music wiring |
+| `test_maintenance.py` | 16 tests — reaper on SQLite: per-job-type owner rollback, stale running/pending jobs, healthy jobs untouched, `updated_at` keying, compare-and-set back-off |
 | `test_asset_sourcer.py` | 4 tests — `resolve_or_reuse` pin, reuse-without-API-call, re-pin, per-beat isolation |
 | `test_llm_judge.py` | 3 tests — neutral-score fallback on provider raise, garbage JSON, out-of-range dimension |
 | `test_tts.py` | 8 tests — provider selection, unknown-provider fallback, `SilentProvider` shared file, `synth_to_budget` clamp |
@@ -278,24 +279,24 @@ combined = int(rule × 0.4 + llm × 0.6)   threshold 80 (NVIDIA) / 65 (local Oll
 | `visibility_timeout` | 7200 s | > worst-case render; prevents duplicate runs on slow tasks |
 | `worker_prefetch_multiplier` | 1 | No worker hoards multiple long tasks |
 | `worker_max_tasks_per_child` | 10 | Respawn render workers to reclaim MoviePy/ffmpeg memory |
-| `max_retries` | 2 | Real, via `should_retry()` — 30 s/60 s backoff on transient failures only; `enrich_context` stays at 0 |
+| `max_retries` | 2 | Real, via `should_retry()` — 30 s/60 s backoff on transient failures only; `enrich_context` and `publish_cut` stay at 0 (publishing is an irreversible external post) |
 
 ### Idempotency
 
-All three tasks guard at entry: `if job.status in (done, running): return`. This makes redelivered tasks safe — a completed job becomes a no-op, and a live sibling is detected by status.
+`job_task` lets only a `pending` job run: `done`/`running` are redelivery no-ops, and `failed` is terminal (an operator retry creates a new Job, so a late redelivery of a reaped job must not run — for publish it would upload the video). The claim is an atomic `UPDATE … WHERE status = 'pending'`, so of two deliveries only one runs the body, and the done-stamp is fenced on `status = 'running'` so a worker the reaper already gave up on cannot commit its result.
 
-This is also why the retry branch resets `job.status` to `pending` before calling `self.retry()`: a retry that left the status at `running` would hit this guard on redelivery and return immediately, making every retry a silent no-op.
+This is also why the retry branch resets `job.status` to `pending` before calling `self.retry()`: a retry that left the status at `running` would be rejected by the claim on redelivery, making every retry a silent no-op.
 
 ### Heartbeat + stuck-job reaper
 
-Tasks call `heartbeat(db, job, progress)` — from `worker/tasks/common.py`, never redefined per task — at every milestone, writing `job.heartbeat_at`.
+`job_task` refreshes `job.heartbeat_at` every 30 s from a background thread while the body runs (an LLM call or a render can block for minutes), and bodies call `heartbeat(db, job, progress)` — from `worker/tasks/common.py`, never redefined per task — for progress.
 
 `reap_stuck_jobs` (Celery beat, 60 s interval) fails two kinds of stalled job:
 
 - `status=running` with `heartbeat_at` older than 5 minutes — worker killed mid-task.
 - `status=pending` with `updated_at` older than 30 minutes — never picked up at all (broker down when `.delay()` ran, or no worker consuming the queue). Keyed on `updated_at`, not `created_at`, so a job sitting in retry backoff is not reaped for being old.
 
-Both then roll the owning reel (`enriching` or `generating`) or cut back to a retryable state.
+Each reap is a compare-and-set that re-checks staleness in the UPDATE (a job that beat or finished after the SELECT is left alone), and rolls back only the owner state the job's type owns (`JOB_IN_FLIGHT`). The task is routed to the `generation` queue; a beat task with no route lands on the default queue that no documented worker consumes.
 
 ### Atomic file writes
 
