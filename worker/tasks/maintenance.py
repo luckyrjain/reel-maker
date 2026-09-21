@@ -15,8 +15,9 @@ from datetime import datetime, timedelta, timezone
 
 from api import models
 from api.db import SessionLocal
-from api.state import REEL_TRANSITIONS, CUT_TRANSITIONS, transition
+from api.state import IN_FLIGHT_STATES
 from worker.celery_app import celery_app
+from worker.tasks.common import rollback_owner
 
 STALE_MINUTES = 5           # > the longest gap between heartbeat updates in any task
 PENDING_STALE_MINUTES = 30  # > the longest a job may legitimately queue behind a render
@@ -61,18 +62,11 @@ def reap_stuck_jobs():
 
 
 def _revert_owner(db, job: models.Job) -> None:
-    """Roll the reel/cut back to a state where the operator can retry."""
-    if job.reel_id:
-        reel = db.get(models.Reel, job.reel_id)
-        if reel and reel.status.value in ("enriching", "generating"):
-            try:
-                transition(reel, "failed", REEL_TRANSITIONS)
-            except ValueError:
-                pass
-    if job.cut_id:
-        cut = db.get(models.Cut, job.cut_id)
-        if cut and cut.status.value in ("rendering", "publishing"):
-            try:
-                transition(cut, "failed", CUT_TRANSITIONS)
-            except ValueError:
-                pass
+    """Roll the reel/cut back to a state where the operator can retry.
+
+    A stalled job of any type may own either kind, so this rolls back the union
+    of every in-flight state. Each task's own failure path uses the narrower
+    per-job-type entry in JOB_IN_FLIGHT (see worker/tasks/common.py::job_task).
+    """
+    for kind, states in IN_FLIGHT_STATES.items():
+        rollback_owner(db, job, kind, states)

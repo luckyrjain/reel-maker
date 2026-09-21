@@ -2,7 +2,8 @@
 from unittest.mock import MagicMock, patch
 
 from api import models
-from worker.tasks.maintenance import CUT_TRANSITIONS, REEL_TRANSITIONS, _revert_owner, reap_stuck_jobs
+from api.state import CUT_TRANSITIONS, REEL_TRANSITIONS
+from worker.tasks.maintenance import _revert_owner, reap_stuck_jobs
 
 
 def _job(reel_id=None, cut_id=None):
@@ -30,7 +31,7 @@ def test_revert_owner_fails_enriching_reel():
     """A reel stalled in 'enriching' must be rolled back, not only 'generating'."""
     db = MagicMock()
     db.get.return_value = _reel("enriching")
-    with patch("worker.tasks.maintenance.transition") as mock_transition:
+    with patch("worker.tasks.common.transition") as mock_transition:
         _revert_owner(db, _job(reel_id=5))
     mock_transition.assert_called_once_with(db.get.return_value, "failed", REEL_TRANSITIONS)
 
@@ -38,7 +39,7 @@ def test_revert_owner_fails_enriching_reel():
 def test_revert_owner_fails_generating_reel():
     db = MagicMock()
     db.get.return_value = _reel("generating")
-    with patch("worker.tasks.maintenance.transition") as mock_transition:
+    with patch("worker.tasks.common.transition") as mock_transition:
         _revert_owner(db, _job(reel_id=5))
     mock_transition.assert_called_once_with(db.get.return_value, "failed", REEL_TRANSITIONS)
 
@@ -46,7 +47,7 @@ def test_revert_owner_fails_generating_reel():
 def test_revert_owner_leaves_finished_reel_alone():
     db = MagicMock()
     db.get.return_value = _reel("guide_ready")
-    with patch("worker.tasks.maintenance.transition") as mock_transition:
+    with patch("worker.tasks.common.transition") as mock_transition:
         _revert_owner(db, _job(reel_id=5))
     mock_transition.assert_not_called()
 
@@ -54,7 +55,7 @@ def test_revert_owner_leaves_finished_reel_alone():
 def test_revert_owner_fails_rendering_cut():
     db = MagicMock()
     db.get.return_value = _cut("rendering")
-    with patch("worker.tasks.maintenance.transition") as mock_transition:
+    with patch("worker.tasks.common.transition") as mock_transition:
         _revert_owner(db, _job(cut_id=9))
     mock_transition.assert_called_once_with(db.get.return_value, "failed", CUT_TRANSITIONS)
 
@@ -63,7 +64,7 @@ def test_revert_owner_fails_publishing_cut():
     """A publish worker killed mid-upload must not leave the cut stuck forever."""
     db = MagicMock()
     db.get.return_value = _cut("publishing")
-    with patch("worker.tasks.maintenance.transition") as mock_transition:
+    with patch("worker.tasks.common.transition") as mock_transition:
         _revert_owner(db, _job(cut_id=9))
     mock_transition.assert_called_once_with(db.get.return_value, "failed", CUT_TRANSITIONS)
 
@@ -71,7 +72,7 @@ def test_revert_owner_fails_publishing_cut():
 def test_revert_owner_leaves_finished_cut_alone():
     db = MagicMock()
     db.get.return_value = _cut("published")
-    with patch("worker.tasks.maintenance.transition") as mock_transition:
+    with patch("worker.tasks.common.transition") as mock_transition:
         _revert_owner(db, _job(cut_id=9))
     mock_transition.assert_not_called()
 
@@ -85,7 +86,7 @@ def _run_reaper(stuck=(), never_started=()):
     db.get.return_value = _reel("enriching")
     with (
         patch("worker.tasks.maintenance.SessionLocal", return_value=db),
-        patch("worker.tasks.maintenance.transition") as mock_transition,
+        patch("worker.tasks.common.transition") as mock_transition,
     ):
         reap_stuck_jobs()
     return mock_transition
