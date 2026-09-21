@@ -18,7 +18,7 @@ from worker.tasks.maintenance import (
 
 _MINUTE = timedelta(minutes=1)
 
-_LONG_AGO = datetime.now(timezone.utc) - timedelta(hours=2)
+_LONG_AGO = datetime.now(timezone.utc) - timedelta(hours=6)
 
 
 @pytest.fixture
@@ -225,20 +225,19 @@ def test_one_bad_job_does_not_stop_the_rest(factory):
 def test_stale_thresholds_leave_room_for_the_heartbeat_thread():
     from worker.tasks import common
     assert STALE_MINUTES * 60 >= 4 * common.HEARTBEAT_INTERVAL_S
-    assert min(PENDING_STALE_MINUTES.values()) > STALE_MINUTES
-    assert set(PENDING_STALE_MINUTES) == {t.value for t in models.JobType}
+    assert PENDING_STALE_MINUTES > STALE_MINUTES
 
 
 @pytest.mark.parametrize("job_type, age_minutes, reaped", [
-    (models.JobType.generate, 45, True),    # generation queue is drained quickly
-    (models.JobType.generate, 10, False),
-    (models.JobType.render, 120, False),    # queued behind other hour-long renders (concurrency 1)
+    (models.JobType.render, 120, False),     # queued behind other hour-long renders (concurrency 1)
+    (models.JobType.generate, 120, False),   # four generation slots can each be busy for hours
+    (models.JobType.publish, 120, False),
     (models.JobType.render, 5 * 60, True),
-    (models.JobType.publish, 30, False),
-    (models.JobType.publish, 90, True),
+    (models.JobType.generate, 5 * 60, True),
+    (models.JobType.enrich, 5 * 60, True),
 ])
-def test_pending_threshold_is_per_job_type(factory, job_type, age_minutes, reaped):
-    """A render legitimately queues for hours behind others; reaping it would silently drop it."""
+def test_a_job_queued_for_hours_is_not_mistaken_for_a_lost_message(factory, job_type, age_minutes, reaped):
+    """A reaped job is terminal, so reaping a merely-queued one silently drops it."""
     job_id, reel_id, cut_id = _make(
         factory, job_type, job_status=models.JobStatus.pending,
         updated_at=datetime.now(timezone.utc) - age_minutes * _MINUTE,
@@ -248,13 +247,33 @@ def test_pending_threshold_is_per_job_type(factory, job_type, age_minutes, reape
     assert (status == models.JobStatus.failed) is reaped
 
 
-def test_max_runtime_leaves_the_reaper_time_to_act_before_a_pending_job_could_be_lost():
-    from worker.tasks import publish, render  # noqa: F401  (registers the tasks)
+def test_the_pending_threshold_outlasts_a_queue_of_capped_renders():
     from worker.celery_app import celery_app
     celery_app.loader.import_default_modules()
     render_cap = celery_app.tasks["worker.tasks.render.render_cut"].run.max_runtime_s
-    # A queued render waits behind at most a few renders that each stop being beaten at render_cap.
-    assert PENDING_STALE_MINUTES["render"] * 60 >= 3 * render_cap
+    # A queued render waits behind at most a few renders that each run up to their cap.
+    assert PENDING_STALE_MINUTES * 60 >= 3 * render_cap
+
+
+def test_a_running_job_with_no_heartbeat_at_all_is_still_reaped(factory):
+    """Rows from before heartbeat_at existed have it NULL; `NULL < cutoff` is never true."""
+    job_id, reel_id, cut_id = _make(factory, models.JobType.generate, job_status=models.JobStatus.running)
+    db = factory()
+    db.query(models.Job).filter(models.Job.id == job_id).update(
+        {"heartbeat_at": None, "started_at": None, "updated_at": _LONG_AGO}, synchronize_session=False)
+    db.commit()
+    reap_stuck_jobs()
+    assert _state(factory, job_id, reel_id, cut_id)[0].status == models.JobStatus.failed
+
+
+def test_a_pending_job_with_no_updated_at_is_judged_by_created_at(factory):
+    job_id, reel_id, cut_id = _make(factory, models.JobType.generate, job_status=models.JobStatus.pending)
+    db = factory()
+    db.query(models.Job).filter(models.Job.id == job_id).update(
+        {"updated_at": None, "created_at": _LONG_AGO}, synchronize_session=False)
+    db.commit()
+    reap_stuck_jobs()
+    assert _state(factory, job_id, reel_id, cut_id)[0].status == models.JobStatus.failed
 
 
 # ── hardening found by mutation testing ───────────────────────────────────────

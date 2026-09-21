@@ -56,6 +56,9 @@ celery_app.conf.update(
         "reap-stuck-jobs": {
             "task": "worker.tasks.maintenance.reap_stuck_jobs",
             "schedule": 60.0,  # every 60 s
+            # It shares the generation queue with long jobs; a starved reaper must not leave an
+            # hour of stale messages to drain in a burst once a slot frees up.
+            "options": {"expires": 55},
         },
         "pull-publish-metrics": {
             "task": "worker.tasks.metrics.pull_publish_metrics",

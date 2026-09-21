@@ -10,6 +10,7 @@ from api.config import settings
 from api.db import get_db
 from api.state import CUT_TRANSITIONS, transition
 from engine.generation.postprocess import _derive_on_screen
+from worker.tasks.common import fail_unenqueued
 from worker.tasks.publish import publish_cut
 from worker.tasks.render import render_cut
 
@@ -26,7 +27,9 @@ def _cut_card(request: Request, cut: models.Cut) -> HTMLResponse:
 
 @router.post("/cuts/{cut_id}/render", response_class=HTMLResponse)
 def trigger_render(cut_id: int, request: Request, db: Session = Depends(get_db)):
-    cut = db.get(models.Cut, cut_id)
+    # FOR UPDATE: a double-click (or Retry render + Retry publish) serialises on the cut row, so the
+    # second request sees the first one's status change instead of both passing the guards below.
+    cut = db.get(models.Cut, cut_id, with_for_update=True)
     if not cut:
         raise HTTPException(status_code=404, detail="Cut not found")
 
@@ -60,7 +63,11 @@ def trigger_render(cut_id: int, request: Request, db: Session = Depends(get_db))
     db.commit()
     db.refresh(job)
 
-    render_cut.delay(job.id)
+    try:
+        render_cut.delay(job.id)
+    except Exception as exc:
+        fail_unenqueued(db, job, exc)
+        raise HTTPException(status_code=503, detail="Could not queue the render — try again") from exc
 
     return templates.TemplateResponse(
         request, "fragments/render_status.html",
@@ -147,7 +154,7 @@ def approve_cut(cut_id: int, request: Request, db: Session = Depends(get_db)):
 
 @router.post("/cuts/{cut_id}/publish", response_class=HTMLResponse)
 def trigger_publish(cut_id: int, request: Request, db: Session = Depends(get_db)):
-    cut = db.get(models.Cut, cut_id)
+    cut = db.get(models.Cut, cut_id, with_for_update=True)   # see trigger_render
     if not cut:
         raise HTTPException(status_code=404, detail="Cut not found")
 
@@ -179,7 +186,11 @@ def trigger_publish(cut_id: int, request: Request, db: Session = Depends(get_db)
     db.commit()
     db.refresh(job)
 
-    publish_cut.delay(job.id)
+    try:
+        publish_cut.delay(job.id)
+    except Exception as exc:
+        fail_unenqueued(db, job, exc)
+        raise HTTPException(status_code=503, detail="Could not queue the publish — try again") from exc
 
     return templates.TemplateResponse(
         request, "fragments/publish_status.html",

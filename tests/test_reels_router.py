@@ -274,6 +274,19 @@ def test_create_reel_defaults_to_youtube_and_instagram(client):
     db.close()
 
 
+def test_create_reel_that_cannot_be_enqueued_fails_fast_instead_of_polling_forever(client):
+    with patch("api.routers.reels.enrich_context") as mock_enrich:
+        mock_enrich.delay.side_effect = ConnectionError("broker down")
+        resp = client.post("/api/reels", data={"context": "A" * 60})
+    assert resp.status_code == 503
+    db = client._session_factory()
+    reel = db.query(models.Reel).order_by(models.Reel.id.desc()).first()
+    assert reel.status == models.ReelStatus.failed
+    job = db.query(models.Job).filter(models.Job.reel_id == reel.id).one()
+    assert job.status == models.JobStatus.failed and "could not enqueue" in job.error
+    db.close()
+
+
 def test_create_reel_honors_explicit_platform_selection(client):
     with patch("api.routers.reels.enrich_context"):
         resp = client.post(

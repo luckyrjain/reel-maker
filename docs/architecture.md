@@ -98,7 +98,7 @@ The browser never fetches JSON. All API responses to the browser are HTML fragme
 | `tasks/enrich_context.py` | `enrich_context(job_id)` — `evaluate_context()` → `script_parser.is_structured()` guard → optional `llm_enrich()` (skipped for structured scripts) → stores `reel.enriched_context` → creates + enqueues generate job |
 | `tasks/generate.py` | `generate_guide(job_id)` — `prepare` (missing-row guard, reel must be `generating`, paid-call budget) → `effective_context = enriched_context or context` → structured/standard path → closed-loop eval retry → DB writes; retries transient failures twice |
 | `tasks/render.py` | `render_cut(job_id)` — `prepare` (missing-row guards) → heartbeat → `resolve_or_reuse()` per beat → `synth_to_budget()` → TTS-accurate timecodes → atomic MP4; retries transient failures twice |
-| `tasks/maintenance.py` | `reap_stuck_jobs()` — Celery beat, every 60 s; fails `running` jobs with stale heartbeat (> 5 min) and `pending` jobs never picked up (> 30 min); routed to the `generation` queue; each reap is a compare-and-set that rolls back only the owner state the job's type owns |
+| `tasks/maintenance.py` | `reap_stuck_jobs()` — Celery beat, every 60 s; fails `running` jobs with stale heartbeat (> 5 min) and `pending` jobs never picked up (> 240 min, `PENDING_STALE_MINUTES`); routed to the `generation` queue with a 55 s message expiry; each reap is a compare-and-set that rolls back only the owner state the job's type owns |
 
 ### `engine/`
 
@@ -141,18 +141,18 @@ The browser never fetches JSON. All API responses to the browser are HTML fragme
 | `test_audio_text_sync.py` | 11 tests — `clean_guide()` regeneration, `_build_text_filter()` proportional timing + Whisper fallback, visual direction anchoring |
 | `test_context_enricher.py` | 13 tests — all 5 evaluator axes at boundary values, combined score, `llm_enrich` |
 | `test_enrich_context_task.py` | 14 tests — enrichment gating, LLM failure fallback, structured script guard, missing reel, owner rollback wiring, orphan cleanup |
-| `test_job_lifecycle.py` | 63 tests — `job_task` on dummy tasks: atomic claim, fenced done-stamp/heartbeat, heartbeat thread, retry/failure/owner rollback, `.delay` signature regression, per-task wiring, beat routing |
+| `test_job_lifecycle.py` | 81 tests — `job_task` on dummy tasks: atomic claim, fenced done-stamp/heartbeat, heartbeat thread, retry/failure/owner rollback, `.delay` signature regression, per-task wiring, beat routing |
 | `test_tasks_real_db.py` | 4 tests — real tasks through `job_task`: post id durable, caption sent, enrich enqueues the real job id |
 | `test_common.py` | 18 tests — transient-error classification (incl. DB connection errors), retry budget boundary |
 | `test_generate_task.py` | 6 tests — missing reel, reel not generating, paid-call budget, structured-path fallback, `music_cue` default |
 | `test_publish_task.py` | 10 tests — safety gate, no auto-retry, early post id, finalize without re-upload, attribution |
-| `test_render_task.py` | 5 tests — missing cut, already-posted cut refused, success clears stale error, music wiring |
-| `test_maintenance.py` | 27 tests — reaper on SQLite: per-job-type rollback and pending thresholds, compare-and-set back-off, status pin |
+| `test_render_task.py` | 6 tests — missing cut, already-posted cut refused, success clears stale error, music wiring |
+| `test_maintenance.py` | 29 tests — reaper on SQLite: per-job-type rollback and pending thresholds, compare-and-set back-off, status pin |
 | `test_asset_sourcer.py` | 4 tests — `resolve_or_reuse` pin, reuse-without-API-call, re-pin, per-beat isolation |
 | `test_llm_judge.py` | 3 tests — neutral-score fallback on provider raise, garbage JSON, out-of-range dimension |
 | `test_tts.py` | 8 tests — provider selection, unknown-provider fallback, `SilentProvider` shared file, `synth_to_budget` clamp |
 
-**144 tests across 14 files.**
+**426 tests across 35 files.**
 
 ---
 
@@ -296,7 +296,7 @@ This is also why the retry branch resets `job.status` to `pending` before callin
 `reap_stuck_jobs` (Celery beat, 60 s interval) fails two kinds of stalled job:
 
 - `status=running` with `heartbeat_at` older than 5 minutes — worker killed mid-task.
-- `status=pending` with `updated_at` older than 30 minutes — never picked up at all (broker down when `.delay()` ran, or no worker consuming the queue). Keyed on `updated_at`, not `created_at`, so a job sitting in retry backoff is not reaped for being old.
+- `status=pending` with `updated_at` older than 240 minutes (`PENDING_STALE_MINUTES`) — never picked up at all (a message lost after a successful enqueue, or no worker consuming the queue). Deliberately long: a job legitimately queues behind hour-long renders (concurrency 1) or busy generation slots, and a reaped job is terminal. A router whose `.delay()` raised fails its job immediately (`fail_unenqueued`) instead of waiting for this. Keyed on `updated_at`, not `created_at`, so a job sitting in retry backoff is not reaped for being old.
 
 Each reap is a compare-and-set that re-checks staleness in the UPDATE (a job that beat or finished after the SELECT is left alone), and rolls back only the owner state the job's type owns (`JOB_IN_FLIGHT`). The task is routed to the `generation` queue; a beat task with no route lands on the default queue that no documented worker consumes.
 

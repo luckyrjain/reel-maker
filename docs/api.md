@@ -108,13 +108,14 @@ Transition a cut from `in_review` to `approved`.
 
 Transition a cut to `rendering` and enqueue the render task.
 
-**Valid from statuses:** `draft`, `in_review` (re-render), `failed` (auto-resets to `draft` first)
+**Valid from statuses:** `draft`, `in_review` (re-render), `failed` (auto-resets to `draft` first) — except a cut that already has a `platform_post_id`, which is refused (see below)
 
 **Response:** `text/html` — `fragments/render_status.html` with HTMX polling trigger.
 
 **Errors:**
 - `404` — cut not found
-- `409` — cut is already `rendering`, or is in a non-renderable status
+- `409` — cut is already `rendering`, is in a non-renderable status, or is already posted (`platform_post_id` set: re-rendering would leave the cut pointing at the live post)
+- `503` — the job could not be queued (broker unreachable); the job and cut are rolled back so it can be retried at once
 
 ---
 

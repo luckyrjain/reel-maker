@@ -8,6 +8,7 @@ from api.db import get_db
 from api import models
 from api.state import transition, REEL_TRANSITIONS
 from engine.generation.estimate import estimate_generation
+from worker.tasks.common import fail_unenqueued
 from worker.tasks.enrich_context import enrich_context
 
 router = APIRouter()
@@ -65,7 +66,11 @@ def create_reel(
     db.commit()
     db.refresh(job)
 
-    enrich_context.delay(job.id)
+    try:
+        enrich_context.delay(job.id)
+    except Exception as exc:
+        fail_unenqueued(db, job, exc)
+        raise HTTPException(status_code=503, detail="Could not queue the job — try again") from exc
 
     return templates.TemplateResponse(
         request, "fragments/pipeline_status.html",

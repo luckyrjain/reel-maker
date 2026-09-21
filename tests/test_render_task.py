@@ -102,6 +102,38 @@ def test_an_already_posted_cut_cannot_be_re_rendered():
     assert job.status == models.JobStatus.failed
 
 
+def test_a_render_that_a_publish_overtook_is_discarded():
+    """Retry render and Retry publish were both started from a failed cut; the publish posted first.
+    Recording this render would let a later finalize mark new content as the posted video."""
+    from worker.tasks.render import render_cut
+
+    job = _job()
+    cut = _cut()
+    reel = _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else (
+        cut if model is models.Cut else reel
+    )
+    db.refresh.side_effect = lambda obj: setattr(obj, "platform_post_id", "yt-posted-meanwhile") if obj is cut else None
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.render.get_asset_sourcer"),
+        patch("worker.tasks.render.get_wiki_sourcer"),
+        patch("worker.tasks.render.get_hf_sourcer"),
+        patch("worker.tasks.render.get_hf_video_sourcer"),
+        patch("worker.tasks.render.get_tts_provider"),
+        patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
+        patch("worker.tasks.render.record_stage"),
+        patch("worker.tasks.render.composite_cut", return_value=18.0),
+    ):
+        with pytest.raises(ValueError, match="posted while it rendered"):
+            render_cut(1)
+
+    assert job.status == models.JobStatus.failed
+    assert not isinstance(cut.video_path, str), "the discarded render must not be recorded on the cut"
+
+
 def test_successful_render_clears_stale_error():
     """A retried-then-successful render must not leave an error in the UI."""
     from worker.tasks.render import render_cut

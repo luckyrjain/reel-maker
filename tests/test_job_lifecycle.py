@@ -22,7 +22,7 @@ from sqlalchemy.pool import StaticPool
 
 from api import models
 from api.state import JOB_IN_FLIGHT
-from worker.tasks.common import JobLost, _error_text, heartbeat, job_task
+from worker.tasks.common import JobLost, _error_text, fail_unenqueued, heartbeat, job_task, lock_job, time_limits
 
 app = Celery("lifecycle_tests", broker="memory://", backend="cache+memory://")
 app.conf.update(task_always_eager=True, task_eager_propagates=True)
@@ -74,6 +74,7 @@ def _task(name, body, job_type="generate", max_retries=2, **kwargs):
     body.__name__ = body.__qualname__ = name.replace(".", "_")
     # A unique name: Celery hands back the already-registered task for a repeated name, whose old
     # body and closures would be reused when this module runs twice in one process.
+    kwargs.setdefault("max_runtime_s", 60)
     unique = f"{name}.{uuid.uuid4().hex[:8]}"
     return app.task(bind=True, max_retries=max_retries, name=unique)(job_task(job_type, **kwargs)(body))
 
@@ -546,23 +547,26 @@ def test_delay_and_apply_async_accept_a_single_job_id(factory):
     assert db.get(models.Job, job_id2).status == models.JobStatus.done
 
 
-def test_every_real_task_is_wired_with_the_right_job_type_and_retry_budget():
-    """A copy-pasted job type silently rolls back the wrong owner (or none) on failure."""
+def test_every_real_task_is_wired_with_the_right_job_type_retry_budget_and_time_limits():
+    """A copy-pasted job type silently rolls back the wrong owner (or none) on failure, and a task
+    without Celery time limits cannot be freed when its body hangs."""
     from worker.celery_app import celery_app
     celery_app.loader.import_default_modules()
     # name: (job_type, max_retries, release_on_shutdown, max_runtime_s)
     expected = {
         "worker.tasks.enrich_context.enrich_context": ("enrich", 0, True, 30 * 60),
-        "worker.tasks.generate.generate_guide": ("generate", 2, True, 2 * 60 * 60),
+        "worker.tasks.generate.generate_guide": ("generate", 2, True, 4 * 60 * 60),
         "worker.tasks.render.render_cut": ("render", 2, True, 60 * 60),
         # publish is not idempotent on the platform side: a retry after a transient error that
         # arrived post-upload, or a redelivery after a shutdown mid-upload, would post twice.
         "worker.tasks.publish.publish_cut": ("publish", 0, False, 60 * 60),
     }
     actual = {}
-    for name in expected:
+    for name, (_, _, _, max_runtime_s) in expected.items():
         task = celery_app.tasks[name]
         actual[name] = (task.run.job_type, task.max_retries, task.run.release_on_shutdown, task.run.max_runtime_s)
+        assert task.soft_time_limit == max_runtime_s, f"{name}: soft_time_limit must equal max_runtime_s"
+        assert task.time_limit > task.soft_time_limit, f"{name}: needs a hard limit after the soft one"
     assert actual == expected
 
 
@@ -573,6 +577,12 @@ def test_every_beat_task_routes_to_a_queue_a_documented_worker_consumes():
     for entry in celery_app.conf.beat_schedule.values():
         route = celery_app.conf.task_routes.get(entry["task"])
         assert route and route["queue"] in consumed, f"{entry['task']} is not routed to a consumed queue"
+
+
+def test_the_reaper_beat_message_expires_so_a_starved_queue_does_not_drain_a_backlog_in_a_burst():
+    from worker.celery_app import celery_app
+    options = celery_app.conf.beat_schedule["reap-stuck-jobs"]["options"]
+    assert options["expires"] < 60
 
 
 # ── state table ───────────────────────────────────────────────────────────────
@@ -852,7 +862,7 @@ def test_the_heartbeat_thread_never_touches_a_job_the_reaper_failed(file_factory
 
     with patch("worker.tasks.common.SessionLocal", file_factory), patch("worker.tasks.common.HEARTBEAT_INTERVAL_S", 0.1):
         _task("t.beat_failed", body)(job_id)
-    assert seen["hb"] == datetime(2020, 1, 1)
+    assert seen["hb"].replace(tzinfo=None) == datetime(2020, 1, 1)   # naive on SQLite, aware on Postgres
 
 
 def test_failure_is_recorded_even_when_the_owner_row_is_gone(factory):
@@ -945,3 +955,149 @@ def test_the_engine_pings_connections_before_use():
     """A backend killed server-side (failover, idle timeout) must be replaced, not fail the first query."""
     from api.db import engine
     assert engine.pool._pre_ping is True
+
+
+# ── round-3 hardening ─────────────────────────────────────────────────────────
+
+def test_error_text_is_linear_on_adversarial_input():
+    """The redaction regex must not backtrack: 1 MB of repeated markers took minutes before."""
+    started = time.monotonic()
+    _error_text(ValueError("[parameters:" * 83_333))
+    _error_text(ValueError("[parameters: x] " * 62_500))
+    assert time.monotonic() - started < 1.0
+
+
+def test_error_text_redacts_parameters_mid_line_and_when_unterminated():
+    assert "SECRET" not in _error_text(ValueError("boom [parameters: ('SECRET',)] tail"))
+    assert "SECRET" not in _error_text(ValueError("boom [parameters: ('SECRET'"))
+    assert _error_text(ValueError("plain failure")) == "plain failure"
+
+
+def test_error_text_survives_an_exception_whose_message_cannot_be_rendered():
+    class Unprintable(Exception):
+        def __str__(self):
+            raise RuntimeError("no")
+    assert "Unprintable" in _error_text(Unprintable())
+
+
+def test_error_text_bounds_its_input_before_redacting():
+    text = _error_text(ValueError("x" * 1_000_000))
+    assert len(text) == 2000
+
+
+def test_the_engine_hides_bound_parameters_from_error_text():
+    from api.db import engine
+    assert engine.hide_parameters is True
+
+
+def test_a_db_error_at_the_claim_is_retried_even_for_a_task_that_never_retries(factory):
+    """Nothing has run yet, so a retry is safe for enrich/publish too; otherwise the job would sit
+    pending until the reaper's threshold, acked and forgotten."""
+    job_id, reel_id, cut_id = _make(factory)
+    task = _task("t.preclaim_zero", lambda self, db, job, ctx: None, max_retries=0)
+    with (
+        patch("worker.tasks.common._advance", side_effect=sa_exc.OperationalError("S", {}, Exception("x"))),
+        patch.object(task, "retry", side_effect=Retry()) as retry,
+    ):
+        with pytest.raises(Retry):
+            task(job_id)
+    assert retry.call_args.kwargs["max_retries"] == 3
+    assert _read(factory, job_id, reel_id, cut_id)[0].status == models.JobStatus.pending
+
+
+def test_a_pre_claim_error_stops_retrying_after_the_pre_claim_budget(factory):
+    job_id, *_ = _make(factory)
+    task = _task("t.preclaim_exhausted", lambda self, db, job, ctx: None, max_retries=0)
+    task.push_request(retries=3)
+    try:
+        with (
+            patch("worker.tasks.common._advance", side_effect=sa_exc.OperationalError("S", {}, Exception("x"))),
+            patch.object(task, "retry", side_effect=Retry()) as retry,
+        ):
+            with pytest.raises(sa_exc.OperationalError):
+                task(job_id)
+    finally:
+        task.pop_request()
+    retry.assert_not_called()
+
+
+def test_an_owned_tasks_retry_keeps_the_tasks_own_budget(factory):
+    job_id, *_ = _make(factory)
+    task = _task("t.owned_budget", _raises(ConnectionError("x")), max_retries=2)
+    with patch.object(task, "retry", side_effect=Retry()) as retry:
+        with pytest.raises(Retry):
+            task(job_id)
+    assert retry.call_args.kwargs["max_retries"] == 2
+
+
+def test_time_limits_give_celery_a_soft_limit_and_a_later_hard_limit():
+    limits = time_limits(600)
+    assert limits["soft_time_limit"] == 600
+    assert limits["time_limit"] > 600
+
+
+def test_max_runtime_is_required(factory):
+    """A default would let a new task inherit a cap nobody chose."""
+    with pytest.raises(TypeError):
+        job_task("generate")
+
+
+def test_lock_job_raises_jobloss_when_the_job_is_no_longer_running(factory):
+    job_id, reel_id, cut_id = _make(factory, status=models.JobStatus.failed)
+    db = factory()
+    with pytest.raises(JobLost):
+        lock_job(db, db.get(models.Job, job_id))
+
+
+def test_lock_job_takes_the_row_without_committing(factory):
+    job_id, reel_id, cut_id = _make(factory, status=models.JobStatus.running)
+    db = factory()
+    lock_job(db, db.get(models.Job, job_id))
+    assert db.in_transaction(), "lock_job must leave the transaction open: the lock is held until the caller commits"
+
+
+def test_enrich_locks_the_job_before_touching_the_reel():
+    """The reaper locks job then reel; locking reel then job here would deadlock against it."""
+    from worker.tasks.enrich_context import enrich_context
+    order = []
+    job, reel, db = MagicMock(), MagicMock(), MagicMock()
+    job.id, job.reel_id, job.status, job.meta, job.attempts = 1, 10, models.JobStatus.pending, {"generation_path": "auto"}, 0
+    reel.context, reel.enriched_context, reel.niche = "ctx", None, "x"
+    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.enrich_context.evaluate_context", return_value=(80, [])),
+        patch("worker.tasks.enrich_context.get_enrichment_provider", return_value=MagicMock()),
+        patch("worker.tasks.enrich_context.record_stage"),
+        patch("worker.tasks.enrich_context.generate_guide"),
+        patch("worker.tasks.enrich_context.lock_job", side_effect=lambda *a: order.append("lock_job")),
+        patch("worker.tasks.enrich_context.transition", side_effect=lambda *a: order.append("transition")),
+    ):
+        enrich_context(1)
+    assert order == ["lock_job", "transition"]
+
+
+@pytest.mark.parametrize("job_type, owner_before, owner_after", [
+    (models.JobType.render, ("cut", models.CutStatus.rendering), ("cut", models.CutStatus.failed)),
+    (models.JobType.publish, ("cut", models.CutStatus.publishing), ("cut", models.CutStatus.failed)),
+    (models.JobType.enrich, ("reel", models.ReelStatus.enriching), ("reel", models.ReelStatus.failed)),
+])
+def test_fail_unenqueued_fails_the_job_and_frees_its_owner(factory, job_type, owner_before, owner_after):
+    kwargs = {"cut_status": owner_before[1]} if owner_before[0] == "cut" else {"reel_status": owner_before[1]}
+    job_id, reel_id, cut_id = _make(factory, job_type, **kwargs)
+    db = factory()
+    fail_unenqueued(db, db.get(models.Job, job_id), ConnectionError("broker down"))
+    job, reel, cut = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.failed and "could not enqueue" in job.error
+    assert (cut.status if owner_after[0] == "cut" else reel.status) == owner_after[1]
+
+
+def test_fail_unenqueued_leaves_a_job_a_worker_already_claimed_alone(factory):
+    """If .delay() raised but the message did get through and a worker started, that worker owns it."""
+    job_id, reel_id, cut_id = _make(factory, models.JobType.render, status=models.JobStatus.running,
+                                    cut_status=models.CutStatus.rendering)
+    db = factory()
+    fail_unenqueued(db, db.get(models.Job, job_id), ConnectionError("timeout after delivery"))
+    job, _, cut = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.running
+    assert cut.status == models.CutStatus.rendering

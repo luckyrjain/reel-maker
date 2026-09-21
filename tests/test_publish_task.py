@@ -200,8 +200,9 @@ def test_a_transient_publisher_error_is_never_retried_automatically():
     assert job.status == models.JobStatus.failed
 
 
-def test_post_id_is_committed_before_the_done_stamp():
-    """The post is live and irreversible: its id must be durable even if the job is reaped later."""
+def test_post_id_is_committed_before_anything_that_can_fail_after_the_upload():
+    """The commit must precede transition(): recording the id only in the done-stamp is not enough,
+    because the done-stamp is lost if transition() raises or the job is reaped."""
     from worker.tasks.publish import publish_cut
 
     job = _job()
@@ -214,14 +215,14 @@ def test_post_id_is_committed_before_the_done_stamp():
         patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.publish.get_publisher") as mock_get_publisher,
         patch("worker.tasks.publish.record_stage"),
-        patch("worker.tasks.publish.transition"),
+        patch("worker.tasks.publish.transition", side_effect=lambda *a: order.append(("transition", None))),
     ):
         mock_get_publisher.return_value.publish.return_value = PublishResult(
             platform_post_id="yt-1", url="https://youtube.com/shorts/yt-1"
         )
         publish_cut(1)
 
-    assert ("commit", "yt-1") in order, "platform_post_id was never committed on its own"
+    assert order.index(("commit", "yt-1")) < order.index(("transition", None))
 
 
 def test_an_already_posted_cut_is_finalized_without_uploading_again():
@@ -245,8 +246,9 @@ def test_an_already_posted_cut_is_finalized_without_uploading_again():
     assert job.status == models.JobStatus.done
 
 
-def test_an_already_posted_cut_still_passes_the_safety_gate():
-    """Finalizing must not become a way around assert_safe_to_publish."""
+def test_an_already_posted_cut_is_finalized_even_if_an_asset_was_flagged_since():
+    """The gate guards what goes OUT. Finalizing uploads nothing, and blocking it would leave a live
+    post unrecorded and the operator with no way out (render is refused for a posted cut)."""
     from worker.tasks.publish import publish_cut
 
     job = _job()
@@ -254,6 +256,13 @@ def test_an_already_posted_cut_still_passes_the_safety_gate():
     cut.platform_post_id = "yt-earlier"
     db = _db_with(job, cut, unsafe_rows=[_unsafe_row()])
 
-    with patch("worker.tasks.common.SessionLocal", return_value=db):
-        with pytest.raises(ValueError, match="not cleared for publishing"):
-            publish_cut(1)
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.publish.get_publisher") as mock_get_publisher,
+        patch("worker.tasks.publish.transition") as mock_transition,
+    ):
+        publish_cut(1)
+
+    mock_get_publisher.return_value.publish.assert_not_called()
+    mock_transition.assert_called_once_with(cut, "published", CUT_TRANSITIONS)
+    assert job.status == models.JobStatus.done

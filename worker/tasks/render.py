@@ -9,7 +9,7 @@ from engine.render.asset_sourcer import get_asset_sourcer, get_hf_sourcer, get_h
 from engine.render.compositor import composite_cut
 from engine.render.tts import SilentProvider, _audio_duration, get_tts_provider
 from worker.celery_app import celery_app
-from worker.tasks.common import heartbeat, job_task
+from worker.tasks.common import heartbeat, job_task, time_limits
 
 
 def _load_cut_and_reel(db, job):
@@ -26,8 +26,11 @@ def _load_cut_and_reel(db, job):
     return cut, reel
 
 
-@celery_app.task(bind=True, max_retries=2)
-@job_task("render", prepare=_load_cut_and_reel, max_runtime_s=60 * 60)
+_MAX_RUNTIME_S = 60 * 60
+
+
+@celery_app.task(bind=True, max_retries=2, **time_limits(_MAX_RUNTIME_S))
+@job_task("render", prepare=_load_cut_and_reel, max_runtime_s=_MAX_RUNTIME_S)
 def render_cut(self, db, job, ctx):
     cut, reel = ctx
     guide = PlatformGuide(**cut.guide)
@@ -123,6 +126,12 @@ def render_cut(self, db, job, ctx):
         ev.detail["duration_s"] = duration
         ev.detail["music_cue"] = music_cue
         ev.detail["music_track"] = music_path.name if music_path else None
+
+    # A publish may have posted this cut while we rendered (both were started from a failed cut).
+    # Re-read it: recording this render would make a later "finalize" mark new content as posted.
+    db.refresh(cut)
+    if cut.platform_post_id:
+        raise ValueError(f"Cut {cut.id} was posted while it rendered ({cut.platform_post_id}) — discarding this render")
 
     cut.video_path = str(out_path)
     cut.thumbnail_path = str(thumb_path)

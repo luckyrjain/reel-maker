@@ -205,3 +205,74 @@ def test_failed_unposted_cut_still_offers_both_retries(client):
     db.close()
     html = client.get(f"/api/reels/{reel_id}").text
     assert "Retry render" in html and "Retry publish" in html
+
+
+# ── enqueue failures and double clicks ───────────────────────────────────────
+
+def _guide_cut(client, status):
+    cut_id = _make_cut(client._session_factory, status)
+    db = client._session_factory()
+    db.get(models.Cut, cut_id).guide = {"beats": []}
+    db.commit()
+    db.close()
+    return cut_id
+
+
+def test_render_that_cannot_be_enqueued_fails_fast_and_frees_the_cut(client):
+    """Otherwise the cut sits in `rendering`, answering every retry with 409, until the reaper decides
+    the message was lost (hours)."""
+    cut_id = _guide_cut(client, models.CutStatus.draft)
+    with patch("api.routers.cuts.render_cut") as mock_task:
+        mock_task.delay.side_effect = ConnectionError("broker down")
+        resp = client.post(f"/api/cuts/{cut_id}/render")
+    assert resp.status_code == 503
+    db = client._session_factory()
+    assert db.get(models.Cut, cut_id).status == models.CutStatus.failed
+    job = db.query(models.Job).filter(models.Job.cut_id == cut_id).one()
+    assert job.status == models.JobStatus.failed and "could not enqueue" in job.error
+    with patch("api.routers.cuts.render_cut"):
+        assert client.post(f"/api/cuts/{cut_id}/render").status_code == 200   # and it can be retried
+
+
+def test_publish_that_cannot_be_enqueued_fails_fast_and_frees_the_cut(client):
+    cut_id = _make_cut(client._session_factory, models.CutStatus.approved)
+    with patch("api.routers.cuts.publish_cut") as mock_task:
+        mock_task.delay.side_effect = ConnectionError("broker down")
+        resp = client.post(f"/api/cuts/{cut_id}/publish")
+    assert resp.status_code == 503
+    db = client._session_factory()
+    assert db.get(models.Cut, cut_id).status == models.CutStatus.failed
+    assert db.query(models.Job).filter(models.Job.cut_id == cut_id).one().status == models.JobStatus.failed
+
+
+def test_the_trigger_routes_lock_the_cut_row_so_a_double_click_serialises(client):
+    """Retry render + Retry publish (or a double click) must not both pass the status guards."""
+    from sqlalchemy.orm import Session
+    cut_id = _guide_cut(client, models.CutStatus.draft)
+    seen = []
+    real_get = Session.get
+
+    def spy(self, entity, ident, **kwargs):
+        if entity is models.Cut:
+            seen.append(kwargs.get("with_for_update"))
+        return real_get(self, entity, ident, **kwargs)
+
+    with patch.object(Session, "get", spy), patch("api.routers.cuts.render_cut"):
+        client.post(f"/api/cuts/{cut_id}/render")
+    assert seen and seen[0] is True
+
+    publish_id = _make_cut(client._session_factory, models.CutStatus.approved)
+    seen.clear()
+    with patch.object(Session, "get", spy), patch("api.routers.cuts.publish_cut"):
+        client.post(f"/api/cuts/{publish_id}/publish")
+    assert seen and seen[0] is True
+
+
+def test_failed_unposted_cut_warns_to_check_the_platform_before_retrying(client):
+    """max_retries=0 only turns an automatic double post into a manual one unless the operator knows."""
+    cut_id = _make_cut(client._session_factory, models.CutStatus.failed)
+    db = client._session_factory()
+    reel_id = db.get(models.Cut, cut_id).reel_id
+    db.close()
+    html = client.get(f"/api/reels/{reel_id}").text
+    assert "check the platform first" in html

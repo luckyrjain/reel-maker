@@ -21,6 +21,7 @@ This file below is the build log (what shipped, phase by phase); that one is the
 | 3.6 | ✅ Done | Pre-generation context evaluation & enrichment |
 | 3.7 | ✅ Done | Generation quality fixes (context drift, audio gaps, prompt fences) |
 | 3.8 | ✅ Done | Repo hygiene, render-path fixes, retry semantics, task-module split |
+| 3.9 | ✅ Done | Job lifecycle consolidation (`job_task`) and reliability hardening |
 | 4a | ✅ Done | Operator visibility (cost, latency, quality, budget cap) |
 | 4b | ✅ Done | Publishing (OAuth, safe_to_publish gate, YouTube + Instagram uploaders, TikTok platform) |
 | 5 | 🔲 Planned | Analytics and polish |
@@ -185,6 +186,33 @@ real against a genuine Ollama timeout and recovered correctly), Wikipedia photo 
 Edge TTS synthesis, and the final MP4/thumbnail — worked as designed.
 
 ---
+
+### Phase 3.9 — Job lifecycle consolidation and reliability hardening
+
+The guard / stamp / retry / failure stanza had been copied into four task modules (and drifted:
+`heartbeat()` before, then the retry fix landing in three separate commits). It now lives in
+`worker/tasks/common.py::job_task`, with the owner-state table `api/state.py::JOB_IN_FLIGHT` shared
+by the tasks and the reaper. Six rounds of adversarial review (correctness, SRE, database, security,
+mutation testing, architecture), with the concurrency-sensitive parts verified on real Postgres 16,
+turned it into a stricter lifecycle. Behaviour changes an operator should know about:
+
+- **Only `pending` jobs run.** The claim is an atomic `UPDATE … WHERE status='pending'`; `failed` is
+  terminal (an operator retry creates a new Job). The done-stamp and `heartbeat()` are fenced the same
+  way, so a worker the reaper gave up on cannot commit or keep writing.
+- **The reaper now actually runs.** `reap_stuck_jobs` had no `task_routes` entry, so beat sent it to the
+  default queue that no documented worker consumes. It is now routed to `generation`, does a
+  per-job compare-and-set, and rolls back only the owner state the job's type owns. The first run after
+  deploy will fail any historic stale rows.
+- **A heartbeat thread** keeps `heartbeat_at` fresh through long LLM / ffmpeg / upload calls, and each
+  task has a `max_runtime_s` enforced as a Celery soft/hard time limit.
+- **Publishing never retries automatically** (`max_retries=0`, no release on shutdown). The post id is
+  committed the moment the upload succeeds, and a re-run with an id set finalizes without uploading.
+  A cut that already has a post id cannot be re-rendered. A timeout *inside* the upload can still lead
+  to a manual double post: the failed-cut card tells the operator to check the platform first.
+- **Routers fail fast** when `.delay()` raises (503, job failed, cut/reel rolled back) instead of
+  leaving the owner in flight until the reaper's 4 h pending threshold.
+- `OperationalError`/`InterfaceError` are transient; `pool_pre_ping` and `hide_parameters` are on;
+  `job.error` is sanitised; task sessions use `expire_on_commit=False`.
 
 ## Phase 4a — Operator visibility (done)
 
@@ -368,9 +396,12 @@ a new required parameter every publisher now takes instead of reading
 | No multi-image collage in one frame | Low | Currently cycles sequentially; side-by-side layout not implemented |
 | MoviePy video readers leak until worker recycle | Low | `_build_media_sub_clip` opens `VideoFileClip`s that only `worker_max_tasks_per_child=10` reclaims; marked with a `ponytail:` comment |
 | `asset_sourcer` degrades silently to black frames | Medium | Every sourcer swallows its own exceptions and returns `None`, so a Pexels/Wikipedia outage produces a black-frame reel that reports success — and never reaches the retry branch |
+| `resolve_or_reuse()` commits the caller's session | Low | Deliberate (no transaction may sit idle across its network calls or the TTS that follows); noted in its docstring. A partial Wikipedia result (one of several names failing) is pinned and reused until `visual_direction` changes |
 | `record_stage()` commits the caller's session | Low | Benign today (all call sites sit on a commit boundary) and documented in `observability.py`, but it will bite whoever wraps a half-applied mutation |
 | `_escape_drawtext` escapes only `\ : % '` | Low | A newline or exotic character in `on_screen_text` could break the FFmpeg filter chain; not observed in practice |
 | Wikipedia licence lookup uses a percent-encoded filename | Low | `_fetch_license()` passes the raw URL segment, so accented/spaced filenames return "unknown" and default to `safe_to_publish=False`. Now live: `assert_safe_to_publish()` blocks these cuts from publishing (Phase 4b), so this under-detection means some legitimately-safe Wikipedia assets get blocked rather than the reverse (a licensing false-negative, not a false-positive) |
+| Reaper does not resume killed jobs | Medium | Under prefork, `pkill` / SIGKILL kills the child without unwinding: the job stays `running`, the redelivered message no-ops, and the reaper fails it after 5 minutes. Nothing re-runs it, so an enrich/generate job loses its (paid) work and a `failed` reel has no retry endpoint. A fix would let the reaper re-enqueue idempotent job types (never publish) a bounded number of times |
+| Failure reason is not shown after a page refresh | Low | `job.error` is rendered only in the polling fragment of the tab that started the job; the cut card and reel page show a generic "Failed" |
 | Cut page does not poll while rendering | Low | `cut_card.html` shows "refresh to update" instead of an auto-refreshing fragment — same limitation for `"publishing"` status (Phase 4b) |
 | LLM judge 60% weight can swing combined score | Low | Log per-attempt rule/judge split from `StageEvent`; tune once data accumulates |
 | Whisper `base` model is slow on CPU | Low | Switch to `faster-whisper` with `base` model for 3-4× speedup on same hardware |

@@ -9,7 +9,7 @@ from engine.generation.pricing import llm_cost_usd
 from engine.generation.script_parser import is_structured as _is_structured_script
 from engine.observability import record_stage
 from worker.celery_app import celery_app
-from worker.tasks.common import heartbeat, job_task, rollback_owner
+from worker.tasks.common import heartbeat, job_task, lock_job, rollback_owner, time_limits
 from worker.tasks.generate import generate_guide
 
 _log = logging.getLogger(__name__)
@@ -49,14 +49,17 @@ def _abandon_generate(db, job, generate_job_id):
 # max_retries=0 on purpose: enrichment falls back to the raw context, and a retry would
 # re-run a paid LLM call for no gain. If the follow-up enqueue fails after the job is done,
 # _abandon_generate cleans up (the reaper would otherwise only notice after 30 minutes).
-@celery_app.task(bind=True, max_retries=0)
+_MAX_RUNTIME_S = 30 * 60
+
+
+@celery_app.task(bind=True, max_retries=0, **time_limits(_MAX_RUNTIME_S))
 @job_task(
     "enrich",
     prepare=_load_reel,
     after_commit=_enqueue_generate,
     after_commit_failed=_abandon_generate,
     start_progress=10,
-    max_runtime_s=30 * 60,
+    max_runtime_s=_MAX_RUNTIME_S,
 )
 def enrich_context(self, db, job, reel):
     # ── Step 1: Evaluate context quality ─────────────────────────────────
@@ -100,6 +103,7 @@ def enrich_context(self, db, job, reel):
     heartbeat(db, job, 80)
 
     # ── Step 3: Transition reel + create and enqueue generate job ─────────
+    lock_job(db, job)   # job row lock before the reel row: the order the reaper takes them (no deadlock)
     transition(reel, "generating", REEL_TRANSITIONS)
 
     generation_path = (job.meta or {}).get("generation_path", "auto")

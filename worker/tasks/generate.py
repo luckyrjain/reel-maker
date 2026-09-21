@@ -29,7 +29,7 @@ from engine.generation.visual_fallback import (
 )
 from engine.observability import paid_call_count, record_stage
 from worker.celery_app import celery_app
-from worker.tasks.common import heartbeat, job_task
+from worker.tasks.common import heartbeat, job_task, time_limits
 
 _log = logging.getLogger(__name__)
 
@@ -319,17 +319,22 @@ def _prepare_generate(db, job):
     reel = db.get(models.Reel, job.reel_id)
     if reel is None:
         raise ValueError(f"Reel {job.reel_id} no longer exists")
-    # enrich_context rolls the reel back to "failed" when it could not confirm this job was
-    # enqueued (a timeout can still leave the message on the broker). Running anyway would
-    # spend paid LLM calls and then fail on the reel's guide_ready transition.
+    # Defence in depth: never spend paid LLM calls on a reel that is no longer generating
+    # (its final transition to guide_ready would fail anyway). enrich_context normally fails
+    # an un-enqueued generate job first, so this is rarely reached.
     if reel.status.value != "generating":
         raise ValueError(f"Reel {reel.id} is '{reel.status.value}', not 'generating' — not running")
     _enforce_paid_call_budget(db, reel.id)
     return reel
 
 
-@celery_app.task(bind=True, max_retries=2)
-@job_task("generate", prepare=_prepare_generate, start_progress=10, max_runtime_s=2 * 60 * 60)
+# Worst case from the code: up to 3 standard-path attempts, each a generate call plus batched
+# enrichment and a judge call, at the 360 s per-call LLM timeout, is about 3.2 h.
+_MAX_RUNTIME_S = 4 * 60 * 60
+
+
+@celery_app.task(bind=True, max_retries=2, **time_limits(_MAX_RUNTIME_S))
+@job_task("generate", prepare=_prepare_generate, start_progress=10, max_runtime_s=_MAX_RUNTIME_S)
 def generate_guide(self, db, job, reel):
     effective_context = reel.enriched_context or reel.context
 

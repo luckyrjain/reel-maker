@@ -8,7 +8,7 @@ from engine.publish.attribution import build_published_caption
 from engine.publish.gate import assert_safe_to_publish
 from engine.publish.registry import credential_provider_for_platform, get_publisher
 from worker.celery_app import celery_app
-from worker.tasks.common import heartbeat, job_task
+from worker.tasks.common import heartbeat, job_task, time_limits
 
 _log = logging.getLogger(__name__)
 
@@ -20,14 +20,19 @@ def _load_cut(db, job):
     return cut
 
 
+_MAX_RUNTIME_S = 60 * 60
+
+
 # max_retries=0 on purpose: publishing is an irreversible external side effect. A transient
 # error (e.g. a read timeout) can arrive AFTER the platform accepted the upload, and an
-# automatic retry would then post the video twice. The operator retries via the UI instead,
-# and the platform_post_id guard below stops a re-run from uploading a second time.
-@celery_app.task(bind=True, max_retries=0)
+# automatic retry would then post the video twice. The operator retries via the UI instead.
+# The platform_post_id guard below only covers failures AFTER the post was recorded; a timeout
+# inside publisher.publish() happens before any id exists, so the operator should check the
+# platform before retrying (the failed-cut card says so).
+@celery_app.task(bind=True, max_retries=0, **time_limits(_MAX_RUNTIME_S))
 # release_on_shutdown=False: a shutdown mid-upload may have been accepted by the platform; a
 # redelivered run would upload again. The job stays running and the reaper fails it instead.
-@job_task("publish", prepare=_load_cut, max_runtime_s=60 * 60, release_on_shutdown=False)
+@job_task("publish", prepare=_load_cut, max_runtime_s=_MAX_RUNTIME_S, release_on_shutdown=False)
 def publish_cut(self, db, job, cut):
     # cut.status is set to "publishing" by the router before this task is
     # enqueued (mirrors trigger_render / render_cut) — this task does not
@@ -36,14 +41,16 @@ def publish_cut(self, db, job, cut):
     if not cut.video_path:
         raise ValueError("Cut has no rendered video — render and approve it before publishing")
 
-    assert_safe_to_publish(db, cut.id)
     heartbeat(db, job, 20)
 
     if cut.platform_post_id:
         # A previous run already posted this cut but did not finish recording it (reaped, or
-        # died before the done-stamp). Finalize without uploading again.
+        # died before the done-stamp). Finalize without uploading again. The safety gate guards
+        # what goes OUT to a platform; nothing is uploaded here, and blocking the finalize would
+        # leave a live post unrecorded with no way for the operator to clear it.
         _log.warning("cut %s already has platform_post_id %s; skipping upload", cut.id, cut.platform_post_id)
     else:
+        assert_safe_to_publish(db, cut.id)   # before any credential lookup or upload
         provider_name = credential_provider_for_platform(cut.platform.value)
         credential = (
             db.query(models.Credential)

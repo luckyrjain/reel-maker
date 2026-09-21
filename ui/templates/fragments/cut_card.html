@@ -212,7 +212,9 @@
       {% if cut.video_path and not cut.platform_post_id %}
       <span class="field-hint">"Retry publish" ships the last successfully
       rendered video — if you edited the guide since then and a re-render just
-      failed, that video won't reflect those edits.</span>
+      failed, that video won't reflect those edits. If the failure was a timeout
+      while uploading, check the platform first: the upload may already have gone
+      through, and retrying would post it twice.</span>
       {% endif %}
     </p>
     <div style="display:flex;gap:8px;flex-wrap:wrap;">
