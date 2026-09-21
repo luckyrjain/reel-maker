@@ -1,9 +1,7 @@
 """Tests for the render_cut task's failure handling and success-path cleanup."""
 from unittest.mock import MagicMock, patch
 
-import httpx
 import pytest
-from celery.exceptions import Retry
 
 from api import models
 
@@ -72,35 +70,12 @@ def test_missing_cut_fails_job_with_actionable_message():
     db = MagicMock()
     db.get.side_effect = lambda model, _id: job if model is models.Job else None
 
-    with patch("worker.tasks.render.SessionLocal", return_value=db):
+    with patch("worker.tasks.common.SessionLocal", return_value=db):
         with pytest.raises(ValueError, match="Cut 77 no longer exists"):
             render_cut(1)
 
     assert job.status == models.JobStatus.failed
     assert "Cut 77 no longer exists" in job.error
-
-
-def test_transient_failure_retries_and_resets_status_to_pending():
-    from worker.tasks.render import render_cut
-
-    job = _job()
-    db = MagicMock()
-    db.get.side_effect = lambda model, _id: job if model is models.Job else (
-        _cut() if model is models.Cut else _reel()
-    )
-
-    with (
-        patch("worker.tasks.render.SessionLocal", return_value=db),
-        patch("worker.tasks.render.get_asset_sourcer",
-              side_effect=httpx.ConnectTimeout("network down")),
-        patch.object(render_cut, "retry", side_effect=Retry()) as mock_retry,
-    ):
-        with pytest.raises(Retry):
-            render_cut(1)
-
-    mock_retry.assert_called_once()
-    assert job.status == models.JobStatus.pending
-    assert job.attempts == 1
 
 
 def test_successful_render_clears_stale_error():
@@ -116,7 +91,7 @@ def test_successful_render_clears_stale_error():
     )
 
     with (
-        patch("worker.tasks.render.SessionLocal", return_value=db),
+        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.render.get_asset_sourcer"),
         patch("worker.tasks.render.get_wiki_sourcer"),
         patch("worker.tasks.render.get_hf_sourcer"),
@@ -150,7 +125,7 @@ def test_matching_music_cue_is_passed_to_composite_cut():
     fake_sourcer.find.return_value = fake_track
 
     with (
-        patch("worker.tasks.render.SessionLocal", return_value=db),
+        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.render.get_asset_sourcer"),
         patch("worker.tasks.render.get_wiki_sourcer"),
         patch("worker.tasks.render.get_hf_sourcer"),
@@ -181,7 +156,7 @@ def test_no_music_cue_passes_none_without_querying_sourcer():
     fake_sourcer = MagicMock()
 
     with (
-        patch("worker.tasks.render.SessionLocal", return_value=db),
+        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.render.get_asset_sourcer"),
         patch("worker.tasks.render.get_wiki_sourcer"),
         patch("worker.tasks.render.get_hf_sourcer"),

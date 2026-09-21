@@ -82,6 +82,10 @@ def test_done_or_running_job_is_a_redelivery_no_op(factory, status):
 
 def test_success_stamps_running_then_done_and_commits_body_mutations_atomically(factory):
     job_id, reel_id, cut_id = _make(factory)
+    db = factory()
+    db.get(models.Job, job_id).error = "stale error from a retried attempt"
+    db.commit()
+    db.close()
     seen = {}
 
     def body(self, db, job, ctx):
@@ -99,7 +103,7 @@ def test_success_stamps_running_then_done_and_commits_body_mutations_atomically(
     job, reel, _ = _read(factory, job_id, reel_id, cut_id)
     assert job.status == models.JobStatus.done
     assert job.progress == 100
-    assert job.error is None
+    assert job.error is None, "a retried-then-successful job must not leave an error in the UI"
     assert job.heartbeat_at is not None
     assert reel.status == models.ReelStatus.guide_ready
 
