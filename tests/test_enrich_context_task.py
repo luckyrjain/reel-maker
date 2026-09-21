@@ -7,8 +7,8 @@ def _make_job(status="pending", meta=None):
     job = MagicMock()
     job.id = 1
     job.reel_id = 10
-    job.status = MagicMock()
-    job.status.value = status
+    from api import models
+    job.status = models.JobStatus(status)
     job.meta = meta or {"generation_path": "auto"}
     job.attempts = 0
     job.progress = 0
@@ -32,7 +32,7 @@ def test_idempotency_guard_done_job():
     job = _make_job(status="done")
     db = MagicMock()
     db.get.return_value = job
-    with patch("worker.tasks.enrich_context.SessionLocal", return_value=db):
+    with patch("worker.tasks.common.SessionLocal", return_value=db):
         enrich_context(1)
     db.add.assert_not_called()
 
@@ -43,7 +43,7 @@ def test_idempotency_guard_running_job():
     job = _make_job(status="running")
     db = MagicMock()
     db.get.return_value = job
-    with patch("worker.tasks.enrich_context.SessionLocal", return_value=db):
+    with patch("worker.tasks.common.SessionLocal", return_value=db):
         enrich_context(1)
     db.add.assert_not_called()
 
@@ -57,7 +57,7 @@ def test_enrichment_runs_when_score_below_threshold():
     db.get.side_effect = lambda model, id_: job if id_ == 1 else reel
 
     with (
-        patch("worker.tasks.enrich_context.SessionLocal", return_value=db),
+        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.enrich_context.evaluate_context", return_value=(40, ["context_too_short"])) as mock_eval,
         patch("worker.tasks.enrich_context.llm_enrich", return_value="Enriched context.") as mock_enrich,
         patch("worker.tasks.enrich_context.get_enrichment_provider", return_value=MagicMock()),
@@ -81,7 +81,7 @@ def test_enrichment_skipped_when_score_above_threshold():
     db.get.side_effect = lambda model, id_: job if id_ == 1 else reel
 
     with (
-        patch("worker.tasks.enrich_context.SessionLocal", return_value=db),
+        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.enrich_context.evaluate_context", return_value=(75, [])),
         patch("worker.tasks.enrich_context.llm_enrich") as mock_enrich,
         patch("worker.tasks.enrich_context.get_enrichment_provider", return_value=MagicMock()),
@@ -104,7 +104,7 @@ def test_generate_guide_always_enqueued_on_success():
     db.get.side_effect = lambda model, id_: job if id_ == 1 else reel
 
     with (
-        patch("worker.tasks.enrich_context.SessionLocal", return_value=db),
+        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.enrich_context.evaluate_context", return_value=(80, [])),
         patch("worker.tasks.enrich_context.get_enrichment_provider", return_value=MagicMock()),
         patch("worker.tasks.enrich_context.generate_guide") as mock_gen,
@@ -125,7 +125,7 @@ def test_llm_failure_is_nonfatal_and_generate_still_enqueued():
     db.get.side_effect = lambda model, id_: job if id_ == 1 else reel
 
     with (
-        patch("worker.tasks.enrich_context.SessionLocal", return_value=db),
+        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.enrich_context.evaluate_context", return_value=(30, ["context_too_short"])),
         patch("worker.tasks.enrich_context.llm_enrich", return_value=None),
         patch("worker.tasks.enrich_context.get_enrichment_provider", return_value=MagicMock()),
@@ -164,7 +164,7 @@ def test_enrichment_skipped_for_structured_script_even_below_threshold():
     db.get.side_effect = lambda model, id_: job if id_ == 1 else reel
 
     with (
-        patch("worker.tasks.enrich_context.SessionLocal", return_value=db),
+        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.enrich_context.evaluate_context", return_value=(25, ["too_short"])),
         patch("worker.tasks.enrich_context.llm_enrich") as mock_enrich,
         patch("worker.tasks.enrich_context.get_enrichment_provider", return_value=MagicMock()),
@@ -191,9 +191,60 @@ def test_missing_reel_fails_job_with_actionable_message():
     db = MagicMock()
     db.get.side_effect = lambda model, _id: job if model is models.Job else None
 
-    with patch("worker.tasks.enrich_context.SessionLocal", return_value=db):
+    with patch("worker.tasks.common.SessionLocal", return_value=db):
         with pytest.raises(ValueError, match="Reel 42 no longer exists"):
             enrich_context(1)
 
     assert job.status == models.JobStatus.failed
     assert "Reel 42 no longer exists" in job.error
+
+
+# ── owner rollback wiring ─────────────────────────────────────────────────
+
+
+def test_failed_enqueue_after_done_rolls_the_reel_back_from_generating():
+    """If generate_guide.delay() raises after the enrich job is committed done,
+    the reel is stuck in "generating" with no job for the reaper to catch."""
+    from api.state import REEL_TRANSITIONS
+    from worker.tasks.enrich_context import enrich_context
+
+    job = _make_job()
+    reel = _make_reel()
+    reel.status.value = "generating"   # the state the (patched) enrich transition leaves it in
+    db = MagicMock()
+    db.get.side_effect = lambda model, id_: job if id_ == 1 else reel
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.enrich_context.evaluate_context", return_value=(80, [])),
+        patch("worker.tasks.enrich_context.get_enrichment_provider", return_value=MagicMock()),
+        patch("worker.tasks.enrich_context.generate_guide") as mock_gen,
+        patch("worker.tasks.enrich_context.transition"),
+        patch("worker.tasks.enrich_context.record_stage"),
+        patch("worker.tasks.common.transition") as mock_rollback,
+    ):
+        mock_gen.delay.side_effect = ConnectionError("broker down")
+        with pytest.raises(ConnectionError):
+            enrich_context(1)
+
+    mock_rollback.assert_called_once_with(reel, "failed", REEL_TRANSITIONS)
+
+
+def test_enrichment_failure_rolls_the_reel_back_from_enriching():
+    from api.state import REEL_TRANSITIONS
+    from worker.tasks.enrich_context import enrich_context
+
+    job = _make_job()
+    reel = _make_reel()   # status "enriching"
+    db = MagicMock()
+    db.get.side_effect = lambda model, id_: job if id_ == 1 else reel
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.enrich_context.evaluate_context", side_effect=ValueError("scoring blew up")),
+        patch("worker.tasks.common.transition") as mock_rollback,
+    ):
+        with pytest.raises(ValueError, match="scoring blew up"):
+            enrich_context(1)
+
+    mock_rollback.assert_called_once_with(reel, "failed", REEL_TRANSITIONS)
