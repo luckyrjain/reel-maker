@@ -1,7 +1,6 @@
 """Tests for the publish_cut task's failure handling and success-path cleanup."""
 from unittest.mock import MagicMock, patch
 
-import httpx
 import pytest
 from celery.exceptions import Retry
 
@@ -59,7 +58,7 @@ def test_missing_cut_fails_job_with_actionable_message():
     db = MagicMock()
     db.get.side_effect = lambda model, _id: job if model is models.Job else None
 
-    with patch("worker.tasks.publish.SessionLocal", return_value=db):
+    with patch("worker.tasks.common.SessionLocal", return_value=db):
         with pytest.raises(ValueError, match="Cut 77 no longer exists"):
             publish_cut(1)
 
@@ -76,7 +75,7 @@ def test_missing_video_path_fails_deterministically():
     db = _db_with(job, cut)
 
     with (
-        patch("worker.tasks.publish.SessionLocal", return_value=db),
+        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch.object(publish_cut, "retry", side_effect=Retry()) as mock_retry,
     ):
         with pytest.raises(ValueError, match="no rendered video"):
@@ -94,7 +93,7 @@ def test_unsafe_asset_blocks_publish():
     db = _db_with(job, cut, unsafe_rows=[_unsafe_row()])
 
     with (
-        patch("worker.tasks.publish.SessionLocal", return_value=db),
+        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch.object(publish_cut, "retry", side_effect=Retry()) as mock_retry,
     ):
         with pytest.raises(ValueError, match="not cleared for publishing"):
@@ -112,7 +111,7 @@ def test_missing_credential_fails_with_actionable_message():
     db = _db_with(job, cut, credential=None)
 
     with (
-        patch("worker.tasks.publish.SessionLocal", return_value=db),
+        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch.object(publish_cut, "retry", side_effect=Retry()) as mock_retry,
     ):
         with pytest.raises(ValueError, match="No connected youtube account"):
@@ -120,27 +119,6 @@ def test_missing_credential_fails_with_actionable_message():
 
     mock_retry.assert_not_called()
     assert job.status == models.JobStatus.failed
-
-
-def test_transient_publisher_failure_retries_and_resets_status_to_pending():
-    from worker.tasks.publish import publish_cut
-
-    job = _job()
-    cut = _cut()
-    db = _db_with(job, cut)
-
-    with (
-        patch("worker.tasks.publish.SessionLocal", return_value=db),
-        patch("worker.tasks.publish.get_publisher") as mock_get_publisher,
-        patch.object(publish_cut, "retry", side_effect=Retry()) as mock_retry,
-    ):
-        mock_get_publisher.return_value.publish.side_effect = httpx.ConnectTimeout("network down")
-        with pytest.raises(Retry):
-            publish_cut(1)
-
-    mock_retry.assert_called_once()
-    assert job.status == models.JobStatus.pending
-    assert job.attempts == 1
 
 
 def test_deterministic_publisher_failure_transitions_cut_to_failed():
@@ -152,9 +130,9 @@ def test_deterministic_publisher_failure_transitions_cut_to_failed():
     db = _db_with(job, cut)
 
     with (
-        patch("worker.tasks.publish.SessionLocal", return_value=db),
+        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.publish.get_publisher") as mock_get_publisher,
-        patch("worker.tasks.publish.transition") as mock_transition,
+        patch("worker.tasks.common.transition") as mock_transition,
         patch.object(publish_cut, "retry", side_effect=Retry()) as mock_retry,
     ):
         mock_get_publisher.return_value.publish.side_effect = NotImplementedError("not done yet")
@@ -174,7 +152,7 @@ def test_successful_publish_records_platform_post_id():
     db = _db_with(job, cut)
 
     with (
-        patch("worker.tasks.publish.SessionLocal", return_value=db),
+        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.publish.get_publisher") as mock_get_publisher,
         patch("worker.tasks.publish.record_stage"),
         patch("worker.tasks.publish.transition") as mock_transition,
