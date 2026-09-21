@@ -283,3 +283,31 @@ def test_abandon_generate_fails_the_orphan_job_and_only_touches_a_generating_ree
     _abandon_generate(db, enrich, running.id)
     db.commit()
     assert db.get(models.Job, running.id).status == models.JobStatus.running
+
+
+def test_abandon_generate_leaves_the_reel_alone_when_the_generate_job_already_started():
+    """The enqueue "failed" (e.g. a timeout after delivery) but a worker did pick the job up: it owns
+    the reel now, and rolling the reel back would let its final transition fail."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    from api import models
+    from worker.tasks.enrich_context import _abandon_generate
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    models.Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine, autoflush=False)()
+    reel = models.Reel(context="c", status=models.ReelStatus.generating)
+    db.add(reel)
+    db.flush()
+    enrich = models.Job(type=models.JobType.enrich, reel_id=reel.id, status=models.JobStatus.failed)
+    started = models.Job(type=models.JobType.generate, reel_id=reel.id, status=models.JobStatus.running)
+    db.add_all([enrich, started])
+    db.commit()
+
+    _abandon_generate(db, enrich, started.id)
+    db.commit()
+
+    assert db.get(models.Job, started.id).status == models.JobStatus.running
+    assert db.get(models.Reel, reel.id).status == models.ReelStatus.generating

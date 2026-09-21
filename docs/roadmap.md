@@ -238,7 +238,8 @@ original plan below in a few ways, noted inline.
 
 **Publish task** (`worker/tasks/publish.py`, `api/routers/cuts.py::trigger_publish`)
 - `publish_cut(job_id)` follows the same idempotency-guard/heartbeat/transient-retry
-  pattern as `generate_guide`/`render_cut`. Gates on `assert_safe_to_publish()`
+  lifecycle (`job_task`) as `generate_guide`/`render_cut`, but with `max_retries=0` and no
+  release-on-shutdown (an accepted upload must never be repeated). Gates on `assert_safe_to_publish()`
   (`engine/publish/gate.py`) before ever calling a platform API — the first
   place `Asset.safe_to_publish` is actually enforced, not just computed.
 - State transitions: `approved|scheduled → publishing → published` or `failed`,

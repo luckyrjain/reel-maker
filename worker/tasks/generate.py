@@ -329,7 +329,7 @@ def _prepare_generate(db, job):
 
 
 @celery_app.task(bind=True, max_retries=2)
-@job_task("generate", prepare=_prepare_generate, start_progress=10)
+@job_task("generate", prepare=_prepare_generate, start_progress=10, max_runtime_s=2 * 60 * 60)
 def generate_guide(self, db, job, reel):
     effective_context = reel.enriched_context or reel.context
 

@@ -33,6 +33,11 @@ def trigger_render(cut_id: int, request: Request, db: Session = Depends(get_db))
     if not cut.guide:
         raise HTTPException(status_code=422, detail="No guide yet — run guide generation first")
 
+    if cut.platform_post_id:
+        # The video is already live. Re-rendering would leave the cut pointing at that post while
+        # a later publish "finalizes" against it without ever uploading the new render.
+        raise HTTPException(status_code=409, detail="Already posted — it cannot be re-rendered")
+
     current = cut.status.value
     if current == "rendering":
         raise HTTPException(status_code=409, detail="Render already in progress")

@@ -202,15 +202,21 @@
 
     {% elif st == "failed" %}
     <p class="error" style="margin-top:10px;margin-bottom:8px;">
+      {% if cut.platform_post_id %}
+      Failed after the video was posted ({{ cut.platform_post_id }}). Retry publish
+      to record it — it will not upload again.
+      {% else %}
       Failed. Retry render if the guide or footage needs regenerating, or retry
       publish directly if the rendered video is fine.
-      {% if cut.video_path %}
+      {% endif %}
+      {% if cut.video_path and not cut.platform_post_id %}
       <span class="field-hint">"Retry publish" ships the last successfully
       rendered video — if you edited the guide since then and a re-render just
       failed, that video won't reflect those edits.</span>
       {% endif %}
     </p>
     <div style="display:flex;gap:8px;flex-wrap:wrap;">
+      {% if not cut.platform_post_id %}
       <div id="render-section-{{ cut.id }}">
         <button class="btn-render"
             hx-post="/api/cuts/{{ cut.id }}/render"
@@ -219,6 +225,7 @@
           Retry render
         </button>
       </div>
+      {% endif %}
       {% if cut.video_path %}
       <div id="publish-section-{{ cut.id }}">
         <button class="btn-approve"

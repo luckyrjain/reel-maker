@@ -33,12 +33,16 @@ def _abandon_generate(db, job, generate_job_id):
     forever-pending job for a failed reel, and the reaper later rolls back whatever the
     reel is doing by then), and roll the reel back from "generating" so the operator can retry.
     """
-    db.query(models.Job).filter(
+    claimed = db.query(models.Job).filter(
         models.Job.id == generate_job_id, models.Job.status == models.JobStatus.pending,
     ).update(
         {"status": models.JobStatus.failed, "error": "generate_guide could not be enqueued"},
         synchronize_session=False,
     )
+    if claimed == 0:
+        # The message did reach a worker (e.g. the publish timed out after delivery) and the
+        # generate job is already running: it owns the reel now, so leave the reel alone.
+        return
     rollback_owner(db, job, "reel", {"generating"})
 
 
@@ -52,6 +56,7 @@ def _abandon_generate(db, job, generate_job_id):
     after_commit=_enqueue_generate,
     after_commit_failed=_abandon_generate,
     start_progress=10,
+    max_runtime_s=30 * 60,
 )
 def enrich_context(self, db, job, reel):
     # ── Step 1: Evaluate context quality ─────────────────────────────────

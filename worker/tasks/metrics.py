@@ -1,7 +1,7 @@
 """Celery beat task: pulls engagement metrics for already-published cuts.
 
 Read-only against each platform's read API — never touches publish state,
-never retries via the publish_cut idempotency/heartbeat machinery (this is a
+never runs under the job_task Job lifecycle that publish_cut uses (this is a
 best-effort background refresh, not a pipeline stage a Cut's status depends
 on). A fetch failure for one cut is logged and skipped so it doesn't abort
 the rest of the batch.

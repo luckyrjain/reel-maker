@@ -148,3 +148,60 @@ def test_publish_status_terminal_failure_shows_retry_button(client):
     assert resp.status_code == 200
     assert "Retry publish" in resp.text
     assert "No connected youtube account" in resp.text
+
+
+# ── re-rendering a cut that is already posted ────────────────────────────────
+
+def _post_it(session_factory, cut_id, post_id="yt-live"):
+    db = session_factory()
+    try:
+        cut = db.get(models.Cut, cut_id)
+        cut.platform_post_id = post_id
+        cut.guide = {"beats": []}          # truthy: trigger_render checks for a guide first
+        db.commit()
+        return cut.reel_id
+    finally:
+        db.close()
+
+
+def test_render_refuses_a_cut_that_is_already_posted(client):
+    """The video is live. A re-render would leave the cut pointing at that post while a later publish
+    'finalizes' against it without uploading the new render."""
+    cut_id = _make_cut(client._session_factory, models.CutStatus.failed)
+    _post_it(client._session_factory, cut_id)
+    with patch("api.routers.cuts.render_cut") as mock_task:
+        resp = client.post(f"/api/cuts/{cut_id}/render")
+    assert resp.status_code == 409
+    assert "posted" in resp.json()["detail"].lower()
+    mock_task.delay.assert_not_called()
+    db = client._session_factory()
+    assert db.get(models.Cut, cut_id).status == models.CutStatus.failed, "the refusal must not move the cut"
+
+
+def test_render_still_works_for_a_failed_cut_that_was_never_posted(client):
+    cut_id = _make_cut(client._session_factory, models.CutStatus.failed)
+    db = client._session_factory()
+    db.get(models.Cut, cut_id).guide = {"beats": []}
+    db.commit()
+    with patch("api.routers.cuts.render_cut") as mock_task:
+        resp = client.post(f"/api/cuts/{cut_id}/render")
+    assert resp.status_code == 200
+    mock_task.delay.assert_called_once()
+
+
+def test_failed_posted_cut_offers_publish_but_not_render(client):
+    cut_id = _make_cut(client._session_factory, models.CutStatus.failed)
+    reel_id = _post_it(client._session_factory, cut_id)
+    html = client.get(f"/api/reels/{reel_id}").text
+    assert "Retry publish" in html
+    assert "Retry render" not in html
+    assert "will not upload again" in html
+
+
+def test_failed_unposted_cut_still_offers_both_retries(client):
+    cut_id = _make_cut(client._session_factory, models.CutStatus.failed)
+    db = client._session_factory()
+    reel_id = db.get(models.Cut, cut_id).reel_id
+    db.close()
+    html = client.get(f"/api/reels/{reel_id}").text
+    assert "Retry render" in html and "Retry publish" in html

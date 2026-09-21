@@ -5,13 +5,16 @@ session the decorator opens sees the same data). Domain behaviour lives in the
 per-task suites; this file owns the claim / stamp / retry / failure / owner
 rollback contract once, for every task.
 """
+import threading
 import time
+import uuid
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
 from celery import Celery
-from celery.exceptions import Retry
+from celery.exceptions import Reject, Retry
 from sqlalchemy import create_engine
 from sqlalchemy import exc as sa_exc
 from sqlalchemy.orm import sessionmaker
@@ -19,7 +22,7 @@ from sqlalchemy.pool import StaticPool
 
 from api import models
 from api.state import JOB_IN_FLIGHT
-from worker.tasks.common import job_task
+from worker.tasks.common import JobLost, _error_text, heartbeat, job_task
 
 app = Celery("lifecycle_tests", broker="memory://", backend="cache+memory://")
 app.conf.update(task_always_eager=True, task_eager_propagates=True)
@@ -69,7 +72,10 @@ def _set_job(factory, job_id, **values):
 def _task(name, body, job_type="generate", max_retries=2, **kwargs):
     # Celery builds a signature header from the function name, so lambdas must be renamed.
     body.__name__ = body.__qualname__ = name.replace(".", "_")
-    return app.task(bind=True, max_retries=max_retries, name=name)(job_task(job_type, **kwargs)(body))
+    # A unique name: Celery hands back the already-registered task for a repeated name, whose old
+    # body and closures would be reused when this module runs twice in one process.
+    unique = f"{name}.{uuid.uuid4().hex[:8]}"
+    return app.task(bind=True, max_retries=max_retries, name=unique)(job_task(job_type, **kwargs)(body))
 
 
 def _raises(exc):
@@ -544,18 +550,19 @@ def test_every_real_task_is_wired_with_the_right_job_type_and_retry_budget():
     """A copy-pasted job type silently rolls back the wrong owner (or none) on failure."""
     from worker.celery_app import celery_app
     celery_app.loader.import_default_modules()
+    # name: (job_type, max_retries, release_on_shutdown, max_runtime_s)
     expected = {
-        "worker.tasks.enrich_context.enrich_context": ("enrich", 0),
-        "worker.tasks.generate.generate_guide": ("generate", 2),
-        "worker.tasks.render.render_cut": ("render", 2),
+        "worker.tasks.enrich_context.enrich_context": ("enrich", 0, True, 30 * 60),
+        "worker.tasks.generate.generate_guide": ("generate", 2, True, 2 * 60 * 60),
+        "worker.tasks.render.render_cut": ("render", 2, True, 60 * 60),
         # publish is not idempotent on the platform side: a retry after a transient error that
-        # arrived post-upload would post twice.
-        "worker.tasks.publish.publish_cut": ("publish", 0),
+        # arrived post-upload, or a redelivery after a shutdown mid-upload, would post twice.
+        "worker.tasks.publish.publish_cut": ("publish", 0, False, 60 * 60),
     }
-    actual = {
-        name: (celery_app.tasks[name].run.job_type, celery_app.tasks[name].max_retries)
-        for name in expected
-    }
+    actual = {}
+    for name in expected:
+        task = celery_app.tasks[name]
+        actual[name] = (task.run.job_type, task.max_retries, task.run.release_on_shutdown, task.run.max_runtime_s)
     assert actual == expected
 
 
@@ -574,3 +581,367 @@ def test_in_flight_table_covers_every_job_type_and_never_names_a_finished_state(
     assert set(JOB_IN_FLIGHT) == {t.value for t in models.JobType}
     for _, state in JOB_IN_FLIGHT.values():
         assert state not in ("guide_ready", "in_review")
+
+
+# ── heartbeat fencing, runtime cap ────────────────────────────────────────────
+
+def test_heartbeat_commits_progress_while_the_job_is_running(factory):
+    job_id, reel_id, cut_id = _make(factory)
+    seen = {}
+
+    def body(self, db, job, ctx):
+        heartbeat(db, job, 55)
+        seen["progress"] = _read(factory, job_id, reel_id, cut_id)[0].progress
+
+    _task("t.hb_ok", body)(job_id)
+    assert seen["progress"] == 55
+
+
+def test_heartbeat_aborts_a_zombie_body_whose_job_the_reaper_already_failed(factory):
+    job_id, reel_id, cut_id = _make(factory)
+    reached = []
+
+    def body(self, db, job, ctx):
+        _set_job(factory, job_id, status=models.JobStatus.failed, error="reaped")   # the reaper
+        db.get(models.Reel, reel_id).status = models.ReelStatus.guide_ready          # uncommitted
+        heartbeat(db, job, 60)                                                        # must raise
+        reached.append("after-heartbeat")
+
+    with pytest.raises(JobLost):
+        _task("t.hb_zombie", body)(job_id)
+
+    assert reached == []
+    job, reel, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.failed
+    assert job.error == "reaped", "the zombie must not overwrite the reaper's verdict"
+    assert job.progress != 60
+    assert reel.status == models.ReelStatus.generating, "its pending mutation must be rolled back"
+
+
+def test_heartbeat_thread_stops_beating_a_body_wedged_past_max_runtime(tmp_path):
+    """The thread proves the process is alive, not that the body progresses; without a cap a hung
+    ffmpeg is never reapable and holds the single render slot forever."""
+    engine = create_engine(f"sqlite:///{tmp_path}/cap.db")
+    models.Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, autoflush=False)
+    job_id, reel_id, cut_id = _make(session_factory)
+    seen = {}
+
+    def body(self, db, job, ctx):
+        def heartbeat_at():
+            other = session_factory()
+            try:
+                return other.get(models.Job, job_id).heartbeat_at
+            finally:
+                other.close()
+        time.sleep(0.25)
+        seen["while_capped_a"] = heartbeat_at()
+        time.sleep(0.6)
+        seen["while_capped_b"] = heartbeat_at()
+
+    with (
+        patch("worker.tasks.common.SessionLocal", session_factory),
+        patch("worker.tasks.common.HEARTBEAT_INTERVAL_S", 0.05),
+    ):
+        _task("t.cap", body, max_runtime_s=0.2)(job_id)
+
+    assert seen["while_capped_a"] == seen["while_capped_b"], "it kept beating past max_runtime_s"
+
+
+# ── failure-path hardening ────────────────────────────────────────────────────
+
+def test_a_refused_retry_fails_the_job_and_rolls_the_owner_back_instead_of_leaving_it_pending(factory):
+    """If the broker is down when self.retry() publishes, Celery raises Reject and the message is dropped."""
+    job_id, reel_id, cut_id = _make(factory)
+    task = _task("t.reject", _raises(ConnectionError("blip")))
+    with patch.object(task, "retry", side_effect=Reject(ConnectionError("broker down"), requeue=False)):
+        with pytest.raises(Reject):
+            task(job_id)
+    job, reel, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.failed
+    assert "could not schedule retry" in job.error
+    assert reel.status == models.ReelStatus.failed
+
+
+def test_shutdown_leaves_the_job_running_when_release_is_disabled(factory):
+    """Publish: a redelivered run after a shutdown mid-upload would post the video twice."""
+    job_id, reel_id, cut_id = _make(factory)
+    task = _task("t.no_release", _raises(SystemExit(1)), release_on_shutdown=False)
+    with pytest.raises(SystemExit):
+        task(job_id)
+    job, reel, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.running   # the reaper fails it once the heartbeat goes stale
+    assert reel.status == models.ReelStatus.generating
+
+
+def test_a_thread_that_cannot_start_does_not_mask_the_real_error_or_leak_the_session(factory):
+    job_id, reel_id, cut_id = _make(factory)
+    closed = []
+
+    class Tracking(sessionmaker(bind=factory.kw["bind"]).class_):
+        def close(self):
+            closed.append(1)
+            return super().close()
+
+    tracked = sessionmaker(bind=factory.kw["bind"], class_=Tracking, autoflush=False)
+    task = _task("t.nostart", lambda self, db, job, ctx: None)
+    with (
+        patch("worker.tasks.common.SessionLocal", tracked),
+        patch("worker.tasks.common.threading.Thread.start", side_effect=RuntimeError("can't start new thread")),
+    ):
+        with pytest.raises(RuntimeError, match="can't start new thread"):
+            task(job_id)
+    assert closed, "the session must always be closed"
+    job, *_ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.failed
+
+
+def test_a_failed_retry_reset_commit_does_not_raise_a_retry_the_redelivery_would_reject(factory):
+    """If the reset-to-pending commit fails, the job is still `running`; raising self.retry() would
+    redeliver a message the claim then rejects. Surface the original error instead."""
+    job_id, reel_id, cut_id = _make(factory)
+    state = {"fail": False}
+
+    class Flaky(sessionmaker(bind=factory.kw["bind"]).class_):
+        def commit(self):
+            if state["fail"]:
+                raise sa_exc.OperationalError("COMMIT", {}, Exception("connection lost"))
+            return super().commit()
+
+    flaky = sessionmaker(bind=factory.kw["bind"], class_=Flaky, autoflush=False)
+
+    def body(self, db, job, ctx):
+        state["fail"] = True
+        raise ConnectionError("blip")
+
+    task = _task("t.commit_fails", body)
+    with patch("worker.tasks.common.SessionLocal", flaky), \
+            patch.object(task, "retry", side_effect=Retry()) as retry:
+        with pytest.raises(ConnectionError, match="blip"):
+            task(job_id)
+    retry.assert_not_called()
+
+
+def test_rollback_owner_trusts_the_database_not_a_cached_copy(factory):
+    """With expire_on_commit=False the session's copy of the reel can be stale; another writer may
+    have moved it on. The failure handler must re-read it before rolling it back."""
+    job_id, reel_id, cut_id = _make(factory)
+
+    def body(self, db, job, ctx):
+        assert db.get(models.Reel, reel_id).status == models.ReelStatus.generating   # cache it
+        other = factory()
+        other.get(models.Reel, reel_id).status = models.ReelStatus.guide_ready       # someone else moves it on
+        other.commit()
+        raise ValueError("boom")
+
+    with pytest.raises(ValueError):
+        _task("t.stale_owner", body)(job_id)
+    _, reel, _ = _read(factory, job_id, reel_id, cut_id)
+    assert reel.status == models.ReelStatus.guide_ready
+
+
+def test_error_text_removes_lone_surrogates_nul_bytes_and_bound_parameters():
+    assert _error_text(ValueError("llm said \ud83d oops")) == "llm said ? oops"
+    assert _error_text(ValueError("a\x00b")) == "ab"
+    leaked = ("(psycopg2.errors.StringDataRightTruncation) value too long\n"
+              "[SQL: UPDATE credentials SET token_blob=%(token_blob)s WHERE id = %(id)s]\n"
+              "[parameters: {'token_blob': 'ya29.SECRET-TOKEN', 'id': 1}]\n"
+              "(Background on this error at: https://sqlalche.me/e/20/9h9h)")
+    text = _error_text(ValueError(leaked))
+    assert "SECRET-TOKEN" not in text
+    assert "value too long" in text and "Background on this error" in text
+
+
+# ── hardening found by mutation testing ───────────────────────────────────────
+
+@pytest.fixture
+def file_factory(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path}/lifecycle.db")
+    models.Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine, autoflush=False)
+
+
+def _beat_threads():
+    return [t for t in threading.enumerate() if t.name.startswith("heartbeat-job-")]
+
+
+def test_failure_discards_the_bodys_uncommitted_mutations(factory):
+    """The failure stamp must not commit a half-done body's writes along with it."""
+    job_id, reel_id, cut_id = _make(factory)
+
+    def body(self, db, job, ctx):
+        db.get(models.Cut, cut_id).caption = "half-done"
+        raise ValueError("boom")
+
+    with pytest.raises(ValueError):
+        _task("t.discard", body)(job_id)
+    _, _, cut = _read(factory, job_id, reel_id, cut_id)
+    assert cut.caption is None
+
+
+def test_shutdown_before_the_claim_leaves_a_siblings_running_job_alone(factory):
+    """An interrupted worker that never owned the job must not hand a sibling's live job back to pending."""
+    job_id, *_ = _make(factory)
+    from worker.tasks import common
+    real, calls = common._advance, {"n": 0}
+
+    def sibling_wins_then_interrupt(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            _set_job(factory, job_id, status=models.JobStatus.running)
+            raise KeyboardInterrupt()
+        return real(*args, **kwargs)
+
+    task = _task("t.preclaim_kbd", lambda self, db, job, ctx: None)
+    with patch("worker.tasks.common._advance", side_effect=sibling_wins_then_interrupt):
+        with pytest.raises(KeyboardInterrupt):
+            task(job_id)
+    assert factory().get(models.Job, job_id).status == models.JobStatus.running
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_no_heartbeat_thread_outlives_the_task(factory, fail):
+    job_id, *_ = _make(factory)
+    body = _raises(ValueError("x")) if fail else (lambda self, db, job, ctx: None)
+    try:
+        _task(f"t.thread.{fail}", body)(job_id)
+    except ValueError:
+        pass
+    assert _beat_threads() == []
+
+
+def test_the_heartbeat_thread_survives_a_transient_db_error(file_factory):
+    job_id, *_ = _make(file_factory)
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        if threading.current_thread().name.startswith("heartbeat-job-"):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise sa_exc.OperationalError("SELECT", {}, Exception("blip"))
+        return file_factory(*args, **kwargs)
+
+    seen = {}
+
+    def body(self, db, job, ctx):
+        def read():
+            other = file_factory()
+            try:
+                return other.get(models.Job, job_id).heartbeat_at
+            finally:
+                other.close()
+        seen["before"] = read()
+        time.sleep(0.8)
+        seen["after"] = read()
+
+    with patch("worker.tasks.common.SessionLocal", flaky), patch("worker.tasks.common.HEARTBEAT_INTERVAL_S", 0.1):
+        _task("t.beat_flaky", body)(job_id)
+    assert calls["n"] >= 2 and seen["after"] > seen["before"]
+
+
+def test_the_heartbeat_thread_never_touches_a_job_the_reaper_failed(file_factory):
+    job_id, *_ = _make(file_factory)
+    seen = {}
+
+    def body(self, db, job, ctx):
+        _set_job(file_factory, job_id, status=models.JobStatus.failed, heartbeat_at=datetime(2020, 1, 1))
+        time.sleep(0.5)
+        other = file_factory()
+        seen["hb"] = other.get(models.Job, job_id).heartbeat_at
+        other.close()
+
+    with patch("worker.tasks.common.SessionLocal", file_factory), patch("worker.tasks.common.HEARTBEAT_INTERVAL_S", 0.1):
+        _task("t.beat_failed", body)(job_id)
+    assert seen["hb"] == datetime(2020, 1, 1)
+
+
+def test_failure_is_recorded_even_when_the_owner_row_is_gone(factory):
+    job_id, reel_id, cut_id = _make(factory, models.JobType.render, cut_status=models.CutStatus.rendering)
+    db = factory()
+    db.delete(db.get(models.Cut, cut_id))
+    db.commit()
+    db.close()
+    with pytest.raises(ValueError):
+        _task("t.gone", _raises(ValueError("boom")), job_type="render")(job_id)
+    job, _, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.failed
+
+
+def test_every_session_the_lifecycle_opens_is_closed(factory):
+    job_id, *_ = _make(factory)
+    opened = []
+
+    def spy(*args, **kwargs):
+        session = factory(*args, **kwargs)
+        session.close = MagicMock(wraps=session.close)
+        opened.append(session)
+        return session
+
+    with patch("worker.tasks.common.SessionLocal", spy):
+        _task("t.close", lambda self, db, job, ctx: None)(job_id)
+    assert opened and all(s.close.called for s in opened)
+
+
+def test_the_retry_message_is_truncated_like_every_other_error(factory):
+    job_id, reel_id, cut_id = _make(factory)
+    task = _task("t.retrymsg", _raises(httpx.ConnectTimeout("y" * 5000)))
+    with patch.object(task, "retry", side_effect=Retry()):
+        with pytest.raises(Retry):
+            task(job_id)
+    job, *_ = _read(factory, job_id, reel_id, cut_id)
+    assert len(job.error) <= 2000
+
+
+def test_a_pre_claim_transient_error_uses_the_real_retry_count_for_backoff(factory):
+    job_id, *_ = _make(factory)
+    task = _task("t.preclaim_retry", lambda self, db, job, ctx: None)
+    task.push_request(retries=1)
+    try:
+        with (
+            patch("worker.tasks.common._advance", side_effect=sa_exc.OperationalError("S", {}, Exception("x"))),
+            patch.object(task, "retry", side_effect=Retry()) as retry,
+        ):
+            with pytest.raises(Retry):
+                task(job_id)
+    finally:
+        task.pop_request()
+    assert retry.call_args.kwargs["countdown"] == 60
+
+
+def test_backoff_keeps_doubling_when_a_task_has_a_bigger_retry_budget(factory):
+    """30*2**retries, not 30*(retries+1): identical for retries 0 and 1, different from 2."""
+    job_id, *_ = _make(factory)
+    task = _task("t.backoff5", _raises(ConnectionError("x")), max_retries=5)
+    task.push_request(retries=2)
+    try:
+        with patch.object(task, "retry", side_effect=Retry()) as retry:
+            with pytest.raises(Retry):
+                task(job_id)
+    finally:
+        task.pop_request()
+    assert retry.call_args.kwargs["countdown"] == 120
+
+
+def test_rollback_owner_swallows_an_invalid_transition(factory, monkeypatch):
+    """The failure handler must never mask the real error, even if the state machine refuses the move."""
+    from api.state import CUT_TRANSITIONS
+    from worker.tasks.common import rollback_owner
+    job_id, reel_id, cut_id = _make(factory, cut_status=models.CutStatus.rendering)
+    monkeypatch.setitem(CUT_TRANSITIONS, "rendering", set())   # rendering -> failed is now illegal
+    db = factory()
+    rollback_owner(db, db.get(models.Job, job_id), "cut", {"rendering"})   # must not raise
+    db.commit()
+    assert factory().get(models.Cut, cut_id).status == models.CutStatus.rendering
+
+
+def test_task_signature_is_what_celery_needs_and_wraps_is_undone():
+    import inspect
+    from worker.tasks.render import render_cut
+    assert list(inspect.signature(render_cut.run).parameters) in (["job_id"], ["self", "job_id"])
+    assert not hasattr(render_cut.run, "__wrapped__")
+
+
+def test_the_engine_pings_connections_before_use():
+    """A backend killed server-side (failover, idle timeout) must be replaced, not fail the first query."""
+    from api.db import engine
+    assert engine.pool._pre_ping is True

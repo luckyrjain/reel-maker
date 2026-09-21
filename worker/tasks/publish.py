@@ -25,7 +25,9 @@ def _load_cut(db, job):
 # automatic retry would then post the video twice. The operator retries via the UI instead,
 # and the platform_post_id guard below stops a re-run from uploading a second time.
 @celery_app.task(bind=True, max_retries=0)
-@job_task("publish", prepare=_load_cut)
+# release_on_shutdown=False: a shutdown mid-upload may have been accepted by the platform; a
+# redelivered run would upload again. The job stays running and the reaper fails it instead.
+@job_task("publish", prepare=_load_cut, max_runtime_s=60 * 60, release_on_shutdown=False)
 def publish_cut(self, db, job, cut):
     # cut.status is set to "publishing" by the router before this task is
     # enqueued (mirrors trigger_render / render_cut) — this task does not
@@ -58,6 +60,7 @@ def publish_cut(self, db, job, cut):
 
         publisher = get_publisher(cut.platform.value)
         caption = build_published_caption(db, cut)
+        db.commit()   # end the read transaction: it would sit idle for the whole upload
         with record_stage(db, cut.reel_id, "publish", cut_id=cut.id, provider=cut.platform.value) as ev:
             result = publisher.publish(cut, credential, db, caption=caption)
             ev.detail["platform_post_id"] = result.platform_post_id

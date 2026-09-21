@@ -171,5 +171,5 @@ The HTML fragments use `.badge-{status}` classes for color coding:
 - Render exceptions are caught in `render_cut` and stored similarly
 - The job fragment displays `job.error` when status is `failed`
 - HTTP 4xx/5xx responses from Pexels, Wikipedia, Edge TTS, or the LLM surface as job failures (not HTTP errors to the browser)
-- Transient failures (connection errors, timeouts, HTTP 429/5xx) are retried twice with 30 s/60 s backoff before the job is failed. During backoff the job sits at `pending` with `error` set to `"transient failure, retry N: ..."`; the message is cleared if a later attempt succeeds
+- Transient failures (connection errors, timeouts, HTTP 429/5xx) are retried twice with 30 s/60 s backoff before the job is failed (`generate_guide` and `render_cut` only: `enrich_context` and `publish_cut` never retry automatically, since an enrichment retry re-runs a paid call for no gain and a publish retry after an accepted upload would post twice). During backoff the job sits at `pending` with `error` set to `"transient failure, retry N: ..."`; the message is cleared if a later attempt succeeds
 - Wikimedia CDN 429 rate-limits are handled silently (retry + thumbnail fallback) and do not fail the job; the beat falls back to Pexels stock footage

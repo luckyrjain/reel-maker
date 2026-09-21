@@ -588,6 +588,7 @@ def resolve_or_reuse(
         .order_by(models.CutAsset.order_in_beat)
         .all()
     )
+    db.commit()   # end the read transaction before any network call below
 
     if pinned and all(p.resolved_from == fingerprint for p in pinned):
         # All pins are current — reuse without any API call
@@ -626,5 +627,5 @@ def resolve_or_reuse(
                 order_in_beat=order,
                 resolved_from=fingerprint,
             ))
-    db.flush()
+    db.commit()   # the caller goes on to TTS/ffmpeg; don't leave the pins uncommitted and idle
     return results

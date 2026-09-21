@@ -19,11 +19,15 @@ def _load_cut_and_reel(db, job):
     reel = db.get(models.Reel, cut.reel_id)
     if reel is None:
         raise ValueError(f"Reel {cut.reel_id} no longer exists")
+    if cut.platform_post_id:
+        # A re-render would change the video while the cut still points at the old live post;
+        # publishing would then "finalize" against that stale post without uploading the new video.
+        raise ValueError(f"Cut {cut.id} is already posted ({cut.platform_post_id}) — it cannot be re-rendered")
     return cut, reel
 
 
 @celery_app.task(bind=True, max_retries=2)
-@job_task("render", prepare=_load_cut_and_reel)
+@job_task("render", prepare=_load_cut_and_reel, max_runtime_s=60 * 60)
 def render_cut(self, db, job, ctx):
     cut, reel = ctx
     guide = PlatformGuide(**cut.guide)

@@ -50,6 +50,7 @@ def _cut():
     cut.id = 5
     cut.reel_id = 10
     cut.guide = _GUIDE
+    cut.platform_post_id = None   # not posted (a bare MagicMock attribute would be truthy)
     cut.platform.value = "youtube_shorts"
     cut.status.value = "rendering"
     return cut
@@ -76,6 +77,29 @@ def test_missing_cut_fails_job_with_actionable_message():
 
     assert job.status == models.JobStatus.failed
     assert "Cut 77 no longer exists" in job.error
+
+
+def test_an_already_posted_cut_cannot_be_re_rendered():
+    """Re-rendering would change the video while the cut still points at the old live post."""
+    from worker.tasks.render import render_cut
+
+    job = _job()
+    cut = _cut()
+    cut.platform_post_id = "yt-live"
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else (
+        cut if model is models.Cut else _reel()
+    )
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.render.composite_cut") as mock_composite,
+    ):
+        with pytest.raises(ValueError, match="already posted"):
+            render_cut(1)
+
+    mock_composite.assert_not_called()
+    assert job.status == models.JobStatus.failed
 
 
 def test_successful_render_clears_stale_error():

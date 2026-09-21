@@ -16,6 +16,8 @@ from worker.tasks.maintenance import (
     PENDING_STALE_MINUTES, STALE_MINUTES, _reap_one, _revert_owner, reap_stuck_jobs,
 )
 
+_MINUTE = timedelta(minutes=1)
+
 _LONG_AGO = datetime.now(timezone.utc) - timedelta(hours=2)
 
 
@@ -150,16 +152,13 @@ def test_reap_one_backs_off_when_the_job_beat_after_it_was_selected(factory):
     """The reaper SELECTs a stale job, then the worker beats; the UPDATE must not fail it."""
     job_id, reel_id, cut_id = _make(factory, models.JobType.render, job_status=models.JobStatus.running,
                                     cut_status=models.CutStatus.rendering, reel_status=models.ReelStatus.guide_ready)
-    reaper = factory()
-    job = reaper.get(models.Job, job_id)             # the reaper's (now stale) snapshot
-
     worker = factory()
     worker.query(models.Job).filter(models.Job.id == job_id).update(
         {"heartbeat_at": datetime.now(timezone.utc)}, synchronize_session=False)
     worker.commit()
 
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_MINUTES)
-    assert _reap_one(reaper, job, "stale", models.Job.heartbeat_at < cutoff) is False
+    assert _reap_one(factory(), job_id, models.JobStatus.running, "stale", models.Job.heartbeat_at < cutoff) is False
 
     job, _, cut = _state(factory, job_id, reel_id, cut_id)
     assert job.status == models.JobStatus.running
@@ -168,17 +167,39 @@ def test_reap_one_backs_off_when_the_job_beat_after_it_was_selected(factory):
 
 def test_reap_one_does_not_overwrite_a_job_that_finished_after_it_was_selected(factory):
     job_id, reel_id, cut_id = _make(factory, models.JobType.render, job_status=models.JobStatus.running)
-    reaper = factory()
-    job = reaper.get(models.Job, job_id)
-
     worker = factory()
     worker.query(models.Job).filter(models.Job.id == job_id).update(
         {"status": models.JobStatus.done}, synchronize_session=False)
     worker.commit()
 
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_MINUTES)
-    assert _reap_one(reaper, job, "stale", models.Job.heartbeat_at < cutoff) is False
+    assert _reap_one(factory(), job_id, models.JobStatus.running, "stale", models.Job.heartbeat_at < cutoff) is False
     assert _state(factory, job_id, reel_id, cut_id)[0].status == models.JobStatus.done
+
+
+def test_the_status_pin_is_the_select_snapshot_not_a_later_re_read(factory):
+    """A job whose worker recovered and failed/reset it between the SELECT and the reaper's turn keeps
+    its real state, even though its heartbeat is still old."""
+    _make(factory, models.JobType.generate, job_status=models.JobStatus.running)
+    second = _make(factory, models.JobType.generate, job_status=models.JobStatus.running)
+    real = _reap_one
+    calls = []
+
+    def racing(db, job_id, seen_status, reason, clause):
+        if not calls:   # after the first reap commits, the second job's worker fails it for real
+            other = factory()
+            other.query(models.Job).filter(models.Job.id == second[0]).update(
+                {"status": models.JobStatus.failed, "error": "REAL ERROR: ffmpeg exit 1"},
+                synchronize_session=False)
+            other.commit()
+        calls.append(job_id)
+        return real(db, job_id, seen_status, reason, clause)
+
+    with patch("worker.tasks.maintenance._reap_one", side_effect=racing):
+        reap_stuck_jobs()
+
+    assert len(calls) == 2
+    assert "REAL ERROR" in _state(factory, *second)[0].error
 
 
 def test_one_bad_job_does_not_stop_the_rest(factory):
@@ -204,4 +225,79 @@ def test_one_bad_job_does_not_stop_the_rest(factory):
 def test_stale_thresholds_leave_room_for_the_heartbeat_thread():
     from worker.tasks import common
     assert STALE_MINUTES * 60 >= 4 * common.HEARTBEAT_INTERVAL_S
-    assert PENDING_STALE_MINUTES > STALE_MINUTES
+    assert min(PENDING_STALE_MINUTES.values()) > STALE_MINUTES
+    assert set(PENDING_STALE_MINUTES) == {t.value for t in models.JobType}
+
+
+@pytest.mark.parametrize("job_type, age_minutes, reaped", [
+    (models.JobType.generate, 45, True),    # generation queue is drained quickly
+    (models.JobType.generate, 10, False),
+    (models.JobType.render, 120, False),    # queued behind other hour-long renders (concurrency 1)
+    (models.JobType.render, 5 * 60, True),
+    (models.JobType.publish, 30, False),
+    (models.JobType.publish, 90, True),
+])
+def test_pending_threshold_is_per_job_type(factory, job_type, age_minutes, reaped):
+    """A render legitimately queues for hours behind others; reaping it would silently drop it."""
+    job_id, reel_id, cut_id = _make(
+        factory, job_type, job_status=models.JobStatus.pending,
+        updated_at=datetime.now(timezone.utc) - age_minutes * _MINUTE,
+    )
+    reap_stuck_jobs()
+    status = _state(factory, job_id, reel_id, cut_id)[0].status
+    assert (status == models.JobStatus.failed) is reaped
+
+
+def test_max_runtime_leaves_the_reaper_time_to_act_before_a_pending_job_could_be_lost():
+    from worker.tasks import publish, render  # noqa: F401  (registers the tasks)
+    from worker.celery_app import celery_app
+    celery_app.loader.import_default_modules()
+    render_cap = celery_app.tasks["worker.tasks.render.render_cut"].run.max_runtime_s
+    # A queued render waits behind at most a few renders that each stop being beaten at render_cap.
+    assert PENDING_STALE_MINUTES["render"] * 60 >= 3 * render_cap
+
+
+# ── hardening found by mutation testing ───────────────────────────────────────
+
+def test_a_job_whose_owner_rollback_fails_is_left_running_and_untouched(factory):
+    """If rolling the owner back blows up, the job's failed stamp must not be committed by the NEXT
+    job's commit, leaving the reel stuck in `generating` forever."""
+    first = _make(factory, models.JobType.generate, job_status=models.JobStatus.running)
+    second = _make(factory, models.JobType.generate, job_status=models.JobStatus.running)
+    real, seen = _revert_owner, []
+
+    def flaky(db, job):
+        seen.append(job.id)
+        if len(seen) == 1:
+            raise RuntimeError("boom")
+        real(db, job)
+
+    with patch("worker.tasks.maintenance._revert_owner", side_effect=flaky):
+        reap_stuck_jobs()
+
+    bad = first if seen[0] == first[0] else second
+    good = second if bad == first else first
+    bad_job, bad_reel, _ = _state(factory, *bad)
+    good_job, good_reel, _ = _state(factory, *good)
+    assert bad_job.status == models.JobStatus.running          # retried on the next pass
+    assert bad_reel.status == models.ReelStatus.generating
+    assert good_job.status == models.JobStatus.failed and good_reel.status == models.ReelStatus.failed
+
+
+def test_the_running_threshold_is_five_minutes(factory):
+    now = datetime.now(timezone.utc)
+    stale = _make(factory, models.JobType.render, job_status=models.JobStatus.running,
+                  heartbeat_at=now - 10 * _MINUTE, updated_at=now - 10 * _MINUTE)
+    fresh = _make(factory, models.JobType.render, job_status=models.JobStatus.running,
+                  heartbeat_at=now - 2 * _MINUTE, updated_at=now - 2 * _MINUTE)
+    reap_stuck_jobs()
+    assert _state(factory, *stale)[0].status == models.JobStatus.failed
+    assert _state(factory, *fresh)[0].status == models.JobStatus.running
+
+
+def test_a_running_job_is_judged_by_heartbeat_at_not_updated_at(factory):
+    now = datetime.now(timezone.utc)
+    ids = _make(factory, models.JobType.render, job_status=models.JobStatus.running,
+                heartbeat_at=now, updated_at=now - timedelta(hours=2))
+    reap_stuck_jobs()
+    assert _state(factory, *ids)[0].status == models.JobStatus.running

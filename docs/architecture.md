@@ -29,7 +29,7 @@ Reel Maker is a local-first, single-operator pipeline that turns a text prompt i
                            │   enrich_context  [generation Q]  │
                            │   generate_guide  [generation Q]  │
                            │   render_cut      [rendering Q]   │
-                           │   reap_stuck_jobs [beat]          │
+                           │   reap_stuck_jobs [generation Q]  │
                            └──┬────────────────┬───────────────┘
                               │                │
              ┌────────────────▼──┐   ┌─────────▼──────────────────────────┐
@@ -140,12 +140,14 @@ The browser never fetches JSON. All API responses to the browser are HTML fragme
 | `test_enrichment.py` | 15 tests — `coerce_beat_type`, `_enrich_batch` response shapes, topic fence assertions |
 | `test_audio_text_sync.py` | 11 tests — `clean_guide()` regeneration, `_build_text_filter()` proportional timing + Whisper fallback, visual direction anchoring |
 | `test_context_enricher.py` | 13 tests — all 5 evaluator axes at boundary values, combined score, `llm_enrich` |
-| `test_enrich_context_task.py` | 13 tests — enrichment gating, LLM failure fallback, structured script guard, missing reel, owner rollback wiring, orphan generate-job cleanup |
-| `test_job_lifecycle.py` | 40 tests — `job_task` on dummy tasks: atomic claim, fenced done-stamp, heartbeat thread, retry/failure/owner rollback, `.delay` signature regression, per-task wiring, beat routing |
+| `test_enrich_context_task.py` | 14 tests — enrichment gating, LLM failure fallback, structured script guard, missing reel, owner rollback wiring, orphan cleanup |
+| `test_job_lifecycle.py` | 63 tests — `job_task` on dummy tasks: atomic claim, fenced done-stamp/heartbeat, heartbeat thread, retry/failure/owner rollback, `.delay` signature regression, per-task wiring, beat routing |
+| `test_tasks_real_db.py` | 4 tests — real tasks through `job_task`: post id durable, caption sent, enrich enqueues the real job id |
 | `test_common.py` | 18 tests — transient-error classification (incl. DB connection errors), retry budget boundary |
 | `test_generate_task.py` | 6 tests — missing reel, reel not generating, paid-call budget, structured-path fallback, `music_cue` default |
-| `test_render_task.py` | 4 tests — missing cut, success clears stale error, music wiring |
-| `test_maintenance.py` | 16 tests — reaper on SQLite: per-job-type owner rollback, stale running/pending jobs, healthy jobs untouched, `updated_at` keying, compare-and-set back-off |
+| `test_publish_task.py` | 10 tests — safety gate, no auto-retry, early post id, finalize without re-upload, attribution |
+| `test_render_task.py` | 5 tests — missing cut, already-posted cut refused, success clears stale error, music wiring |
+| `test_maintenance.py` | 27 tests — reaper on SQLite: per-job-type rollback and pending thresholds, compare-and-set back-off, status pin |
 | `test_asset_sourcer.py` | 4 tests — `resolve_or_reuse` pin, reuse-without-API-call, re-pin, per-beat isolation |
 | `test_llm_judge.py` | 3 tests — neutral-score fallback on provider raise, garbage JSON, out-of-range dimension |
 | `test_tts.py` | 8 tests — provider selection, unknown-provider fallback, `SilentProvider` shared file, `synth_to_budget` clamp |
@@ -274,7 +276,7 @@ combined = int(rule × 0.4 + llm × 0.6)   threshold 80 (NVIDIA) / 65 (local Oll
 
 | Setting | Value | Reason |
 |---|---|---|
-| `task_acks_late` | `True` | Ack only after task returns — killed worker requeues |
+| `task_acks_late` | `True` | Ack only after task returns — killed worker requeues (the redelivered message finds the job `running`/`failed` and no-ops; recovery is the reaper failing the job, then an operator retry) |
 | `task_reject_on_worker_lost` | `True` | SIGKILL requeues rather than drops |
 | `visibility_timeout` | 7200 s | > worst-case render; prevents duplicate runs on slow tasks |
 | `worker_prefetch_multiplier` | 1 | No worker hoards multiple long tasks |

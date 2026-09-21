@@ -45,7 +45,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 353 tests across 30+ files (4 test_compositor tests need ffmpeg on PATH)
+.venv/bin/pytest                            # 397 tests across 30+ files (4 test_compositor tests need ffmpeg on PATH)
 .venv/bin/pytest tests/test_foo.py::bar -s
 
 # New migration after changing models.py
@@ -87,11 +87,11 @@ In both paths, `postprocess.py` strips section-label prefixes from `vo_script` a
 - Structured path has a quality gate: if score < threshold, falls through to standard LLM path. Records `structured_score` and `structured_fallback: True` in `job.meta`.
 
 **Reliability features:**
-- `task_acks_late=True` — broker acks only after task returns; a killed worker requeues rather than silently loses.
+- `task_acks_late=True` — broker acks only after task returns, so a killed worker's message is redelivered rather than silently lost. The redelivered message finds the job `running` (or `failed`) and no-ops, so recovery is the reaper failing the job and an operator retry, not an automatic re-run.
 - `task_reject_on_worker_lost=True` — task requeued when worker is SIGKILLed.
-- **Transient-failure retry** — `generate_guide` and `render_cut` retry up to twice with 30 s/60 s backoff when `worker/tasks/common.py::should_retry()` classifies the exception as transient (httpx transport errors, timeouts, HTTP 429/5xx). Deterministic failures — bad LLM JSON, quality-below-threshold, a missing row, ffmpeg's non-zero exit — fail once, unchanged. The retry branch resets `job.status` to `pending` before calling `self.retry()`: the idempotency guard rejects `running`, so a retry that left the status alone would be a silent no-op. It must **not** bump `job.attempts` — task entry already does. `enrich_context` and `publish_cut` stay `max_retries=0` on purpose (`publish_cut` is an irreversible external post: a transient error can arrive *after* the platform accepted the upload, and a retry would post twice). Database connection errors (`OperationalError`/`InterfaceError`) count as transient. All of this lives in `worker/tasks/common.py::job_task` — never re-implement it in a task.
+- **Transient-failure retry** — `generate_guide` and `render_cut` retry up to twice with 30 s/60 s backoff when `worker/tasks/common.py::should_retry()` classifies the exception as transient (httpx transport errors, timeouts, HTTP 429/5xx). Deterministic failures — bad LLM JSON, quality-below-threshold, a missing row, ffmpeg's non-zero exit — fail once, unchanged. The retry branch resets `job.status` to `pending` before calling `self.retry()`: the idempotency guard rejects `running`, so a retry that left the status alone would be a silent no-op. It must **not** bump `job.attempts` — task entry already does. `enrich_context` and `publish_cut` stay `max_retries=0` on purpose (`publish_cut` is an irreversible external post: a transient error can arrive *after* the platform accepted the upload, and a retry would post twice). Database connection errors (`OperationalError`/`InterfaceError`) count as transient, and `api/db.py` sets `pool_pre_ping=True` so a backend killed server-side (failover, idle timeout) is replaced before use. All of this lives in `worker/tasks/common.py::job_task` — never re-implement it in a task.
 - **Idempotency guard / atomic claim** at task entry: only a `pending` job runs. `done`/`running` are redelivery no-ops and `failed` is terminal (an operator retry creates a new Job). The claim is `UPDATE … WHERE status='pending'`, so of two deliveries only one runs the body. The done-stamp is fenced the same way (`WHERE status='running'`): a worker the reaper already gave up on has its uncommitted mutations rolled back rather than committed.
-- **Heartbeat** — `job_task` refreshes `job.heartbeat_at` every 30 s from a background thread while the body runs (bodies block for minutes on an LLM call, ffmpeg or an upload); bodies also call `heartbeat()` for progress. `reap_stuck_jobs` (Celery beat, every 60 s, routed to the `generation` queue — an unrouted beat task lands on the default queue that no documented worker consumes) fails any `running` job without a heartbeat update in the last 5 minutes, **and** any `pending` job whose `updated_at` is older than 30 minutes (broker was down when `.delay()` ran, or no worker consumes the queue). The pending branch keys on `updated_at`, not `created_at`, so a job sitting in retry backoff is not reaped for being old. Each reap is a compare-and-set that re-checks staleness in the UPDATE, and rolls back only the owner state that job's type owns (`JOB_IN_FLIGHT`).
+- **Heartbeat** — `job_task` refreshes `job.heartbeat_at` every 30 s from a background thread while the body runs (bodies block for minutes on an LLM call, ffmpeg or an upload); bodies also call `heartbeat()` for progress. `reap_stuck_jobs` (Celery beat, every 60 s, routed to the `generation` queue — an unrouted beat task lands on the default queue that no documented worker consumes) fails any `running` job without a heartbeat update in the last 5 minutes, **and** any `pending` job whose `updated_at` is older than 30 minutes (broker was down when `.delay()` ran, or no worker consumes the queue). The pending branch keys on `updated_at`, not `created_at`, so a job sitting in retry backoff is not reaped for being old. Each reap is a compare-and-set that re-checks the status and staleness the SELECT saw, and rolls back only the owner state that job's type owns (`JOB_IN_FLIGHT`). The `pending` threshold is per job type (`PENDING_STALE_MINUTES`: enrich/generate 30, publish 60, render 240) because a render queues behind hour-long renders at concurrency 1 and a reaped job is terminal. The heartbeat thread stops beating a body after its `max_runtime_s` (enrich 30 min, generate 2 h, render 60 min, publish 60 min) so a hung ffmpeg/upload becomes reapable instead of holding the render slot forever.
 - **Atomic MP4 write** — FFmpeg writes to `.tmp.mp4`, then `os.replace()` to the final path; a killed process never leaves a servable half-written file.
 
 ## Module layout
@@ -124,10 +124,10 @@ worker/
                       fenced done-stamp, transient-retry reset, failure stamp + per-job-type owner rollback via
                       api/state.py::JOB_IN_FLIGHT); rollback_owner(); should_retry() / is_transient_error() /
                       heartbeat() — shared task helpers
-    generate.py       generate_guide(job_id) — idempotency guard, heartbeat, enrichment,
+    generate.py       generate_guide(job_id) — prepare (reel must be `generating`, paid-call budget), enrichment,
                       conflict injection, visuals LLM, closed-loop eval retry, observability,
                       paid-call budget cap (_enforce_paid_call_budget)
-    render.py         render_cut(job_id) — idempotency guard, heartbeat, resolve_or_reuse,
+    render.py         render_cut(job_id) — prepare (refuses an already-posted cut), resolve_or_reuse,
                       synth_to_budget, TTS-accurate timecodes, atomic MP4, observability;
                       resolves a music track via get_music_sourcer().find(music_cue) and
                       passes it to composite_cut()
@@ -223,13 +223,14 @@ tests/
   test_enrichment.py          15 tests — coerce_beat_type, _enrich_batch response parsing, topic fence
   test_audio_text_sync.py     11 tests — clean_guide() regeneration, _build_text_filter() proportional timing + whisper fallback, PATCH re-derivation, visual direction anchoring
   test_context_enricher.py    13 tests — evaluate_context axes, llm_enrich
-  test_enrich_context_task.py 13 tests — enrichment gating, LLM failure fallback, structured script guard, missing reel, owner rollback wiring, orphan generate-job cleanup
-  test_maintenance.py         16 tests — reaper on in-memory SQLite: per-job-type owner rollback, stale running/pending jobs, healthy jobs untouched, updated_at keying, compare-and-set back-off
+  test_enrich_context_task.py 14 tests — enrichment gating, LLM failure fallback, structured script guard, missing reel, owner rollback wiring, orphan generate-job cleanup (only when it claimed the orphan)
+  test_maintenance.py         27 tests — reaper on in-memory SQLite: per-job-type owner rollback, stale running/pending jobs, per-job-type pending thresholds, healthy jobs untouched, updated_at keying, compare-and-set back-off, status pin = SELECT snapshot, one bad job doesn't stop the rest
   test_tts.py                  8 tests — provider selection, unknown-provider fallback, SilentProvider shared file, synth_to_budget clamp
   test_common.py              18 tests — transient-error classification (incl. DB connection errors), retry budget
-  test_job_lifecycle.py       40 tests — job_task on dummy tasks (in-memory SQLite): atomic claim/race, fenced done-stamp, heartbeat thread, prepare-before-attempts, retry/backoff, failure stamp (NUL, masked errors, reaped job), DB errors, shutdown release, per-job-type owner rollback, after_commit + cleanup hook, `.delay` signature regression, per-task job_type/max_retries wiring, beat-task routing
+  test_job_lifecycle.py       63 tests — job_task on dummy tasks (in-memory SQLite): atomic claim/race, fenced done-stamp and heartbeat (JobLost), heartbeat thread (survives DB blips, never touches a reaped job, stops at max_runtime_s, never outlives the task), prepare-before-attempts, retry/backoff, refused retry (Reject), failure stamp (NUL/surrogates/[parameters] redacted, reaped job, masked errors, discarded half-writes), DB errors, shutdown release + opt-out, per-job-type owner rollback (fresh state), after_commit + cleanup hook, `.delay` signature regression, per-task job_type/max_retries/shutdown/runtime wiring, beat-task routing, pool_pre_ping
+  test_tasks_real_db.py       4 tests — real tasks through job_task on SQLite: post id durable after a post-upload failure, built caption sent, enrich enqueues the real job id
   test_generate_task.py        6 tests — missing reel, reel not generating, paid-call budget, structured-path fallback, music_cue default
-  test_render_task.py          4 tests — missing cut, success clears stale error, music wiring
+  test_render_task.py          5 tests — missing cut, already-posted cut refused, success clears stale error, music wiring
   test_asset_sourcer.py        4 tests — resolve_or_reuse pin, reuse, re-pin, beat isolation
   test_asset_sourcer_cost.py   9 tests — HF cost StageEvents charged only on real generation, not cache hits
   test_music_source.py         8 tests — LocalMusicSource keyword matching, missing/empty library
@@ -242,9 +243,9 @@ tests/
   test_publish_gate.py         3 tests — safe_to_publish enforcement
   test_oauth.py               13 tests — OAuth state CSRF, YouTube/Instagram authorize+exchange, long-lived token swap, token-in-header regression
   test_credentials_router.py   9 tests — connect/callback/disconnect routes
-  test_publish_task.py        10 tests — publish_cut safety gate (publisher never reached), no auto-retry, post id committed early, re-run finalizes without re-upload, attribution caption
+  test_publish_task.py        10 tests — publish_cut safety gate (publisher never reached, also on the finalize path), no auto-retry, post id committed early, re-run finalizes without re-upload, attribution caption
   test_publish_registry.py     7 tests — platform→publisher, platform→credential-provider, platform→metrics-fetcher mapping
-  test_cuts_publish_router.py  6 tests — POST /cuts/{id}/publish state-guard and enqueue
+  test_cuts_publish_router.py 12 tests — POST /cuts/{id}/publish state-guard and enqueue; render refused for an already-posted cut; failed-cut card offers publish (not render) once posted
   test_youtube_publisher.py    6 tests — resumable upload flow, token refresh, whitespace-caption fallback
   test_instagram_publisher.py  7 tests — container create/poll/publish flow, error paths, token-in-header regression
   test_attribution.py          8 tests — build_attribution_block dedup/formatting, build_published_caption
@@ -298,14 +299,17 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 ## Key conventions
 
 - **Routers return HTML, not JSON** (except `GET /api/jobs/{id}`). Use `response_class=HTMLResponse` and `templates.TemplateResponse(...)`.
-- **Every Celery task** is `@celery_app.task(bind=True, max_retries=n)` over `@job_task("<job type>", prepare=..., after_commit=..., after_commit_failed=...)` from `worker/tasks/common.py`, wrapping a body `(self, db, job, ctx)`. The decorator owns the claim, heartbeat, done-stamp, retry-reset and failure stamp; the body calls `heartbeat()` for progress and raises to fail.
+- **Every Job-backed task** (`enrich_context`, `generate_guide`, `render_cut`, `publish_cut`; not the beat tasks `reap_stuck_jobs`/`pull_publish_metrics`) is `@celery_app.task(bind=True, max_retries=n)` over `@job_task("<job type>", prepare=..., after_commit=..., after_commit_failed=...)` from `worker/tasks/common.py`, wrapping a body `(self, db, job, ctx)`. The decorator owns the claim, heartbeat, done-stamp, retry-reset and failure stamp; the body calls `heartbeat()` for progress and raises to fail.
   - Order: `status != pending` → return; atomic claim (`pending → running`, losing the race returns); heartbeat thread starts; `prepare(db, job) -> ctx`; `attempts` bump + `started_at`; body; fenced done-stamp; `after_commit(result)`.
   - `prepare` runs after the claim but **before** `attempts`/`started_at` are set: row loads, `... no longer exists` guards and budget checks go here, so a failure there fails the job without bumping `attempts`.
   - The body must **not commit after its last domain mutation** — the done-stamp commit lands it atomically with `status = done`. `record_stage()`/`heartbeat()` commit, so keep them before the final mutations. The one deliberate exception is an irreversible external side effect (`publish_cut` commits `platform_post_id` right after the upload).
   - `after_commit(result)` runs after the done commit (used by `enrich_context` to enqueue `generate_guide`); it receives the body's return value, never a session, and never retries. If it raises, the job is flipped `done → failed` and `after_commit_failed(db, job, result)` cleans up what the body left behind (`enrich_context` fails the orphan generate Job and rolls the reel back from `generating`).
   - Sessions are opened with `expire_on_commit=False`; the default would leave a transaction idle-in-transaction across every long LLM / ffmpeg / upload call. The done-stamp fence, not fresh reloads, protects against a stale view.
-  - Every lifecycle write is a compare-and-set on `Job.status`, so a worker that lost the job (reaped, or claimed by a sibling) never overwrites the winner or rolls back its owner. Errors while recording a failure are logged and never mask the original exception; NUL bytes are stripped from `job.error`. A `SystemExit`/`KeyboardInterrupt` releases the job back to `pending`.
-  - The wrapper's signature is forced to `(self, job_id)`: `functools.wraps` alone exposes the body's signature and `.delay(job_id)` raises `TypeError`. `run.job_type` records the wiring for tests.
+  - Every lifecycle write is a compare-and-set on `Job.status`, so a worker that lost the job (reaped, or claimed by a sibling) never overwrites the winner or rolls back its owner. Errors while recording a failure are logged and never mask the original exception; NUL bytes are stripped from `job.error`. A `SystemExit`/`KeyboardInterrupt` releases the job back to `pending` (unless `release_on_shutdown=False`).
+  - `del run.__wrapped__` is what keeps `.delay(job_id)` working: `functools.wraps` alone exposes the body's signature to Celery and it raises `TypeError`. `run.job_type` / `release_on_shutdown` / `max_runtime_s` record the wiring for tests.
+  - `heartbeat()` is fenced: it raises `JobLost` when the job is no longer `running` (the reaper gave up on it), aborting a zombie body at its next milestone. It COMMITS, so call it before the body's last mutations.
+  - `release_on_shutdown=False` (publish): a `SystemExit` mid-upload leaves the job `running` for the reaper instead of resetting it to `pending` — a redelivered run would upload the video again. A refused retry (`Reject`, broker down) fails the job at once.
+  - `job.error` is sanitised (`_error_text`): NUL bytes and lone surrogates removed (Postgres rejects them, which would fail the commit that records the failure) and SQLAlchemy's `[parameters: …]` redacted (they can echo bound tokens).
   - Failure rolls back the owner via `api/state.py::JOB_IN_FLIGHT` — only the state that job type owns (a stale render job never flips a `publishing` cut); the reaper uses the same table. `guide_ready`/`in_review` are deliberately absent.
 - **Idempotency guard**: see the atomic claim above. A `failed` job never re-runs: a late redelivery of a job the reaper already failed would otherwise (for publish) upload the video.
 - **Asset pinning**: use `resolve_or_reuse()` (not `resolve_beat_assets()`) from render tasks. It reuses pinned assets when `visual_direction` fingerprint matches; re-resolves and re-pins only changed beats. This makes re-renders fast and deterministic.
