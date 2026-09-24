@@ -200,3 +200,24 @@ def test_the_soft_time_limit_in_the_structured_path_does_not_fall_back_to_the_st
 
     standard_path.assert_not_called()
     assert job.status == models.JobStatus.failed
+
+
+def test_generate_caption_hashtags_does_not_swallow_the_soft_time_limit():
+    """A bare except Exception around the blocking llm.complete() call would silently launder a
+    runtime-limit breach into 'no caption, use the fallback template' and let the task run on to a
+    normal-looking completion instead of failing visibly."""
+    from celery.exceptions import SoftTimeLimitExceeded
+    from worker.tasks.generate import _generate_caption_hashtags
+
+    llm = MagicMock()
+    llm.complete.side_effect = SoftTimeLimitExceeded()
+    with pytest.raises(SoftTimeLimitExceeded):
+        _generate_caption_hashtags([], "football", llm)
+
+
+def test_generate_caption_hashtags_still_falls_back_on_an_ordinary_error():
+    from worker.tasks.generate import _generate_caption_hashtags
+
+    llm = MagicMock()
+    llm.complete.side_effect = ValueError("bad json")
+    assert _generate_caption_hashtags([], "football", llm) == ("", [])

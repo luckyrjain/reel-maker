@@ -278,9 +278,10 @@ def test_failed_unposted_cut_warns_to_check_the_platform_before_retrying(client)
     assert "check the platform first" in html
 
 
-def test_the_job_is_committed_before_it_is_enqueued(client):
-    """.delay() must run with the job row already visible to a worker and no transaction of ours open
-    across it (a slow broker failure would otherwise outlive an idle-in-transaction timeout).
+def _assert_committed_before_enqueue(client, trigger, patch_target):
+    """Shared shape for the "no transaction open across .delay()" regression test: the job row must
+    already be visible to a worker and the router's own session must hold no transaction at the moment
+    .delay() runs (a slow broker failure would otherwise outlive an idle-in-transaction timeout).
 
     A mocked .delay() can't observe transaction state through a second connection: the commit already
     made the row visible regardless of what runs after it. The regression this guards (db.refresh()
@@ -290,7 +291,6 @@ def test_the_job_is_committed_before_it_is_enqueued(client):
     from api.db import get_db
     from api.main import app
 
-    cut_id = _guide_cut(client, models.CutStatus.draft)
     sessions = []
     real_override = app.dependency_overrides[get_db]
 
@@ -318,13 +318,45 @@ def test_the_job_is_committed_before_it_is_enqueued(client):
 
     app.dependency_overrides[get_db] = tracking_override
     try:
-        with patch("api.routers.cuts.render_cut") as mock_task:
+        with patch(patch_target) as mock_task:
             mock_task.delay.side_effect = delay
-            assert client.post(f"/api/cuts/{cut_id}/render").status_code == 200
+            resp = trigger()
     finally:
         app.dependency_overrides[get_db] = real_override
+    assert resp.status_code == 200, resp.text
     assert seen["visible"] is True
     assert seen["in_transaction_during_delay"] is False
+
+
+def test_render_status_fragment_offers_a_retry_button_on_failure(client):
+    """render_status.html's polling fragment showed only the badge and error text on failure, with no
+    way to retry short of a full page reload -- unlike publish_status.html, which already had one."""
+    cut_id = _make_cut(client._session_factory, models.CutStatus.failed, video_path=None)
+    db = client._session_factory()
+    job = models.Job(type=models.JobType.render, reel_id=db.get(models.Cut, cut_id).reel_id,
+                     cut_id=cut_id, status=models.JobStatus.failed, error="ffmpeg exit 1")
+    db.add(job)
+    db.commit()
+    job_id = job.id
+    db.close()
+
+    resp = client.get(f"/api/cuts/{cut_id}/render-status", params={"job_id": job_id})
+    assert resp.status_code == 200
+    assert "ffmpeg exit 1" in resp.text
+    assert f'hx-post="/api/cuts/{cut_id}/render"' in resp.text
+    assert "Retry render" in resp.text
+
+
+def test_the_render_job_is_committed_before_it_is_enqueued(client):
+    cut_id = _guide_cut(client, models.CutStatus.draft)
+    _assert_committed_before_enqueue(
+        client, lambda: client.post(f"/api/cuts/{cut_id}/render"), "api.routers.cuts.render_cut")
+
+
+def test_the_publish_job_is_committed_before_it_is_enqueued(client):
+    cut_id = _make_cut(client._session_factory, models.CutStatus.approved)
+    _assert_committed_before_enqueue(
+        client, lambda: client.post(f"/api/cuts/{cut_id}/publish"), "api.routers.cuts.publish_cut")
 
 
 def test_approve_and_edit_lock_the_cut_row_like_the_trigger_routes(client):
@@ -348,6 +380,33 @@ def test_approve_and_edit_lock_the_cut_row_like_the_trigger_routes(client):
     with patch.object(Session, "get", spy):
         client.patch(f"/api/cuts/{editable}", data={"caption": "new"})
     assert seen and seen[0] is True
+
+
+def test_update_cut_reads_the_body_before_taking_the_row_lock(client):
+    """The lock must be taken AFTER the body is read: a slow or stalled client would otherwise hold the
+    row lock (and a pool connection) for as long as its body trickles in, starving every other request
+    waiting on that lock -- not just requests for this cut."""
+    from sqlalchemy.orm import Session
+    from starlette.requests import Request
+
+    cut_id = _make_cut(client._session_factory, models.CutStatus.in_review)
+    order = []
+    real_get = Session.get
+    real_form = Request.form
+
+    def get_spy(self, entity, ident, **kwargs):
+        if entity is models.Cut and kwargs.get("with_for_update"):
+            order.append("lock")
+        return real_get(self, entity, ident, **kwargs)
+
+    async def form_spy(self, *a, **k):
+        order.append("form")
+        return await real_form(self, *a, **k)
+
+    with patch.object(Session, "get", get_spy), patch.object(Request, "form", form_spy):
+        resp = client.patch(f"/api/cuts/{cut_id}", data={"caption": "new"})
+    assert resp.status_code == 200
+    assert order == ["form", "lock"]
 
 
 def test_a_failed_request_is_reported_to_the_operator_not_swallowed_by_htmx(client):

@@ -160,6 +160,11 @@ def _generate_caption_hashtags(
         hashtags = data.get("hashtags", [])
         if caption and isinstance(hashtags, list) and len(hashtags) >= 5:
             return caption, [str(h).lstrip("#") for h in hashtags[:15]]
+    except SoftTimeLimitExceeded:
+        # llm.complete() is the blocking call inside this try; a bare except Exception here would
+        # silently launder a runtime-limit breach into "no caption, use the fallback template" and
+        # let the task keep running to a normal-looking completion instead of failing visibly.
+        raise
     except Exception:
         pass
     return "", []

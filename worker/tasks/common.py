@@ -47,7 +47,10 @@ HEARTBEAT_INTERVAL_S = 30
 # task therefore declares a max_runtime_s, used twice: the thread stops beating past it (so the
 # reaper fails a wedged job's record), and the task registers it as a Celery soft_time_limit
 # (see time_limits()), which raises SoftTimeLimitExceeded inside the body and, if that is ignored,
-# kills the worker process after a grace period - the only thing that frees a hung slot.
+# kills the worker process after a grace period, which is the only thing that frees a hung slot.
+# This is best-effort, not a guarantee: it's a race against _fail_interrupted's own DB write, and
+# Celery escalates SIGTERM->SIGKILL, so a plain SIGKILL (or losing that race) skips this path
+# entirely. The reaper remains the actual backstop, not a rarely-needed fallback.
 TIME_LIMIT_GRACE_S = 120
 
 # A DB error before the job was claimed means nothing has run yet, so retrying is always safe,
@@ -154,8 +157,11 @@ def rollback_owner(db, job, kind: str, states: Collection[str]) -> None:
 
 _PARAMETERS = re.compile(r"\[parameters:[^\n]*")
 # psycopg2 puts the offending row in the exception text ("DETAIL:  Failing row contains (...)",
-# "Key (col)=(value) already exists"), which hide_parameters does not cover.
-_DB_DETAIL = re.compile(r"(?m)^[ \t]*(?:DETAIL|CONTEXT):[^\n]*")
+# "Key (col)=(value) already exists"), which hide_parameters does not cover. DETAIL/CONTEXT are
+# always the trailing part of the message, and libpq wraps a long "Failing row contains (...)" onto
+# a second physical line -- redact to the end of the string, not just to the end of the first line,
+# or the wrapped continuation (which can itself hold column values) leaks past a [^\n]* bound.
+_DB_DETAIL = re.compile(r"(?ms)^[ \t]*(?:DETAIL|CONTEXT):.*")
 _MAX_ERROR_INPUT = 20_000
 
 
@@ -272,40 +278,61 @@ def _fail_job_keep_owner(db, job_id, message: str) -> bool:
     return True
 
 
+def _finalize_or_reconnect(db, job_id: int, write) -> None:
+    """Roll back, run ``write(session, job_id)``, commit. These are last-resort, one-shot failure
+    recorders with no other net: if this doesn't land, the job is stuck until the reaper (hours).
+
+    The connection `db` holds may itself be the thing that died — a server-side kill, or the
+    database's idle_in_transaction_session_timeout, can land at exactly the moment this runs, since
+    it is often called BECAUSE something just went wrong. A dead socket can't be rolled back into a
+    clean state, so `db.rollback()` itself can raise. When that (or the write, or the commit) fails
+    with a connection-level error, retry the whole sequence once on a brand-new session rather than
+    silently losing the failure this call exists to record. Any other exception (a real bug in
+    `write`) is not retried and propagates as-is.
+    """
+    def attempt(session):
+        session.rollback()
+        session.expire_all()
+        write(session, job_id)
+        session.commit()
+
+    try:
+        attempt(db)
+    except (sa_exc.OperationalError, sa_exc.InterfaceError):
+        fresh = SessionLocal()
+        try:
+            attempt(fresh)
+        finally:
+            fresh.close()
+
+
 def _fail_interrupted(db, job_id, exc: BaseException, owner_kind: str, owner_state: str) -> None:
     """SystemExit / KeyboardInterrupt while the job was running (worker shut down or killed by a
     Celery hard time limit): fail it now. Do NOT hand it back to pending: Celery has already
     acked or dropped the message, so nothing would ever pick a pending job up again."""
-    db.rollback()
-    db.expire_all()
-    _fail_job(db, job_id, models.JobStatus.running,
-              f"Worker was shut down while the job was running ({type(exc).__name__}). "
-              "The work was not finished; retry it.", owner_kind, owner_state)
-    db.commit()
+    message = (f"Worker was shut down while the job was running ({type(exc).__name__}). "
+               "The work was not finished; retry it.")
+    _finalize_or_reconnect(db, job_id, lambda s, jid: _fail_job(
+        s, jid, models.JobStatus.running, message, owner_kind, owner_state))
 
 
 def _fail_rejected_retry(db, job_id, exc, owner_kind, owner_state) -> None:
     """The broker refused the retry message (Reject): it is dropped, so fail the job now
     rather than leaving it pending until the reaper's pending threshold."""
-    db.rollback()
-    db.expire_all()
-    _fail_job(db, job_id, models.JobStatus.pending, f"could not schedule retry: {_error_text(exc)}",
-              owner_kind, owner_state)
-    db.commit()
+    message = f"could not schedule retry: {_error_text(exc)}"
+    _finalize_or_reconnect(db, job_id, lambda s, jid: _fail_job(
+        s, jid, models.JobStatus.pending, message, owner_kind, owner_state))
 
 
 def fail_unenqueued(db, job, exc: BaseException) -> None:
     """A router created a Job but could not enqueue it: fail it and free its owner now.
 
     Otherwise the cut/reel sits in flight, refusing every retry with 409, until the reaper's
-    pending threshold (hours) decides the message was lost. Starts from a clean transaction: the
-    caller's may have been killed by the database's idle_in_transaction_session_timeout while the
-    enqueue was failing slowly.
+    pending threshold (hours) decides the message was lost.
     """
-    db.rollback()
     kind, state = JOB_IN_FLIGHT[job.type.value]
-    _fail_job(db, job.id, models.JobStatus.pending, f"could not enqueue: {_error_text(exc)}", kind, state)
-    db.commit()
+    message = f"could not enqueue: {_error_text(exc)}"
+    _finalize_or_reconnect(db, job.id, lambda s, jid: _fail_job(s, jid, models.JobStatus.pending, message, kind, state))
 
 
 def job_task(
@@ -440,7 +467,25 @@ def job_task(
                 committed = True
 
                 if after_commit:
-                    after_commit(result)
+                    try:
+                        after_commit(result)
+                    except Exception:
+                        raise   # unchanged: the except Exception branch below runs the same cleanup
+                    except BaseException as hook_exc:
+                        # SystemExit/KeyboardInterrupt specifically: the job already completed
+                        # (committed=True), so only after_commit_failed can undo what after_commit
+                        # left half-done (e.g. an un-enqueued follow-up job). The except BaseException
+                        # branch further down only acts when not committed, so without this a shutdown
+                        # exactly here would skip cleanup entirely, falling back to the reaper's much
+                        # slower sweep to notice at all.
+                        try:
+                            message = _describe(hook_exc, max_runtime_s)
+                            if _fail_job_keep_owner(db, job_id, message) and after_commit_failed:
+                                after_commit_failed(db, db.get(models.Job, job_id), result)
+                            db.commit()
+                        except Exception:
+                            _log.exception("could not record after_commit failure for job %s", job_id)
+                        raise
 
             except Exception as exc:
                 retry = False
@@ -467,9 +512,13 @@ def job_task(
                             max_retries=_retry_budget(self, owned),
                         )
                     except Reject:
+                        # Safe whether or not this run ever claimed the job: _fail_rejected_retry
+                        # CASes off `pending`, which is the job's real status in both cases — owned
+                        # jobs were just reset to pending above, and an unclaimed job never left it.
+                        # The same "no message is coming back" reasoning _settle_failure applies to
+                        # an unclaimed job with no retries left applies here too.
                         try:
-                            if owned:
-                                _fail_rejected_retry(db, job_id, exc, owner_kind, owner_state)
+                            _fail_rejected_retry(db, job_id, exc, owner_kind, owner_state)
                         except Exception:
                             _log.exception("could not fail job %s after a refused retry", job_id)
                         raise

@@ -93,13 +93,16 @@ def render_status_fragment(
 
 @router.patch("/cuts/{cut_id}", response_class=HTMLResponse)
 async def update_cut(cut_id: int, request: Request, db: Session = Depends(get_db)):
+    # Read the body BEFORE taking any lock: a slow or stalled client (flaky connection, proxy hiccup —
+    # no malice needed) would otherwise hold the row lock, and a pool connection, for as long as the
+    # body trickles in. That starves every other request waiting on the same lock, not just this cut's.
+    form = await request.form()
+
     cut = db.get(models.Cut, cut_id, with_for_update=True)   # see trigger_render
     if not cut:
         raise HTTPException(status_code=404, detail="Cut not found")
     if cut.status.value != "in_review":
         raise HTTPException(status_code=409, detail="Can only edit cuts with status 'in_review'")
-
-    form = await request.form()
 
     if form.get("caption", "").strip():
         cut.caption = form["caption"].strip()

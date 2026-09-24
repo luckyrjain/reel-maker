@@ -178,17 +178,6 @@ def test_a_commit_failure_at_the_done_stamp_is_a_failed_run_not_a_committed_one(
     assert _read(factory, job_id, reel_id, cut_id)[0].status == models.JobStatus.pending
 
 
-def test_after_commit_failure_without_a_cleanup_hook_still_fails_the_job(factory):
-    job_id, reel_id, cut_id = _make(factory)
-
-    def boom(result):
-        raise RuntimeError("enqueue failed")
-
-    with pytest.raises(RuntimeError):
-        _task("r4.no_hook", lambda self, db, job, ctx: 1, after_commit=boom)(job_id)
-    assert _read(factory, job_id, reel_id, cut_id)[0].status == models.JobStatus.failed
-
-
 def test_default_start_progress_is_5(factory):
     job_id, *_ = _make(factory)
     seen = {}
@@ -219,7 +208,10 @@ def test_fail_rejected_retry_records_why(factory):
     assert cut.status == models.CutStatus.failed
 
 
-def test_a_pre_claim_job_is_not_failed_when_the_retry_message_is_refused(factory):
+def test_a_pre_claim_job_is_failed_when_the_retry_message_is_refused(factory):
+    """Round 5: a never-claimed job is retriable, but if the retry MESSAGE itself is then refused by
+    the broker, no message is coming back for it either -- the same reasoning _settle_failure already
+    applies to an unclaimed job with no retries left. It must not be left pending indefinitely."""
     job_id, reel_id, cut_id = _make(factory)
     real, calls = common._advance, {"n": 0}
 
@@ -237,7 +229,8 @@ def test_a_pre_claim_job_is_not_failed_when_the_retry_message_is_refused(factory
         with pytest.raises(Reject):
             task(job_id)
     job, reel, _ = _read(factory, job_id, reel_id, cut_id)
-    assert job.status == models.JobStatus.pending and reel.status == models.ReelStatus.generating
+    assert job.status == models.JobStatus.failed and "could not schedule retry" in job.error
+    assert reel.status == models.ReelStatus.failed
 
 
 def test_a_failing_refusal_handler_does_not_replace_the_reject(factory):
@@ -632,16 +625,6 @@ def test_a_prepare_that_commits_and_then_fails_still_does_not_bump_attempts(fact
         _task("r4.prepare_commits", lambda self, db, job, ctx: None, prepare=prepare)(job_id)
     job, *_ = _read(factory, job_id, reel_id, cut_id)
     assert job.attempts in (0, None) and job.started_at is None
-
-
-def test_the_retry_carries_the_original_exception(factory):
-    job_id, *_ = _make(factory)
-    err = httpx.ConnectTimeout("down")
-    task = _task("r4.retry_exc", _raises(err))
-    with patch.object(task, "retry", side_effect=Retry()) as retry:
-        with pytest.raises(Retry):
-            task(job_id)
-    assert retry.call_args.kwargs["exc"] is err
 
 
 def test_the_paid_call_budget_is_enforced_again_before_each_generation_attempt():

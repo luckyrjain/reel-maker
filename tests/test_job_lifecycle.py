@@ -585,7 +585,7 @@ def test_every_job_task_is_wired_with_the_right_job_type_retry_budget_and_time_l
         "worker.tasks.publish.publish_cut": ("publish", 0, 60 * 60),
     }
     actual = {}
-    for name, (job_type, max_retries, max_runtime_s) in expected.items():
+    for name in expected:  # the tuple itself is only compared at the end, against `actual`
         task = celery_app.tasks[name]
         run = task.run
         actual[name] = (run.job_type, task.max_retries, run.max_runtime_s)
@@ -1233,3 +1233,158 @@ def test_fail_unenqueued_starts_from_a_clean_transaction(factory):
     fail_unenqueued(db, job, ConnectionError("broker down"))
     assert _read(factory, job_id, reel_id, cut_id)[2].caption is None
     assert _read(factory, job_id, reel_id, cut_id)[0].status == models.JobStatus.failed
+
+
+# ── round-5 hardening ──────────────────────────────────────────────────────────
+
+def test_fail_interrupted_recovers_when_its_own_connection_is_dead(factory):
+    """A server-side kill can land on the very connection this is trying to use to record the
+    failure; db.rollback() itself then raises. It must retry on a fresh session, not silently no-op."""
+    from worker.tasks.common import _fail_interrupted
+
+    job_id, reel_id, cut_id = _make(factory, status=models.JobStatus.running)
+    db = factory()
+
+    class Dead:
+        def rollback(self):
+            raise sa_exc.OperationalError("ROLLBACK", {}, Exception("server closed the connection"))
+
+    with patch.object(db, "rollback", Dead().rollback):
+        _fail_interrupted(db, job_id, SystemExit(1), "reel", "generating")
+    job2, reel2, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job2.status == models.JobStatus.failed
+    assert "shut down" in job2.error
+    assert reel2.status == models.ReelStatus.failed
+
+
+def test_fail_rejected_retry_recovers_when_its_own_connection_is_dead(factory):
+    from worker.tasks.common import _fail_rejected_retry
+
+    job_id, reel_id, cut_id = _make(factory)
+    db = factory()
+
+    class Dead:
+        def rollback(self):
+            raise sa_exc.OperationalError("ROLLBACK", {}, Exception("gone"))
+
+    with patch.object(db, "rollback", Dead().rollback):
+        _fail_rejected_retry(db, job_id, ConnectionError("broker down"), "reel", "generating")
+    job, reel, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.failed
+    assert reel.status == models.ReelStatus.failed
+
+
+def test_fail_unenqueued_recovers_when_its_own_connection_is_dead(factory):
+    from worker.tasks.common import fail_unenqueued
+
+    job_id, reel_id, cut_id = _make(factory)
+    db = factory()
+    job = db.get(models.Job, job_id)
+
+    class Dead:
+        def rollback(self):
+            raise sa_exc.OperationalError("ROLLBACK", {}, Exception("gone"))
+
+    with patch.object(db, "rollback", Dead().rollback):
+        fail_unenqueued(db, job, ConnectionError("broker down"))
+    job2, reel2, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job2.status == models.JobStatus.failed
+    assert reel2.status == models.ReelStatus.failed
+
+
+def test_a_non_connection_error_in_a_failure_recorder_is_not_retried_on_a_fresh_session(factory):
+    """Only OperationalError/InterfaceError (a dead connection) triggers the fresh-session retry; a
+    real bug in the write itself must not be silently retried and hidden."""
+    from worker.tasks.common import _finalize_or_reconnect
+
+    job_id, *_ = _make(factory)
+    db = factory()
+    calls = []
+
+    def boom(session, jid):
+        calls.append(1)
+        raise ValueError("real bug")
+
+    with pytest.raises(ValueError, match="real bug"):
+        _finalize_or_reconnect(db, job_id, boom)
+    assert len(calls) == 1, "must not retry a non-connection error on a fresh session"
+
+
+def test_after_commit_shutdown_runs_the_cleanup_hook_and_rolls_back_the_owner(factory):
+    """A SystemExit during after_commit (e.g. a shutdown mid-.delay()) must not skip cleanup: the
+    body already ran (committed=True), so only after_commit_failed can undo what it left half-done."""
+    job_id, reel_id, cut_id = _make(factory, models.JobType.enrich, reel_status=models.ReelStatus.generating)
+    cleaned = []
+
+    def after_commit(result):
+        raise SystemExit(1)
+
+    def after_commit_failed(db, job, result):
+        from worker.tasks.common import rollback_owner as _rb
+        cleaned.append((job.id, result))
+        _rb(db, job, "reel", {"generating"})
+
+    task = _task("t.after_shutdown", lambda self, db, job, ctx: 9, job_type="enrich",
+                 after_commit=after_commit, after_commit_failed=after_commit_failed)
+    with pytest.raises(SystemExit):
+        task(job_id)
+    assert cleaned == [(job_id, 9)]
+    job, reel, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.failed
+    assert reel.status == models.ReelStatus.failed
+
+
+def test_after_commit_exception_still_uses_the_one_cleanup_path_not_both(factory):
+    """A plain Exception from after_commit must run the cleanup exactly once (via the outer except
+    Exception branch), not also through the new BaseException handler around the after_commit call."""
+    job_id, *_ = _make(factory, models.JobType.enrich, reel_status=models.ReelStatus.generating)
+    calls = []
+
+    def after_commit_failed(db, job, result):
+        calls.append(1)
+
+    task = _task("t.after_once", lambda self, db, job, ctx: None, job_type="enrich",
+                 after_commit=MagicMock(side_effect=ConnectionError("broker down")),
+                 after_commit_failed=after_commit_failed)
+    with pytest.raises(ConnectionError):
+        task(job_id)
+    assert calls == [1]
+
+
+def test_a_refused_retry_fails_an_unclaimed_job_not_just_a_claimed_one(factory):
+    """Round 5: the sibling branch in _settle_failure fails an unclaimed, unretriable job at once with
+    the same 'no message is coming back' reasoning; a refused retry message deserves the same
+    treatment whether or not this run ever claimed the job."""
+    job_id, reel_id, cut_id = _make(factory)
+    task = _task("t.reject_unclaimed", _raises(ConnectionError("blip")))
+    from worker.tasks import common
+    real_advance, calls = common._advance, {"n": 0}
+
+    def fail_only_the_claim(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sa_exc.OperationalError("S", {}, Exception("x"))
+        return real_advance(*a, **k)
+
+    with (
+        patch("worker.tasks.common._advance", side_effect=fail_only_the_claim),
+        patch.object(task, "retry", side_effect=Reject(ConnectionError("broker down"), requeue=False)),
+    ):
+        with pytest.raises(Reject):
+            task(job_id)
+    job, reel, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.failed
+    assert reel.status == models.ReelStatus.failed
+
+
+def test_error_text_redacts_a_multi_line_wrapped_database_detail_block():
+    """libpq wraps a long 'Failing row contains (...)' DETAIL onto a second physical line; redacting
+    only to the end of the first line (a [^\\n]* bound) leaks the wrapped continuation, which can
+    itself hold other column values from the same row."""
+    leaked = ("null value violates not-null constraint\n"
+              "DETAIL:  Failing row contains (1, youtube, ya29.PREFIX_TOKEN\n"
+              "ya29.SECRET_CONTINUATION_LINE, null).")
+    text = _error_text(ValueError(leaked))
+    assert "SECRET_CONTINUATION_LINE" not in text
+    assert "PREFIX_TOKEN" not in text
+    assert "violates not-null constraint" in text

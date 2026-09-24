@@ -287,6 +287,50 @@ def test_create_reel_that_cannot_be_enqueued_fails_fast_instead_of_polling_forev
     db.close()
 
 
+def test_the_enrich_job_is_committed_before_it_is_enqueued(client):
+    """Same shape as the cuts router's equivalent test: no transaction of ours may be open across
+    .delay() (a slow broker failure would otherwise outlive an idle-in-transaction timeout), and the
+    worker must already be able to see the job row it's handed."""
+    from api.db import get_db
+    from api.main import app
+
+    sessions = []
+    real_override = app.dependency_overrides[get_db]
+
+    def tracking_override():
+        gen = real_override()
+        db = next(gen)
+        sessions.append(db)
+        try:
+            yield db
+        finally:
+            try:
+                next(gen)
+            except StopIteration:
+                pass
+
+    seen = {}
+
+    def delay(job_id):
+        assert isinstance(job_id, int)
+        seen["in_transaction_during_delay"] = sessions[-1].in_transaction()
+        other = client._session_factory()
+        job = other.get(models.Job, job_id)
+        seen["visible"] = job is not None and job.status == models.JobStatus.pending
+        other.close()
+
+    app.dependency_overrides[get_db] = tracking_override
+    try:
+        with patch("api.routers.reels.enrich_context") as mock_enrich:
+            mock_enrich.delay.side_effect = delay
+            resp = client.post("/api/reels", data={"context": "A" * 60})
+    finally:
+        app.dependency_overrides[get_db] = real_override
+    assert resp.status_code == 200, resp.text
+    assert seen["visible"] is True
+    assert seen["in_transaction_during_delay"] is False
+
+
 def test_create_reel_honors_explicit_platform_selection(client):
     with patch("api.routers.reels.enrich_context"):
         resp = client.post(
