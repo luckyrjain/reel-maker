@@ -1,0 +1,26 @@
+{# htmx-swappable performance notes list. Expects `notes` (list[PerformanceNote]) in context. #}
+<div id="performance-notes">
+  {% if not notes %}
+  <p class="empty-state">No performance notes yet.</p>
+  {% else %}
+  <ul class="performance-note-list" style="list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:8px;">
+    {% for note in notes %}
+    <li style="display:flex;align-items:flex-start;gap:8px;">
+      <input type="checkbox" {% if note.active %}checked{% endif %}
+             hx-post="/api/insights/notes/{{ note.id }}/toggle"
+             hx-target="#performance-notes"
+             hx-swap="outerHTML"
+             title="Active — seeded into future guide generation when checked">
+      <span style="flex:1;{% if not note.active %}color:#9ca3af;text-decoration:line-through;{% endif %}">
+        {{ note.text }}
+      </span>
+      <button type="button" class="btn-delete" title="Delete"
+              hx-delete="/api/insights/notes/{{ note.id }}"
+              hx-target="#performance-notes"
+              hx-swap="outerHTML"
+              hx-confirm="Delete this performance note?">×</button>
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</div>

@@ -1,6 +1,6 @@
 # Guide Quality Evaluation
 
-`engine/generation/evaluator.py` — `score_guide(context, guide, target_length_s) → (int, list[str])`
+`engine/generation/evaluator.py` — `score_guide(context, guide, target_length_s, axis_multipliers=None) → (int, list[str])`
 
 Called inside `worker/tasks/generate.py` after each LLM generation attempt.
 
@@ -357,6 +357,47 @@ Threshold is **80** when `USE_NVIDIA_FOR_GENERATION=true`, **65** for local Olla
 
 ---
 
+## Per-axis weight multipliers (`axis_multipliers`)
+
+`score_guide()` takes an optional `axis_multipliers: dict[str, float] | None` parameter, sourced from `Settings.evaluator_axis_weight_multipliers` (`api/config.py`) and passed by `worker/tasks/generate.py` on **every** `score_guide()` call — both the structured and standard paths, since this scales the scorer itself, not a prompt.
+
+**Default is a no-op.** `evaluator_axis_weight_multipliers` defaults to `{}`, and an empty/`None` dict leaves every axis's deduction exactly as documented above — this is a hard requirement (see Rollout below), not just the common case.
+
+**Keys** are the same internal axis names `score_guide()` already tracks in its `deductions` dict for the "Score breakdown — ..." diagnostic line: `retention`, `narrative`, `context`, `insight`, `alignment`, `clip`, `editability`, `emotion`, `audio`, `variety`, `duration`, `caption_hashtag`, `cta`, `tone`, `throughline`, `specificity`, `repetition` — one per documented axis (§1–17 above). A few axes (`emotion`, `duration`, `caption_hashtag`) accumulate from more than one code path into the same key; the multiplier only sees the *final* per-axis total, which is fine for scaling purposes.
+
+**Formula**, applied once, immediately before the final `return` (after the 23 existing `score -=` sites, and after the `score < 0` diagnostic block — see the note below):
+
+```python
+if axis_multipliers:
+    score += sum(
+        deductions[k] * (1.0 - axis_multipliers.get(k, 1.0))
+        for k in deductions
+    )
+return max(0, min(100, score)), issues
+```
+
+Each axis's deduction was already subtracted from `score` inline, unscaled. The correction `deductions[k] * (1.0 - m_k)`, added back to `score`, undoes the excess deduction and applies the scaled one instead:
+
+| `m_k` (multiplier) | Meaning | Worked example (`deductions["cta"] = 3`, baseline `score = 97`) |
+|---|---|---|
+| `0.0` | Remove that axis's deduction entirely | correction `= 3*(1-0) = 3` → `score = 100` |
+| `1.0` (unconfigured default) | No change | correction `= 3*(1-1) = 0` → `score = 97` |
+| `2.0` | Double that axis's deduction | correction `= 3*(1-2) = -3` → `score = 94` (6-pt total deduction) |
+
+An axis name in `axis_multipliers` that `deductions` never produced (a typo, or an axis that simply didn't fire for this guide) is never looked up — a no-op, never a `KeyError`. No restructuring of the 23 `score -=` sites was needed; the correction block reuses the `deductions` dict that already existed purely for the issue-string breakdown.
+
+**Cosmetic edge case**: the `score < 0` diagnostic message (just above the correction block) is built from the *pre-correction* score/deduction total, so it can legitimately diverge from the final multiplier-corrected score when a multiplier is active. This is a known inconsistency in a rare diagnostic string, not a scoring bug.
+
+**This is a manual lever, not an algorithm.** No code in this repo derives these values statistically — they're set by an operator who has looked at the `/api/insights` quality↔engagement correlation (see below) and formed a hypothesis that one axis doesn't track real engagement well. Automatic/statistical weight tuning from the correlation data is explicitly out of scope (see `docs/specs/2026-09-phase5-quality-engagement-feedback.md` §5) — silently changing scoring behavior from an n≈10–20 sample is the same overfitting risk as auto-injecting past reel content into prompts (§3.1 of that spec).
+
+---
+
+## Performance-informed feedback (`prior_feedback` seeding)
+
+Separately from the evaluator itself, `worker/tasks/generate.py` seeds the standard LLM path's `prior_feedback` (see "Retry behaviour" above) from every **active** `PerformanceNote` row (`api/models.py`) — plain-English, operator-written notes such as "Hooks phrased as a direct question outperform statement hooks." Seeded from attempt 1, not just retries, and preserved across all 3 attempts (the retry-replace line is additive: `feedback = active_notes + [...]`, not a plain replace — see CLAUDE.md's Key conventions for why that distinction matters). This is deliberately **not** automatic few-shot injection of raw past-reel content — see `docs/specs/2026-09-phase5-quality-engagement-feedback.md` §3.1 for why that specific approach was rejected (topic-drift and small-*n*-overfitting risk, both previously-documented failure modes in this codebase). `job.meta["performance_note_ids"]` records which notes were active for a given generate run, written by the same shared line as `quality_score` (reached by both paths).
+
+---
+
 ## What this evaluator does NOT check
 
 These are covered by `judge_guide()` (LLM semantic judge):
@@ -388,5 +429,6 @@ The rule scorer catches structural and mechanical failures. The LLM judge catche
 | Add more emotion words | Extend `_EMOTION_POSITIVE` / `_EMOTION_NEGATIVE` sets |
 | Add encyclopaedic patterns to catch | Extend `_ARTICLE_TONE` regex |
 | Penalise more repetition | Lower the 0.5 overlap threshold in Axis 17 |
+| Discount an axis that doesn't track real engagement | Set `EVALUATOR_AXIS_WEIGHT_MULTIPLIERS` (JSON dict env var), e.g. `'{"insight": 0.5}'` — see "Per-axis weight multipliers" above |
 
 All constants are at the top of `evaluator.py`.

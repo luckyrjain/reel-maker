@@ -725,3 +725,100 @@ def test_identical_platform_cuts_score_the_same_as_one():
     )
 
     assert score_guide(_CTX, two_cuts, 30)[0] == score_guide(_CTX, one_cut, 30)[0]
+
+
+# ── axis_multipliers (§3.6) ────────────────────────────────────────────────────
+# score_guide()'s optional axis_multipliers param scales a named axis's deduction
+# before the final return. None/empty must be a byte-identical no-op — this is a
+# hard gate per docs/specs/2026-09-phase5-quality-engagement-feedback.md §8,
+# since score_guide() decides whether real content gets published.
+
+def _multiplier_fixture_guides():
+    """A handful of distinct guides already exercised elsewhere in this file —
+    used to assert axis_multipliers=None/{} is byte-identical to the current
+    (no-param) behavior across more than one shape, not just a single guide."""
+    weak_hook = _guide(
+        _beat(0, "hook", 5, "Argentina are a good team.", "Argentina game"),
+        _beat(1, "body", 10,
+              "Lionel Messi creates 12 key passes per game, more than any other player. "
+              "But the left-back is exposed and that weakness is a real danger.",
+              "Lionel Messi through-ball key pass Copa America 2024"),
+        _beat(2, "cta", 8,
+              "Could this weakness cost Argentina the World Cup? Drop your prediction below.",
+              "Argentina World Cup trophy celebration 2022"),
+    )
+    no_cta = _guide(
+        _beat(0, "hook", 5, "Could Argentina win the World Cup?", "Argentina training"),
+        _beat(1, "body", 10, "Romero is strong and reliable.", "Romero tackle"),
+        _beat(2, "body", 10, "Messi is the key playmaker.", "Messi dribble"),
+    )
+    passive_cta = _guide(
+        _beat(0, "hook", 5, "Could one weakness cost Argentina the World Cup?", "Argentina training"),
+        _beat(1, "body", 10,
+              "Romero's press allows Argentina to defend higher, however the left-back is exposed.",
+              "Romero tackle"),
+        _beat(2, "cta", 8, "Subscribe.", "Argentina celebration"),
+    )
+    return [weak_hook, no_cta, passive_cta]
+
+
+def test_axis_multipliers_none_is_byte_identical_to_default():
+    for guide in _multiplier_fixture_guides():
+        default_score, default_issues = score_guide(_CTX, guide, 45)
+        none_score, none_issues = score_guide(_CTX, guide, 45, axis_multipliers=None)
+        assert none_score == default_score
+        assert none_issues == default_issues
+
+
+def test_axis_multipliers_empty_dict_is_byte_identical_to_default():
+    for guide in _multiplier_fixture_guides():
+        default_score, default_issues = score_guide(_CTX, guide, 45)
+        empty_score, empty_issues = score_guide(_CTX, guide, 45, axis_multipliers={})
+        assert empty_score == default_score
+        assert empty_issues == default_issues
+
+
+def _no_action_cta_guide():
+    """A guide with a deterministic, single-path CTA deduction of exactly 3
+    ('no action phrase at all') — picked because axis 'cta' only ever
+    accumulates from this one code path (evaluator.py's Axis 13), unlike
+    'emotion'/'duration'/'caption_hashtag' which accumulate from more than
+    one site and so can't give a clean expected-value assertion."""
+    return _guide(
+        _beat(0, "hook", 5, "Could one weakness cost Argentina the World Cup?", "Argentina training"),
+        _beat(1, "body", 10,
+              "Romero's press allows Argentina to defend higher, however the left-back is exposed.",
+              "Romero tackle"),
+        _beat(2, "cta", 8, "Thanks for tuning in, see you next time.", "Argentina celebration"),
+    )
+
+
+def test_axis_multiplier_zero_removes_exactly_that_axis_deduction():
+    guide = _no_action_cta_guide()
+    baseline_score, baseline_issues = score_guide(_CTX, guide, 45)
+    assert any("no action phrase" in i.lower() for i in baseline_issues), (
+        "fixture must trigger the deterministic 3-pt 'no action phrase' CTA deduction"
+    )
+    assert baseline_score <= 97, "fixture score must have headroom for a +3 correction to be visible"
+
+    zeroed_score, _ = score_guide(_CTX, guide, 45, axis_multipliers={"cta": 0.0})
+    assert zeroed_score == baseline_score + 3
+
+
+def test_axis_multiplier_above_one_increases_the_deduction():
+    guide = _no_action_cta_guide()
+    baseline_score, _ = score_guide(_CTX, guide, 45)
+    assert baseline_score >= 3, "fixture score must have headroom for a -3 correction to be visible"
+
+    doubled_score, _ = score_guide(_CTX, guide, 45, axis_multipliers={"cta": 2.0})
+    assert doubled_score == baseline_score - 3
+
+
+def test_unknown_axis_name_in_multipliers_is_a_no_op_not_a_keyerror():
+    guide = _no_action_cta_guide()
+    baseline_score, _ = score_guide(_CTX, guide, 45)
+
+    # A typo'd/nonexistent axis name must never raise — an operator typo in
+    # Settings.evaluator_axis_weight_multipliers must not crash generation.
+    typo_score, _ = score_guide(_CTX, guide, 45, axis_multipliers={"ctaa": 0.0, "not_a_real_axis": 5.0})
+    assert typo_score == baseline_score

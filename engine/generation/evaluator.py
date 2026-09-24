@@ -289,10 +289,19 @@ def _visual_category(visual: str) -> str:
 
 # ── main scorer ───────────────────────────────────────────────────────────────
 
-def score_guide(context: str, guide: MasterGuide, target_length_s: float) -> tuple[int, list[str]]:
+def score_guide(
+    context: str,
+    guide: MasterGuide,
+    target_length_s: float,
+    axis_multipliers: dict[str, float] | None = None,
+) -> tuple[int, list[str]]:
     """
     Score a generated MasterGuide against the standard for a top-tier automated reel.
     Returns (score 0–100, list of human-readable issues).
+
+    axis_multipliers: optional per-axis deduction scaling (Settings.evaluator_axis_weight_multipliers).
+    None/empty is a no-op — every axis behaves exactly as documented below. See the
+    correction block at the end of this function for the exact formula and worked examples.
 
     Axes (max deductions exceed 100; final score clamped to 0–100)
     ────
@@ -882,4 +891,19 @@ def score_guide(context: str, guide: MasterGuide, target_length_s: float) -> tup
             f"Score overflow ({abs(score)} pts below zero) — guide fails on too many axes "
             "simultaneously; fix the highest-deduction issues above before retrying"
         )
+
+    # Per-axis multiplier correction — see docs/evaluation.md and
+    # docs/specs/2026-09-phase5-quality-engagement-feedback.md §3.6 for the derivation.
+    # No-op (score unchanged) when axis_multipliers is None/empty, or for any axis name
+    # not present in `deductions` (an operator typo is never a KeyError). This runs
+    # AFTER the score<0 diagnostic above on purpose — that message is built from the
+    # pre-correction score/deduction total and can legitimately diverge from the final
+    # multiplier-corrected score when a multiplier is active; that's a cosmetic
+    # inconsistency in an edge-case diagnostic, not a scoring bug.
+    if axis_multipliers:
+        score += sum(
+            deductions[k] * (1.0 - axis_multipliers.get(k, 1.0))
+            for k in deductions
+        )
+
     return max(0, min(100, score)), issues

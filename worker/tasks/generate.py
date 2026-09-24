@@ -345,6 +345,19 @@ _MAX_RUNTIME_S = 4 * 60 * 60
 def generate_guide(self, db, job, reel):
     effective_context = reel.enriched_context or reel.context
 
+    # Queried once, unconditionally, before the structured-vs-standard branch below —
+    # the shared job.meta write at the end of this function (reached by BOTH paths)
+    # records performance_note_ids, and the standard path's prior_feedback seed also
+    # reads active_notes. Querying this inside the `if guide is None:` (standard-path)
+    # block instead would NameError on every structured-path success — see
+    # docs/specs/2026-09-phase5-quality-engagement-feedback.md §3.5.
+    active_notes_rows = (
+        db.query(models.PerformanceNote)
+        .filter(models.PerformanceNote.active.is_(True)).all()
+    )
+    active_notes = [n.text for n in active_notes_rows]
+    axis_multipliers = settings.evaluator_axis_weight_multipliers or None
+
     cuts = db.query(models.Cut).filter(models.Cut.reel_id == reel.id).all()
     platforms = [c.platform.value for c in cuts]
     target_lengths = {c.platform.value: c.target_length_s or 45.0 for c in cuts}
@@ -382,7 +395,7 @@ def generate_guide(self, db, job, reel):
                 reel, cuts, llm, db, target_lengths, stubs, context=effective_context
             )
             clean_guide(guide, voiceover_mode)
-            rule_s, rule_i = score_guide(effective_context, guide, max_target)
+            rule_s, rule_i = score_guide(effective_context, guide, max_target, axis_multipliers)
             last_score, last_issues = _combined_score(
                 rule_s, rule_i, guide, effective_context,
                 db=db, reel_id=reel.id, attempt=1,
@@ -406,7 +419,10 @@ def generate_guide(self, db, job, reel):
         job.meta = {**(job.meta or {}), "path": "standard", "stub_count": len(stubs) if stubs else 0}
         db.commit()
         generate_provider = "nvidia" if is_nvidia_generation() else "ollama"
-        feedback: list[str] = []
+        # Seeded from attempt 1, not just retries — every active PerformanceNote is
+        # automatic prompt-injection plumbing once an operator has curated it (see
+        # docs/specs/2026-09-phase5-quality-engagement-feedback.md §3.2).
+        feedback: list[str] = list(active_notes)
         best_guide: MasterGuide | None = None
         best_score = 0
 
@@ -457,7 +473,7 @@ def generate_guide(self, db, job, reel):
                 ev.tokens_out = usage_after.get("completion_tokens", 0) - usage_before.get("completion_tokens", 0)
                 ev.cost_usd = llm_cost_usd(enrich_provider, ev.tokens_in, ev.tokens_out)
 
-            rule_s, rule_i = score_guide(effective_context, candidate, max_target)
+            rule_s, rule_i = score_guide(effective_context, candidate, max_target, axis_multipliers)
             last_score, last_issues = _combined_score(
                 rule_s, rule_i, candidate, effective_context,
                 db=db, reel_id=reel.id, attempt=attempt + 1,
@@ -472,7 +488,11 @@ def generate_guide(self, db, job, reel):
                 best_score = last_score
                 best_guide = candidate
 
-            feedback = [i for i in last_issues if not i.startswith("Score breakdown")]
+            # MUST be additive, not a plain replace — active_notes is seeded into
+            # `feedback` before attempt 1 (above), and a wholesale overwrite here would
+            # silently drop those performance notes on attempt 2 and 3. See
+            # docs/specs/2026-09-phase5-quality-engagement-feedback.md §3.5.
+            feedback = active_notes + [i for i in last_issues if not i.startswith("Score breakdown")]
             last_exc = None
 
         # Accept best-of-N rather than failing when nothing clears the threshold
@@ -527,4 +547,7 @@ def generate_guide(self, db, job, reel):
         cut.hook_variants = hook_variants or None
 
     transition(reel, "guide_ready", REEL_TRANSITIONS)
-    job.meta = {**(job.meta or {}), "quality_score": last_score}
+    # Shared by both paths — active_notes_rows is always defined by now regardless of
+    # which path produced `guide` (queried unconditionally at the top of this function).
+    job.meta = {**(job.meta or {}), "quality_score": last_score,
+                "performance_note_ids": [n.id for n in active_notes_rows]}

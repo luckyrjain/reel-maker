@@ -89,6 +89,17 @@ class Settings(BaseSettings):
     meta_oauth_app_id: str = ""
     meta_oauth_app_secret: str = ""
 
+    # Per-axis scoring multipliers for score_guide()'s 17-axis rule scorer. Keys are axis
+    # names as used in evaluator.py's internal deduction tracking (see docs/evaluation.md
+    # for the full axis list); a multiplier scales that axis's deduction before the final
+    # sum. Empty by default — every axis behaves exactly as it does today until an axis
+    # name is added here. This is a manual lever informed by docs/specs/2026-09-phase5-
+    # quality-engagement-feedback.md §2's correlation data, not an auto-tuned weight — no
+    # code in this repo derives these values statistically. First dict-typed Settings
+    # field — pydantic-settings parses it from its env var as JSON, e.g.
+    # EVALUATOR_AXIS_WEIGHT_MULTIPLIERS='{"insight": 0.5}'.
+    evaluator_axis_weight_multipliers: dict[str, float] = {}
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 
