@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install edge-tts ruff
+
+      # Scoped to F/E9 (real bugs): the wider bugbear ruleset flags this repo's routine
+      # FastAPI `Depends()`-in-default-argument idiom as B008, which isn't a real issue here.
+      - name: Ruff
+        run: ruff check --select F,E9 .
+
+      - name: pytest
+        run: pytest -q
