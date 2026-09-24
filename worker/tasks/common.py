@@ -242,6 +242,10 @@ def _stamp_failed_and_run_cleanup(db, job_id, message: str, after_commit_failed,
     `done` forever, with no error recorded and no cleanup ever having happened), and if it performs
     more than one write and raises partway through, only ITS partial writes roll back -- not the
     fail-stamp, and not left half-committed either.
+
+    ``on_shutdown`` only labels the exception log line (" on shutdown" appended) so a hook failure
+    during the SystemExit/KeyboardInterrupt path reads differently from one during ordinary
+    after_commit failure handling; it has no effect on the CAS, the savepoint, or what gets committed.
     """
     if _fail_job_keep_owner(db, job_id, message) and after_commit_failed:
         try:
@@ -301,7 +305,15 @@ def _settle_failure(self, db, job_id, exc, *, owned, committed, owner_kind, owne
 
 
 def _fail_job_keep_owner(db, job_id, message: str) -> bool:
-    """done -> failed after a failed after_commit; the hook owns cleanup of the owner."""
+    """done -> failed after a failed after_commit; the hook owns cleanup of the owner.
+
+    The durable write here is the ``_advance`` UPDATE above; the ``job.status``/``job.error``
+    assignment is a Python-side mirror only. That ordering matters to `_stamp_failed_and_run_cleanup`:
+    it calls this BEFORE opening the cleanup hook's SAVEPOINT, so a hook that raises rolls back only
+    its own work -- ``ROLLBACK TO SAVEPOINT`` never touches a statement that ran before the savepoint
+    opened. If this function's durable write ever moved to happen lazily at flush/commit time instead
+    of via an immediate bulk UPDATE, it would need to move ahead of the savepoint too.
+    """
     if not _advance(db, job_id, models.JobStatus.done, {"status": models.JobStatus.failed, "error": message[:2000]}):
         return False
     job = db.get(models.Job, job_id)

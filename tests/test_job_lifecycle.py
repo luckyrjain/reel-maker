@@ -5,6 +5,7 @@ session the decorator opens sees the same data). Domain behaviour lives in the
 per-task suites; this file owns the claim / stamp / retry / failure / owner
 rollback contract once, for every task.
 """
+import logging
 import threading
 import time
 import uuid
@@ -584,6 +585,45 @@ def test_a_partially_written_cleanup_hook_rolls_back_atomically(factory):
     assert other_job.status == models.JobStatus.pending, "hook's partial write must not survive its own raise"
     job, _, _ = _read(factory, job_id, reel_id, cut_id)
     assert job.status == models.JobStatus.failed
+
+
+def test_stamp_failed_and_run_cleanup_skips_the_hook_when_the_cas_loses(factory):
+    """_fail_job_keep_owner CASes from `done`; if a sibling or the reaper already touched the job
+    (it's no longer `done`), the hook must not run -- calling it anyway could double-run
+    irreversible cleanup (failing an already-failed orphan Job again, rolling back a reel state a
+    sibling has already moved past)."""
+    from worker.tasks.common import _stamp_failed_and_run_cleanup
+
+    job_id, *_ = _make(factory, models.JobType.enrich, status=models.JobStatus.failed)
+    hook = MagicMock()
+    db = factory()
+    _stamp_failed_and_run_cleanup(db, job_id, "some failure", hook, None)
+    db.commit()
+    hook.assert_not_called()
+
+
+def test_stamp_failed_and_run_cleanup_labels_the_log_line_by_shutdown_or_not(factory, caplog):
+    """on_shutdown's only effect is the log-message suffix; nothing else distinguishes the two
+    call sites' cleanup-hook-failure handling. Verify the suffix actually appears (or doesn't)."""
+    from worker.tasks.common import _stamp_failed_and_run_cleanup
+
+    def failing_hook(db, job, result):
+        raise RuntimeError("boom")
+
+    job_id, *_ = _make(factory, models.JobType.enrich, status=models.JobStatus.done)
+    db = factory()
+    with caplog.at_level(logging.ERROR, logger="worker.tasks.common"):
+        _stamp_failed_and_run_cleanup(db, job_id, "orig failure", failing_hook, None, on_shutdown=True)
+    db.commit()
+    assert any("on shutdown" in r.getMessage() for r in caplog.records)
+
+    other_job_id, *_ = _make(factory, models.JobType.enrich, status=models.JobStatus.done)
+    db2 = factory()
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger="worker.tasks.common"):
+        _stamp_failed_and_run_cleanup(db2, other_job_id, "orig failure", failing_hook, None, on_shutdown=False)
+    db2.commit()
+    assert not any("on shutdown" in r.getMessage() for r in caplog.records)
 
 
 def test_a_body_failure_does_not_run_the_cleanup_hook(factory):

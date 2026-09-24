@@ -231,7 +231,10 @@ PostgreSQL 16, not just SQLite. Behaviour changes an operator should know about:
   still committed rather than silently rolled back with the job left looking `done` forever. The hook
   runs inside its own `db.begin_nested()` SAVEPOINT, so a raise partway through a multi-write hook
   (`_abandon_generate`'s real shape: fail the orphaned follow-up Job, then roll the reel back) undoes
-  only the hook's own writes — not the failure stamp, and not a half-done cleanup either.
+  only the hook's own writes — not the failure stamp, and not a half-done cleanup either. Unlike the
+  rest of this section, the SAVEPOINT path itself is verified against SQLite only (the test suite's
+  engine) — not yet checked against real PostgreSQL 16, where a poisoned-transaction error inside the
+  hook would exercise `ROLLBACK TO SAVEPOINT` differently than SQLite's more forgiving behavior.
 - `_generate_caption_hashtags`'s fallback path no longer swallows `SoftTimeLimitExceeded` — a timeout
   there now fails the task visibly instead of completing with a template caption.
 
