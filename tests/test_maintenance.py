@@ -123,11 +123,114 @@ def test_healthy_jobs_are_left_alone(factory):
     running = _make(factory, models.JobType.render, job_status=models.JobStatus.running,
                     heartbeat_at=now - timedelta(seconds=30), updated_at=now)
     pending = _make(factory, models.JobType.render, job_status=models.JobStatus.pending, updated_at=now)
-    finished = _make(factory, models.JobType.render, job_status=models.JobStatus.done)
+    # cut_status must reflect where a genuinely successful render leaves its cut (in_review), not
+    # the default `rendering` -- a `done` job whose cut is still `rendering` is exactly the
+    # done-orphan signature reap_stuck_jobs now also looks for, and _make's default cut_status
+    # exists to represent an in-flight owner, not a completed one.
+    finished = _make(factory, models.JobType.render, job_status=models.JobStatus.done,
+                     cut_status=models.CutStatus.in_review)
     reap_stuck_jobs()
     assert _state(factory, *running)[0].status == models.JobStatus.running
     assert _state(factory, *pending)[0].status == models.JobStatus.pending
     assert _state(factory, *finished)[0].status == models.JobStatus.done
+
+
+# ── done-orphan reaping: a lost after_commit_failed fail-stamp ─────────────────
+
+@pytest.mark.parametrize("job_type, reel_status, cut_status, reel_after, cut_after", [
+    (models.JobType.enrich, models.ReelStatus.enriching, models.CutStatus.draft,
+     models.ReelStatus.failed, models.CutStatus.draft),
+    (models.JobType.generate, models.ReelStatus.generating, models.CutStatus.draft,
+     models.ReelStatus.failed, models.CutStatus.draft),
+    (models.JobType.render, models.ReelStatus.guide_ready, models.CutStatus.rendering,
+     models.ReelStatus.guide_ready, models.CutStatus.failed),
+    (models.JobType.publish, models.ReelStatus.guide_ready, models.CutStatus.publishing,
+     models.ReelStatus.guide_ready, models.CutStatus.failed),
+])
+def test_reaps_a_done_job_whose_owner_is_still_in_flight(factory, job_type, reel_status, cut_status,
+                                                          reel_after, cut_after):
+    """The on-disk signature of a lost after_commit_failed fail-stamp: `done`, no error, and the
+    owner still sitting exactly where only this job type was ever responsible for moving it on
+    from. Mirrors test_revert_owner_fails_only_what_the_job_type_owns's per-type matrix, since the
+    owner-rollback half of this is the same call, just reached through the done-orphan path."""
+    job_id, reel_id, cut_id = _make(factory, job_type, job_status=models.JobStatus.done,
+                                    reel_status=reel_status, cut_status=cut_status)
+    reap_stuck_jobs()
+    job, reel, cut = _state(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.failed
+    assert "after_commit_failed" in job.error
+    assert (reel.status, cut.status) == (reel_after, cut_after)
+
+
+@pytest.mark.parametrize("job_type, reel_status, cut_status", [
+    (models.JobType.enrich, models.ReelStatus.generating, models.CutStatus.draft),
+    (models.JobType.generate, models.ReelStatus.guide_ready, models.CutStatus.draft),
+    (models.JobType.render, models.ReelStatus.guide_ready, models.CutStatus.in_review),
+    (models.JobType.publish, models.ReelStatus.guide_ready, models.CutStatus.published),
+])
+def test_does_not_reap_a_done_job_whose_owner_already_moved_on(factory, job_type, reel_status, cut_status):
+    """The overwhelming common case: a genuinely successful `done` job whose owner transitioned
+    forward as part of that same success, atomically with the done-stamp. Its `updated_at` is
+    exactly as "stale" as an orphan's by this definition, forever after -- only the owner-state
+    join tells the two apart."""
+    job_id, reel_id, cut_id = _make(factory, job_type, job_status=models.JobStatus.done,
+                                    reel_status=reel_status, cut_status=cut_status)
+    reap_stuck_jobs()
+    job, reel, cut = _state(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.done
+    assert (reel.status, cut.status) == (reel_status, cut_status)
+
+
+def test_does_not_reap_a_done_job_that_already_has_an_error(factory):
+    """A `done` job with a non-NULL error is not this signature (a `done` job's error is always
+    None on genuine success -- see job_task's own done-stamp write) -- whatever put an error there,
+    it isn't the failure mode this reap path exists for, and re-marking it failed a second time,
+    with a misleading reason, would be worse than leaving it exactly as some other process left it."""
+    job_id, reel_id, cut_id = _make(factory, models.JobType.enrich, job_status=models.JobStatus.done,
+                                    reel_status=models.ReelStatus.enriching)
+    db = factory()
+    # updated_at must be pinned back to _LONG_AGO too (onupdate would otherwise stamp it "now" and
+    # the job would be excluded from candidates for being fresh, not for having an error -- see
+    # _make's own comment on this exact onupdate gotcha).
+    db.query(models.Job).filter(models.Job.id == job_id).update(
+        {"error": "some other note", "updated_at": _LONG_AGO}, synchronize_session=False
+    )
+    db.commit()
+    reap_stuck_jobs()
+    job, reel, _ = _state(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.done
+    assert job.error == "some other note"
+    assert reel.status == models.ReelStatus.enriching
+
+
+def test_does_not_reap_a_recently_completed_done_job(factory):
+    """A job that finished moments ago, with its owner (so far) still in-flight, must not be
+    treated as stuck -- DONE_ORPHAN_STALE_MINUTES exists exactly to give job_task's own
+    done-stamp-plus-owner-transition commit room to have landed just before the reaper's read,
+    not to declare a fresh completion broken."""
+    now = datetime.now(timezone.utc)
+    job_id, reel_id, cut_id = _make(factory, models.JobType.enrich, job_status=models.JobStatus.done,
+                                    reel_status=models.ReelStatus.enriching, updated_at=now)
+    reap_stuck_jobs()
+    job, reel, _ = _state(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.done
+    assert reel.status == models.ReelStatus.enriching
+
+
+def test_done_orphan_threshold_is_fifteen_minutes(factory):
+    from worker.tasks.maintenance import DONE_ORPHAN_STALE_MINUTES
+    assert DONE_ORPHAN_STALE_MINUTES == 15
+
+    now = datetime.now(timezone.utc)
+    just_inside = _make(factory, models.JobType.enrich, job_status=models.JobStatus.done,
+                        reel_status=models.ReelStatus.enriching,
+                        updated_at=now - _MINUTE * (DONE_ORPHAN_STALE_MINUTES - 1))
+    just_outside = _make(factory, models.JobType.generate, job_status=models.JobStatus.done,
+                         reel_status=models.ReelStatus.generating,
+                         updated_at=now - _MINUTE * (DONE_ORPHAN_STALE_MINUTES + 1))
+    reap_stuck_jobs()
+    assert _state(factory, *just_inside)[0].status == models.JobStatus.done
+    assert _state(factory, *just_outside)[0].status == models.JobStatus.failed
 
 
 def test_pending_branch_keys_on_updated_at_not_created_at(factory):
