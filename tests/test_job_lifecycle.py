@@ -678,6 +678,10 @@ def test_a_savepoint_rollback_failure_does_not_mask_a_shutdown_signal_from_the_h
     with patch("sqlalchemy.dialects.sqlite.pysqlite.SQLiteDialect_pysqlite.do_rollback_to_savepoint", boom):
         with pytest.raises(SystemExit, match="shutdown mid-hook"):
             _stamp_failed_and_run_cleanup(db, job_id, "orig failure", hook, None)
+    # close() rolls back anything left uncommitted, exactly like job_task's own `finally: db.close()`
+    # -- without it, an uncommitted write can still read back as present via the shared StaticPool
+    # connection, masking a missing commit (this is what job_task's real db.close() would expose).
+    db.close()
     job, _, _ = _read(factory, job_id, reel_id, cut_id)
     assert job.status == models.JobStatus.failed
 
