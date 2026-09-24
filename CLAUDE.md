@@ -46,7 +46,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 617 tests across 30+ files (4 test_compositor tests need ffmpeg on PATH; 1 kokoro voice test skips without the kokoro package)
+.venv/bin/pytest                            # 624 tests across 30+ files (4 test_compositor tests need ffmpeg on PATH; 1 kokoro voice test skips without the kokoro package)
 .venv/bin/pytest tests/test_foo.py::bar -s
 
 # New migration after changing models.py
@@ -194,7 +194,14 @@ engine/
                       scales a named axis's deduction via one small correction block immediately before
                       the final return, reusing the deductions dict already built for the issue-string
                       breakdown — None/empty is a byte-identical no-op to every prior test in this file;
-                      see docs/evaluation.md
+                      Script→Visual Alignment (20 pts) redistributes across only the sub-signals
+                      (entity/action/context) that actually apply to the content, full credit when
+                      none do — a non-football niche whose VO never triggers a person name/action
+                      verb/event-year regex must not have this whole axis collapse to a flat deduction
+                      (Phase 6c fairness fix, see docs/roadmap.md); Visual Variety (5 pts) skips its
+                      deduction when every beat's visual_direction is uncategorized "other" — its 6
+                      categories are unconditionally football vocabulary with no niche gate at all,
+                      unlike the axes below that swap in a _UNIVERSAL regex; see docs/evaluation.md
     llm_judge.py      judge_guide() — LLM semantic judge; 5 dims × 0–20 = 100 pts
     postprocess.py    clean_guide() — strips label prefixes; derives up to 5 on_screen_text segments
     hook_variants.py  generate_hook_variants() — one best-effort LLM call for N_VARIANTS (3) alternate
@@ -266,9 +273,22 @@ migrations/
     0008_tts_voice.py   Reel.tts_voice column
 
 tests/
-  test_evaluator.py           34 tests — all 17 evaluator axes + helpers, multi-platform dedupe,
+  test_evaluator.py           41 tests — all 17 evaluator axes + helpers, multi-platform dedupe,
                               axis_multipliers no-op default (None/{} byte-identical to every existing
-                              fixture), zero/doubled/unknown-axis multiplier correction
+                              fixture), zero/doubled/unknown-axis multiplier correction; non-football
+                              niche fairness (Phase 6c) — realistic finance/fitness fixtures no longer
+                              unfairly capped, alignment axis gives full credit when no sub-signal
+                              applies (regression-guarded against also disabling real mismatches),
+                              visual variety not penalized when every beat is uncategorized "other"
+                              (regression-guarded against also disabling real repetition within a
+                              recognized football category, and against the known "mostly other"
+                              residual gap — see docs/roadmap.md Phase 6c); assertions read the
+                              deduction directly off the "Score breakdown" issue line
+                              (`_axis_deduction()`) rather than an axis-specific issue message, since
+                              at least one such message (alignment's) is gated behind a narrower
+                              condition that stays empty regardless of the deduction's real value —
+                              an independent review caught the original assertions passing vacuously
+                              against a full revert of the fix
   test_script_parser.py       11 tests — parse() routing, beat splitting, _derive_on_screen
   test_state.py               11 tests — REEL_TRANSITIONS, CUT_TRANSITIONS, invalid moves
   test_enrichment.py          15 tests — coerce_beat_type, _enrich_batch response parsing, topic fence
@@ -444,7 +464,7 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 - **Phase 4b** ✅ — Publishing: OAuth connect-account flow (YouTube Data API + Instagram Graph API), `safe_to_publish` hard gate enforced at publish time, TikTok added as a third `CutPlatform` for render/review (publishing itself deliberately not implemented — see Key conventions), `scheduled`/`publishing`/`published` cut states wired end-to-end. Not done: attribution block in captions, TikTok publishing, unpublish/re-publish flows.
 - **Phase 5** ✅ — Analytics: local-library music mixing with sidechain ducking (`LocalMusicSource` + `_build_ffmpeg_args`), HF asset-generation cost tracking (`engine/render/pricing.py`, `asset_hf_video`/`asset_hf_image` StageEvents), Wikipedia attribution block appended to published captions (`engine/publish/attribution.py`), post-publish metrics pull-back every 6h (`worker/tasks/metrics.py`), quality-vs-views surfaced on the reel list and per-cut engagement stats on the cut card. Quality↔engagement correlation (`engine/analytics/correlation.py`, `GET /api/insights`) and performance-informed feedback (`PerformanceNote` CRUD + seeding into `prior_feedback`, `evaluator_axis_weight_multipliers` lever) shipped after — see below.
 - **Phase 5g** ✅ — Quality↔engagement correlation + performance-informed feedback: closes the last two Phase 5 items (`docs/specs/2026-09-phase5-quality-engagement-feedback.md`). `GET /api/insights` shows a Pearson `r` (+ `sample_size`, always shown together, never `r` alone) between `quality_score` and max per-reel `views`, refusing to compute below `MIN_SAMPLE=5` reels or on zero variance in either series — with an explicit, permanent UI caveat about restriction-of-range bias (scores cluster near the acceptance threshold by construction) and "correlation, not causation." Same page shows a top/bottom-3 performer table (combined into one list when `n < 6`) with each performer's hook line, for a human operator to write `PerformanceNote`s from — **not** automatic few-shot injection of raw past-reel content, a deliberate scope decision (see the spec's §3.1: this codebase has already been burned by topic-drift from unconstrained prior context leaking into generation). Every active note is seeded into the standard LLM path's `prior_feedback` from attempt 1 onward. `evaluator_axis_weight_multipliers` (`Settings`, default `{}`) is a manual per-axis scoring lever informed by the correlation data — no code in this repo derives these values statistically.
-- **Phase 6 (partial)** — Creative range: hook/thumbnail variant generation, and per-reel TTS voice choice. `render_cut` samples 4 thumbnail candidates per render (`Cut.thumbnail_candidates`); `generate_guide` generates 3 alternate hook lines once per accepted guide (`Cut.hook_variants`, best-effort — never fails the job). Operator picks either from the `in_review` cut card (`POST /cuts/{id}/thumbnail`, `POST /cuts/{id}/hook-variant`). `Reel.tts_voice` (create-reel form, curated edge-tts voice list) lets each reel sound different — edge provider only, see Key conventions. Not done: non-football niche evaluator fixtures, brand customization (logo/watermark/text color).
+- **Phase 6 (partial)** — Creative range: hook/thumbnail variant generation, per-reel TTS voice choice, and non-football niche evaluator fairness fixes. `render_cut` samples 4 thumbnail candidates per render (`Cut.thumbnail_candidates`); `generate_guide` generates 3 alternate hook lines once per accepted guide (`Cut.hook_variants`, best-effort — never fails the job). Operator picks either from the `in_review` cut card (`POST /cuts/{id}/thumbnail`, `POST /cuts/{id}/hook-variant`). `Reel.tts_voice` (create-reel form, curated edge-tts voice list) lets each reel sound different — edge provider only, see Key conventions. Investigating the evaluator's "universal" niche vocabulary found 2 real fairness bugs (Script→Visual Alignment collapsing to a flat max deduction, Visual Variety being unconditionally football-only with no niche gate at all) — both fixed, see the `evaluator.py` module-layout entry and `docs/roadmap.md` Phase 6c. Not done: brand customization (logo/watermark/text color).
 
 ## Worker queues
 

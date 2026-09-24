@@ -524,12 +524,35 @@ def score_guide(
             if _context_re.search(vis):
                 context_matches += 1
 
-    entity_score  = (entity_matches / entity_total) * 8  if entity_total  else 0
-    action_score  = (action_matches / action_total) * 8  if action_total  else 0
-    context_score = (context_matches / context_total) * 4 if context_total else 0
+    # Each sub-signal only contributes to the 20-point max when it actually applies to
+    # this content (entity_total/action_total/context_total > 0). A niche whose VO never
+    # names a person or uses action/event vocabulary (personal finance, tech reviews,
+    # cooking — anything without named individuals or competition-style verbs) would
+    # otherwise have every sub-signal's *_total stay 0, collapsing this whole axis to a
+    # flat 20-point deduction regardless of how well the visuals actually match the
+    # script — confirmed empirically: a realistic, well-aligned personal-finance guide
+    # scored align_deduction=20 (the maximum) purely because _person_names()/_actions_re/
+    # _context_re found nothing to check, not because anything was actually misaligned.
+    # Redistributing the 20 points across only the applicable sub-signals — and treating
+    # zero applicable sub-signals as full credit rather than zero — mirrors the same
+    # "not applicable ≠ maximally bad" principle Insight Density already applies to
+    # non-tactical reels (the 2/4 tactical baseline above).
+    applicable_max = 0.0
+    align_score = 0.0
+    if entity_total:
+        applicable_max += 8
+        align_score += (entity_matches / entity_total) * 8
+    if action_total:
+        applicable_max += 8
+        align_score += (action_matches / action_total) * 8
+    if context_total:
+        applicable_max += 4
+        align_score += (context_matches / context_total) * 4
 
-    align_score = entity_score + action_score + context_score
-    align_deduction = max(0, round(20 - align_score))
+    if applicable_max == 0:
+        align_deduction = 0
+    else:
+        align_deduction = max(0, round(20 - (align_score / applicable_max) * 20))
     if align_deduction > 0:
         score -= align_deduction
         deductions["alignment"] = align_deduction
@@ -714,9 +737,20 @@ def score_guide(
         )
 
     # ── 10. Visual Variety (5 pts) ────────────────────────────────────────────
+    # _VISUAL_CATEGORY_RE (unlike the niche-gated regexes above) is not conditioned on
+    # `_football` at all — its six categories are entirely football/sports vocabulary
+    # (goal, tactic, celebrat, crowd, train, sprint...). _visual_category() falls back to
+    # "other" when nothing matches, which every beat's visual_direction does for a niche
+    # like personal finance or cooking — collapsing unique_cats to 1 and triggering this
+    # deduction on every single non-football reel, regardless of how visually varied the
+    # footage actually is. Only penalize when the shared category is a REAL one the
+    # scheme recognized (a genuine repetition finding); "all beats are 'other'" means the
+    # categorization scheme doesn't apply to this content at all, not that it's repetitive.
     categories = [_visual_category(b.visual_direction) for b in all_beats]
     unique_cats = len(set(categories))
-    if unique_cats < 2:
+    if unique_cats == 1 and categories[0] == "other":
+        pass   # scheme found nothing football-specific anywhere — inapplicable, not a finding
+    elif unique_cats < 2:
         score -= 5
         deductions["variety"] = 5
         issues.append(

@@ -146,12 +146,24 @@ Three sub-scores (8 + 8 + 4 pts):
 - **Action (8):** If VO has action verbs (`tackles`, `passes`, `scores`…), so does the visual
 - **Context (4):** If VO mentions a tournament/year, the visual references the same
 
+**Fairness fix (Phase 6c):** each sub-score only counts toward the 20-point max when it
+actually *applies* — i.e. at least one beat's VO triggered that sub-signal at all. A niche
+whose VO never names a person or uses action/event vocabulary (personal finance, tech
+reviews, cooking) has every sub-signal inapplicable; the axis now gives **full credit**
+rather than collapsing to the max deduction. Before this fix, a well-aligned personal-finance
+guide scored `alignment:-20` — the maximum possible deduction — purely because
+`_person_names()`/`_VO_ACTIONS_UNIVERSAL`/`_SPECIFIC_CONTEXT_UNIVERSAL` found nothing to
+check, not because anything was actually misaligned:
+
 ```
-deduction = round(20 − (entity_score + action_score + context_score))
+applicable_max = 8 if entity applies else 0, + 8 if action applies, + 4 if context applies
+deduction = 0                                              if applicable_max == 0
+deduction = round(20 − (achieved / applicable_max) * 20)   otherwise
 ```
 
-❌ VO: `"Messi's vision unlocks defenses"` / Visual: `"Argentina team celebration"` → miss  
-✅ VO: `"Messi's vision unlocks defenses"` / Visual: `"Messi through-ball key pass Copa 2024"` → hit
+❌ VO: `"Messi's vision unlocks defenses"` / Visual: `"Argentina team celebration"` → miss (entity applies, unmatched)  
+✅ VO: `"Messi's vision unlocks defenses"` / Visual: `"Messi through-ball key pass Copa 2024"` → hit  
+✅ VO: `"Compound interest builds wealth over time"` / Visual: `"calculator and growing coin stack"` → no applicable sub-signal, full credit
 
 ---
 
@@ -226,13 +238,23 @@ Target: ~3 words/sec for hook beats, ~3.5 words/sec for body beats. Hook opener 
 
 ### 10. Visual Variety — 5 pts
 
-Categories: `highlight`, `tactical`, `celebration`, `crowd`, `training`, `action`, `other`
+Categories: `highlight`, `tactical`, `celebration`, `crowd`, `training`, `action`, `other`.
+**Unlike every other niche-aware axis, these 6 real categories are unconditionally football
+vocabulary — there is no `_UNIVERSAL` variant and no niche gate at all.**
+`_visual_category()` falls back to `"other"` for anything that doesn't match.
 
 | Unique categories | Deduction |
 |-------------------|-----------|
 | ≥3 | 0 |
 | 2 | −2 |
-| 1 | −5 |
+| 1, and that category is a real one | −5 |
+| 1, and that category is `"other"` | 0 (Phase 6c fairness fix — see below) |
+
+**Fairness fix (Phase 6c):** every beat in a non-football reel's visual descriptions maps to
+`"other"`, so `unique_cats` was always 1, triggering a guaranteed −5 on every single
+non-football reel regardless of how visually varied the footage actually was. "All beats are
+`'other'`" now means the categorization scheme doesn't apply to this content, not that it's
+repetitive — the deduction only fires when beats *do* share one real, recognized category.
 
 ---
 

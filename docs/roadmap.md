@@ -25,7 +25,7 @@ This file below is the build log (what shipped, phase by phase); that one is the
 | 4a | ✅ Done | Operator visibility (cost, latency, quality, budget cap) |
 | 4b | ✅ Done | Publishing (OAuth, safe_to_publish gate, YouTube + Instagram uploaders, TikTok platform) |
 | 5 | ✅ Done | Analytics and polish |
-| 6 | 🔲 Partial | Creative range — hook/thumbnail variant generation and per-reel TTS voice done; non-football fixtures, brand customization not started |
+| 6 | 🔲 Partial | Creative range — hook/thumbnail variant generation, per-reel TTS voice, non-football fairness fixes done; brand customization not started |
 
 ---
 
@@ -623,11 +623,74 @@ follow-up if that provider sees real use; not built now since `TTS_PROVIDER`
 defaults to `edge` and Kokoro requires Python < 3.13, already a narrower
 audience.
 
-### 6c. Non-football niche evaluator fixtures — not done
+### 6c. Non-football niche evaluator fixtures — done
 
-`evaluator.py`'s "universal" fallback patterns exist but have no real test
-fixtures outside football content — whether they score other niches fairly
-is unmeasured.
+Wrote realistic personal-finance and fitness fixtures and measured them
+against `score_guide()`. Found two real, confirmed fairness bugs, both
+fixed in `engine/generation/evaluator.py`:
+
+1. **Script→Visual Alignment (20 pts) collapsed to a flat max deduction**
+   whenever a niche's VO never triggered `_person_names()` /
+   `_VO_ACTIONS_UNIVERSAL` / `_SPECIFIC_CONTEXT_UNIVERSAL` anywhere — the
+   normal case for personal finance, tech reviews, cooking, anything
+   without named individuals or competition-style action verbs. A
+   perfectly well-aligned finance guide scored `alignment:-20` (the max)
+   purely because there was nothing to check, not because anything was
+   misaligned. Fixed by redistributing the 20 points across only the
+   sub-signals that actually apply, with zero applicable sub-signals
+   treated as full credit — the same "not applicable ≠ maximally bad"
+   principle Insight Density already used for its tactical-vocabulary
+   baseline.
+2. **Visual Variety (5 pts) was not niche-gated at all.** Its 6 categories
+   (highlight/tactical/celebration/crowd/training/action) are entirely
+   football vocabulary, and `_visual_category()` falls back to `"other"`
+   for anything that doesn't match. Every beat in a non-football reel
+   mapped to `"other"`, collapsing `unique_cats` to 1 and triggering a
+   flat -5 "no visual variety" deduction on every single non-football
+   reel, regardless of actual visual variety. Fixed by treating "every
+   beat is 'other'" as the categorization scheme not applying, not as a
+   genuine repetition finding.
+
+Both bugs were severe enough to matter in production: a realistic finance
+guide scored 47/100 before the fix (below `_JUDGE_RULE_MIN=55`, meaning it
+would never even reach the LLM judge for partial credit — `generate_guide`
+would burn all 3 retries and accept a garbage best-of-3), 72/100 after.
+Fitness: 43 → 64. Mutation-verified (temporarily reverted both fixes,
+confirmed the new regression tests fail, restored) — see
+`tests/test_evaluator.py`'s "non-football niche fairness" section.
+
+**Independent review caught a real gap in the tests themselves**, not just
+the fix: the first version of the alignment tests asserted the absence of
+the axis's issue *message* ("Script → visual misalignment: ..."), but that
+message is gated behind a separate, narrower condition (`parts`, built only
+from sub-signals that individually apply) — it stays empty whenever every
+sub-signal is inapplicable, *regardless of the deduction's actual value*.
+Reverting the fix and re-running the original tests confirmed they still
+passed — a vacuous check. Fixed by reading the deduction directly off the
+unconditional "Score breakdown" issue line (`_axis_deduction()` helper);
+re-verified the same revert now correctly fails 4 tests.
+
+**Known, documented residual gap** (not fixed, deliberately): Visual
+Variety's fix only covers "every beat is `'other'`." If just one beat's
+wording incidentally trips a football-vocabulary regex (e.g. "training
+session drill" in an otherwise generic reel) while the rest stay
+uncategorizable, `unique_cats` becomes 2 and the untouched `-2` "Limited
+visual variety" branch still fires — the same class of bug, one level less
+contained, for a niche where the scheme still doesn't meaningfully apply.
+Fixing it properly means changing how football content itself is scored
+too (should an "other" beat still count as a free variety token, the way
+it implicitly does today?), which needs its own dedicated verification
+pass, not a rushed scope-expansion here. Pinned by
+`test_visual_variety_still_penalizes_a_mostly_other_reel_that_incidentally_matches_one_real_category`
+so a future fix is a deliberate, visible test change.
+
+Clip Availability (10 pts) has a related, smaller bias — a genuinely
+sourceable but generic visual (e.g. "calculator and growing stack of coins
+animation") scores lower than a named-person visual regardless of niche —
+left as a documented, lower-severity limitation rather than fixed here;
+the person-name-driven heuristic doesn't have a good non-name proxy for
+"this is sourceable" without risking new false positives for genuinely
+vague visuals.
 
 ### 6d. Brand customization — not done
 

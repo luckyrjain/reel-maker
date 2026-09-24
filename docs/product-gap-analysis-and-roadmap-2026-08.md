@@ -107,7 +107,7 @@ Numbered to extend `docs/roadmap.md`'s existing phase log (0–3.8 done). Sequen
 
 - ~~Hook/thumbnail variant generation (N candidates, operator — later, engagement data — picks)~~ ✅ Done — see `docs/roadmap.md` Phase 6a
 - ~~Configurable TTS voice per reel (data + UI already 90% there; `voice` param just needs threading through)~~ ✅ Done — see `docs/roadmap.md` Phase 6b
-- Non-football niche validation: real test fixtures for 2–3 other niches, measure whether the "universal" evaluator patterns actually score fairly
+- ~~Non-football niche validation: real test fixtures for 2–3 other niches, measure whether the "universal" evaluator patterns actually score fairly~~ ✅ Done — found and fixed 2 real fairness bugs, see `docs/roadmap.md` Phase 6c
 - Brand customization: logo/watermark, configurable text color, per-channel presets
 
 ### Phase 7 — Production hardening

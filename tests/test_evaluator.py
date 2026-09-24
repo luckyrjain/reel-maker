@@ -1,7 +1,23 @@
 """Tests for engine/generation/evaluator.py"""
 
+import re
+
 from engine.generation.guide_schema import Beat, MasterGuide, PlatformGuide
 from engine.generation.evaluator import score_guide, _person_names
+
+
+def _axis_deduction(issues: list[str], axis: str) -> int:
+    """Read a named axis's deduction straight off the 'Score breakdown — ...' issue line,
+    which reflects the `deductions` dict unconditionally — unlike axis-specific issue
+    messages (e.g. "Script → visual misalignment: ..."), which some axes only append
+    under an additional, narrower condition (see the alignment axis: its message text is
+    gated behind per-sub-signal `parts`, which stays empty whenever every sub-signal is
+    inapplicable, even if a bug made the deduction itself nonzero — checking for the
+    *message* would silently pass either way). 0 if the axis isn't in the breakdown at
+    all, i.e. its deduction was 0."""
+    breakdown = next((i for i in issues if i.startswith("Score breakdown")), "")
+    m = re.search(rf"{axis}:−(\d+)", breakdown)
+    return int(m.group(1)) if m else 0
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
@@ -13,14 +29,14 @@ def _beat(index, type="body", duration_s=8, vo="", visual="player action"):
     )
 
 
-def _guide(*beats) -> MasterGuide:
+def _guide(*beats, niche="football", caption="Test caption.") -> MasterGuide:
     return MasterGuide(
         title="Test",
-        niche="football",
+        niche=niche,
         cuts=[PlatformGuide(
             platform="youtube_shorts",
             target_length_s=45,
-            caption="Test caption.",
+            caption=caption,
             hashtags=["football"] * 10,
             beats=list(beats),
         )],
@@ -822,3 +838,214 @@ def test_unknown_axis_name_in_multipliers_is_a_no_op_not_a_keyerror():
     # Settings.evaluator_axis_weight_multipliers must not crash generation.
     typo_score, _ = score_guide(_CTX, guide, 45, axis_multipliers={"ctaa": 0.0, "not_a_real_axis": 5.0})
     assert typo_score == baseline_score
+
+
+# ── non-football niche fairness (Phase 6c) ──────────────────────────────────────
+#
+# score_guide() gates 3 axes (Insight Density, Script→Visual Alignment, Clip
+# Availability — 45 of 100 pts) on `guide.niche`, swapping in a "_UNIVERSAL" regex
+# variant for anything that isn't football/soccer/futbol. Investigating whether that
+# variant was actually fair to genuinely different content (not just renamed football
+# vocabulary) found two real, confirmed bugs, both fixed here:
+#
+# 1. Script→Visual Alignment collapsed to a flat 20-point deduction whenever a niche's
+#    VO never triggered _person_names()/_VO_ACTIONS_UNIVERSAL/_SPECIFIC_CONTEXT_UNIVERSAL
+#    anywhere — which is the normal case for personal finance, tech reviews, cooking,
+#    anything without named individuals or competition-style action verbs. A perfectly
+#    well-aligned finance guide scored align_deduction=20 (the max) purely because there
+#    was nothing to check, not because anything was misaligned. Fixed by redistributing
+#    the 20 points across only the sub-signals that actually apply, with zero applicable
+#    sub-signals treated as full credit (see engine/generation/evaluator.py's comment on
+#    the fix — same "not applicable ≠ maximally bad" principle Insight Density already
+#    uses for its tactical-vocabulary baseline).
+# 2. Visual Variety (5 pts) is not niche-gated at all — its 6 categories
+#    (highlight/tactical/celebration/crowd/training/action) are entirely football
+#    vocabulary, and _visual_category() falls back to "other" for anything that
+#    doesn't match. Every beat in a non-football reel mapped to "other", collapsing
+#    unique_cats to 1 and triggering the flat -5 "no visual variety" deduction on
+#    every single non-football reel, regardless of how visually varied the footage
+#    actually was. Fixed by treating "every beat is 'other'" as the categorization
+#    scheme not applying to this content, not as a genuine repetition finding.
+
+_CTX_FINANCE = (
+    "Compound interest is the most powerful force in personal finance. "
+    "If you invest $500 a month starting at age 25, you'll have over $1.3 million by 65. "
+    "But most people wait until 35 to start, losing a decade of growth. "
+    "The S&P 500 has averaged 10% annual returns since 1957."
+)
+
+_CTX_FITNESS = (
+    "Most people think more cardio burns more fat, but that's a myth. "
+    "Strength training raises your resting metabolism for up to 38 hours after a workout. "
+    "A 2021 study found strength training burned more fat over 12 weeks than steady cardio. "
+    "The catch: most beginners quit within 6 weeks because they don't see results fast enough."
+)
+
+
+def _finance_guide() -> MasterGuide:
+    return _guide(
+        _beat(0, "hook", 4, "This decade of delay could cost you $700,000. Here's why.",
+              "person looking at phone shocked, dramatic lighting"),
+        _beat(1, "body", 10,
+              "Since 1957 the S&P 500 has averaged 10% a year, because compound interest lets "
+              "your money earn money on its own money. But there's a catch nobody tells you.",
+              "calculator and growing stack of coins animation, close up"),
+        _beat(2, "body", 10,
+              "Most people wait until 35 to start investing, and that single decade of delay is "
+              "a hidden danger — it can cost you $700,000 in lost growth by retirement.",
+              "clock ticking with money fading away, dramatic zoom"),
+        _beat(3, "cta", 8,
+              "Don't let that decade of delay become your $700,000 mistake — comment 'START' "
+              "and I'll send you the guide.",
+              "phone with investment app open, celebratory confetti"),
+        niche="personal finance",
+        caption="This one decade of delay could cost you $700,000 — here's the math nobody shows you.",
+    )
+
+
+def _fitness_guide() -> MasterGuide:
+    return _guide(
+        _beat(0, "hook", 4, "Is cardio secretly sabotaging your fat loss?",
+              "person on treadmill looking frustrated, gym lighting"),
+        _beat(1, "body", 10,
+              "A 2021 study found strength training burns more fat over 12 weeks than steady "
+              "cardio, because it raises your resting metabolism for 38 hours after you finish. "
+              "But there's a catch nobody warns you about.",
+              "2021 research study data visualization, person lifting weights closeup"),
+        _beat(2, "body", 10,
+              "The hidden danger: most beginners quit within 6 weeks because they don't see "
+              "results fast enough, giving up right before the metabolism boost kicks in.",
+              "calendar pages flipping fast, person looking discouraged"),
+        _beat(3, "cta", 8,
+              "Don't quit at week 5 and miss the exact week it starts working — comment "
+              "'WEEK 6' if you're committing to push through.",
+              "person finishing a strong final rep, celebratory fist pump"),
+        niche="fitness",
+        caption="Skip cardio? This 2021 study says strength training burns more fat — and most quit right before it works.",
+    )
+
+
+def test_realistic_finance_guide_is_not_unfairly_capped():
+    """The empirical finding this whole section documents: before the two fixes above,
+    this exact fixture scored 47/100 (alignment:-20, variety:-5) — mutation-verified by
+    temporarily reverting both fixes and confirming this test fails — purely from
+    vocabulary mismatch, not from any real flaw a human reviewer would point to. It now clears
+    _JUDGE_RULE_MIN (worker/tasks/generate.py) — the bar below which a guide never even
+    reaches the LLM judge for partial credit (_combined_score() short-circuits) — and
+    neither fixed axis appears as a deduction. Remaining deductions (hook phrasing, open
+    loops, throughline) are genuine, niche-agnostic content-quality signals, not touched
+    by this fix, and this fixture intentionally leaves some on the table rather than
+    being tuned to a perfect score."""
+    from worker.tasks.generate import _JUDGE_RULE_MIN
+    score, issues = score_guide(_CTX_FINANCE, _finance_guide(), 45)
+    assert score >= _JUDGE_RULE_MIN, f"score={score}, issues={issues}"
+    assert not any("visual misalignment" in i for i in issues)
+    assert not any("visual variety" in i for i in issues)
+
+
+def test_realistic_fitness_guide_is_not_unfairly_capped():
+    """Before the fix: 43/100 (alignment:-16, variety:-5), same mutation-verified as the
+    finance test above. See that test for what the remaining threshold and deductions
+    do and don't mean here."""
+    from worker.tasks.generate import _JUDGE_RULE_MIN
+    score, issues = score_guide(_CTX_FITNESS, _fitness_guide(), 45)
+    assert score >= _JUDGE_RULE_MIN, f"score={score}, issues={issues}"
+    assert not any("visual misalignment" in i for i in issues)
+    assert not any("visual variety" in i for i in issues)
+
+
+def test_alignment_axis_gives_full_credit_when_no_sub_signal_applies():
+    """No person names, no action verbs, no event/year context anywhere in the VO —
+    entity_total=action_total=context_total=0. Before the fix this collapsed the whole
+    20-point axis to a flat deduction; it must now contribute nothing at all."""
+    guide = _guide(
+        _beat(0, "hook", 4, "This one habit changes everything about your morning.",
+              "sunrise over a quiet kitchen counter"),
+        _beat(1, "body", 10, "Drinking water first thing rehydrates your body after a long night.",
+              "glass of water on a bright windowsill"),
+        _beat(2, "cta", 6, "Try it tomorrow and notice the difference.",
+              "calm morning routine, soft light"),
+        niche="wellness",
+    )
+    # Not "not any(... in issues)": the alignment axis's own issue *message* is gated
+    # behind per-sub-signal `parts`, which is empty whenever every sub-signal is
+    # inapplicable regardless of the deduction's actual value — that check would pass
+    # vacuously even against the pre-fix, unfixed code (verified by reverting the fix
+    # and re-running this exact test: it still passed). Read the deduction directly off
+    # the unconditional "Score breakdown" line instead.
+    _, issues = score_guide(_CTX_FINANCE, guide, 45)
+    assert _axis_deduction(issues, "alignment") == 0, issues
+
+
+def test_alignment_axis_still_penalizes_a_real_mismatch_when_a_signal_applies():
+    """Regression guard for the fix above: when a sub-signal genuinely does apply
+    (here, a name the universal action/context regexes would also catch) and the visual
+    ignores it, the axis must still deduct — the fix must not have quietly disabled it.
+    Asserts the deduction directly (not just score_ali > score_mis, which the pre-fix
+    formula would also satisfy for this fixture and so doesn't isolate the fix)."""
+    mismatched = _guide(
+        _beat(0, "hook", 5, "Can Jenna Cole turn this business around?", "empty office at night"),
+        _beat(1, "body", 10, "Jenna Cole grew revenue 40% in one quarter.", "crowd cheering stadium"),
+        _beat(2, "cta", 5, "Subscribe.", "logo"),
+        niche="business",
+    )
+    aligned = _guide(
+        _beat(0, "hook", 5, "Can Jenna Cole turn this business around?", "Jenna Cole in her office"),
+        _beat(1, "body", 10, "Jenna Cole grew revenue 40% in one quarter.", "Jenna Cole presenting growth chart"),
+        _beat(2, "cta", 5, "Subscribe.", "logo"),
+        niche="business",
+    )
+    _, issues_mis = score_guide(_CTX_FINANCE, mismatched, 45)
+    _, issues_ali = score_guide(_CTX_FINANCE, aligned, 45)
+    assert _axis_deduction(issues_mis, "alignment") > 0
+    assert _axis_deduction(issues_ali, "alignment") == 0
+
+
+def test_visual_variety_not_penalized_when_no_beat_matches_any_category():
+    """Every visual_direction maps to '_visual_category() == "other"' — the six
+    categories are unconditionally football vocabulary. Before the fix this was a
+    guaranteed -5 on every non-football reel regardless of actual visual variety."""
+    guide = _guide(
+        _beat(0, "hook", 4, "Is cardio secretly sabotaging your fat loss?",
+              "person on treadmill looking frustrated"),
+        _beat(1, "body", 10, "Strength training raises your metabolism for 38 hours.",
+              "calculator and growing stack of coins"),
+        _beat(2, "cta", 6, "Comment START and I'll send you the guide.",
+              "phone with investment app open"),
+        niche="fitness",
+    )
+    _, issues = score_guide(_CTX_FITNESS, guide, 45)
+    assert _axis_deduction(issues, "variety") == 0, issues
+
+
+def test_visual_variety_still_penalizes_real_repetition_within_recognized_categories():
+    """Regression guard: when beats DO map to a real (football) category and it's the
+    same one every time, that's a genuine finding — the fix must not have disabled it."""
+    guide = _guide(
+        _beat(0, "hook", 5, "Could Argentina win?", "crowd cheering stadium"),
+        _beat(1, "body", 10, "Messi creates 12 key passes.", "fans in the crowd"),
+        _beat(2, "cta", 5, "Subscribe.", "stadium crowd atmosphere"),
+    )
+    _, issues = score_guide(_CTX, guide, 45)
+    assert _axis_deduction(issues, "variety") == 5, issues
+
+
+def test_visual_variety_still_penalizes_a_mostly_other_reel_that_incidentally_matches_one_real_category():
+    """Known, documented residual gap (not fixed here — see docs/roadmap.md Phase 6c):
+    if only one beat's wording incidentally trips a football-vocabulary regex (e.g.
+    'training' below) while the rest are genuinely uncategorizable, unique_cats becomes
+    2 ('other' + 'training') and the untouched -2 'Limited visual variety' branch still
+    fires — for a niche where the categorization scheme still doesn't meaningfully
+    apply. This test pins the CURRENT (imperfect) behavior so a future fix for it is a
+    deliberate, visible test change, not a silent one."""
+    guide = _guide(
+        _beat(0, "hook", 4, "This one habit changes everything about your morning.",
+              "sunrise over a quiet kitchen counter"),
+        _beat(1, "body", 10, "Drinking water first thing rehydrates your body after a long night.",
+              "glass of water on a bright windowsill"),
+        _beat(2, "cta", 6, "Try it as part of your daily training session drill.",
+              "calm morning training session drill routine"),
+        niche="wellness",
+    )
+    _, issues = score_guide(_CTX_FINANCE, guide, 45)
+    assert _axis_deduction(issues, "variety") == 2, issues
