@@ -358,10 +358,18 @@ def _recover_from_hook_failure(db, job_id, message: str, nested) -> bool:
                         "partial writes may still be committed alongside the fail-stamp", job_id)
         return False
     try:
-        _fail_job_keep_owner(db, job_id, message)
+        redone = _fail_job_keep_owner(db, job_id, message)
     except Exception:
         _log.exception("could not redo the failure stamp for job %s after discarding the "
                         "poisoned transaction", job_id)
+        return False
+    if not redone:
+        # The CAS (`WHERE status='done'`) didn't match -- a sibling or the reaper moved the job
+        # on in the gap between the full rollback and this redo. Not an exception, so it would
+        # otherwise fall through to `return True` and claim the fail-stamp is confirmed when
+        # nothing was actually written here.
+        _log.error("could not redo the failure stamp for job %s: it was no longer `done` after "
+                   "the poisoned transaction was discarded", job_id)
         return False
     return True
 

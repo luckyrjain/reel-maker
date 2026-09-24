@@ -734,6 +734,23 @@ def test_recover_from_hook_failure_is_not_confirmed_when_the_stamp_redo_fails(fa
         assert _recover_from_hook_failure(db, job_id, "orig failure", nested) is False
 
 
+def test_recover_from_hook_failure_is_not_confirmed_when_the_redo_cas_loses_the_race(factory):
+    """_fail_job_keep_owner returns False (not an exception) when its CAS doesn't match -- e.g. a
+    sibling or the reaper moved the job on in the gap between the full rollback and this redo.
+    That must not be silently treated the same as a successful redo: nothing was actually
+    written, so returning True here would contradict this function's own documented contract
+    ("confirmed durable")."""
+    from worker.tasks.common import _recover_from_hook_failure
+
+    job_id, *_ = _make(factory, models.JobType.enrich, status=models.JobStatus.done)
+    db = factory()
+    nested = MagicMock()
+    nested.rollback.side_effect = sa_exc.OperationalError("ROLLBACK TO SAVEPOINT", {}, Exception("gone"))
+
+    with patch("worker.tasks.common._fail_job_keep_owner", return_value=False):
+        assert _recover_from_hook_failure(db, job_id, "orig failure", nested) is False
+
+
 def test_recover_from_hook_failure_confirms_after_a_full_rollback_and_successful_redo(factory):
     """The full recovery path: SAVEPOINT rollback fails, full db.rollback() succeeds, and the
     fail-stamp CAS redo on the now-clean transaction succeeds too."""

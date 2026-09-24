@@ -300,7 +300,23 @@ PostgreSQL 16, not just SQLite. Behaviour changes an operator should know about:
     "failure stamp staged, not yet committed" instead of overclaiming "still recorded") had only been
     applied to that one rare branch — the much more common "recovery succeeded" branch still overclaimed
     "still recorded" for the exact same reason (neither caller commits until after this function
-    returns). Reworded both branches consistently.
+    returns). Reworded both branches consistently. Separately, `_recover_from_hook_failure`'s redo step
+    caught exceptions from `_fail_job_keep_owner` but ignored its boolean return — `False` means the CAS
+    (`WHERE status='done'`) didn't match (a sibling or the reaper moved the job on in the gap since the
+    full rollback), not an exception, so a lost CAS silently fell through to `return True`, contradicting
+    the function's own documented contract ("confirmed durable"). Fixed to check the return value too.
+    Independently verified against real PostgreSQL 16 (`pg_terminate_backend`, a real server-side trigger
+    to force the redo's `UPDATE` to fail, a second connection to check MVCC visibility of the staged
+    write) — confirmed all four original recovery outcomes hold, confirmed the "staged" wording is
+    accurate (Postgres has no working `READ UNCOMMITTED`; the write is genuinely invisible to any other
+    session until commit, and genuinely can vanish if that commit then fails), and surfaced one adjacent,
+    narrower, pre-existing gap not introduced by this ladder: `_fail_job_keep_owner`'s own internal
+    `db.get()` (a read-only ORM identity-map refresh, not the CAS itself, and not `_recover_from_hook_failure`'s call
+    to it) is unguarded — a connection death exactly there propagates raw into `job_task`'s generic
+    catch-all with none of this section's specific diagnostics, even though it's the identical
+    underlying race one statement earlier. Not fixed here (out of scope for this ladder, and
+    `_fail_job_keep_owner` is used by every job-failure path in this file, not just this one); noted for
+    a future pass.
 
   </details>
 - `_generate_caption_hashtags`'s fallback path no longer swallows `SoftTimeLimitExceeded` — a timeout
