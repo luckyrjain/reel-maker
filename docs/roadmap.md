@@ -253,7 +253,14 @@ PostgreSQL 16, not just SQLite. Behaviour changes an operator should know about:
     unhandled, that would be caught by the ordinary hook-failure branch and silently swallowed,
     masking the shutdown. `_stamp_failed_and_run_cleanup` now checks for exactly this shape (an
     `Exception` whose `__context__` is a `BaseException` that isn't itself an `Exception`) and
-    recovers the original signal before committing the fail-stamp and re-raising it.
+    recovers the original signal before committing the fail-stamp and re-raising it. Independently
+    re-verified against real PostgreSQL 16 for both `SystemExit` and `KeyboardInterrupt`, plus a
+    negative control (an ordinary hook exception under the same forced rollback failure correctly
+    stays unrecovered, not misclassified as a shutdown). The trigger condition — a worker shutdown
+    signal landing at the same moment the DB connection dies — is not two independent coincidences
+    either: a rolling deploy is exactly when workers receive SIGTERM *and* when connections get
+    severed (a managed Postgres failover/maintenance window, a load balancer connection sweep, or a
+    future connection pooler's reload, none of which are unusual during the same rollout).
   - **One narrow gap remains, not worth a code change today**: if the hook raises BaseException
     *and* the guarded `_commit_or_log` commit *also* fails, the Job row is left at `status=done`
     with no error recorded, and the reaper's sweep only scans `running`/`pending` rows — that Job is

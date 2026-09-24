@@ -246,6 +246,16 @@ def _commit_or_log(db, job_id, context: str) -> None:
         _log.exception("could not commit for job %s%s", job_id, context)
 
 
+def _commit_stamp_and_reraise(db, job_id, exc: BaseException, context: str, *, cause=None) -> None:
+    """Commit the fail-stamp via _commit_or_log, then propagate `exc` -- shared by both places in
+    _stamp_failed_and_run_cleanup that must let a shutdown signal through (raised directly by the
+    hook, or recovered from behind a masking SAVEPOINT-rollback failure via `cause`)."""
+    _commit_or_log(db, job_id, context)
+    if cause is not None:
+        raise exc from cause
+    raise exc
+
+
 def _stamp_failed_and_run_cleanup(db, job_id, message: str, after_commit_failed, result, *,
                                   on_shutdown: bool = False) -> None:
     """done -> failed stamp, then the cleanup hook (if any), for a body whose after_commit already
@@ -274,14 +284,14 @@ def _stamp_failed_and_run_cleanup(db, job_id, message: str, after_commit_failed,
     A subtlety in how that BaseException reaches us at all: if the hook did more than a bare raise (a
     real write, like `_abandon_generate`'s), `db.begin_nested()`'s own `__exit__` tries to roll back the
     SAVEPOINT on the way out, and SQLAlchemy's `SessionTransaction.rollback()` RE-RAISES a failed
-    DBAPI-level rollback rather than swallowing it (confirmed by reading its source, after this file
-    briefly and incorrectly documented the opposite following an unrepresentative no-write repro). If
-    that rollback itself fails -- the connection dying is exactly what a shutdown can correlate with --
-    the ordinary `Exception` it raises REPLACES the hook's SystemExit/KeyboardInterrupt as what's
-    propagating out of the `with` block, though the original survives as `exc.__context__` (Python sets
-    this automatically). Left unhandled, that ordinary exception would be caught by the sibling `except
-    Exception:` below, logged as a routine hook failure, and swallowed -- masking the shutdown entirely.
-    The `except Exception as exc:` clause checks for exactly this shape and recovers the original signal.
+    DBAPI-level rollback rather than swallowing it. If that rollback itself fails -- the connection
+    dying is exactly what a shutdown can correlate with (see docs/roadmap.md's Phase 3.9 section for
+    the investigation history) -- the ordinary `Exception` it raises REPLACES the hook's
+    SystemExit/KeyboardInterrupt as what's propagating out of the `with` block, though the original
+    survives as `exc.__context__` (Python sets this automatically). Left unhandled, that ordinary
+    exception would be caught by the sibling `except Exception:` below, logged as a routine hook
+    failure, and swallowed -- masking the shutdown entirely. The `except Exception as exc:` clause
+    checks for exactly this shape and recovers the original signal.
     """
     if _fail_job_keep_owner(db, job_id, message) and after_commit_failed:
         try:
@@ -297,14 +307,14 @@ def _stamp_failed_and_run_cleanup(db, job_id, message: str, after_commit_failed,
                 _log.exception("SAVEPOINT rollback itself failed for job %s while a shutdown signal was "
                                 "propagating from the cleanup hook; recovering the original signal",
                                 job_id)
-                _commit_or_log(db, job_id, " (recording the failure stamp during a masked shutdown)")
-                raise masked_shutdown from exc
+                _commit_stamp_and_reraise(db, job_id, masked_shutdown,
+                                          " (recording the failure stamp during a masked shutdown)",
+                                          cause=exc)
             suffix = " on shutdown" if on_shutdown else ""
             _log.exception("after_commit_failed hook raised for job %s%s; failure stamp still recorded, "
                             "hook's own partial writes rolled back", job_id, suffix)
-        except BaseException:
-            _commit_or_log(db, job_id, " (recording the failure stamp during shutdown)")
-            raise
+        except BaseException as exc:
+            _commit_stamp_and_reraise(db, job_id, exc, " (recording the failure stamp during shutdown)")
 
 
 def _settle_failure(self, db, job_id, exc, *, owned, committed, owner_kind, owner_state,
