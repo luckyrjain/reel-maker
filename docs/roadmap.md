@@ -255,18 +255,19 @@ PostgreSQL 16, not just SQLite. Behaviour changes an operator should know about:
     orphaned follow-up Job stays `pending` and gets reaped after `PENDING_STALE_MINUTES`; that's
     incidental to `_abandon_generate`'s specific shape, not a guarantee `_stamp_failed_and_run_cleanup`
     makes for every hook. A future hook with no such side effect would leave its owner stuck in its
-    in-flight status with no automatic recovery in this specific double-fault — the cheap mitigation,
-    if/when a second `after_commit_failed` hook is added, is extending `reap_stuck_jobs` to also sweep
-    `done` jobs whose owner is still sitting in the state `JOB_IN_FLIGHT` maps to, past some staleness
-    threshold; not done now since it would be speculative hardening for a failure mode with zero live
-    instances today.
+    in-flight status with no automatic recovery in this specific double-fault. **Mitigated**:
+    `reap_stuck_jobs` (`worker/tasks/maintenance.py::_done_orphan_candidates`) also sweeps `done` jobs,
+    `error IS NULL`, whose owner is still sitting in the state `JOB_IN_FLIGHT` maps to that job type,
+    past `DONE_ORPHAN_STALE_MINUTES` (15) — one query per job type, joined to the owner table so a
+    genuinely successful `done` job (indistinguishable from a stuck one by the Job row's own columns
+    alone) never matches. Covered by `tests/test_maintenance.py`.
   - **Detecting it**: the only trace is a handful of log lines from logger `worker.tasks.common`
     (`SAVEPOINT rollback itself failed`, `could not roll back the poisoned transaction`, `could not
     redo the failure stamp`, `could NOT confirm`, `could not load job ... for the cleanup hook`, `could
     not record failure of job`) — there is no alerting on any of them (this repo has none configured
     for anything), so this is moot until some alerting exists. A Job whose `status` is `done`, `error`
     is `None`, and whose owner (reel/cut) is still in the in-flight state `JOB_IN_FLIGHT` maps to that
-    job type is the on-disk signature; nothing currently queries for that combination either.
+    job type is the on-disk signature; `reap_stuck_jobs` now queries for that combination every 60 s.
 
   <details>
   <summary>Investigation history (rounds 10-14) — why this code looks the way it does</summary>
