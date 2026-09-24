@@ -254,15 +254,21 @@ PostgreSQL 16, not just SQLite. Behaviour changes an operator should know about:
     masking the shutdown. `_stamp_failed_and_run_cleanup` now checks for exactly this shape (an
     `Exception` whose `__context__` is a `BaseException` that isn't itself an `Exception`) and
     recovers the original signal before committing the fail-stamp and re-raising it.
-  - **One narrow gap remains, not worth a code change**: if the hook raises BaseException *and* the
-    guarded `_commit_or_log` commit *also* fails, the Job row is left at `status=done` with no error
-    recorded, and the reaper's sweep only scans `running`/`pending` rows — that Job is never
-    revisited. `enrich_context`'s hook (`_abandon_generate`) happens to self-heal the reel anyway,
+  - **One narrow gap remains, not worth a code change today**: if the hook raises BaseException
+    *and* the guarded `_commit_or_log` commit *also* fails, the Job row is left at `status=done`
+    with no error recorded, and the reaper's sweep only scans `running`/`pending` rows — that Job is
+    never revisited. This isn't really two independent unlucky events: the same dying connection
+    that fails the SAVEPOINT rollback (masking the shutdown, handled above) plausibly fails the very
+    next commit too, so this is one failure mode with two consecutive symptoms, not a rare
+    coincidence. `enrich_context`'s hook (`_abandon_generate`) happens to self-heal the reel anyway,
     because its own orphaned follow-up Job stays `pending` and gets reaped after
     `PENDING_STALE_MINUTES`; that's incidental to `_abandon_generate`'s specific shape, not a
     guarantee `_stamp_failed_and_run_cleanup` makes for every hook. A future hook with no such side
     effect would leave its owner stuck in its in-flight status with no automatic recovery in this
-    specific double-fault.
+    specific double-fault — the cheap mitigation, if/when a second `after_commit_failed` hook is
+    added, is extending `reap_stuck_jobs` to also sweep `done` jobs whose owner is still sitting in
+    the state `JOB_IN_FLIGHT` maps to, past some staleness threshold; not done now since it would be
+    speculative hardening for a failure mode with zero live instances today.
   - **Detecting it**: the only trace is a log line, `could not commit for job <id> (recording the
     failure stamp during shutdown)` from logger `worker.tasks.common` — there is no alerting on it
     (this repo has none configured for anything). A Job whose `status` is `done`, `error` is `None`,
