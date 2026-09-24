@@ -16,7 +16,7 @@ import subprocess
 import numpy as np
 import soundfile as sf
 
-from engine.render.compositor import _build_ffmpeg_args, composite_cut
+from engine.render.compositor import _build_ffmpeg_args, _write_thumbnail_candidates, composite_cut
 
 
 def _has_audio_stream(path) -> bool:
@@ -58,6 +58,42 @@ def test_composite_cut_preserves_vo_audio(tmp_path):
         "rendered video has no audio stream — the VO track builder silently "
         "dropped every beat's audio (see module docstring)"
     )
+
+
+# ── _write_thumbnail_candidates — no ffmpeg, a fake clip object is enough ───
+
+class _FakeClip:
+    """Duck-types the bits of a MoviePy clip _write_thumbnail_candidates uses."""
+    def __init__(self, duration):
+        self.duration = duration
+
+    def get_frame(self, t):
+        return np.zeros((10, 10, 3), dtype=np.uint8)
+
+
+def test_write_thumbnail_candidates_first_is_the_original_thumbnail_path(tmp_path):
+    thumb = tmp_path / "thumb.jpg"
+    paths = _write_thumbnail_candidates(_FakeClip(duration=20.0), thumb)
+    assert paths[0] == thumb
+    assert thumb.exists()
+
+
+def test_write_thumbnail_candidates_writes_distinct_sibling_files(tmp_path):
+    thumb = tmp_path / "thumb.jpg"
+    paths = _write_thumbnail_candidates(_FakeClip(duration=20.0), thumb)
+    assert len(paths) == len(set(paths)) == 4   # 1 original + 3 extra candidates
+    for p in paths:
+        assert p.exists()
+    assert paths[1].name == "thumb_1.jpg"
+
+
+def test_write_thumbnail_candidates_clamps_to_a_very_short_clip(tmp_path):
+    """A clip barely longer than the safety margin must not produce a negative/zero timestamp crash."""
+    thumb = tmp_path / "thumb.jpg"
+    paths = _write_thumbnail_candidates(_FakeClip(duration=0.3), thumb)
+    assert len(paths) == 4
+    for p in paths:
+        assert p.exists()
 
 
 # ── _build_ffmpeg_args — pure function, no subprocess needed ────────────────

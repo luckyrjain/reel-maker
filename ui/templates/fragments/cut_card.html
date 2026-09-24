@@ -21,6 +21,25 @@
   {# ── Caption + hashtags + beats (editable in in_review, read-only otherwise) ── #}
 
   {% if editable %}
+
+  {% if cut.hook_variants %}
+  <div class="hook-variants" style="margin-bottom:4px;">
+    <span class="field-label" style="display:block;margin-bottom:4px;">Hook alternates</span>
+    <div style="display:flex;flex-direction:column;gap:4px;">
+    {% for variant in cut.hook_variants %}
+      <button type="button" class="btn-hook-variant"
+          hx-post="/api/cuts/{{ cut.id }}/hook-variant"
+          hx-vals='{"index": {{ loop.index0 }} }'
+          hx-target="#cut-card-{{ cut.id }}"
+          hx-swap="outerHTML"
+          style="text-align:left;">
+        {{ variant }}
+      </button>
+    {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
   <form
     hx-patch="/api/cuts/{{ cut.id }}"
     hx-target="#cut-card-{{ cut.id }}"
@@ -141,6 +160,32 @@
       {{ "%.1f" | format(cut.duration_s or 0) }}s ·
       <a href="/api/cuts/{{ cut.id }}/video" download style="color:#6366f1;">Download MP4</a>
     </p>
+    {% endif %}
+
+    {% if cut.thumbnail_candidates %}
+    <div class="thumbnail-candidates" style="margin-top:8px;">
+      <span class="field-hint" style="display:block;margin-bottom:4px;">Thumbnail</span>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;">
+      {% for candidate in cut.thumbnail_candidates %}
+        {% set chosen = candidate == cut.thumbnail_path %}
+        {% if editable %}
+        <button type="button" class="btn-thumbnail{{ ' chosen' if chosen else '' }}"
+            hx-post="/api/cuts/{{ cut.id }}/thumbnail"
+            hx-vals='{"index": {{ loop.index0 }} }'
+            hx-target="#cut-card-{{ cut.id }}"
+            hx-swap="outerHTML"
+            style="padding:0;border:2px solid {{ '#6366f1' if chosen else 'transparent' }};border-radius:6px;line-height:0;">
+          <img src="/api/cuts/{{ cut.id }}/thumbnail/{{ loop.index0 }}" alt="Thumbnail candidate {{ loop.index }}"
+               style="width:64px;height:114px;object-fit:cover;border-radius:4px;display:block;">
+        </button>
+        {% else %}
+        <img src="/api/cuts/{{ cut.id }}/thumbnail/{{ loop.index0 }}" alt="Thumbnail candidate {{ loop.index }}"
+             style="width:64px;height:114px;object-fit:cover;border-radius:4px;
+                    {{ 'border:2px solid #6366f1;' if chosen else '' }}">
+        {% endif %}
+      {% endfor %}
+      </div>
+    </div>
     {% endif %}
 
     {% if st == "in_review" %}

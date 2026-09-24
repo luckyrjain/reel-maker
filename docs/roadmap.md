@@ -24,7 +24,8 @@ This file below is the build log (what shipped, phase by phase); that one is the
 | 3.9 | ✅ Done | Job lifecycle consolidation (`job_task`) and reliability hardening |
 | 4a | ✅ Done | Operator visibility (cost, latency, quality, budget cap) |
 | 4b | ✅ Done | Publishing (OAuth, safe_to_publish gate, YouTube + Instagram uploaders, TikTok platform) |
-| 5 | 🔲 Planned | Analytics and polish |
+| 5 | ✅ Done | Analytics and polish |
+| 6 | 🔲 Partial | Creative range — hook/thumbnail variant generation done; per-reel TTS voice, non-football fixtures, brand customization not started |
 
 ---
 
@@ -495,6 +496,57 @@ the caption is empty) without mutating the DB-stored caption — the publish
 task passes the composed string through `Publisher.publish(..., caption=)`,
 a new required parameter every publisher now takes instead of reading
 `cut.caption` directly.
+
+---
+
+## Phase 6 — Creative range (partial)
+
+Sourced from `docs/product-gap-analysis-and-roadmap-2026-08.md`'s Phase 6.
+Only the first item is built; the rest are untouched.
+
+### 6a. Hook/thumbnail variant generation — done
+
+Two independent, cheap additions — neither regenerates the guide:
+
+- **Thumbnails**: `engine/render/compositor.py::composite_cut()` now returns
+  `(duration, thumbnail_candidates)`. `_write_thumbnail_candidates()` samples
+  4 frames per render — the original ~0.5s-in frame first (at
+  `thumbnail_path` itself, so a caller that only reads `candidates[0]` sees
+  the exact pre-existing behavior), plus 3 more at 25%/60%/85% of the reel's
+  duration, written as `{stem}_1/_2/_3{suffix}` siblings. No LLM cost.
+  `render_cut` stores the full list on `Cut.thumbnail_candidates` and
+  defaults `Cut.thumbnail_path` to `candidates[0]`.
+- **Hooks**: `engine/generation/hook_variants.py::generate_hook_variants()` —
+  one best-effort LLM call (via `get_enrichment_provider()`) after
+  `generate_guide` already accepts a guide, asking for 3 alternate lines for
+  the hook beat's `vo_script`. Runs once per reel (not once per cut — platform
+  guides normally share identical beats), gated behind the same paid-call
+  budget check as the rest of generation, and never raises: any failure
+  (bad JSON, provider error, budget exhausted) just means `Cut.hook_variants`
+  stays `None`. Cost is tracked via the same `StageEvent`/`llm_cost_usd()`
+  path as every other LLM call site (`stage="hook_variants"`).
+- Both are operator-picked from the `in_review` cut card
+  (`POST /cuts/{id}/thumbnail`, `POST /cuts/{id}/hook-variant` in
+  `api/routers/cuts.py`), gated to `in_review` the same way the beat-edit
+  PATCH endpoint is. A re-render replaces `thumbnail_candidates` wholesale —
+  same as `video_path` — so an operator's thumbnail pick from a previous
+  render doesn't survive a re-render.
+
+### 6b. Configurable TTS voice per reel — not done
+
+`voice` param already exists on `EdgeTTSProvider`/`get_tts_provider()`; the
+create-reel form has no voice selector and nothing threads a per-reel choice
+through.
+
+### 6c. Non-football niche evaluator fixtures — not done
+
+`evaluator.py`'s "universal" fallback patterns exist but have no real test
+fixtures outside football content — whether they score other niches fairly
+is unmeasured.
+
+### 6d. Brand customization — not done
+
+No logo/watermark, no configurable overlay text color, no per-channel presets.
 
 ---
 

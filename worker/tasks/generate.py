@@ -16,6 +16,7 @@ from engine.generation.beat_enrichment import (
 from engine.generation.estimate import resolve_generation_path
 from engine.generation.evaluator import score_guide
 from engine.generation.guide_schema import Beat, MasterGuide, PlatformGuide
+from engine.generation.hook_variants import generate_hook_variants
 from engine.generation.llm import get_llm_provider, get_enrichment_provider, is_nvidia_generation
 from engine.generation.llm_judge import judge_guide
 from engine.generation.postprocess import clean_guide, _derive_on_screen as _postprocess_derive_on_screen
@@ -491,6 +492,29 @@ def generate_guide(self, db, job, reel):
 
     heartbeat(db, job, 80)
 
+    # One cheap extra call for alternate hook lines — all platform guides normally share
+    # identical beats (see CLAUDE.md), so this runs once per reel, not once per cut, and
+    # the same variant list is applied to every cut below. Best-effort: a failure or an
+    # exhausted paid-call budget just means no variants, never a failed generate job.
+    hook_variants: list[str] = []
+    hook_beat = guide.cuts[0].beats[0] if guide.cuts and guide.cuts[0].beats else None
+    if hook_beat is not None and hook_beat.type == "hook" and hook_beat.vo_script.strip() \
+            and paid_call_count(db, reel.id) < settings.max_paid_llm_calls_per_reel:
+        hook_provider = "nvidia" if settings.nvidia_api_key else "ollama"
+        hook_llm = get_enrichment_provider()
+        with record_stage(db, reel.id, "hook_variants", provider=hook_provider) as ev:
+            # A single one-shot call inside generate_hook_variants() — last_usage (not
+            # total_usage) is the right field, same as the main "generate" stage above;
+            # no before/after diffing needed since there's only one call to diff against.
+            hook_variants = generate_hook_variants(
+                hook_beat.vo_script, effective_context, reel.niche or "", hook_llm,
+            )
+            usage = getattr(hook_llm, "last_usage", {})
+            ev.tokens_in = usage.get("prompt_tokens")
+            ev.tokens_out = usage.get("completion_tokens")
+            ev.cost_usd = llm_cost_usd(hook_provider, ev.tokens_in, ev.tokens_out)
+            ev.detail["variant_count"] = len(hook_variants)
+
     for platform_guide in guide.cuts:
         cut = next(
             (c for c in cuts if c.platform.value == platform_guide.platform), None
@@ -500,6 +524,7 @@ def generate_guide(self, db, job, reel):
         cut.guide = platform_guide.model_dump()
         cut.caption = platform_guide.caption
         cut.hashtags = platform_guide.hashtags
+        cut.hook_variants = hook_variants or None
 
     transition(reel, "guide_ready", REEL_TRANSITIONS)
     job.meta = {**(job.meta or {}), "quality_score": last_score}

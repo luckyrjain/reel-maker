@@ -45,7 +45,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 545 tests across 30+ files (4 test_compositor tests need ffmpeg on PATH)
+.venv/bin/pytest                            # 579 tests across 30+ files (4 test_compositor tests need ffmpeg on PATH)
 .venv/bin/pytest tests/test_foo.py::bar -s
 
 # New migration after changing models.py
@@ -113,7 +113,8 @@ api/
                       GET /api/reels/{id} (pipeline cost/latency/quality panel), POST /api/reels/estimate
     jobs.py           GET /api/jobs/{id} (JSON + HTML fragment)
     cuts.py           POST /render, PATCH, POST /approve, POST /publish, render-status,
-                      publish-status, video stream
+                      publish-status, video stream, thumbnail stream + POST /thumbnail
+                      (choose a candidate), POST /hook-variant (swap the hook beat's vo_script)
     credentials.py    GET /api/credentials (connect/disconnect UI), GET /{provider}/authorize,
                       GET /{provider}/callback, POST /{provider}/disconnect
 
@@ -126,11 +127,14 @@ worker/
                       heartbeat() — shared task helpers
     generate.py       generate_guide(job_id) — prepare (reel must be `generating`, paid-call budget), enrichment,
                       conflict injection, visuals LLM, closed-loop eval retry, observability,
-                      paid-call budget cap (_enforce_paid_call_budget)
+                      paid-call budget cap (_enforce_paid_call_budget); after an accepted guide, one
+                      best-effort extra call via generate_hook_variants() stores alt hook lines on
+                      every cut of the reel (same list — beats are normally identical across platforms)
     render.py         render_cut(job_id) — prepare (refuses an already-posted cut), resolve_or_reuse,
                       synth_to_budget, TTS-accurate timecodes, atomic MP4, observability;
                       resolves a music track via get_music_sourcer().find(music_cue) and
-                      passes it to composite_cut()
+                      passes it to composite_cut(); stores all returned thumbnail candidates on
+                      cut.thumbnail_candidates, cut.thumbnail_path defaults to candidates[0]
     publish.py        publish_cut(job_id) — safe_to_publish gate, builds caption via
                       build_published_caption() (appends attribution block), dispatches to
                       engine/publish/registry.py, commits platform_post_id the moment the post is
@@ -158,6 +162,9 @@ engine/
     evaluator.py      score_guide() — 17-axis rule scorer (0–100); see docs/evaluation.md
     llm_judge.py      judge_guide() — LLM semantic judge; 5 dims × 0–20 = 100 pts
     postprocess.py    clean_guide() — strips label prefixes; derives up to 5 on_screen_text segments
+    hook_variants.py  generate_hook_variants() — one best-effort LLM call for N_VARIANTS (3) alternate
+                      hook-beat lines, given the current hook vo_script + context + niche; [] on any
+                      failure (never raises — this runs after the guide already cleared the quality gate)
   render/
     asset_sourcer.py  PexelsVideoSource + WikipediaImageSource (with license metadata fetch);
                       HuggingFaceImageSource (FLUX.1-schnell) + HuggingFaceVideoSource (LTX-Video);
@@ -172,7 +179,11 @@ engine/
                       (0.0 until the operator sets a real per-unit price)
     tts.py            EdgeTTSProvider.synthesize() + .synth_to_budget(); _audio_duration() helper
     captions.py       transcribe_audio() — Whisper word-level timestamps; no-op if not installed
-    compositor.py     composite_cut() — MoviePy stage + FFmpeg drawtext stage;
+    compositor.py     composite_cut() — MoviePy stage + FFmpeg drawtext stage; returns
+                      (duration, thumbnail_candidates) — _write_thumbnail_candidates() samples 4 frames
+                      across the reel (the original ~0.5s-in frame first, at thumbnail_path itself, plus
+                      3 more at thumbnail_path's stem + `_1`/`_2`/`_3`) so a caller that only reads
+                      candidates[0] sees the exact pre-existing single-frame behavior;
                       120ms audio fade in/out per beat (moviepy.audio.fx.AudioFadeIn/AudioFadeOut via .with_effects()) for smooth narration transitions;
                       _build_text_filter() uses Whisper timestamps when available, proportional fallback;
                       accepts music_path — _build_ffmpeg_args() adds a sidechain-ducked (VO present) or
@@ -215,6 +226,7 @@ migrations/
     0003_context_enrichment.py  enriched_context column; enriching/enrich enum values
     0004_publishing.py  tiktok CutPlatform value; Credential.provider_account_id + refresh_token_blob
     0005_metrics.py   Cut.views/likes/comments/metrics_updated_at columns
+    0006_variants.py  Cut.thumbnail_candidates + Cut.hook_variants columns
 
 tests/
   test_evaluator.py           29 tests — all 17 evaluator axes + helpers, multi-platform dedupe
@@ -224,7 +236,7 @@ tests/
   test_audio_text_sync.py     11 tests — clean_guide() regeneration, _build_text_filter() proportional timing + whisper fallback, PATCH re-derivation, visual direction anchoring
   test_context_enricher.py    13 tests — evaluate_context axes, llm_enrich
   test_enrich_context_task.py 14 tests — enrichment gating, LLM failure fallback, structured script guard, missing reel, owner rollback wiring, orphan generate-job cleanup (only when it claimed the orphan)
-  test_maintenance.py         29 tests — reaper on in-memory SQLite: per-job-type owner rollback, stale running/pending jobs, per-job-type pending thresholds, healthy jobs untouched, updated_at keying, compare-and-set back-off, status pin = SELECT snapshot, one bad job doesn't stop the rest
+  test_maintenance.py         40 tests — reaper on in-memory SQLite: per-job-type owner rollback, stale running/pending jobs, per-job-type pending thresholds, healthy jobs untouched, updated_at keying, compare-and-set back-off, status pin = SELECT snapshot, one bad job doesn't stop the rest, done-orphan sweep (lost after_commit_failed fail-stamp) per job type, existing-error/freshness exclusions
   test_tts.py                  8 tests — provider selection, unknown-provider fallback, SilentProvider shared file, synth_to_budget clamp
   test_common.py              18 tests — transient-error classification (incl. DB connection errors), retry budget
   test_job_lifecycle.py      122 tests — job_task on dummy tasks (in-memory SQLite): atomic claim/race, fenced done-stamp and heartbeat (JobLost), heartbeat thread (survives DB blips, never touches a reaped job, stops at max_runtime_s, never outlives the task), prepare-before-attempts, retry/backoff, refused retry (Reject, incl. an unclaimed job), failure stamp (NUL/surrogates/[parameters]/DETAIL/CONTEXT redacted incl. multi-line, reaped job, masked errors, discarded half-writes), DB errors, fail-fast on shutdown/hard-kill, dead-connection recovery in the terminal failure recorders (incl. InterfaceError, fresh-session close on both a successful and a failed retry attempt), per-job-type owner rollback (fresh state), after_commit + cleanup hook (incl. a shutdown during the hook itself, a hook that itself raises without discarding the failure stamp, and a multi-write hook rolling back atomically via its own SAVEPOINT), `.delay` signature regression, per-task job_type/max_retries/runtime wiring, beat-task routing, pool_pre_ping
@@ -233,6 +245,7 @@ tests/
   test_tasks_real_db.py       4 tests — real tasks through job_task on SQLite: post id durable after a post-upload failure, built caption sent, enrich enqueues the real job id
   test_generate_task.py        9 tests — missing reel, reel not generating, paid-call budget, structured-path fallback (incl. a soft-limit kill), music_cue default, caption/hashtags does not swallow a runtime-limit timeout
   test_render_task.py          6 tests — missing cut, already-posted cut refused, success clears stale error, music wiring
+  test_hook_variants.py        9 tests — generate_hook_variants(): JSON-list/dict-wrapped parsing, excludes a variant identical to the original, caps at N_VARIANTS, empty hook skips the LLM call, malformed JSON/non-list/non-string items/provider exception all degrade to []
   test_asset_sourcer.py        7 tests — resolve_or_reuse pin, reuse, re-pin, beat isolation, commits (no open transaction on either resolve or reuse path), Wikipedia names all searched before any asset is flushed
   test_asset_sourcer_cost.py   9 tests — HF cost StageEvents charged only on real generation, not cache hits
   test_music_source.py         8 tests — LocalMusicSource keyword matching, missing/empty library
@@ -253,7 +266,8 @@ tests/
   test_attribution.py          8 tests — build_attribution_block dedup/formatting, build_published_caption
   test_metrics_fetcher.py      6 tests — YouTube/Instagram metrics parsing, token-in-header regression
   test_metrics_task.py         6 tests — pull_publish_metrics fetcher/credential skip paths, per-cut failure isolation
-  test_compositor.py           7 tests — _build_ffmpeg_args no-music/sidechain/no-VO branches, real ffmpeg music-mixing end-to-end
+  test_compositor.py           10 tests — _build_ffmpeg_args no-music/sidechain/no-VO branches, real ffmpeg music-mixing end-to-end (4 of these need ffmpeg on PATH), _write_thumbnail_candidates (no ffmpeg — a fake clip object) covering first-candidate-is-original-path, distinct sibling files, short-clip clamping
+  test_variants_router.py      11 tests — POST /cuts/{id}/hook-variant (swap + rederive on_screen_text, wrong status, out-of-range index, no variants), POST /cuts/{id}/thumbnail (choose, wrong status, out-of-range, no candidates), GET /cuts/{id}/thumbnail/{index} (serves file, 404 out-of-range, 403 outside VIDEO_STORE_DIR)
 
 ui/templates/
   index.html          Context-entry form; niche/platform picker + target_length + voiceover_mode +
@@ -287,7 +301,7 @@ docs/
 ## Data model
 
 - `reels` — master concept; `status` tracks generation phase
-- `cuts` — one row per platform (`youtube_shorts`, `instagram_reels`, or `tiktok`); holds `guide` (JSONB), `caption`, `hashtags`, `video_path`, `thumbnail_path`, `platform_post_id`, `published_at`, `views`, `likes`, `comments`, `metrics_updated_at` (last three populated by `pull_publish_metrics()`, `None` until the first successful pull)
+- `cuts` — one row per platform (`youtube_shorts`, `instagram_reels`, or `tiktok`); holds `guide` (JSONB), `caption`, `hashtags`, `video_path`, `thumbnail_path`, `thumbnail_candidates` (JSON list of every frame `render_cut` sampled — `thumbnail_path` is whichever one is currently chosen, `[0]` by default), `hook_variants` (JSON list of alternate hook-beat lines generated once per guide, `None` if generation failed or the paid-call budget was already spent), `platform_post_id`, `published_at`, `views`, `likes`, `comments`, `metrics_updated_at` (last three populated by `pull_publish_metrics()`, `None` until the first successful pull)
 - `assets` — cached media files; deduplicated by `(source, source_ref)`; `source` is `pexels`, `wikipedia`, `huggingface`, or `huggingface_video`; `type` is `footage` or `photo`; includes `license_url`, `attribution`, `safe_to_publish`. HF-generated assets are `safe_to_publish=True`.
 - `cut_assets` — per-beat asset binding ledger; `beat_index` + `order_in_beat` identify position; `resolved_from` is `sha256(visual_direction)[:16]` for change detection; unique constraint on `(cut_id, beat_index, order_in_beat)`; `start_s`/`end_s` updated after TTS measurement
 - `jobs` — every async operation (`enrich`, `generate`, `render`, `publish`); includes `started_at`, `heartbeat_at`, `meta` (JSON — stores `generation_path`, `path`, `stub_count`, `quality_score` on success, and optionally `structured_score`/`structured_fallback` when structured path fell back to standard); `error` is `None` on success, set to exception message on failure only
@@ -337,7 +351,8 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 - **Audio fade in compositor**: `composite_cut()` applies `.with_effects([AudioFadeIn(0.12), AudioFadeOut(0.12)])` to each beat's `AudioFileClip`. Order: subclip if too long → fade → `.with_start(t)`. Fade before `with_start` is required — fades compute against the clip's own timeline, not the composite. `AudioFileClip` has no `.audio_fadein()`/`.audio_fadeout()` methods in MoviePy 2.x — fades are effects, not chainable methods. The exception from calling the non-existent methods was caught by a bare `except Exception: pass` around the VO track builder, so this shipped for months rendering every video with zero audio before a live end-to-end run caught it; the handler now logs via `_log.exception()` instead of swallowing silently.
 - **Topic fence in enrichment prompts**: `_enrich_batch()` and `_make_conflict_stub()` include an explicit "Do not introduce matches, tournaments, scorelines, or players not mentioned in the beat/context" constraint. Prevents LLM from drifting into unrelated events.
 - **Visual direction prompt anchoring**: `build_visuals_messages()` system prompt instructs the LLM to derive `visual_direction` ONLY from the specific players, actions, and events named in that beat's VO — not from the global context.
-- **Video streaming path guard**: `stream_video` validates `cut.video_path` is under `VIDEO_STORE_DIR` via `Path.resolve().is_relative_to()` before serving — never bypass this.
+- **Video streaming path guard**: `stream_video` validates `cut.video_path` is under `VIDEO_STORE_DIR` via `Path.resolve().is_relative_to()` before serving — never bypass this. `stream_thumbnail` applies the identical guard to `cut.thumbnail_candidates[index]`.
+- **Hook variants and thumbnail candidates are generated once per reel/render, not tunable per request**: `generate_hook_variants()` runs a single best-effort call after the guide already cleared the quality gate — it never fails the generate job, and the same variant list is copied onto every cut of the reel (platform guides normally share identical beats). `render_cut` always writes all 4 thumbnail candidates; there's no config to change the count or sample points other than editing `engine/render/compositor.py::_THUMBNAIL_CANDIDATE_FRACTIONS`. Both `POST /cuts/{id}/hook-variant` and `POST /cuts/{id}/thumbnail` are gated to `in_review` only, same as the PATCH beat-edit endpoint — a re-render replaces `thumbnail_candidates` wholesale (any prior operator pick is lost, same as `video_path`).
 - **safe_to_publish is enforced exactly once**: `engine/publish/gate.py::assert_safe_to_publish()`, called in `publish_cut` immediately before any credential lookup or upload. It guards what goes OUT to a platform, so the finalize path (a cut that already has a `platform_post_id`, which uploads nothing) is not gated: blocking it would leave a live post unrecorded with no operator way out. Nowhere else checks it — computing the field (asset_sourcer.py) is not the same as enforcing it.
 - **Paid-call budget cap**: `_enforce_paid_call_budget()` in `generate.py` checks `paid_call_count(db, reel.id) < Settings.max_paid_llm_calls_per_reel` at task entry and before each standard-path retry attempt. It's a lifetime-per-reel count (no per-job scoping) — not exploitable today since nothing re-triggers a `generate` Job for a reel that already has one, but a future "regenerate guide" flow would need an explicit reset path, not just raising the global setting.
 - **Cost estimates come from real history, not guessed token counts**: `engine/generation/estimate.py::estimate_generation()` averages actual `StageEvent.cost_usd` from past reels on the same generation path — reels where the structured path fell through to standard (`job.meta["structured_fallback"]`) are excluded from the "standard" bucket so they don't inflate it with wasted structured-attempt cost. Reports "no history yet" rather than fabricating a number.
@@ -361,7 +376,8 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 - **Phase 3.5** ✅ — Hardening: acks_late reliability, idempotency guards, heartbeat + stuck-job reaper, per-beat asset pinning (deterministic re-render), observability (StageEvent), credential encryption, a substantially expanded test suite; evaluator upgraded to 17 axes (conversational tone, hook-CTA throughline, per-beat specificity, repetition)
 - **Phase 4a** ✅ — Operator visibility: reel list page, per-reel cost/latency/quality panel sourced from `StageEvent`, `StageEvent.cost_usd` implemented for every LLM call site (NVIDIA rates only — HF asset-generation cost is not tracked), pre-generation cost/time estimate from real history, hard cap on paid LLM calls per reel
 - **Phase 4b** ✅ — Publishing: OAuth connect-account flow (YouTube Data API + Instagram Graph API), `safe_to_publish` hard gate enforced at publish time, TikTok added as a third `CutPlatform` for render/review (publishing itself deliberately not implemented — see Key conventions), `scheduled`/`publishing`/`published` cut states wired end-to-end. Not done: attribution block in captions, TikTok publishing, unpublish/re-publish flows.
-- **Phase 5** ✅ — Analytics: local-library music mixing with sidechain ducking (`LocalMusicSource` + `_build_ffmpeg_args`), HF asset-generation cost tracking (`engine/render/pricing.py`, `asset_hf_video`/`asset_hf_image` StageEvents), Wikipedia attribution block appended to published captions (`engine/publish/attribution.py`), post-publish metrics pull-back every 6h (`worker/tasks/metrics.py`), quality-vs-views surfaced on the reel list and per-cut engagement stats on the cut card.
+- **Phase 5** ✅ — Analytics: local-library music mixing with sidechain ducking (`LocalMusicSource` + `_build_ffmpeg_args`), HF asset-generation cost tracking (`engine/render/pricing.py`, `asset_hf_video`/`asset_hf_image` StageEvents), Wikipedia attribution block appended to published captions (`engine/publish/attribution.py`), post-publish metrics pull-back every 6h (`worker/tasks/metrics.py`), quality-vs-views surfaced on the reel list and per-cut engagement stats on the cut card. Not done: correlating `quality_score` against real engagement (still an operator eyeballing the table), feeding high/low performers back into `prior_feedback`/evaluator weights.
+- **Phase 6 (partial)** — Creative range: hook/thumbnail variant generation. `render_cut` samples 4 thumbnail candidates per render (`Cut.thumbnail_candidates`); `generate_guide` generates 3 alternate hook lines once per accepted guide (`Cut.hook_variants`, best-effort — never fails the job). Operator picks either from the `in_review` cut card (`POST /cuts/{id}/thumbnail`, `POST /cuts/{id}/hook-variant`). Not done: per-reel TTS voice choice, non-football niche evaluator fixtures, brand customization (logo/watermark/text color).
 
 ## Worker queues
 

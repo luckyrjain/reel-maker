@@ -125,7 +125,7 @@ def test_a_render_that_a_publish_overtook_is_discarded():
         patch("worker.tasks.render.get_tts_provider"),
         patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
         patch("worker.tasks.render.record_stage"),
-        patch("worker.tasks.render.composite_cut", return_value=18.0),
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"])),
     ):
         with pytest.raises(ValueError, match="posted while it rendered"):
             render_cut(1)
@@ -155,7 +155,7 @@ def test_successful_render_clears_stale_error():
         patch("worker.tasks.render.get_tts_provider"),
         patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
         patch("worker.tasks.render.record_stage"),
-        patch("worker.tasks.render.composite_cut", return_value=18.0),
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"])),
     ):
         render_cut(1)
 
@@ -190,7 +190,7 @@ def test_matching_music_cue_is_passed_to_composite_cut():
         patch("worker.tasks.render.get_music_sourcer", return_value=fake_sourcer),
         patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
         patch("worker.tasks.render.record_stage"),
-        patch("worker.tasks.render.composite_cut", return_value=18.0) as mock_composite,
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"])) as mock_composite,
     ):
         render_cut(1)
 
@@ -221,7 +221,7 @@ def test_no_music_cue_passes_none_without_querying_sourcer():
         patch("worker.tasks.render.get_music_sourcer", return_value=fake_sourcer),
         patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
         patch("worker.tasks.render.record_stage"),
-        patch("worker.tasks.render.composite_cut", return_value=18.0) as mock_composite,
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"])) as mock_composite,
     ):
         render_cut(1)
 

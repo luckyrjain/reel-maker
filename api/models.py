@@ -85,6 +85,12 @@ class Cut(Base):
     hashtags = Column(JSON)
     video_path = Column(String(500))
     thumbnail_path = Column(String(500))
+    # All candidate frames written by the last render; thumbnail_path is whichever one is
+    # currently chosen (candidates[0] by default — see engine/render/compositor.py).
+    thumbnail_candidates = Column(JSON)
+    # Alternate opening-line text for the hook beat, generated once per guide
+    # (worker/tasks/generate.py) so the operator can swap it in without a full regeneration.
+    hook_variants = Column(JSON)
     duration_s = Column(Float)
     status = Column(SAEnum(CutStatus), default=CutStatus.draft, nullable=False)
     published_at = Column(DateTime(timezone=True))

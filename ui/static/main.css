@@ -234,3 +234,9 @@ h3 { font-size: 0.95rem; font-weight: 700; margin-bottom: 10px; color: #374151; 
 .btn-approve:hover { background: #047857; }
 .btn-save { background: #f3f4f6; color: #374151; padding: 9px 20px; border: 1px solid #d1d5db; border-radius: 6px; font: inherit; font-size: 0.85rem; font-weight: 600; cursor: pointer; }
 .btn-save:hover { background: #e5e7eb; }
+
+/* ── Hook / thumbnail variant picking ── */
+.btn-hook-variant { background: #fff; color: #374151; padding: 7px 10px; border: 1px solid #d1d5db; border-radius: 6px; font: inherit; font-size: 0.82rem; cursor: pointer; }
+.btn-hook-variant:hover { background: #f3f4f6; border-color: #6366f1; }
+.btn-thumbnail { background: transparent; cursor: pointer; }
+.btn-thumbnail:hover { opacity: 0.85; }

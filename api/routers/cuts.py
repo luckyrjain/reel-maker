@@ -233,3 +233,62 @@ def stream_video(cut_id: int, db: Session = Depends(get_db)):
         media_type="video/mp4",
         filename=f"reel_{cut.reel_id}_{cut.platform.value}.mp4",
     )
+
+
+@router.get("/cuts/{cut_id}/thumbnail/{index}")
+def stream_thumbnail(cut_id: int, index: int, db: Session = Depends(get_db)):
+    cut = db.get(models.Cut, cut_id)
+    if not cut or not cut.thumbnail_candidates or not (0 <= index < len(cut.thumbnail_candidates)):
+        raise HTTPException(status_code=404, detail="Thumbnail not found")
+    video_store = Path(settings.video_store_dir).resolve()
+    resolved = Path(cut.thumbnail_candidates[index]).resolve()
+    if not resolved.is_relative_to(video_store):   # see stream_video
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return FileResponse(resolved, media_type="image/jpeg")
+
+
+@router.post("/cuts/{cut_id}/thumbnail", response_class=HTMLResponse)
+async def choose_thumbnail(cut_id: int, request: Request, db: Session = Depends(get_db)):
+    form = await request.form()   # see update_cut — read before the lock
+    cut = db.get(models.Cut, cut_id, with_for_update=True)
+    if not cut:
+        raise HTTPException(status_code=404, detail="Cut not found")
+    if cut.status.value != "in_review":
+        raise HTTPException(status_code=409, detail="Can only choose a thumbnail for cuts with status 'in_review'")
+    try:
+        index = int(form.get("index", ""))
+    except ValueError:
+        raise HTTPException(status_code=422, detail="index must be an integer")
+    if not cut.thumbnail_candidates or not (0 <= index < len(cut.thumbnail_candidates)):
+        raise HTTPException(status_code=422, detail="No such thumbnail candidate")
+    cut.thumbnail_path = cut.thumbnail_candidates[index]
+    db.commit()
+    return _cut_card(request, cut)
+
+
+@router.post("/cuts/{cut_id}/hook-variant", response_class=HTMLResponse)
+async def choose_hook_variant(cut_id: int, request: Request, db: Session = Depends(get_db)):
+    form = await request.form()   # see update_cut — read before the lock
+    cut = db.get(models.Cut, cut_id, with_for_update=True)
+    if not cut:
+        raise HTTPException(status_code=404, detail="Cut not found")
+    if cut.status.value != "in_review":
+        raise HTTPException(status_code=409, detail="Can only swap the hook for cuts with status 'in_review'")
+    try:
+        index = int(form.get("index", ""))
+    except ValueError:
+        raise HTTPException(status_code=422, detail="index must be an integer")
+    if not cut.hook_variants or not (0 <= index < len(cut.hook_variants)) or not cut.guide:
+        raise HTTPException(status_code=422, detail="No such hook variant")
+
+    guide = dict(cut.guide)
+    beats = [dict(b) for b in guide.get("beats", [])]
+    if not beats or beats[0].get("type") != "hook":
+        raise HTTPException(status_code=422, detail="This cut's guide has no hook beat")
+    new_vo = cut.hook_variants[index]
+    beats[0]["vo_script"] = new_vo
+    beats[0]["on_screen_text"] = _derive_on_screen(new_vo, max_lines=5)
+    guide["beats"] = beats
+    cut.guide = guide
+    db.commit()
+    return _cut_card(request, cut)
