@@ -228,7 +228,10 @@ PostgreSQL 16, not just SQLite. Behaviour changes an operator should know about:
   job whose retry message the broker refused was previously left `pending` until the reaper's threshold.
 - **`after_commit` raising `SystemExit`/`KeyboardInterrupt`** (not just `Exception`) still runs the
   `after_commit_failed` cleanup hook; if the hook itself raises, the failure stamp it already wrote is
-  still committed rather than silently rolled back with the job left looking `done` forever.
+  still committed rather than silently rolled back with the job left looking `done` forever. The hook
+  runs inside its own `db.begin_nested()` SAVEPOINT, so a raise partway through a multi-write hook
+  (`_abandon_generate`'s real shape: fail the orphaned follow-up Job, then roll the reel back) undoes
+  only the hook's own writes — not the failure stamp, and not a half-done cleanup either.
 - `_generate_caption_hashtags`'s fallback path no longer swallows `SoftTimeLimitExceeded` — a timeout
   there now fails the task visibly instead of completing with a template caption.
 

@@ -557,6 +557,35 @@ def test_a_failing_cleanup_hook_does_not_discard_the_failure_stamp(factory):
     assert "broker down" in job.error
 
 
+def test_a_partially_written_cleanup_hook_rolls_back_atomically(factory):
+    """The hook runs inside its own SAVEPOINT: if it performs more than one write and raises
+    partway through, ALL of its writes roll back together -- not just the second, leaving the
+    first silently committed. This mirrors _abandon_generate's real shape (fail the orphaned
+    follow-up Job, then roll the reel back): without the savepoint, a raise between those two
+    writes would leave the follow-up Job terminally `failed` -- invisible to the reaper's
+    pending-job sweep -- while the reel stayed stuck `generating` with no backstop at all."""
+    job_id, reel_id, cut_id = _make(factory, models.JobType.enrich)
+    other_job_id, *_ = _make(factory, models.JobType.generate, status=models.JobStatus.pending)
+
+    def hook(db, job, result):
+        db.query(models.Job).filter(models.Job.id == other_job_id).update(
+            {"status": models.JobStatus.failed})
+        db.flush()
+        raise RuntimeError("second step blew up")
+
+    task = _task("t.partial_hook", lambda self, db, job, ctx: 1, job_type="enrich",
+                 after_commit=MagicMock(side_effect=ConnectionError("broker down")),
+                 after_commit_failed=hook)
+    with pytest.raises(ConnectionError):
+        task(job_id)
+
+    db = factory()
+    other_job = db.get(models.Job, other_job_id)
+    assert other_job.status == models.JobStatus.pending, "hook's partial write must not survive its own raise"
+    job, _, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.failed
+
+
 def test_a_body_failure_does_not_run_the_cleanup_hook(factory):
     job_id, *_ = _make(factory, models.JobType.enrich)
     hook = MagicMock()
@@ -1364,6 +1393,41 @@ def test_finalize_or_reconnect_closes_the_fresh_session_it_opens(factory):
     assert reel2.status == models.ReelStatus.failed
 
 
+def test_finalize_or_reconnect_closes_the_fresh_session_even_when_its_own_attempt_fails(factory):
+    """The success case above can't tell `try: attempt(fresh) finally: fresh.close()` apart from
+    unguarded `attempt(fresh); fresh.close()` -- both look identical when the fresh attempt
+    succeeds. Make the fresh session's own write fail too, so only the finally block closes it."""
+    from worker.tasks import common as common_module
+    from worker.tasks.common import _finalize_or_reconnect
+
+    job_id, *_ = _make(factory)
+    db = factory()
+    opened = []
+
+    real_session_local = common_module.SessionLocal
+
+    def spying_session_local(*args, **kwargs):
+        session = real_session_local(*args, **kwargs)
+        session.close = MagicMock(wraps=session.close)
+        opened.append(session)
+        return session
+
+    class Dead:
+        def rollback(self):
+            raise sa_exc.OperationalError("ROLLBACK", {}, Exception("gone"))
+
+    def write(session, jid):
+        raise ValueError("a real bug in write, not a connection error")
+
+    with patch.object(db, "rollback", Dead().rollback), \
+         patch("worker.tasks.common.SessionLocal", spying_session_local):
+        with pytest.raises(ValueError, match="a real bug"):
+            _finalize_or_reconnect(db, job_id, write)
+
+    assert len(opened) == 1
+    opened[0].close.assert_called_once()
+
+
 def test_a_non_connection_error_in_a_failure_recorder_is_not_retried_on_a_fresh_session(factory):
     """Only OperationalError/InterfaceError (a dead connection) triggers the fresh-session retry; a
     real bug in the write itself must not be silently retried and hidden."""
@@ -1413,7 +1477,7 @@ def test_a_failing_cleanup_hook_does_not_discard_the_shutdown_failure_stamp(fact
     job_id, reel_id, cut_id = _make(factory, models.JobType.enrich, reel_status=models.ReelStatus.generating)
 
     def after_commit(result):
-        raise SystemExit(1)
+        raise SystemExit("shutdown mid-flight")
 
     def after_commit_failed(db, job, result):
         raise RuntimeError("cleanup blew up")
@@ -1424,6 +1488,7 @@ def test_a_failing_cleanup_hook_does_not_discard_the_shutdown_failure_stamp(fact
         task(job_id)
     job, _, _ = _read(factory, job_id, reel_id, cut_id)
     assert job.status == models.JobStatus.failed
+    assert "shutdown mid-flight" in job.error
 
 
 def test_after_commit_exception_still_uses_the_one_cleanup_path_not_both(factory):
