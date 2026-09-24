@@ -648,6 +648,28 @@ def test_a_shutdown_signal_inside_the_cleanup_hook_still_commits_the_failure_sta
     assert "broker down" in job.error
 
 
+def test_a_commit_failure_while_recording_a_shutdown_does_not_mask_the_shutdown(factory):
+    """If db.commit() itself fails while trying to durably record the fail-stamp after the hook's
+    own BaseException, the ORIGINAL SystemExit/KeyboardInterrupt must still propagate -- not the
+    commit failure -- matching this file's rule everywhere else that a failure recording a failure
+    is logged, never allowed to replace what's actually happening."""
+    from worker.tasks.common import _stamp_failed_and_run_cleanup
+
+    def hook(db, job, result):
+        raise SystemExit("shutdown mid-cleanup")
+
+    job_id, *_ = _make(factory, models.JobType.enrich, status=models.JobStatus.done)
+    db = factory()
+
+    class Dead:
+        def commit(self):
+            raise sa_exc.OperationalError("COMMIT", {}, Exception("connection gone"))
+
+    with patch.object(db, "commit", Dead().commit):
+        with pytest.raises(SystemExit, match="shutdown mid-cleanup"):
+            _stamp_failed_and_run_cleanup(db, job_id, "orig failure", hook, None)
+
+
 def test_a_body_failure_does_not_run_the_cleanup_hook(factory):
     job_id, *_ = _make(factory, models.JobType.enrich)
     hook = MagicMock()

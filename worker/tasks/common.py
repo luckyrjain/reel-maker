@@ -265,7 +265,14 @@ def _stamp_failed_and_run_cleanup(db, job_id, message: str, after_commit_failed,
             _log.exception("after_commit_failed hook raised for job %s%s; failure stamp still recorded, "
                             "hook's own partial writes rolled back", job_id, suffix)
         except BaseException:
-            db.commit()
+            try:
+                db.commit()
+            except Exception:
+                # Never let a bookkeeping failure replace the shutdown signal itself -- log it and
+                # still propagate the original BaseException, matching this file's rule elsewhere
+                # (job_task's own terminal handlers) that a failure recording a failure is logged,
+                # not allowed to mask what's actually happening.
+                _log.exception("could not commit the failure stamp for job %s during shutdown", job_id)
             raise
 
 
