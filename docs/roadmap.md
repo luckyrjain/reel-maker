@@ -269,7 +269,10 @@ PostgreSQL 16, not just SQLite. Behaviour changes an operator should know about:
     persist them — breaking `_stamp_failed_and_run_cleanup`'s own guarantee that only the hook's OWN
     writes roll back on a raise. Fixed by doing a full `db.rollback()` (which works even though the
     savepoint-scoped one didn't) to discard everything, then redoing just the fail-stamp CAS before
-    committing. The trigger condition — a worker shutdown signal landing at the same moment the DB
+    committing — and that redo is itself guarded too: a third failure in a row (the redo's own CAS
+    write failing) must not replace the shutdown signal that survived the first two, so it's caught
+    and logged separately rather than left to propagate and mask the signal a third time. The trigger
+    condition — a worker shutdown signal landing at the same moment the DB
     connection dies — is not two independent coincidences either: a rolling deploy is exactly when
     workers receive SIGTERM *and* when connections get severed (a managed Postgres failover/
     maintenance window, a load balancer connection sweep, or a future connection pooler's reload,

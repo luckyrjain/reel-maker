@@ -696,16 +696,13 @@ def test_an_ordinary_hook_bug_during_an_ambient_shutdown_is_not_misclassified(fa
 
 def test_a_savepoint_rollback_failure_does_not_mask_a_shutdown_signal_from_the_hook(factory):
     """If the hook does a real write before raising SystemExit/KeyboardInterrupt (like
-    _abandon_generate's real shape, not a bare raise), db.begin_nested()'s own __exit__ tries to
-    roll back the SAVEPOINT on the way out -- and SQLAlchemy's SessionTransaction.rollback()
-    RE-RAISES a failed DBAPI-level rollback rather than swallowing it. If that rollback itself
-    fails (the connection dying is exactly what a shutdown can correlate with), the resulting
-    ordinary Exception REPLACES the hook's shutdown signal as what's propagating -- caught by the
-    sibling `except Exception:` branch and silently swallowed as a routine hook failure, unless
-    recovered from exc.__context__ (which Python sets automatically). This reproduces the exact
-    scenario a background reviewer used to disprove this file's own earlier, incomplete
-    investigation (which used a hook with no prior write, so no live SAVEPOINT rollback was ever
-    actually attempted, and the masking never triggered)."""
+    _abandon_generate's real shape, not a bare raise), the explicit `nested.rollback()` call tries
+    to roll back the SAVEPOINT -- and SQLAlchemy's SessionTransaction.rollback() RE-RAISES a failed
+    DBAPI-level rollback rather than swallowing it. Without discarding the poisoned transaction and
+    redoing the fail-stamp on a clean one, the hook's own shutdown signal (or its still-pending
+    writes) could be lost. This reproduces the exact scenario a background reviewer used to disprove
+    this file's own earlier, incomplete investigation (which used a hook with no prior write, so no
+    live SAVEPOINT rollback was ever actually attempted, and the failure never triggered)."""
     from worker.tasks.common import _stamp_failed_and_run_cleanup
 
     job_id, reel_id, cut_id = _make(factory, models.JobType.enrich, status=models.JobStatus.done)
@@ -735,6 +732,44 @@ def test_a_savepoint_rollback_failure_does_not_mask_a_shutdown_signal_from_the_h
         "the failed ROLLBACK TO SAVEPOINT never actually discarded the hook's own write -- "
         "committing anyway would durably persist it, breaking the guarantee that only the "
         "hook's OWN writes roll back on a raise")
+
+
+def test_a_third_failure_redoing_the_stamp_still_does_not_mask_the_shutdown(factory):
+    """Triple fault: the SAVEPOINT rollback fails, the recovery db.rollback() succeeds, and then
+    redoing the fail-stamp CAS (_fail_job_keep_owner, called again on the now-clean transaction)
+    ITSELF fails too. That third failure must not replace the shutdown signal that's been
+    surviving two failures already -- it's just as easy to lose it here as at either earlier step,
+    and the whole point of this branch is making sure it survives every failure along the way."""
+    from worker.tasks.common import _stamp_failed_and_run_cleanup
+
+    job_id, *_ = _make(factory, models.JobType.enrich, status=models.JobStatus.done)
+    other_job_id, *_ = _make(factory, models.JobType.generate, status=models.JobStatus.pending)
+
+    def hook(db, job, result):
+        db.query(models.Job).filter(models.Job.id == other_job_id).update(
+            {"status": models.JobStatus.failed})
+        db.flush()
+        raise SystemExit("shutdown mid-hook")
+
+    def boom(*a, **k):
+        raise OSError("simulated dead connection during ROLLBACK TO SAVEPOINT")
+
+    import worker.tasks.common as common_mod
+    real_fail_job_keep_owner = common_mod._fail_job_keep_owner
+    calls = {"n": 0}
+
+    def flaky_fail_job_keep_owner(db, job_id, message):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("second CAS attempt also fails")
+        return real_fail_job_keep_owner(db, job_id, message)
+
+    db = factory()
+    with patch("sqlalchemy.dialects.sqlite.pysqlite.SQLiteDialect_pysqlite.do_rollback_to_savepoint", boom), \
+         patch("worker.tasks.common._fail_job_keep_owner", flaky_fail_job_keep_owner):
+        with pytest.raises(SystemExit, match="shutdown mid-hook"):
+            _stamp_failed_and_run_cleanup(db, job_id, "orig failure", hook, None)
+    assert calls["n"] == 2, "the redo must actually have been attempted for this test to mean anything"
 
 
 def test_a_commit_failure_while_recording_a_shutdown_does_not_mask_the_shutdown(factory):

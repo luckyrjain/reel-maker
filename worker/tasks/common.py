@@ -318,7 +318,14 @@ def _stamp_failed_and_run_cleanup(db, job_id, message: str, after_commit_failed,
                                     "hook's partial writes may still be committed alongside the "
                                     "fail-stamp", job_id)
                 else:
-                    _fail_job_keep_owner(db, job_id, message)
+                    try:
+                        _fail_job_keep_owner(db, job_id, message)
+                    except Exception:
+                        # A third failure in a row (SAVEPOINT rollback, then this). Must not let
+                        # it replace hook_exc below -- the whole point of this branch is making
+                        # sure the shutdown signal survives every failure along the way.
+                        _log.exception("could not redo the failure stamp for job %s after "
+                                        "discarding the poisoned transaction", job_id)
             if isinstance(hook_exc, Exception):
                 suffix = " on shutdown" if on_shutdown else ""
                 _log.exception("after_commit_failed hook raised for job %s%s; failure stamp still "
