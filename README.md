@@ -195,7 +195,7 @@ All values are read from `.env` (or environment variables):
 
 | Variable | Default | Description |
 |---|---|---|
-| `DATABASE_URL` | `postgresql://reelmaker:reelmaker@localhost:5432/reelmaker` | Postgres connection string |
+| `DATABASE_URL` | `postgresql+psycopg2://reelmaker:reelmaker@localhost:5432/reelmaker` | Postgres connection string (explicit `+psycopg2` driver — the project depends on `psycopg2-binary`, not `psycopg` v3) |
 | `REDIS_URL` | `redis://localhost:6379/0` | Celery broker and result backend |
 | `LLM_BASE_URL` | `http://localhost:11434/v1` | OpenAI-compatible LLM endpoint (Ollama) |
 | `LLM_MODEL` | `qwen3:14b` | Model name passed to the LLM endpoint |

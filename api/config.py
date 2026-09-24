@@ -2,7 +2,13 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    database_url: str = "postgresql://reelmaker:reelmaker@localhost:5432/reelmaker"
+    # Explicit +psycopg2 driver — the project depends on psycopg2-binary specifically,
+    # not psycopg (v3). A bare "postgresql://" scheme leaves SQLAlchemy to pick a
+    # default dialect, and newer SQLAlchemy releases default that to psycopg (v3) if
+    # nothing forces otherwise — breaking with ModuleNotFoundError: No module named
+    # 'psycopg' in any environment (e.g. fresh CI installs, no lockfile) that only has
+    # psycopg2-binary installed, as this repo's pyproject.toml specifies.
+    database_url: str = "postgresql+psycopg2://reelmaker:reelmaker@localhost:5432/reelmaker"
     redis_url: str = "redis://localhost:6379/0"
 
     llm_base_url: str = "http://localhost:11434/v1"
