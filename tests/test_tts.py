@@ -32,6 +32,46 @@ def test_edge_provider_selected_when_configured(tmp_path):
         assert isinstance(get_tts_provider(tmp_path), EdgeTTSProvider)
 
 
+# ── per-reel voice override ──────────────────────────────────────────────────
+
+def test_curated_voice_is_threaded_through_to_edge_provider(tmp_path):
+    pytest.importorskip("edge_tts")
+    with patch("engine.render.tts.settings") as mock_settings:
+        mock_settings.tts_provider = "edge"
+        provider = get_tts_provider(tmp_path, voice="en-US-JennyNeural")
+    assert isinstance(provider, EdgeTTSProvider)
+    assert provider.voice == "en-US-JennyNeural"
+
+
+def test_no_voice_uses_the_provider_default(tmp_path):
+    pytest.importorskip("edge_tts")
+    with patch("engine.render.tts.settings") as mock_settings:
+        mock_settings.tts_provider = "edge"
+        provider = get_tts_provider(tmp_path, voice=None)
+    assert provider.voice == EdgeTTSProvider.DEFAULT_VOICE
+
+
+def test_uncurated_voice_falls_back_to_the_default_instead_of_reaching_edge_tts(tmp_path):
+    """Defense in depth — api/routers/reels.py already validates against
+    CURATED_EDGE_VOICES before storing Reel.tts_voice, but get_tts_provider() must
+    not blindly forward an arbitrary string to edge_tts.Communicate() either."""
+    pytest.importorskip("edge_tts")
+    with patch("engine.render.tts.settings") as mock_settings:
+        mock_settings.tts_provider = "edge"
+        provider = get_tts_provider(tmp_path, voice="not-a-real-voice")
+    assert provider.voice == EdgeTTSProvider.DEFAULT_VOICE
+
+
+def test_voice_override_is_ignored_for_kokoro(tmp_path):
+    """Kokoro's voice IDs (e.g. 'af_heart') are a different namespace than edge-tts's —
+    an edge voice name must never reach KokoroProvider."""
+    pytest.importorskip("kokoro")
+    with patch("engine.render.tts.settings") as mock_settings:
+        mock_settings.tts_provider = "kokoro"
+        provider = get_tts_provider(tmp_path, voice="en-US-JennyNeural")
+    assert provider.voice == "af_heart"   # KokoroProvider's own default, untouched
+
+
 def test_silent_provider_returns_one_shared_file(tmp_path):
     """Why render_cut must not measure SilentProvider output for beat durations."""
     provider = SilentProvider(tmp_path)

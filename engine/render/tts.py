@@ -143,6 +143,23 @@ def _audio_duration(path: Path) -> float | None:
     return None
 
 
+# A curated subset of edge-tts's ~400 voices, offered on the create-reel form so every
+# reel doesn't have to sound identical. Deliberately not the full catalog — a free-text
+# voice field would let a typo reach edge_tts.Communicate() deep inside a Celery task at
+# render time, failing minutes into a job instead of at submission. (value, display label).
+CURATED_EDGE_VOICES: list[tuple[str, str]] = [
+    ("en-GB-RyanNeural", "Ryan (British, male) — default"),
+    ("en-US-GuyNeural", "Guy (American, male)"),
+    ("en-US-JennyNeural", "Jenny (American, female)"),
+    ("en-GB-SoniaNeural", "Sonia (British, female)"),
+    ("en-AU-WilliamNeural", "William (Australian, male)"),
+    ("en-AU-NatashaNeural", "Natasha (Australian, female)"),
+    ("en-IE-ConnorNeural", "Connor (Irish, male)"),
+    ("en-IN-PrabhatNeural", "Prabhat (Indian, male)"),
+]
+_CURATED_EDGE_VOICE_NAMES = {v for v, _ in CURATED_EDGE_VOICES}
+
+
 class EdgeTTSProvider:
     """TTS via Microsoft Edge TTS — free neural voices, no C extensions, Python 3.14 compatible."""
 
@@ -193,7 +210,16 @@ class EdgeTTSProvider:
         return self.synthesize(text, rate=f"{pct:+d}%")
 
 
-def get_tts_provider(cache_dir: Path) -> "EdgeTTSProvider | KokoroProvider | SilentProvider":
+def get_tts_provider(
+    cache_dir: Path, voice: str | None = None
+) -> "EdgeTTSProvider | KokoroProvider | SilentProvider":
+    """`voice` is a per-reel override, only meaningful for EdgeTTSProvider — Kokoro's voice
+    IDs (e.g. "af_heart") are a different namespace than edge-tts's (e.g. "en-GB-RyanNeural"),
+    so passing an edge voice name through to Kokoro would just fail at synthesis time. Kokoro
+    always uses its own default; there is no per-reel voice choice for it in this pipeline.
+    An unrecognized value (not in CURATED_EDGE_VOICES) is treated the same as None — see
+    api/routers/reels.py::create_reel, which already validates against the curated set before
+    it ever reaches here, but this is defense in depth, not the only check."""
     provider = settings.tts_provider.lower()
     if provider == "kokoro":
         try:
@@ -207,6 +233,8 @@ def get_tts_provider(cache_dir: Path) -> "EdgeTTSProvider | KokoroProvider | Sil
     if provider in ("edge", "kokoro"):  # fall through from failed kokoro import
         try:
             import edge_tts  # noqa: F401
+            if voice in _CURATED_EDGE_VOICE_NAMES:
+                return EdgeTTSProvider(cache_dir, voice=voice)
             return EdgeTTSProvider(cache_dir)
         except ImportError:
             _log.warning(

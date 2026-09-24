@@ -25,7 +25,7 @@ This file below is the build log (what shipped, phase by phase); that one is the
 | 4a | ✅ Done | Operator visibility (cost, latency, quality, budget cap) |
 | 4b | ✅ Done | Publishing (OAuth, safe_to_publish gate, YouTube + Instagram uploaders, TikTok platform) |
 | 5 | ✅ Done | Analytics and polish |
-| 6 | 🔲 Partial | Creative range — hook/thumbnail variant generation done; per-reel TTS voice, non-football fixtures, brand customization not started |
+| 6 | 🔲 Partial | Creative range — hook/thumbnail variant generation and per-reel TTS voice done; non-football fixtures, brand customization not started |
 
 ---
 
@@ -599,11 +599,29 @@ Two independent, cheap additions — neither regenerates the guide:
   same as `video_path` — so an operator's thumbnail pick from a previous
   render doesn't survive a re-render.
 
-### 6b. Configurable TTS voice per reel — not done
+### 6b. Configurable TTS voice per reel — done
 
-`voice` param already exists on `EdgeTTSProvider`/`get_tts_provider()`; the
-create-reel form has no voice selector and nothing threads a per-reel choice
-through.
+`Reel.tts_voice` (migration `0008`, nullable — `None` means the provider
+default, `EdgeTTSProvider.DEFAULT_VOICE`) is set from a new "Voice" selector
+on the create-reel form. The selector offers
+`engine/render/tts.py::CURATED_EDGE_VOICES`, a curated ~8-voice subset of
+edge-tts's ~400 — deliberately not a free-text field: a typo'd voice name
+would otherwise fail deep inside `edge_tts.Communicate()` at render time,
+minutes into a Celery task, instead of at submission.
+`api/routers/reels.py::create_reel` validates the submitted value against
+the curated set and drops anything else to `None` (same "unrecognized
+values are dropped rather than raising 422" policy the `platforms`
+checkboxes already use); `get_tts_provider(cache_dir, voice=...)`
+independently re-validates as defense in depth, so a value that somehow
+reached the DB some other way still can't reach `edge_tts` unvalidated.
+
+Only applies to `TTS_PROVIDER=edge`. Kokoro's voice IDs (e.g. `af_heart`)
+are a different namespace than edge-tts's (e.g. `en-US-JennyNeural`) — an
+edge voice name is never forwarded to `KokoroProvider`, which always uses
+its own default. A per-reel Kokoro voice choice is a separate, smaller
+follow-up if that provider sees real use; not built now since `TTS_PROVIDER`
+defaults to `edge` and Kokoro requires Python < 3.13, already a narrower
+audience.
 
 ### 6c. Non-football niche evaluator fixtures — not done
 

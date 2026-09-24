@@ -44,7 +44,7 @@ def render_cut(self, db, job, ctx):
     wiki = get_wiki_sourcer(asset_store)
     hf_video = get_hf_video_sourcer(asset_store)
     hf = get_hf_sourcer(asset_store)
-    tts = get_tts_provider(asset_store / "tts")
+    tts = get_tts_provider(asset_store / "tts", voice=reel.tts_voice)
 
     beat_asset_pairs: list[list] = []
     beat_video_paths: list[list[Path | None]] = []
