@@ -47,7 +47,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 633 tests across 30+ files (4 test_compositor tests need ffmpeg on PATH; 1 kokoro voice test skips without the kokoro package)
+.venv/bin/pytest                            # 635 tests across 30+ files (4 test_compositor tests need ffmpeg on PATH; 1 kokoro voice test skips without the kokoro package)
 .venv/bin/pytest tests/test_foo.py::bar -s
 
 # New migration after changing models.py
@@ -148,7 +148,11 @@ worker/
                       synth_to_budget, TTS-accurate timecodes, atomic MP4, observability;
                       resolves a music track via get_music_sourcer().find(music_cue) and
                       passes it to composite_cut(); stores all returned thumbnail candidates on
-                      cut.thumbnail_candidates, cut.thumbnail_path defaults to candidates[0]
+                      cut.thumbnail_candidates, cut.thumbnail_path defaults to candidates[0];
+                      tracks which beats' resolve_or_reuse() call returned no real media at all
+                      ([(None, None)], resolve_beat_assets()'s "nothing found anywhere in the
+                      chain" sentinel) and writes the list to cut.black_frame_beat_indices
+                      (Phase 7a) — a re-render replaces it wholesale, same as thumbnail_candidates
     publish.py        publish_cut(job_id) — safe_to_publish gate, builds caption via
                       build_published_caption() (appends attribution block), dispatches to
                       engine/publish/registry.py, commits platform_post_id the moment the post is
@@ -276,6 +280,7 @@ migrations/
     0007_performance_notes.py  performance_notes table (id, text, active, created_at)
     0008_tts_voice.py   Reel.tts_voice column
     0009_text_color.py  Reel.text_color column
+    0010_black_frame_visibility.py  Cut.black_frame_beat_indices column
 
 tests/
   test_evaluator.py           41 tests — all 17 evaluator axes + helpers, multi-platform dedupe,
@@ -311,7 +316,7 @@ tests/
                               2 regression tests (mutation-tested against the naive/buggy version first):
                               seeded PerformanceNotes survive past attempt 1 on retry (the retry-replace bug),
                               structured-path success doesn't NameError on performance_note_ids (the wrong-branch-query bug)
-  test_render_task.py          9 tests — missing cut, already-posted cut refused, success clears stale error, music wiring, reel.tts_voice/text_color threaded into get_tts_provider()/composite_cut()
+  test_render_task.py          11 tests — missing cut, already-posted cut refused, success clears stale error, music wiring, reel.tts_voice/text_color threaded into get_tts_provider()/composite_cut(), black_frame_beat_indices flagged when a beat resolves no real media and stays None when every beat does
   test_hook_variants.py        9 tests — generate_hook_variants(): JSON-list/dict-wrapped parsing, excludes a variant identical to the original, caps at N_VARIANTS, empty hook skips the LLM call, malformed JSON/non-list/non-string items/provider exception all degrade to []
   test_asset_sourcer.py        7 tests — resolve_or_reuse pin, reuse, re-pin, beat isolation, commits (no open transaction on either resolve or reuse path), Wikipedia names all searched before any asset is flushed
   test_asset_sourcer_cost.py   9 tests — HF cost StageEvents charged only on real generation, not cache hits
@@ -387,7 +392,7 @@ docs/
 ## Data model
 
 - `reels` — master concept; `status` tracks generation phase; `tts_voice` (nullable) is a per-reel edge-tts voice override, `None` = provider default; `text_color` (nullable) is a per-reel on-screen text color override, `None` = `"white"` (see Key conventions for both — `text_color` in particular is validated as a filter-injection guard, not just a UX curation)
-- `cuts` — one row per platform (`youtube_shorts`, `instagram_reels`, or `tiktok`); holds `guide` (JSONB), `caption`, `hashtags`, `video_path`, `thumbnail_path`, `thumbnail_candidates` (JSON list of every frame `render_cut` sampled — `thumbnail_path` is whichever one is currently chosen, `[0]` by default), `hook_variants` (JSON list of alternate hook-beat lines generated once per guide, `None` if generation failed or the paid-call budget was already spent), `platform_post_id`, `published_at`, `views`, `likes`, `comments`, `metrics_updated_at` (last three populated by `pull_publish_metrics()`, `None` until the first successful pull)
+- `cuts` — one row per platform (`youtube_shorts`, `instagram_reels`, or `tiktok`); holds `guide` (JSONB), `caption`, `hashtags`, `video_path`, `thumbnail_path`, `thumbnail_candidates` (JSON list of every frame `render_cut` sampled — `thumbnail_path` is whichever one is currently chosen, `[0]` by default), `hook_variants` (JSON list of alternate hook-beat lines generated once per guide, `None` if generation failed or the paid-call budget was already spent), `black_frame_beat_indices` (JSON list of 0-indexed beats that got no real media anywhere in the asset-sourcer fallback chain and rendered as a black frame; `None` when every beat resolved something — Phase 7a operator visibility, see Key conventions), `platform_post_id`, `published_at`, `views`, `likes`, `comments`, `metrics_updated_at` (last three populated by `pull_publish_metrics()`, `None` until the first successful pull)
 - `assets` — cached media files; deduplicated by `(source, source_ref)`; `source` is `pexels`, `wikipedia`, `huggingface`, or `huggingface_video`; `type` is `footage` or `photo`; includes `license_url`, `attribution`, `safe_to_publish`. HF-generated assets are `safe_to_publish=True`.
 - `cut_assets` — per-beat asset binding ledger; `beat_index` + `order_in_beat` identify position; `resolved_from` is `sha256(visual_direction)[:16]` for change detection; unique constraint on `(cut_id, beat_index, order_in_beat)`; `start_s`/`end_s` updated after TTS measurement
 - `jobs` — every async operation (`enrich`, `generate`, `render`, `publish`); includes `started_at`, `heartbeat_at`, `meta` (JSON — stores `generation_path`, `path`, `stub_count`, `quality_score` on success, and optionally `structured_score`/`structured_fallback` when structured path fell back to standard, and `performance_note_ids` — the active `PerformanceNote` ids at the time of this generate run, written by the same shared `job.meta` line as `quality_score`); `error` is `None` on success, set to exception message on failure only
@@ -470,6 +475,7 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 - **Phase 5** ✅ — Analytics: local-library music mixing with sidechain ducking (`LocalMusicSource` + `_build_ffmpeg_args`), HF asset-generation cost tracking (`engine/render/pricing.py`, `asset_hf_video`/`asset_hf_image` StageEvents), Wikipedia attribution block appended to published captions (`engine/publish/attribution.py`), post-publish metrics pull-back every 6h (`worker/tasks/metrics.py`), quality-vs-views surfaced on the reel list and per-cut engagement stats on the cut card. Quality↔engagement correlation (`engine/analytics/correlation.py`, `GET /api/insights`) and performance-informed feedback (`PerformanceNote` CRUD + seeding into `prior_feedback`, `evaluator_axis_weight_multipliers` lever) shipped after — see below.
 - **Phase 5g** ✅ — Quality↔engagement correlation + performance-informed feedback: closes the last two Phase 5 items (`docs/specs/2026-09-phase5-quality-engagement-feedback.md`). `GET /api/insights` shows a Pearson `r` (+ `sample_size`, always shown together, never `r` alone) between `quality_score` and max per-reel `views`, refusing to compute below `MIN_SAMPLE=5` reels or on zero variance in either series — with an explicit, permanent UI caveat about restriction-of-range bias (scores cluster near the acceptance threshold by construction) and "correlation, not causation." Same page shows a top/bottom-3 performer table (combined into one list when `n < 6`) with each performer's hook line, for a human operator to write `PerformanceNote`s from — **not** automatic few-shot injection of raw past-reel content, a deliberate scope decision (see the spec's §3.1: this codebase has already been burned by topic-drift from unconstrained prior context leaking into generation). Every active note is seeded into the standard LLM path's `prior_feedback` from attempt 1 onward. `evaluator_axis_weight_multipliers` (`Settings`, default `{}`) is a manual per-axis scoring lever informed by the correlation data — no code in this repo derives these values statistically.
 - **Phase 6 (partial)** — Creative range: hook/thumbnail variant generation, per-reel TTS voice choice, non-football niche evaluator fairness fixes, and per-reel text color. `render_cut` samples 4 thumbnail candidates per render (`Cut.thumbnail_candidates`); `generate_guide` generates 3 alternate hook lines once per accepted guide (`Cut.hook_variants`, best-effort — never fails the job). Operator picks either from the `in_review` cut card (`POST /cuts/{id}/thumbnail`, `POST /cuts/{id}/hook-variant`). `Reel.tts_voice` (create-reel form, curated edge-tts voice list) lets each reel sound different — edge provider only, see Key conventions. Investigating the evaluator's "universal" niche vocabulary found 2 real fairness bugs (Script→Visual Alignment collapsing to a flat max deduction, Visual Variety being unconditionally football-only with no niche gate at all) — both fixed, see the `evaluator.py` module-layout entry and `docs/roadmap.md` Phase 6c. `Reel.text_color` (create-reel form, curated color list) is the first slice of brand customization (Phase 6d) — done as a security-validated lever (unescaped ffmpeg filter interpolation), not just a UX one. Not done: logo/watermark overlay, per-channel presets.
+- **Phase 7 (partial)** — Production hardening: `asset_sourcer` black-frame visibility. `render_cut` now tracks which beats got no real media anywhere in the Wikipedia → Pexels → HF Video → HF Image fallback chain and writes the list to `Cut.black_frame_beat_indices` (migration `0010`), surfaced as a warning banner on the `in_review`+ cut card. The sourcers themselves still swallow exceptions and degrade silently *internally* — this only stops the *result* from being silent to the operator; a real retry/alerting fix is a separate, larger design pass. Not done: golden-reel smoke test in CI, startup LLM-model validation, Dockerfile, auth/rate-limiting scope decision.
 
 ## Worker queues
 

@@ -1,6 +1,6 @@
 # Data Model
 
-All tables are defined in `api/models.py`. Migrations: `0001_initial.py` (base schema) + `0002_improvements.py` (pinning, licensing, observability, heartbeat) + `0003_context_enrichment.py` (enriched_context column, enriching/enrich enum values) + `0004_publishing.py` (tiktok platform, Credential refresh/account-id columns) + `0005_metrics.py` (Cut engagement columns) + `0006_variants.py` (Cut thumbnail/hook-variant columns) + `0007_performance_notes.py` (`performance_notes` table) + `0008_tts_voice.py` (Reel.tts_voice column) + `0009_text_color.py` (Reel.text_color column). Video and audio files live on disk under `ASSET_STORE_DIR` / `VIDEO_STORE_DIR`; the DB stores paths, never blobs.
+All tables are defined in `api/models.py`. Migrations: `0001_initial.py` (base schema) + `0002_improvements.py` (pinning, licensing, observability, heartbeat) + `0003_context_enrichment.py` (enriched_context column, enriching/enrich enum values) + `0004_publishing.py` (tiktok platform, Credential refresh/account-id columns) + `0005_metrics.py` (Cut engagement columns) + `0006_variants.py` (Cut thumbnail/hook-variant columns) + `0007_performance_notes.py` (`performance_notes` table) + `0008_tts_voice.py` (Reel.tts_voice column) + `0009_text_color.py` (Reel.text_color column) + `0010_black_frame_visibility.py` (Cut.black_frame_beat_indices column). Video and audio files live on disk under `ASSET_STORE_DIR` / `VIDEO_STORE_DIR`; the DB stores paths, never blobs.
 
 ---
 
@@ -42,6 +42,7 @@ One row per platform per reel. All generated content for a platform lives here.
 | `hashtags` | JSON array | List of strings, no `#` prefix |
 | `video_path` | varchar(500) | Absolute path to rendered MP4 on disk |
 | `thumbnail_path` | varchar(500) | Absolute path to thumbnail JPEG |
+| `black_frame_beat_indices` | JSON, nullable | 0-indexed beats where the asset-sourcer fallback chain (Wikipedia → Pexels → HF Video → HF Image) found nothing and the compositor rendered a black frame for that beat's full duration. `None` when every beat resolved real media. Written by `render_cut`, replaced wholesale on re-render. |
 | `duration_s` | float | Actual rendered duration in seconds |
 | `status` | enum `CutStatus` | See state machine |
 | `published_at` | timestamptz | Set when publish completes |

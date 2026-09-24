@@ -26,6 +26,7 @@ This file below is the build log (what shipped, phase by phase); that one is the
 | 4b | ✅ Done | Publishing (OAuth, safe_to_publish gate, YouTube + Instagram uploaders, TikTok platform) |
 | 5 | ✅ Done | Analytics and polish |
 | 6 | 🔲 Partial | Creative range — hook/thumbnail variant generation, per-reel TTS voice, non-football fairness fixes, configurable text color done; logo/watermark + per-channel presets not started |
+| 7 | 🔲 Partial | Production hardening — asset_sourcer black-frame visibility done; golden-reel CI test, startup model validation, Dockerfile, auth/rate-limit decision not started |
 
 ---
 
@@ -724,6 +725,43 @@ follow-up with its own scoping pass rather than folded into this one.
 
 ---
 
+## Phase 7 — Production hardening (partial)
+
+### 7a. `asset_sourcer` black-frame visibility — done
+
+The fallback chain itself (Wikipedia → Pexels → HF Video → HF Image → black
+frame) is unchanged and still swallows every sourcer's own exceptions
+internally — that's a separate, larger fix (retry semantics, alerting) not
+attempted here. What's fixed is the *visibility* gap: a beat where the
+whole chain came up empty rendered a black frame for its full duration
+with no trace anywhere an operator would look. `worker/tasks/render.py`
+now tracks, per beat, whether `resolve_or_reuse()` returned real media at
+all (`resolve_beat_assets()`'s sentinel for "nothing found anywhere" is
+`[(None, None)]`); the 0-indexed list of affected beats is written to the
+new `Cut.black_frame_beat_indices` column (migration `0010`, nullable — a
+re-render replaces it wholesale, same as `thumbnail_candidates`). The
+`in_review`+ cut card shows a warning banner naming the affected beats
+when the list is non-empty. See the Open Issues table below for what's
+still not addressed (the sourcers themselves still degrade silently at
+the source — this only stops the *result* from being silent).
+
+### Not started
+
+- Golden-reel smoke test in CI (would have caught the months-long silent
+  zero-audio bug documented in Phase 3.9's own history — a real end-to-end
+  render, not just unit tests)
+- CI pipeline currently runs pytest + ruff only, no golden-reel job
+- Startup validation: ping configured LLM model endpoints, fail fast on a
+  dead model instead of failing every generation job individually one at
+  a time (this bit in practice — see the NVIDIA model-catalog-drift entry
+  in `docs/product-gap-analysis-and-roadmap-2026-08.md`)
+- Dockerfile for the API + workers — `docker-compose.yml` only defines
+  `postgres`/`redis` today, no deploy path beyond a local venv
+- Auth / rate-limiting scope decision — still the silent absence the gap
+  analysis flagged, not yet an explicit "we chose not to, because X"
+
+---
+
 ## Open issues
 
 | Issue | Severity | Notes |
@@ -731,7 +769,7 @@ follow-up with its own scoping pass rather than folded into this one.
 | `safe_to_publish` gate checks the current pins, not the video that will ship | Medium | `resolve_or_reuse()` re-pins and commits per beat as the operator edits and re-renders; a failed render never clears `cut.video_path`. If render N used a non-free asset (blocked) and a later render N+1 re-pins to a safe one but then itself fails, "Retry publish" gates against the safe N+1 pins while `video_path` still points at render N's (unsafe) video — the gate passes and the wrong video ships, with attribution built from the wrong pins too. Fix would clear `video_path` (or check a pins fingerprint) whenever a render starts or re-pins |
 | No multi-image collage in one frame | Low | Currently cycles sequentially; side-by-side layout not implemented |
 | MoviePy video readers leak until worker recycle | Low | `_build_media_sub_clip` opens `VideoFileClip`s that only `worker_max_tasks_per_child=10` reclaims; marked with a `ponytail:` comment |
-| `asset_sourcer` degrades silently to black frames | Medium | Every sourcer swallows its own exceptions and returns `None`, so a Pexels/Wikipedia outage produces a black-frame reel that reports success — and never reaches the retry branch |
+| `asset_sourcer` degrades silently to black frames | ✅ Fixed (Phase 7a) | Every sourcer still swallows its own exceptions and returns `None` internally (unchanged — a real fix there needs its own design pass), but the *visibility* half is done: `Cut.black_frame_beat_indices` (migration `0010`) records which beats got nothing from the whole Wikipedia → Pexels → HF Video → HF Image chain, written by `render_cut`, surfaced as a warning banner on the `in_review`+ cut card. A Pexels/Wikipedia outage still produces a black-frame reel and still reports `done` — but the operator now sees it on the card instead of discovering it by watching the video. See the Phase 7 section above for what's still open (the sourcers still don't retry or alert). |
 | `resolve_or_reuse()` commits the caller's session | Low | Deliberate (no transaction may sit idle across its network calls or the TTS that follows); noted in its docstring. A partial Wikipedia result (one of several names failing) is pinned and reused until `visual_direction` changes |
 | `record_stage()` commits the caller's session | Low | Benign today (all call sites sit on a commit boundary) and documented in `observability.py`, but it will bite whoever wraps a half-applied mutation |
 | `_escape_drawtext` escapes only `\ : % '` | Low | A newline or exotic character in `on_screen_text` could break the FFmpeg filter chain; not observed in practice |
