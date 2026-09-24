@@ -236,10 +236,16 @@ PostgreSQL 16, not just SQLite. Behaviour changes an operator should know about:
   by hand against real PostgreSQL 16, including a genuine `IntegrityError` raised from inside the
   SAVEPOINT (not just a Python-level exception) to confirm `ROLLBACK TO SAVEPOINT` correctly
   un-poisons the transaction — the fail-stamp survived and the hook's own write reverted, matching
-  SQLite's behavior. A SystemExit/KeyboardInterrupt raised BY THE HOOK ITSELF (not by `after_commit`)
-  is deliberately not swallowed by the SAVEPOINT wrapper, but does commit the fail-stamp before
-  re-raising — without that, the exception unwinding straight to `job_task`'s `finally: db.close()`
-  would roll it back too.
+  SQLite's behavior (that check used an ordinary exception inside the SAVEPOINT, not a
+  SystemExit/KeyboardInterrupt specifically — SQLAlchemy's nested-transaction cleanup doesn't
+  special-case BaseException vs. Exception, so there's no reason to expect different behavior, but
+  it wasn't independently re-checked). A SystemExit/KeyboardInterrupt raised BY THE HOOK ITSELF (not
+  by `after_commit`) is deliberately not swallowed by the SAVEPOINT wrapper, but does commit the
+  fail-stamp before re-raising — without that, the exception unwinding straight to `job_task`'s
+  `finally: db.close()` would roll it back too. That commit is itself guarded: if it fails (a DB
+  error while a shutdown is already in progress is exactly when this is likeliest), the failure is
+  logged and the original BaseException still propagates rather than being replaced by the commit
+  error.
 - `_generate_caption_hashtags`'s fallback path no longer swallows `SoftTimeLimitExceeded` — a timeout
   there now fails the task visibly instead of completing with a template caption.
 
