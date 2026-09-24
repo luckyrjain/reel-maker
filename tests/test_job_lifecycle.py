@@ -670,6 +670,52 @@ def test_a_commit_failure_while_recording_a_shutdown_does_not_mask_the_shutdown(
             _stamp_failed_and_run_cleanup(db, job_id, "orig failure", hook, None)
 
 
+def test_a_commit_failure_during_shutdown_is_actually_logged(factory, caplog):
+    """The whole point of catching the commit failure is so an operator has a log line tying it
+    to this job -- not just that the original exception still propagates. Assert the log line
+    itself, not only the control flow around it."""
+    from worker.tasks.common import _stamp_failed_and_run_cleanup
+
+    def hook(db, job, result):
+        raise SystemExit("shutdown mid-cleanup")
+
+    job_id, *_ = _make(factory, models.JobType.enrich, status=models.JobStatus.done)
+    db = factory()
+
+    class Dead:
+        def commit(self):
+            raise sa_exc.OperationalError("COMMIT", {}, Exception("connection gone"))
+
+    with patch.object(db, "commit", Dead().commit):
+        with caplog.at_level(logging.ERROR, logger="worker.tasks.common"):
+            with pytest.raises(SystemExit):
+                _stamp_failed_and_run_cleanup(db, job_id, "orig failure", hook, None)
+    assert any(f"job {job_id}" in r.getMessage() for r in caplog.records)
+
+
+def test_a_second_shutdown_signal_during_the_commit_itself_still_propagates(factory):
+    """A second genuine BaseException raised BY db.commit() itself (a second real shutdown signal
+    landing mid-commit, not an ordinary DB error) must not be swallowed -- it replaces whatever was
+    propagating before it, which is an accepted trade-off since either way the process still exits,
+    the actual goal. This locks in _commit_or_log's `except Exception` (not `except BaseException`)
+    as deliberate, not an oversight."""
+    from worker.tasks.common import _stamp_failed_and_run_cleanup
+
+    def hook(db, job, result):
+        raise SystemExit("first shutdown signal")
+
+    job_id, *_ = _make(factory, models.JobType.enrich, status=models.JobStatus.done)
+    db = factory()
+
+    class Dead:
+        def commit(self):
+            raise KeyboardInterrupt("second shutdown signal")
+
+    with patch.object(db, "commit", Dead().commit):
+        with pytest.raises(KeyboardInterrupt, match="second shutdown signal"):
+            _stamp_failed_and_run_cleanup(db, job_id, "orig failure", hook, None)
+
+
 def test_a_body_failure_does_not_run_the_cleanup_hook(factory):
     job_id, *_ = _make(factory, models.JobType.enrich)
     hook = MagicMock()

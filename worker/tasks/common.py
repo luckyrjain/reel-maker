@@ -231,6 +231,21 @@ def _fail_job(db, job_id, from_status, message: str, owner_kind: str, owner_stat
     return True
 
 
+def _commit_or_log(db, job_id, context: str) -> None:
+    """Commit; on failure, log and swallow -- never let a failure recording something replace
+    whatever exception is already propagating past this point.
+
+    Only catches ``Exception``: a second genuine ``BaseException`` (a shutdown signal landing a
+    second time, mid-commit) is deliberately let through rather than swallowed, matching this
+    file's rule that a shutdown always propagates. It replaces whatever was propagating before it
+    -- an accepted trade-off, since either way the process still exits, which is the actual goal.
+    """
+    try:
+        db.commit()
+    except Exception:
+        _log.exception("could not commit for job %s%s", job_id, context)
+
+
 def _stamp_failed_and_run_cleanup(db, job_id, message: str, after_commit_failed, result, *,
                                   on_shutdown: bool = False) -> None:
     """done -> failed stamp, then the cleanup hook (if any), for a body whose after_commit already
@@ -265,14 +280,7 @@ def _stamp_failed_and_run_cleanup(db, job_id, message: str, after_commit_failed,
             _log.exception("after_commit_failed hook raised for job %s%s; failure stamp still recorded, "
                             "hook's own partial writes rolled back", job_id, suffix)
         except BaseException:
-            try:
-                db.commit()
-            except Exception:
-                # Never let a bookkeeping failure replace the shutdown signal itself -- log it and
-                # still propagate the original BaseException, matching this file's rule elsewhere
-                # (job_task's own terminal handlers) that a failure recording a failure is logged,
-                # not allowed to mask what's actually happening.
-                _log.exception("could not commit the failure stamp for job %s during shutdown", job_id)
+            _commit_or_log(db, job_id, " (recording the failure stamp during shutdown)")
             raise
 
 
