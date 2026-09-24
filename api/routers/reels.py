@@ -9,6 +9,7 @@ from api import models
 from api.state import transition, REEL_TRANSITIONS
 from engine.generation.estimate import estimate_generation
 from engine.observability import latest_quality_scores
+from engine.render.tts import CURATED_EDGE_VOICES
 from worker.tasks.common import fail_unenqueued
 from worker.tasks.enrich_context import enrich_context
 
@@ -17,6 +18,7 @@ templates = Jinja2Templates(directory="ui/templates")
 
 REEL_LIST_PAGE_SIZE = 50
 _DEFAULT_PLATFORMS = [models.CutPlatform.youtube_shorts, models.CutPlatform.instagram_reels]
+_CURATED_TTS_VOICE_NAMES = {v for v, _ in CURATED_EDGE_VOICES}
 
 
 @router.post("/reels", response_class=HTMLResponse)
@@ -28,12 +30,20 @@ def create_reel(
     target_length_s: Annotated[float, Form()] = 45.0,
     generation_path: Annotated[str, Form()] = "auto",
     platforms: Annotated[list[str] | None, Form()] = None,
+    tts_voice: Annotated[Optional[str], Form()] = None,
     db: Session = Depends(get_db),
 ):
+    # Same "drop, don't 422" policy as the platforms checkboxes below — a stray or
+    # renamed <option> value shouldn't fail the whole submission, it should just fall
+    # back to the provider default (None). get_tts_provider() re-checks this anyway.
+    if tts_voice not in _CURATED_TTS_VOICE_NAMES:
+        tts_voice = None
+
     reel = models.Reel(
         context=context,
         niche=niche,
         voiceover_mode=voiceover_mode,
+        tts_voice=tts_voice,
         status=models.ReelStatus.draft,
     )
     db.add(reel)

@@ -65,6 +65,10 @@ class Reel(Base):
     enriched_context = Column(Text, nullable=True)
     niche = Column(String(255))
     voiceover_mode = Column(String(50), default="voiceover")
+    # Edge-tts voice name from engine/render/tts.py::CURATED_EDGE_VOICES, or None to use
+    # EdgeTTSProvider.DEFAULT_VOICE. Only applies when TTS_PROVIDER=edge (the default) — see
+    # get_tts_provider()'s docstring for why Kokoro doesn't get a per-reel voice choice.
+    tts_voice = Column(String(100), nullable=True)
     status = Column(SAEnum(ReelStatus), default=ReelStatus.draft, nullable=False)
     created_at = Column(DateTime(timezone=True), default=_now)
     updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)

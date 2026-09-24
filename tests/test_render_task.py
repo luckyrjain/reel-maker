@@ -198,6 +198,34 @@ def test_matching_music_cue_is_passed_to_composite_cut():
     assert mock_composite.call_args.kwargs["music_path"] is fake_track
 
 
+def test_reel_tts_voice_is_passed_to_get_tts_provider():
+    from worker.tasks.render import render_cut
+
+    job = _job()
+    cut = _cut()
+    reel = _reel()
+    reel.tts_voice = "en-US-JennyNeural"
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else (
+        cut if model is models.Cut else reel
+    )
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.render.get_asset_sourcer"),
+        patch("worker.tasks.render.get_wiki_sourcer"),
+        patch("worker.tasks.render.get_hf_sourcer"),
+        patch("worker.tasks.render.get_hf_video_sourcer"),
+        patch("worker.tasks.render.get_tts_provider") as mock_get_tts,
+        patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
+        patch("worker.tasks.render.record_stage"),
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"])),
+    ):
+        render_cut(1)
+
+    assert mock_get_tts.call_args.kwargs["voice"] == "en-US-JennyNeural"
+
+
 def test_no_music_cue_passes_none_without_querying_sourcer():
     from worker.tasks.render import render_cut
 

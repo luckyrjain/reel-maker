@@ -368,6 +368,44 @@ def test_create_reel_ignores_unknown_platform_values(client):
     db.close()
 
 
+def test_create_reel_honors_explicit_tts_voice_selection(client):
+    with patch("api.routers.reels.enrich_context"):
+        resp = client.post(
+            "/api/reels",
+            data={"context": "A" * 60, "generation_path": "structured", "tts_voice": "en-US-JennyNeural"},
+        )
+    assert resp.status_code == 200
+    db = client._session_factory()
+    reel = db.query(models.Reel).order_by(models.Reel.id.desc()).first()
+    assert reel.tts_voice == "en-US-JennyNeural"
+    db.close()
+
+
+def test_create_reel_ignores_unknown_tts_voice_value(client):
+    """Same 'drop, don't 422' policy as unknown platform values — falls back to None
+    (the provider default) rather than failing the whole submission."""
+    with patch("api.routers.reels.enrich_context"):
+        resp = client.post(
+            "/api/reels",
+            data={"context": "A" * 60, "generation_path": "structured", "tts_voice": "not-a-real-voice"},
+        )
+    assert resp.status_code == 200
+    db = client._session_factory()
+    reel = db.query(models.Reel).order_by(models.Reel.id.desc()).first()
+    assert reel.tts_voice is None
+    db.close()
+
+
+def test_create_reel_without_tts_voice_defaults_to_none(client):
+    with patch("api.routers.reels.enrich_context"):
+        resp = client.post("/api/reels", data={"context": "A" * 60, "generation_path": "structured"})
+    assert resp.status_code == 200
+    db = client._session_factory()
+    reel = db.query(models.Reel).order_by(models.Reel.id.desc()).first()
+    assert reel.tts_voice is None
+    db.close()
+
+
 def test_estimate_endpoint_detects_structured_script(client):
     structured_ctx = (
         "GOALKEEPER\nMartinez saves penalties.\n"
