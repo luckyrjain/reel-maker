@@ -63,14 +63,16 @@ def create_reel(
         meta={"generation_path": generation_path},
     )
     db.add(job)
-    db.commit()
-    db.refresh(job)
+    db.flush()
+    job_id = job.id
+    db.commit()   # nothing may be open across .delay() (see api/routers/cuts.py::trigger_render)
 
     try:
-        enrich_context.delay(job.id)
+        enrich_context.delay(job_id)
     except Exception as exc:
         fail_unenqueued(db, job, exc)
         raise HTTPException(status_code=503, detail="Could not queue the job — try again") from exc
+    db.refresh(job)
 
     return templates.TemplateResponse(
         request, "fragments/pipeline_status.html",

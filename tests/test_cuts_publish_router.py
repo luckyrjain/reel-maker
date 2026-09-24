@@ -276,3 +276,86 @@ def test_failed_unposted_cut_warns_to_check_the_platform_before_retrying(client)
     db.close()
     html = client.get(f"/api/reels/{reel_id}").text
     assert "check the platform first" in html
+
+
+def test_the_job_is_committed_before_it_is_enqueued(client):
+    """.delay() must run with the job row already visible to a worker and no transaction of ours open
+    across it (a slow broker failure would otherwise outlive an idle-in-transaction timeout).
+
+    A mocked .delay() can't observe transaction state through a second connection: the commit already
+    made the row visible regardless of what runs after it. The regression this guards (db.refresh()
+    called BEFORE .delay(), which opens a read transaction that then sits open across the broker call)
+    only shows up by inspecting the router's own session at the moment .delay() runs.
+    """
+    from api.db import get_db
+    from api.main import app
+
+    cut_id = _guide_cut(client, models.CutStatus.draft)
+    sessions = []
+    real_override = app.dependency_overrides[get_db]
+
+    def tracking_override():
+        gen = real_override()
+        db = next(gen)
+        sessions.append(db)
+        try:
+            yield db
+        finally:
+            try:
+                next(gen)
+            except StopIteration:
+                pass
+
+    seen = {}
+
+    def delay(job_id):
+        assert isinstance(job_id, int)
+        seen["in_transaction_during_delay"] = sessions[-1].in_transaction()
+        other = client._session_factory()
+        job = other.get(models.Job, job_id)
+        seen["visible"] = job is not None and job.status == models.JobStatus.pending
+        other.close()
+
+    app.dependency_overrides[get_db] = tracking_override
+    try:
+        with patch("api.routers.cuts.render_cut") as mock_task:
+            mock_task.delay.side_effect = delay
+            assert client.post(f"/api/cuts/{cut_id}/render").status_code == 200
+    finally:
+        app.dependency_overrides[get_db] = real_override
+    assert seen["visible"] is True
+    assert seen["in_transaction_during_delay"] is False
+
+
+def test_approve_and_edit_lock_the_cut_row_like_the_trigger_routes(client):
+    """An approve racing a render otherwise lets the render do its paid work and then fail its final transition."""
+    from sqlalchemy.orm import Session
+    cut_id = _make_cut(client._session_factory, models.CutStatus.in_review)
+    seen = []
+    real_get = Session.get
+
+    def spy(self, entity, ident, **kwargs):
+        if entity is models.Cut:
+            seen.append(kwargs.get("with_for_update"))
+        return real_get(self, entity, ident, **kwargs)
+
+    with patch.object(Session, "get", spy):
+        client.post(f"/api/cuts/{cut_id}/approve")
+    assert seen and seen[0] is True
+
+    seen.clear()
+    editable = _make_cut(client._session_factory, models.CutStatus.in_review)
+    with patch.object(Session, "get", spy):
+        client.patch(f"/api/cuts/{editable}", data={"caption": "new"})
+    assert seen and seen[0] is True
+
+
+def test_a_failed_request_is_reported_to_the_operator_not_swallowed_by_htmx(client):
+    """htmx does not swap 4xx/5xx responses, so without a handler the 503 for an unqueueable job
+    looks like nothing happened."""
+    assert client.get("/static/htmx-errors.js").status_code == 200
+    assert "htmx:responseError" in client.get("/static/htmx-errors.js").text
+    assert "/static/htmx-errors.js" in client.get("/").text
+    cut_id = _make_cut(client._session_factory, models.CutStatus.failed)
+    reel_id = client._session_factory().get(models.Cut, cut_id).reel_id
+    assert "/static/htmx-errors.js" in client.get(f"/api/reels/{reel_id}").text

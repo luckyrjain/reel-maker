@@ -388,18 +388,34 @@ def test_non_transient_error_before_the_claim_does_not_touch_the_job(factory):
 
 # ── worker shutdown ───────────────────────────────────────────────────────────
 
-def test_shutdown_releases_the_job_so_the_redelivered_message_can_run(factory):
+def test_shutdown_fails_the_job_at_once_and_frees_its_owner(factory):
+    """SystemExit under prefork means a SIGTERM (restart) or the hard time limit. Celery has already acked
+    or dropped the message, so a job handed back to `pending` would sit there with no message anywhere,
+    holding its cut/reel in flight until the reaper's hours-long pending threshold."""
     job_id, reel_id, cut_id = _make(factory)
     task = _task("t.shutdown", _raises(SystemExit(1)))
     with pytest.raises(SystemExit):
         task(job_id)
     job, reel, _ = _read(factory, job_id, reel_id, cut_id)
-    assert job.status == models.JobStatus.pending
-    assert reel.status == models.ReelStatus.generating, "a shutdown is not a failure"
+    assert job.status == models.JobStatus.failed
+    assert "shut down" in job.error
+    assert reel.status == models.ReelStatus.failed, "the owner must be freed so the operator can retry"
 
+
+def test_a_redelivered_message_for_a_shut_down_job_is_a_no_op(factory):
+    job_id, *_ = _make(factory)
+    with pytest.raises(SystemExit):
+        _task("t.shutdown_a", _raises(SystemExit(1)))(job_id)
     ran = []
-    _task("t.shutdown2", lambda self, db, job, ctx: ran.append(1))(job_id)
-    assert ran == [1]
+    _task("t.shutdown_b", lambda self, db, job, ctx: ran.append(1))(job_id)
+    assert ran == []
+
+
+def test_a_keyboard_interrupt_is_handled_like_a_shutdown(factory):
+    job_id, reel_id, cut_id = _make(factory)
+    with pytest.raises(KeyboardInterrupt):
+        _task("t.kbd", _raises(KeyboardInterrupt()))(job_id)
+    assert _read(factory, job_id, reel_id, cut_id)[0].status == models.JobStatus.failed
 
 
 # ── owner rollback, per job type ──────────────────────────────────────────────
@@ -547,26 +563,35 @@ def test_delay_and_apply_async_accept_a_single_job_id(factory):
     assert db.get(models.Job, job_id2).status == models.JobStatus.done
 
 
-def test_every_real_task_is_wired_with_the_right_job_type_retry_budget_and_time_limits():
+def test_every_job_task_is_wired_with_the_right_job_type_retry_budget_and_time_limits():
     """A copy-pasted job type silently rolls back the wrong owner (or none) on failure, and a task
-    without Celery time limits cannot be freed when its body hangs."""
+    without Celery time limits cannot be freed when its body hangs.
+
+    Looked up by name rather than by scanning celery_app.tasks: in this test PROCESS, a task
+    registered via app.task() on any Celery() instance (e.g. this module's own scratch `app`,
+    constructed below) also shows up bound to celery_app under the same name — confirmed
+    experimentally, not documented Celery behaviour. Scanning the registry would therefore assert
+    over test-only tasks too, keyed by whichever app happened to finalize last.
+    """
     from worker.celery_app import celery_app
     celery_app.loader.import_default_modules()
-    # name: (job_type, max_retries, release_on_shutdown, max_runtime_s)
+    # name: (job_type, max_retries, max_runtime_s)
     expected = {
-        "worker.tasks.enrich_context.enrich_context": ("enrich", 0, True, 30 * 60),
-        "worker.tasks.generate.generate_guide": ("generate", 2, True, 4 * 60 * 60),
-        "worker.tasks.render.render_cut": ("render", 2, True, 60 * 60),
+        "worker.tasks.enrich_context.enrich_context": ("enrich", 0, 30 * 60),
+        "worker.tasks.generate.generate_guide": ("generate", 2, 4 * 60 * 60),
+        "worker.tasks.render.render_cut": ("render", 2, 60 * 60),
         # publish is not idempotent on the platform side: a retry after a transient error that
-        # arrived post-upload, or a redelivery after a shutdown mid-upload, would post twice.
-        "worker.tasks.publish.publish_cut": ("publish", 0, False, 60 * 60),
+        # arrived post-upload would post twice.
+        "worker.tasks.publish.publish_cut": ("publish", 0, 60 * 60),
     }
     actual = {}
-    for name, (_, _, _, max_runtime_s) in expected.items():
+    for name, (job_type, max_retries, max_runtime_s) in expected.items():
         task = celery_app.tasks[name]
-        actual[name] = (task.run.job_type, task.max_retries, task.run.release_on_shutdown, task.run.max_runtime_s)
-        assert task.soft_time_limit == max_runtime_s, f"{name}: soft_time_limit must equal max_runtime_s"
+        run = task.run
+        actual[name] = (run.job_type, task.max_retries, run.max_runtime_s)
+        assert task.soft_time_limit == run.max_runtime_s, f"{name}: soft_time_limit must equal max_runtime_s"
         assert task.time_limit > task.soft_time_limit, f"{name}: needs a hard limit after the soft one"
+        assert name in celery_app.conf.task_routes, f"{name}: needs a task_routes entry"
     assert actual == expected
 
 
@@ -671,17 +696,6 @@ def test_a_refused_retry_fails_the_job_and_rolls_the_owner_back_instead_of_leavi
     assert job.status == models.JobStatus.failed
     assert "could not schedule retry" in job.error
     assert reel.status == models.ReelStatus.failed
-
-
-def test_shutdown_leaves_the_job_running_when_release_is_disabled(factory):
-    """Publish: a redelivered run after a shutdown mid-upload would post the video twice."""
-    job_id, reel_id, cut_id = _make(factory)
-    task = _task("t.no_release", _raises(SystemExit(1)), release_on_shutdown=False)
-    with pytest.raises(SystemExit):
-        task(job_id)
-    job, reel, _ = _read(factory, job_id, reel_id, cut_id)
-    assert job.status == models.JobStatus.running   # the reaper fails it once the heartbeat goes stale
-    assert reel.status == models.ReelStatus.generating
 
 
 def test_a_thread_that_cannot_start_does_not_mask_the_real_error_or_leak_the_session(factory):
@@ -1101,3 +1115,121 @@ def test_fail_unenqueued_leaves_a_job_a_worker_already_claimed_alone(factory):
     job, _, cut = _read(factory, job_id, reel_id, cut_id)
     assert job.status == models.JobStatus.running
     assert cut.status == models.CutStatus.rendering
+
+
+# ── round-4 hardening ─────────────────────────────────────────────────────────
+
+def test_a_pre_claim_error_that_will_not_be_retried_fails_the_pending_job_and_frees_the_owner(factory):
+    """No message comes back for it, so it would otherwise sit pending (owner in flight) for the reaper."""
+    job_id, reel_id, cut_id = _make(factory, models.JobType.render, cut_status=models.CutStatus.rendering,
+                                    reel_status=models.ReelStatus.guide_ready)
+    task = _task("t.preclaim_fail", lambda self, db, job, ctx: None, job_type="render", max_retries=0)
+    calls = {"n": 0}
+    from worker.tasks import common
+    real = common._advance
+
+    def fail_only_the_claim(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("schema not migrated")        # non-transient, before the claim
+        return real(*args, **kwargs)
+
+    with patch("worker.tasks.common._advance", side_effect=fail_only_the_claim), \
+            patch.object(task, "retry", side_effect=Retry()) as retry:
+        with pytest.raises(ValueError, match="schema not migrated"):
+            task(job_id)
+    retry.assert_not_called()
+    job, _, cut = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.failed and "could not start" in job.error
+    assert cut.status == models.CutStatus.failed
+
+
+def test_pre_claim_retries_that_are_used_up_fail_the_pending_job(factory):
+    job_id, reel_id, cut_id = _make(factory)
+    task = _task("t.preclaim_used_up", lambda self, db, job, ctx: None, max_retries=0)
+    task.push_request(retries=3)
+    from worker.tasks import common
+    real, calls = common._advance, {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sa_exc.OperationalError("S", {}, Exception("still down"))
+        return real(*args, **kwargs)
+
+    try:
+        with patch("worker.tasks.common._advance", side_effect=flaky):
+            with pytest.raises(sa_exc.OperationalError):
+                task(job_id)
+    finally:
+        task.pop_request()
+    assert _read(factory, job_id, reel_id, cut_id)[0].status == models.JobStatus.failed
+
+
+def test_a_pre_claim_failure_leaves_a_job_a_sibling_already_claimed_alone(factory):
+    job_id, reel_id, cut_id = _make(factory)
+    from worker.tasks import common
+    real, calls = common._advance, {"n": 0}
+
+    def sibling_claims_then_error(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            _set_job(factory, job_id, status=models.JobStatus.running)
+            raise ValueError("boom")
+        return real(*args, **kwargs)
+
+    task = _task("t.preclaim_sibling", lambda self, db, job, ctx: None)
+    with patch("worker.tasks.common._advance", side_effect=sibling_claims_then_error):
+        with pytest.raises(ValueError):
+            task(job_id)
+    job, reel, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.running
+    assert reel.status == models.ReelStatus.generating
+
+
+def test_the_soft_time_limit_is_reported_as_a_timeout_not_as_an_opaque_exception_name(factory):
+    from celery.exceptions import SoftTimeLimitExceeded
+    job_id, reel_id, cut_id = _make(factory)
+    task = _task("t.soft", _raises(SoftTimeLimitExceeded()), max_runtime_s=90)
+    with patch.object(task, "retry", side_effect=Retry()) as retry:
+        with pytest.raises(SoftTimeLimitExceeded):
+            task(job_id)
+    retry.assert_not_called()
+    job, reel, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.failed
+    assert "90 s runtime limit" in job.error
+    assert reel.status == models.ReelStatus.failed
+
+
+def test_an_exception_with_no_message_still_leaves_an_error_the_ui_will_show():
+    """The status templates show the error and the Retry button only when job.error is set;
+    httpx.ReadTimeout('') stringifies to ''."""
+    assert _error_text(httpx.ReadTimeout("")) == "ReadTimeout (no message)"
+    assert _error_text(TimeoutError()) == "TimeoutError (no message)"
+    assert _error_text(ValueError("   ")) == "ValueError (no message)"
+
+
+def test_error_text_redacts_database_row_detail_lines():
+    """psycopg2 puts the offending row (which can hold a token) in the exception text; hide_parameters
+    does not cover it."""
+    leaked = ("null value in column \"token_blob\" of relation \"credentials\" violates not-null constraint\n"
+              "DETAIL:  Failing row contains (54, youtube, null, ya29.SECRET-TOKEN, null)\n"
+              "CONTEXT:  SQL statement \"INSERT ...\"")
+    text = _error_text(ValueError(leaked))
+    assert "SECRET-TOKEN" not in text
+    assert "violates not-null constraint" in text
+    text = _error_text(ValueError("duplicate key\nDETAIL:  Key (email)=(a@b.c) already exists."))
+    assert "a@b.c" not in text
+
+
+def test_fail_unenqueued_starts_from_a_clean_transaction(factory):
+    """The router's transaction may have been killed by idle_in_transaction_session_timeout while the enqueue
+    was failing slowly; it must not be the first thing fail_unenqueued touches."""
+    job_id, reel_id, cut_id = _make(factory, models.JobType.render, cut_status=models.CutStatus.rendering,
+                                    reel_status=models.ReelStatus.guide_ready)
+    db = factory()
+    job = db.get(models.Job, job_id)
+    db.get(models.Cut, cut_id).caption = "unflushed edit from a dead transaction"
+    fail_unenqueued(db, job, ConnectionError("broker down"))
+    assert _read(factory, job_id, reel_id, cut_id)[2].caption is None
+    assert _read(factory, job_id, reel_id, cut_id)[0].status == models.JobStatus.failed

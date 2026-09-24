@@ -60,14 +60,16 @@ def trigger_render(cut_id: int, request: Request, db: Session = Depends(get_db))
         progress=0,
     )
     db.add(job)
-    db.commit()
-    db.refresh(job)
+    db.flush()
+    job_id = job.id
+    db.commit()   # nothing may be open across .delay(): a slow broker failure would outlive an idle-in-transaction timeout
 
     try:
-        render_cut.delay(job.id)
+        render_cut.delay(job_id)
     except Exception as exc:
         fail_unenqueued(db, job, exc)
         raise HTTPException(status_code=503, detail="Could not queue the render — try again") from exc
+    db.refresh(job)
 
     return templates.TemplateResponse(
         request, "fragments/render_status.html",
@@ -91,7 +93,7 @@ def render_status_fragment(
 
 @router.patch("/cuts/{cut_id}", response_class=HTMLResponse)
 async def update_cut(cut_id: int, request: Request, db: Session = Depends(get_db)):
-    cut = db.get(models.Cut, cut_id)
+    cut = db.get(models.Cut, cut_id, with_for_update=True)   # see trigger_render
     if not cut:
         raise HTTPException(status_code=404, detail="Cut not found")
     if cut.status.value != "in_review":
@@ -140,7 +142,7 @@ async def update_cut(cut_id: int, request: Request, db: Session = Depends(get_db
 
 @router.post("/cuts/{cut_id}/approve", response_class=HTMLResponse)
 def approve_cut(cut_id: int, request: Request, db: Session = Depends(get_db)):
-    cut = db.get(models.Cut, cut_id)
+    cut = db.get(models.Cut, cut_id, with_for_update=True)   # see trigger_render
     if not cut:
         raise HTTPException(status_code=404, detail="Cut not found")
     if cut.status.value != "in_review":
@@ -183,14 +185,16 @@ def trigger_publish(cut_id: int, request: Request, db: Session = Depends(get_db)
         progress=0,
     )
     db.add(job)
-    db.commit()
-    db.refresh(job)
+    db.flush()
+    job_id = job.id
+    db.commit()   # see trigger_render
 
     try:
-        publish_cut.delay(job.id)
+        publish_cut.delay(job_id)
     except Exception as exc:
         fail_unenqueued(db, job, exc)
         raise HTTPException(status_code=503, detail="Could not queue the publish — try again") from exc
+    db.refresh(job)
 
     return templates.TemplateResponse(
         request, "fragments/publish_status.html",

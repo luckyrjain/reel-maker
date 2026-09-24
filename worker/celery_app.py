@@ -27,8 +27,9 @@ celery_app.conf.update(
     task_acks_late=True,
     task_reject_on_worker_lost=True,
 
-    # Redis visibility timeout must exceed the worst-case task duration.
-    # Renders can take 10+ min on slow machines; 2 h gives headroom.
+    # A redelivery of a still-running job is a safe no-op (the atomic claim rejects it: only a
+    # pending job runs), so this does not need to exceed every task's max_runtime_s (generate's
+    # cap is 4 h). It only needs to outlast normal broker/worker hiccups.
     broker_transport_options={"visibility_timeout": 7200},
 
     # Prevent any one worker from hoarding multiple long tasks.

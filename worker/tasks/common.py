@@ -18,7 +18,7 @@ from collections.abc import Collection
 from datetime import datetime, timezone
 
 import httpx
-from celery.exceptions import Reject
+from celery.exceptions import Reject, SoftTimeLimitExceeded
 from sqlalchemy import exc as sa_exc
 
 from api import models
@@ -153,14 +153,18 @@ def rollback_owner(db, job, kind: str, states: Collection[str]) -> None:
 
 
 _PARAMETERS = re.compile(r"\[parameters:[^\n]*")
+# psycopg2 puts the offending row in the exception text ("DETAIL:  Failing row contains (...)",
+# "Key (col)=(value) already exists"), which hide_parameters does not cover.
+_DB_DETAIL = re.compile(r"(?m)^[ \t]*(?:DETAIL|CONTEXT):[^\n]*")
 _MAX_ERROR_INPUT = 20_000
 
 
 def _error_text(exc: BaseException) -> str:
     """The exception text as safe to store in job.error (persisted and shown in the UI).
 
-    Linear time on any input: it is capped before the regex runs, and the regex has no
-    backtracking (it redacts from "[parameters:" to the end of that line).
+    Linear time on any input: it is capped before the regexes run, and neither backtracks (each
+    redacts from a fixed marker to the end of its line). Never empty: the status templates show
+    an error and a Retry button only when job.error is set.
     """
     try:
         text = str(exc)
@@ -168,9 +172,24 @@ def _error_text(exc: BaseException) -> str:
         text = f"<{type(exc).__name__}: message could not be rendered>"
     text = text[:_MAX_ERROR_INPUT]
     text = _PARAMETERS.sub("[parameters: <redacted>]", text)   # SQLAlchemy echoes bound values
+    text = _DB_DETAIL.sub("<database detail redacted>", text)
     text = text.replace("\x00", "")                            # Postgres rejects NUL in text
     text = text.encode("utf-8", "replace").decode("utf-8")     # ...and lone surrogates (psycopg2)
-    return text[:2000]
+    return text.strip()[:2000] or f"{type(exc).__name__} (no message)"
+
+
+def _describe(exc: BaseException, max_runtime_s: float) -> str:
+    """What to store in job.error: the scrubbed text, or a clear reason for a timeout."""
+    if isinstance(exc, SoftTimeLimitExceeded):
+        return (f"Exceeded its {max_runtime_s:g} s runtime limit (Celery soft time limit) and was "
+                "stopped. The work is not resumed: retry it, or check what it was waiting on.")
+    return _error_text(exc)
+
+
+def _retry_budget(task, owned: bool) -> int:
+    """How many retries this run may still make. A run that never claimed its job has done nothing
+    yet, so it may retry a few times even when the task itself never retries (enrich, publish)."""
+    return task.max_retries if owned else max(task.max_retries, PRECLAIM_MAX_RETRIES)
 
 
 def _heartbeat_loop(job_id: int, stop: threading.Event, max_runtime_s: float) -> None:
@@ -191,8 +210,23 @@ def _heartbeat_loop(job_id: int, stop: threading.Event, max_runtime_s: float) ->
             _log.warning("heartbeat write failed for job %s", job_id, exc_info=True)
 
 
+def _fail_job(db, job_id, from_status, message: str, owner_kind: str, owner_state: str) -> bool:
+    """Compare-and-set the Job to failed and free its owner (no commit). False if the job had moved on.
+
+    The one place a job is failed from a state we hold no claim on: a sibling that claimed it,
+    or the reaper that already failed it, makes the CAS lose and leaves job and owner alone.
+    """
+    if not _advance(db, job_id, from_status, {"status": models.JobStatus.failed, "error": message[:2000]}):
+        return False
+    job = db.get(models.Job, job_id)
+    job.status = models.JobStatus.failed   # mirror the CAS onto the loaded object
+    job.error = message[:2000]
+    rollback_owner(db, job, owner_kind, {owner_state})
+    return True
+
+
 def _settle_failure(self, db, job_id, exc, *, owned, committed, owner_kind, owner_state,
-                    result, after_commit_failed) -> bool:
+                    result, after_commit_failed, max_runtime_s) -> bool:
     """Record a failure. True when the caller should raise ``self.retry()``.
 
     Every write is a compare-and-set on Job.status, so a run that lost its job (reaped, or
@@ -200,12 +234,17 @@ def _settle_failure(self, db, job_id, exc, *, owned, committed, owner_kind, owne
     """
     db.rollback()
     db.expire_all()   # rollback() is a no-op when no transaction is open; never trust cached rows
-    message = _error_text(exc)
+    message = _describe(exc, max_runtime_s)
+    retriable = should_retry(exc, self.request.retries, _retry_budget(self, owned))
     if not owned:
-        # Never claimed: nothing has run and there is nothing of ours to stamp, so a retry is safe
-        # whatever the task's own budget.
-        return should_retry(exc, self.request.retries, max(self.max_retries, PRECLAIM_MAX_RETRIES))
-    retriable = should_retry(exc, self.request.retries, self.max_retries)
+        if retriable:
+            return True
+        # Never claimed and never retried again: no message will come back for this job, so fail it
+        # now instead of leaving it pending (and its owner in flight) for the reaper. If a sibling
+        # did claim it, the CAS loses and it is left alone.
+        _fail_job(db, job_id, models.JobStatus.pending, f"could not start: {message}", owner_kind, owner_state)
+        db.commit()
+        return False
     if not committed and retriable:
         ok = _advance(db, job_id, models.JobStatus.running, {
             "status": models.JobStatus.pending,
@@ -213,19 +252,36 @@ def _settle_failure(self, db, job_id, exc, *, owned, committed, owner_kind, owne
         })
         db.commit()
         return ok              # only after the reset is durable
-    was = models.JobStatus.done if committed else models.JobStatus.running
-    if _advance(db, job_id, was, {"status": models.JobStatus.failed, "error": message}):
-        job = db.get(models.Job, job_id)
-        job.status = models.JobStatus.failed   # mirror the CAS onto the loaded object
-        job.error = message
-        if committed:
-            # The body already ran and its owner state moved on; only the hook knows what to undo.
-            if after_commit_failed:
-                after_commit_failed(db, job, result)
-        else:
-            rollback_owner(db, job, owner_kind, {owner_state})
+    if committed:
+        # The body already ran and its owner state moved on; only the hook knows what to undo.
+        if _fail_job_keep_owner(db, job_id, message) and after_commit_failed:
+            after_commit_failed(db, db.get(models.Job, job_id), result)
+    else:
+        _fail_job(db, job_id, models.JobStatus.running, message, owner_kind, owner_state)
     db.commit()
     return False
+
+
+def _fail_job_keep_owner(db, job_id, message: str) -> bool:
+    """done -> failed after a failed after_commit; the hook owns cleanup of the owner."""
+    if not _advance(db, job_id, models.JobStatus.done, {"status": models.JobStatus.failed, "error": message[:2000]}):
+        return False
+    job = db.get(models.Job, job_id)
+    job.status = models.JobStatus.failed
+    job.error = message[:2000]
+    return True
+
+
+def _fail_interrupted(db, job_id, exc: BaseException, owner_kind: str, owner_state: str) -> None:
+    """SystemExit / KeyboardInterrupt while the job was running (worker shut down or killed by a
+    Celery hard time limit): fail it now. Do NOT hand it back to pending: Celery has already
+    acked or dropped the message, so nothing would ever pick a pending job up again."""
+    db.rollback()
+    db.expire_all()
+    _fail_job(db, job_id, models.JobStatus.running,
+              f"Worker was shut down while the job was running ({type(exc).__name__}). "
+              "The work was not finished; retry it.", owner_kind, owner_state)
+    db.commit()
 
 
 def _fail_rejected_retry(db, job_id, exc, owner_kind, owner_state) -> None:
@@ -233,11 +289,8 @@ def _fail_rejected_retry(db, job_id, exc, owner_kind, owner_state) -> None:
     rather than leaving it pending until the reaper's pending threshold."""
     db.rollback()
     db.expire_all()
-    if _advance(db, job_id, models.JobStatus.pending, {
-        "status": models.JobStatus.failed,
-        "error": f"could not schedule retry: {_error_text(exc)}"[:2000],
-    }):
-        rollback_owner(db, db.get(models.Job, job_id), owner_kind, {owner_state})
+    _fail_job(db, job_id, models.JobStatus.pending, f"could not schedule retry: {_error_text(exc)}",
+              owner_kind, owner_state)
     db.commit()
 
 
@@ -245,14 +298,13 @@ def fail_unenqueued(db, job, exc: BaseException) -> None:
     """A router created a Job but could not enqueue it: fail it and free its owner now.
 
     Otherwise the cut/reel sits in flight, refusing every retry with 409, until the reaper's
-    pending threshold (hours) decides the message was lost.
+    pending threshold (hours) decides the message was lost. Starts from a clean transaction: the
+    caller's may have been killed by the database's idle_in_transaction_session_timeout while the
+    enqueue was failing slowly.
     """
+    db.rollback()
     kind, state = JOB_IN_FLIGHT[job.type.value]
-    if _advance(db, job.id, models.JobStatus.pending, {
-        "status": models.JobStatus.failed,
-        "error": f"could not enqueue: {_error_text(exc)}"[:2000],
-    }):
-        rollback_owner(db, job, kind, {state})
+    _fail_job(db, job.id, models.JobStatus.pending, f"could not enqueue: {_error_text(exc)}", kind, state)
     db.commit()
 
 
@@ -264,7 +316,6 @@ def job_task(
     after_commit_failed=None,
     max_runtime_s: float,
     start_progress: int = 5,
-    release_on_shutdown: bool = True,
 ):
     """Wrap a task body in the Job lifecycle. Apply beneath ``@celery_app.task(bind=True, ...)``.
 
@@ -292,34 +343,39 @@ def job_task(
     Failure: roll back, then either reset to ``pending`` and ``self.retry()`` (transient
     error with retries left; ``attempts`` is NOT bumped) or stamp ``failed`` and roll the
     owner back per ``JOB_IN_FLIGHT[job_type]``. Every STATUS write is a compare-and-set, so a
-    worker that lost the job never changes its status or its owner. ``progress``, ``attempts``,
-    ``started_at`` and ``job.meta`` are plain writes. If the broker refuses the retry message
-    the job is failed at once. A failure in ``after_commit`` never retries (the body already
-    ran): the job is flipped ``done -> failed`` and ``after_commit_failed(db, job, result)``
-    alone cleans up what the body left behind, including the owner. If the run never claimed
-    the job (e.g. a DB error at the guard), nothing has run, so a transient error is retried up
-    to PRECLAIM_MAX_RETRIES even for a task with ``max_retries=0``. Errors while recording a
-    failure are logged and never mask the original exception.
+    worker that lost the job never changes its status or its owner. ``started_at``, ``attempts``,
+    ``job.meta`` and the ``start_progress`` write are plain; ``heartbeat()`` and the done-stamp write
+    ``progress`` inside a compare-and-set. If the broker refuses the retry message the job is failed at
+    once. A failure in ``after_commit`` never retries (the body already ran): the job is flipped
+    ``done -> failed`` and ``after_commit_failed(db, job, result)`` alone cleans up what the body left
+    behind, including the owner. A run that never claimed the job (e.g. a DB error at the guard) has
+    done nothing, so a transient error is retried up to PRECLAIM_MAX_RETRIES even for a task with
+    ``max_retries=0``; once that is used up, or for a non-transient error, the still-pending job is
+    failed and its owner freed (no message will come back for it). Errors while recording a failure
+    are logged and never mask the original exception. ``job.error`` is never empty, has database row
+    detail and bound parameters redacted, and says so plainly when the cause was the soft time limit.
 
     ``max_runtime_s`` (required) is the longest a body may run. Pass the same number to
     ``time_limits()`` on ``@celery_app.task`` so Celery raises SoftTimeLimitExceeded in the body
     and, failing that, kills the worker process: stopping the heartbeat alone only lets the
-    reaper fail the job record, it does not free a hung worker slot.
+    reaper fail the job record, it does not free a hung worker slot. A body that swallows
+    ``Exception`` around its blocking calls also swallows the soft limit (do not: re-raise it);
+    the hard limit then ends the run.
 
-    A ``BaseException`` (SystemExit, KeyboardInterrupt) releases the job back to ``pending`` so the
-    redelivered message passes step 1 - unless ``release_on_shutdown=False``, for tasks whose side
-    effects are not safe to repeat (publish): the job then stays ``running`` and the reaper fails
-    it. Note this path only runs where Python unwinds (solo/threads pools, Ctrl-C); a prefork
-    child killed by SIGTERM/SIGKILL (the documented ``pkill`` restart) never reaches it, and the
-    job is failed by the reaper after STALE_MINUTES instead.
+    A ``BaseException`` (SystemExit, KeyboardInterrupt) means the worker is shutting down or the hard
+    time limit is killing the process. The job is FAILED at once and its owner freed. It is never handed
+    back to ``pending``: Celery has already acked or dropped the message, so nothing would pick a pending
+    job up again (the reaper would only notice hours later). A child killed with SIGKILL never gets here;
+    its job stays ``running`` and the reaper fails it after STALE_MINUTES.
 
     ``del run.__wrapped__`` is what keeps ``.delay(job_id)`` working: functools.wraps would
     otherwise expose the body's signature to Celery, which rejects the call with TypeError.
 
-    Adding a new job type takes three edits, not one: a JobType value, its ``JOB_IN_FLIGHT``
-    entry (api/state.py), and a ``max_runtime_s``. Always set ``max_retries`` on the task:
-    Celery's default of 3 would silently enable retries. ``run.job_type``, ``run.max_runtime_s``
-    and ``run.release_on_shutdown`` exist so tests can pin each task's wiring.
+    Adding a new job type takes several edits, not one: a JobType value, its ``JOB_IN_FLIGHT`` entry
+    (api/state.py), a ``task_routes`` entry (worker/celery_app.py), ``**time_limits(...)`` on the
+    ``@celery_app.task`` and a ``max_runtime_s``. Always set ``max_retries`` on the task: Celery's
+    default of 3 would silently enable retries. ``run.job_type`` and ``run.max_runtime_s`` exist so
+    tests can pin each task's wiring (a test fails for any registered task that lacks time limits).
     """
     owner_kind, owner_state = JOB_IN_FLIGHT[job_type]
 
@@ -393,6 +449,7 @@ def job_task(
                         self, db, job_id, exc, owned=owned, committed=committed,
                         owner_kind=owner_kind, owner_state=owner_state,
                         result=result, after_commit_failed=after_commit_failed,
+                        max_runtime_s=max_runtime_s,
                     )
                 except Exception:
                     # Never let a bookkeeping failure replace the real error.
@@ -407,7 +464,7 @@ def job_task(
                     try:
                         raise self.retry(
                             exc=exc, countdown=30 * 2 ** self.request.retries,
-                            max_retries=self.max_retries if owned else max(self.max_retries, PRECLAIM_MAX_RETRIES),
+                            max_retries=_retry_budget(self, owned),
                         )
                     except Reject:
                         try:
@@ -418,15 +475,14 @@ def job_task(
                         raise
                 raise
 
-            except BaseException:
-                # SystemExit / KeyboardInterrupt (worker cold shutdown).
-                if release_on_shutdown and owned and not committed:
+            except BaseException as exc:
+                # SystemExit / KeyboardInterrupt: the worker is shutting down, or a Celery hard time
+                # limit is killing this process. Fail the job now (see _fail_interrupted).
+                if owned and not committed:
                     try:
-                        db.rollback()
-                        _advance(db, job_id, models.JobStatus.running, {"status": models.JobStatus.pending})
-                        db.commit()
+                        _fail_interrupted(db, job_id, exc, owner_kind, owner_state)
                     except Exception:
-                        _log.exception("could not release job %s on shutdown", job_id)
+                        _log.exception("could not fail job %s on shutdown", job_id)
                 raise
             finally:
                 stop.set()
@@ -438,7 +494,6 @@ def job_task(
 
         del run.__wrapped__
         run.job_type = job_type   # exposed so tests can pin each task's wiring
-        run.release_on_shutdown = release_on_shutdown
         run.max_runtime_s = max_runtime_s
         return run
 

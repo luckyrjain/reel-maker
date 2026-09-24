@@ -192,9 +192,9 @@ Edge TTS synthesis, and the final MP4/thumbnail — worked as designed.
 The guard / stamp / retry / failure stanza had been copied into four task modules (and drifted:
 `heartbeat()` before, then the retry fix landing in three separate commits). It now lives in
 `worker/tasks/common.py::job_task`, with the owner-state table `api/state.py::JOB_IN_FLIGHT` shared
-by the tasks and the reaper. Six rounds of adversarial review (correctness, SRE, database, security,
-mutation testing, architecture), with the concurrency-sensitive parts verified on real Postgres 16,
-turned it into a stricter lifecycle. Behaviour changes an operator should know about:
+by the tasks and the reaper. The concurrency-sensitive parts (the atomic claim, the fenced done-stamp,
+lock ordering against the reaper, idle-in-transaction across long calls) were verified against real
+PostgreSQL 16, not just SQLite. Behaviour changes an operator should know about:
 
 - **Only `pending` jobs run.** The claim is an atomic `UPDATE … WHERE status='pending'`; `failed` is
   terminal (an operator retry creates a new Job). The done-stamp and `heartbeat()` are fenced the same
@@ -212,7 +212,13 @@ turned it into a stricter lifecycle. Behaviour changes an operator should know a
 - **Routers fail fast** when `.delay()` raises (503, job failed, cut/reel rolled back) instead of
   leaving the owner in flight until the reaper's 4 h pending threshold.
 - `OperationalError`/`InterfaceError` are transient; `pool_pre_ping` and `hide_parameters` are on;
-  `job.error` is sanitised; task sessions use `expire_on_commit=False`.
+  `job.error` is sanitised (never empty, database row detail and bound parameters redacted, a soft
+  time-limit failure says so in plain language); task sessions use `expire_on_commit=False`.
+- **A worker shutdown (or a hard time limit) fails the job at once**, freeing its owner immediately,
+  rather than handing it back to `pending` — Celery has already acked or dropped the message by then,
+  so a `pending` job would otherwise wait for the reaper's threshold with no message coming back for it.
+- **`approve_cut` and `update_cut` also lock the cut row**, matching the trigger routes, so an approve
+  cannot race a render past its own status guard.
 
 ## Phase 4a — Operator visibility (done)
 
@@ -393,6 +399,7 @@ a new required parameter every publisher now takes instead of reading
 
 | Issue | Severity | Notes |
 |---|---|---|
+| `safe_to_publish` gate checks the current pins, not the video that will ship | Medium | `resolve_or_reuse()` re-pins and commits per beat as the operator edits and re-renders; a failed render never clears `cut.video_path`. If render N used a non-free asset (blocked) and a later render N+1 re-pins to a safe one but then itself fails, "Retry publish" gates against the safe N+1 pins while `video_path` still points at render N's (unsafe) video — the gate passes and the wrong video ships, with attribution built from the wrong pins too. Fix would clear `video_path` (or check a pins fingerprint) whenever a render starts or re-pins |
 | No multi-image collage in one frame | Low | Currently cycles sequentially; side-by-side layout not implemented |
 | MoviePy video readers leak until worker recycle | Low | `_build_media_sub_clip` opens `VideoFileClip`s that only `worker_max_tasks_per_child=10` reclaims; marked with a `ponytail:` comment |
 | `asset_sourcer` degrades silently to black frames | Medium | Every sourcer swallows its own exceptions and returns `None`, so a Pexels/Wikipedia outage produces a black-frame reel that reports success — and never reaches the retry branch |

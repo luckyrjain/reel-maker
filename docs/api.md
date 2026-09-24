@@ -22,6 +22,9 @@ Create a reel and enqueue **context enrichment** (which in turn enqueues guide g
 
 **Response:** `text/html` — `fragments/pipeline_status.html` fragment polling `GET /api/reels/{reel_id}/active-job-fragment` every 2 s.
 
+**Errors:**
+- `503` — the job could not be queued (broker unreachable); the reel and job are rolled back to `failed` so it can be retried at once
+
 ---
 
 ### `GET /api/reels/{reel_id}/active-job-fragment`
@@ -114,6 +117,7 @@ Transition a cut to `rendering` and enqueue the render task.
 
 **Errors:**
 - `404` — cut not found
+- `422` — cut has no guide yet
 - `409` — cut is already `rendering`, is in a non-renderable status, or is already posted (`platform_post_id` set: re-rendering would leave the cut pointing at the live post)
 - `503` — the job could not be queued (broker unreachable); the job and cut are rolled back so it can be retried at once
 
@@ -126,6 +130,34 @@ HTMX polling endpoint for render progress.
 **Query params:** `job_id` (required)
 
 **Response:** `text/html` — `fragments/render_status.html`. When `done`, the fragment contains a `<video>` element. Polling stops when status is `done` or `failed`.
+
+---
+
+### `POST /api/cuts/{cut_id}/publish`
+
+Transition a cut to `publishing` and enqueue the publish task. `assert_safe_to_publish()` runs inside the task, immediately before any upload — not gated on a cut that already has a `platform_post_id` (see below), so a finalize never blocks on it.
+
+**Valid from statuses:** `approved`, `scheduled`, `failed` (auto-resets to `approved` first)
+
+If the cut already has a `platform_post_id` (a previous run posted it but did not finish recording that — reaped, or shut down before the done-stamp), the task finalizes without uploading again.
+
+**Response:** `text/html` — `fragments/publish_status.html` with HTMX polling trigger.
+
+**Errors:**
+- `404` — cut not found
+- `422` — cut has no rendered video
+- `409` — cut is already `publishing`, or is in a non-publishable status
+- `503` — the job could not be queued (broker unreachable); the job and cut are rolled back so it can be retried at once
+
+---
+
+### `GET /api/cuts/{cut_id}/publish-status`
+
+HTMX polling endpoint for publish progress.
+
+**Query params:** `job_id` (required)
+
+**Response:** `text/html` — `fragments/publish_status.html`. Polling stops when status is `done` or `failed`.
 
 ---
 

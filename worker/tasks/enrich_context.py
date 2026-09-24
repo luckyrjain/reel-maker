@@ -46,12 +46,12 @@ def _abandon_generate(db, job, generate_job_id):
     rollback_owner(db, job, "reel", {"generating"})
 
 
-# max_retries=0 on purpose: enrichment falls back to the raw context, and a retry would
-# re-run a paid LLM call for no gain. If the follow-up enqueue fails after the job is done,
-# _abandon_generate cleans up (the reaper would otherwise only notice after 30 minutes).
 _MAX_RUNTIME_S = 30 * 60
 
 
+# max_retries=0 on purpose: enrichment falls back to the raw context, and a retry would
+# re-run a paid LLM call for no gain. If the follow-up enqueue fails after the job is done,
+# _abandon_generate cleans up (the reaper would otherwise only notice after hours).
 @celery_app.task(bind=True, max_retries=0, **time_limits(_MAX_RUNTIME_S))
 @job_task(
     "enrich",

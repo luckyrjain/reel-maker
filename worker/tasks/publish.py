@@ -28,11 +28,10 @@ _MAX_RUNTIME_S = 60 * 60
 # automatic retry would then post the video twice. The operator retries via the UI instead.
 # The platform_post_id guard below only covers failures AFTER the post was recorded; a timeout
 # inside publisher.publish() happens before any id exists, so the operator should check the
-# platform before retrying (the failed-cut card says so).
+# platform before retrying (the failed-cut card says so). The same caveat applies to a shutdown or
+# the soft time limit landing mid-upload.
 @celery_app.task(bind=True, max_retries=0, **time_limits(_MAX_RUNTIME_S))
-# release_on_shutdown=False: a shutdown mid-upload may have been accepted by the platform; a
-# redelivered run would upload again. The job stays running and the reaper fails it instead.
-@job_task("publish", prepare=_load_cut, max_runtime_s=_MAX_RUNTIME_S, release_on_shutdown=False)
+@job_task("publish", prepare=_load_cut, max_runtime_s=_MAX_RUNTIME_S)
 def publish_cut(self, db, job, cut):
     # cut.status is set to "publishing" by the router before this task is
     # enqueued (mirrors trigger_render / render_cut) — this task does not

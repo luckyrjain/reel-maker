@@ -1,6 +1,7 @@
 import json
 import logging
 
+from celery.exceptions import SoftTimeLimitExceeded
 from pydantic import ValidationError
 
 from api import models
@@ -387,6 +388,8 @@ def generate_guide(self, db, job, reel):
             if last_score < quality_threshold:
                 job.meta = {**(job.meta or {}), "structured_score": last_score, "structured_fallback": True}
                 guide = None
+        except SoftTimeLimitExceeded:
+            raise   # the runtime limit ends the whole task; falling back to the standard path would ignore it
         except Exception as exc:
             last_exc = exc
             guide = None

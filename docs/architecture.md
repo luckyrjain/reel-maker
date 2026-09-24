@@ -148,7 +148,7 @@ The browser never fetches JSON. All API responses to the browser are HTML fragme
 | `test_publish_task.py` | 10 tests — safety gate, no auto-retry, early post id, finalize without re-upload, attribution |
 | `test_render_task.py` | 6 tests — missing cut, already-posted cut refused, success clears stale error, music wiring |
 | `test_maintenance.py` | 29 tests — reaper on SQLite: per-job-type rollback and pending thresholds, compare-and-set back-off, status pin |
-| `test_asset_sourcer.py` | 4 tests — `resolve_or_reuse` pin, reuse-without-API-call, re-pin, per-beat isolation |
+| `test_asset_sourcer.py` | 7 tests — `resolve_or_reuse` pin, reuse-without-API-call, re-pin, per-beat isolation, commit behaviour, Wikipedia search-before-cache ordering |
 | `test_llm_judge.py` | 3 tests — neutral-score fallback on provider raise, garbage JSON, out-of-range dimension |
 | `test_tts.py` | 8 tests — provider selection, unknown-provider fallback, `SilentProvider` shared file, `synth_to_budget` clamp |
 
@@ -277,8 +277,8 @@ combined = int(rule × 0.4 + llm × 0.6)   threshold 80 (NVIDIA) / 65 (local Oll
 | Setting | Value | Reason |
 |---|---|---|
 | `task_acks_late` | `True` | Ack only after task returns — killed worker requeues (the redelivered message finds the job `running`/`failed` and no-ops; recovery is the reaper failing the job, then an operator retry) |
-| `task_reject_on_worker_lost` | `True` | SIGKILL requeues rather than drops |
-| `visibility_timeout` | 7200 s | > worst-case render; prevents duplicate runs on slow tasks |
+| `task_reject_on_worker_lost` | `True` | SIGKILL redelivers the message rather than dropping it; the redelivery finds the job `running` (or already `failed` by the reaper) and no-ops — recovery is the reaper failing the job, not an automatic re-run |
+| `visibility_timeout` | 7200 s | Outlasts normal broker/worker hiccups; a redelivery of a still-running job is a safe no-op via the atomic claim, so this need not exceed every task's `max_runtime_s` (generate's cap is 4 h) |
 | `worker_prefetch_multiplier` | 1 | No worker hoards multiple long tasks |
 | `worker_max_tasks_per_child` | 10 | Respawn render workers to reclaim MoviePy/ffmpeg memory |
 | `max_retries` | 2 | Real, via `should_retry()` — 30 s/60 s backoff on transient failures only; `enrich_context` and `publish_cut` stay at 0 (publishing is an irreversible external post) |

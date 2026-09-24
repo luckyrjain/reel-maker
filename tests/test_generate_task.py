@@ -172,3 +172,31 @@ def test_structured_path_non_hook_beats_have_no_music_cue():
     )
     assert guide.beats[1].music_cue is None
     assert guide.beats[2].music_cue is None
+
+
+def test_the_soft_time_limit_in_the_structured_path_does_not_fall_back_to_the_standard_path():
+    """The structured path catches Exception and falls back to a second, paid LLM path; that would
+    swallow the runtime limit and keep running to the hard kill."""
+    from celery.exceptions import SoftTimeLimitExceeded
+    from worker.tasks.generate import generate_guide
+
+    job = _job()
+    reel = _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
+    db.query.return_value.filter.return_value.all.return_value = [_cut()]
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.generate.paid_call_count", return_value=0),
+        patch("worker.tasks.generate.get_llm_provider"),
+        patch("worker.tasks.generate.script_parser.parse", return_value=[MagicMock()]),
+        patch("worker.tasks.generate.resolve_generation_path", return_value="structured"),
+        patch("worker.tasks.generate._generate_from_structured_script", side_effect=SoftTimeLimitExceeded()),
+        patch("worker.tasks.generate.build_messages") as standard_path,
+    ):
+        with pytest.raises(SoftTimeLimitExceeded):
+            generate_guide(1)
+
+    standard_path.assert_not_called()
+    assert job.status == models.JobStatus.failed
