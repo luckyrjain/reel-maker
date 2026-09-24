@@ -231,10 +231,15 @@ PostgreSQL 16, not just SQLite. Behaviour changes an operator should know about:
   still committed rather than silently rolled back with the job left looking `done` forever. The hook
   runs inside its own `db.begin_nested()` SAVEPOINT, so a raise partway through a multi-write hook
   (`_abandon_generate`'s real shape: fail the orphaned follow-up Job, then roll the reel back) undoes
-  only the hook's own writes — not the failure stamp, and not a half-done cleanup either. Unlike the
-  rest of this section, the SAVEPOINT path itself is verified against SQLite only (the test suite's
-  engine) — not yet checked against real PostgreSQL 16, where a poisoned-transaction error inside the
-  hook would exercise `ROLLBACK TO SAVEPOINT` differently than SQLite's more forgiving behavior.
+  only the hook's own writes — not the failure stamp, and not a half-done cleanup either. The
+  automated test suite exercises this against SQLite only, but the mechanism was separately checked
+  by hand against real PostgreSQL 16, including a genuine `IntegrityError` raised from inside the
+  SAVEPOINT (not just a Python-level exception) to confirm `ROLLBACK TO SAVEPOINT` correctly
+  un-poisons the transaction — the fail-stamp survived and the hook's own write reverted, matching
+  SQLite's behavior. A SystemExit/KeyboardInterrupt raised BY THE HOOK ITSELF (not by `after_commit`)
+  is deliberately not swallowed by the SAVEPOINT wrapper, but does commit the fail-stamp before
+  re-raising — without that, the exception unwinding straight to `job_task`'s `finally: db.close()`
+  would roll it back too.
 - `_generate_caption_hashtags`'s fallback path no longer swallows `SoftTimeLimitExceeded` — a timeout
   there now fails the task visibly instead of completing with a template caption.
 

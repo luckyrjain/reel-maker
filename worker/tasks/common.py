@@ -246,6 +246,15 @@ def _stamp_failed_and_run_cleanup(db, job_id, message: str, after_commit_failed,
     ``on_shutdown`` only labels the exception log line (" on shutdown" appended) so a hook failure
     during the SystemExit/KeyboardInterrupt path reads differently from one during ordinary
     after_commit failure handling; it has no effect on the CAS, the savepoint, or what gets committed.
+
+    A SystemExit/KeyboardInterrupt raised BY THE HOOK ITSELF (a shutdown signal landing exactly while
+    it runs) is not swallowed here -- this file's own rule is that a shutdown always propagates so the
+    process actually exits. But it must not propagate WITHOUT committing first: neither caller commits
+    the fail-stamp `_fail_job_keep_owner` already wrote until after this function returns normally, and
+    a BaseException unwinding out of `job_task`'s `run()` skips straight to its `finally: db.close()`
+    (sibling `except` clauses on the same `try` do not catch each other's escapes) -- which would roll
+    the uncommitted fail-stamp back right along with the hook's already-reverted SAVEPOINT. Committing
+    here, once, right before re-raising, is what keeps that from silently losing the fail-stamp again.
     """
     if _fail_job_keep_owner(db, job_id, message) and after_commit_failed:
         try:
@@ -255,6 +264,9 @@ def _stamp_failed_and_run_cleanup(db, job_id, message: str, after_commit_failed,
             suffix = " on shutdown" if on_shutdown else ""
             _log.exception("after_commit_failed hook raised for job %s%s; failure stamp still recorded, "
                             "hook's own partial writes rolled back", job_id, suffix)
+        except BaseException:
+            db.commit()
+            raise
 
 
 def _settle_failure(self, db, job_id, exc, *, owned, committed, owner_kind, owner_state,
@@ -307,12 +319,13 @@ def _settle_failure(self, db, job_id, exc, *, owned, committed, owner_kind, owne
 def _fail_job_keep_owner(db, job_id, message: str) -> bool:
     """done -> failed after a failed after_commit; the hook owns cleanup of the owner.
 
-    The durable write here is the ``_advance`` UPDATE above; the ``job.status``/``job.error``
-    assignment is a Python-side mirror only. That ordering matters to `_stamp_failed_and_run_cleanup`:
-    it calls this BEFORE opening the cleanup hook's SAVEPOINT, so a hook that raises rolls back only
-    its own work -- ``ROLLBACK TO SAVEPOINT`` never touches a statement that ran before the savepoint
-    opened. If this function's durable write ever moved to happen lazily at flush/commit time instead
-    of via an immediate bulk UPDATE, it would need to move ahead of the savepoint too.
+    `_stamp_failed_and_run_cleanup` calls this BEFORE opening the cleanup hook's SAVEPOINT, so a hook
+    that raises rolls back only its own work. This is safe regardless of whether this function's own
+    write to ``job`` is an immediate bulk UPDATE or a plain ORM attribute assignment left for the next
+    flush: SQLAlchemy's ``Session.begin_nested()`` always flushes pending session state before
+    establishing the SAVEPOINT (``SessionTransaction._take_snapshot()``), so anything written here,
+    however it was written, is already durable to the SAVEPOINT before the hook's code runs -- only
+    calling this function AFTER the SAVEPOINT had opened would put its write at risk.
     """
     if not _advance(db, job_id, models.JobStatus.done, {"status": models.JobStatus.failed, "error": message[:2000]}):
         return False

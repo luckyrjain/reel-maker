@@ -626,6 +626,28 @@ def test_stamp_failed_and_run_cleanup_labels_the_log_line_by_shutdown_or_not(fac
     assert not any("on shutdown" in r.getMessage() for r in caplog.records)
 
 
+def test_a_shutdown_signal_inside_the_cleanup_hook_still_commits_the_failure_stamp(factory):
+    """A SystemExit/KeyboardInterrupt raised BY THE HOOK ITSELF (not by after_commit -- a shutdown
+    signal landing exactly while the hook runs) must not escape without committing the fail-stamp
+    _fail_job_keep_owner already wrote. It is deliberately NOT swallowed (this file's rule is that a
+    shutdown always propagates), but an uncommitted BaseException unwinding straight past job_task's
+    except-Exception siblings to its `finally: db.close()` would roll the fail-stamp back right along
+    with the hook's already-reverted SAVEPOINT -- silently reverting the job to looking `done` again."""
+    job_id, reel_id, cut_id = _make(factory, models.JobType.enrich)
+
+    def hook(db, job, result):
+        raise SystemExit("shutdown mid-cleanup")
+
+    task = _task("t.hook_raises_systemexit", lambda self, db, job, ctx: 1, job_type="enrich",
+                 after_commit=MagicMock(side_effect=ConnectionError("broker down")),
+                 after_commit_failed=hook)
+    with pytest.raises(SystemExit):
+        task(job_id)
+    job, _, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.failed
+    assert "broker down" in job.error
+
+
 def test_a_body_failure_does_not_run_the_cleanup_hook(factory):
     job_id, *_ = _make(factory, models.JobType.enrich)
     hook = MagicMock()
