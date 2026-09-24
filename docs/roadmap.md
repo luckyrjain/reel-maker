@@ -300,7 +300,21 @@ PostgreSQL 16, not just SQLite. Behaviour changes an operator should know about:
     failure stamp during shutdown)` from logger `worker.tasks.common` — there is no alerting on it
     (this repo has none configured for anything). A Job whose `status` is `done`, `error` is `None`,
     and whose owner (reel/cut) is still in the in-flight state `JOB_IN_FLIGHT` maps to that job type
-    is the on-disk signature; nothing currently queries for that combination.
+    is the on-disk signature; nothing currently queries for that combination. A background SRE
+    reviewer's stronger recommendation was to alert on this function's own degraded-path log lines
+    directly (`SAVEPOINT rollback itself failed`, `could not roll back the poisoned transaction`,
+    `could not redo the failure stamp`, `could NOT confirm`, `could not load job ... for the cleanup
+    hook`, `could not record failure of job`) rather than only documenting the on-disk signature —
+    cheap once any alerting exists, moot until it does.
+  - **Extraction**: after four consecutive rounds each finding a real bug in the SAVEPOINT-rollback
+    recovery ladder specifically (rounds 10-13), the nested-try/except-plus-mutable-flag encoding of
+    that ~20-line block was pulled into its own function, `_recover_from_hook_failure(db, job_id,
+    message, nested) -> bool`, following the same extraction idiom this file already used twice
+    (`_commit_or_log`, `_commit_stamp_and_reraise`). Same behavior (confirmed: full suite green
+    before and after, byte-for-byte identical log lines), but the four recovery outcomes (savepoint
+    rollback ok / fails+full-rollback fails / fails+full-rollback ok+redo fails / fails+full-rollback
+    ok+redo ok) are now independently unit-tested against the extracted function directly, instead of
+    only reachable by also driving the outer hook-invocation and shutdown-classification logic.
 - `_generate_caption_hashtags`'s fallback path no longer swallows `SoftTimeLimitExceeded` — a timeout
   there now fails the task visibly instead of completing with a template caption.
 

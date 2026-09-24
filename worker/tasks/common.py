@@ -309,39 +309,17 @@ def _stamp_failed_and_run_cleanup(db, job_id, message: str, after_commit_failed,
             # never got a chance to run. Misattributing this to "the hook raised" (by putting the
             # db.get() inside the hook's own try/except) would send an operator looking at the
             # wrong function during an incident.
+            # "staged", not "recorded": _fail_job_keep_owner's write is only pending in this
+            # session's transaction here -- neither caller commits until after this function
+            # returns, so claiming it's durable would overstate what's actually confirmed yet.
             _log.exception("could not load job %s for the cleanup hook; hook not invoked, "
-                            "failure stamp still recorded", job_id)
+                            "failure stamp staged but not yet committed", job_id)
             return
         nested = db.begin_nested()
         try:
             after_commit_failed(db, hook_job, result)
         except BaseException as hook_exc:
-            # Whether the fail-stamp write and the hook's own rollback both land is tracked
-            # explicitly, so the log line below never claims more than actually happened.
-            confirmed = True
-            try:
-                nested.rollback()
-            except Exception:
-                confirmed = False
-                _log.exception("SAVEPOINT rollback itself failed for job %s; discarding the hook's "
-                                "still-pending writes and redoing the failure stamp", job_id)
-                try:
-                    db.rollback()
-                except Exception:
-                    _log.exception("could not roll back the poisoned transaction for job %s; the "
-                                    "hook's partial writes may still be committed alongside the "
-                                    "fail-stamp", job_id)
-                else:
-                    try:
-                        _fail_job_keep_owner(db, job_id, message)
-                    except Exception:
-                        # A third failure in a row (SAVEPOINT rollback, then this). Must not let
-                        # it replace hook_exc below -- the whole point of this branch is making
-                        # sure the shutdown signal survives every failure along the way.
-                        _log.exception("could not redo the failure stamp for job %s after "
-                                        "discarding the poisoned transaction", job_id)
-                    else:
-                        confirmed = True
+            confirmed = _recover_from_hook_failure(db, job_id, message, nested)
             if isinstance(hook_exc, Exception):
                 suffix = " on shutdown" if on_shutdown else ""
                 if confirmed:
@@ -359,6 +337,33 @@ def _stamp_failed_and_run_cleanup(db, job_id, message: str, after_commit_failed,
                                           " (recording the failure stamp during shutdown)")
         else:
             nested.commit()
+
+
+def _recover_from_hook_failure(db, job_id, message: str, nested) -> bool:
+    """Roll back the hook's SAVEPOINT; on failure, fall back to a full rollback + fail-stamp CAS
+    redo. Returns whether the fail-stamp is confirmed durable and the hook's writes confirmed
+    discarded -- never raises for a failure along this recovery path itself (each step is caught,
+    logged, and folded into the return value), only for a fresh BaseException from a DB call.
+    """
+    try:
+        nested.rollback()
+        return True
+    except Exception:
+        _log.exception("SAVEPOINT rollback itself failed for job %s; discarding the hook's "
+                        "still-pending writes and redoing the failure stamp", job_id)
+    try:
+        db.rollback()
+    except Exception:
+        _log.exception("could not roll back the poisoned transaction for job %s; the hook's "
+                        "partial writes may still be committed alongside the fail-stamp", job_id)
+        return False
+    try:
+        _fail_job_keep_owner(db, job_id, message)
+    except Exception:
+        _log.exception("could not redo the failure stamp for job %s after discarding the "
+                        "poisoned transaction", job_id)
+        return False
+    return True
 
 
 def _settle_failure(self, db, job_id, exc, *, owned, committed, owner_kind, owner_state,

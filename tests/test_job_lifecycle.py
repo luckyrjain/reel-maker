@@ -694,6 +694,59 @@ def test_an_ordinary_hook_bug_during_an_ambient_shutdown_is_not_misclassified(fa
     assert not any("SAVEPOINT rollback itself failed" in r.getMessage() for r in caplog.records)
 
 
+# ── _recover_from_hook_failure: the SAVEPOINT-rollback recovery ladder, in isolation ──────────
+
+def test_recover_from_hook_failure_confirms_when_the_savepoint_rollback_just_works(factory):
+    """The common case: nested.rollback() succeeds outright, nothing else runs."""
+    from worker.tasks.common import _recover_from_hook_failure
+
+    job_id, *_ = _make(factory, models.JobType.enrich, status=models.JobStatus.done)
+    db = factory()
+    nested = MagicMock()
+    assert _recover_from_hook_failure(db, job_id, "orig failure", nested) is True
+    nested.rollback.assert_called_once()
+
+
+def test_recover_from_hook_failure_is_not_confirmed_when_the_full_rollback_also_fails(factory):
+    job_id, *_ = _make(factory, models.JobType.enrich, status=models.JobStatus.done)
+    db = factory()
+    nested = MagicMock()
+    nested.rollback.side_effect = sa_exc.OperationalError("ROLLBACK TO SAVEPOINT", {}, Exception("gone"))
+
+    class AlwaysDead:
+        def rollback(self):
+            raise sa_exc.OperationalError("ROLLBACK", {}, Exception("connection gone"))
+
+    with patch.object(db, "rollback", AlwaysDead().rollback):
+        from worker.tasks.common import _recover_from_hook_failure
+        assert _recover_from_hook_failure(db, job_id, "orig failure", nested) is False
+
+
+def test_recover_from_hook_failure_is_not_confirmed_when_the_stamp_redo_fails(factory):
+    from worker.tasks.common import _recover_from_hook_failure
+
+    job_id, *_ = _make(factory, models.JobType.enrich, status=models.JobStatus.done)
+    db = factory()
+    nested = MagicMock()
+    nested.rollback.side_effect = sa_exc.OperationalError("ROLLBACK TO SAVEPOINT", {}, Exception("gone"))
+
+    with patch("worker.tasks.common._fail_job_keep_owner", side_effect=RuntimeError("redo failed")):
+        assert _recover_from_hook_failure(db, job_id, "orig failure", nested) is False
+
+
+def test_recover_from_hook_failure_confirms_after_a_full_rollback_and_successful_redo(factory):
+    """The full recovery path: SAVEPOINT rollback fails, full db.rollback() succeeds, and the
+    fail-stamp CAS redo on the now-clean transaction succeeds too."""
+    from worker.tasks.common import _recover_from_hook_failure
+
+    job_id, *_ = _make(factory, models.JobType.enrich, status=models.JobStatus.done)
+    db = factory()
+    nested = MagicMock()
+    nested.rollback.side_effect = sa_exc.OperationalError("ROLLBACK TO SAVEPOINT", {}, Exception("gone"))
+    assert _recover_from_hook_failure(db, job_id, "orig failure", nested) is True
+    assert db.get(models.Job, job_id).status == models.JobStatus.failed
+
+
 def test_a_savepoint_rollback_failure_does_not_mask_a_shutdown_signal_from_the_hook(factory):
     """If the hook does a real write before raising SystemExit/KeyboardInterrupt (like
     _abandon_generate's real shape, not a bare raise), the explicit `nested.rollback()` call tries
