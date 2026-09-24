@@ -772,6 +772,73 @@ def test_a_third_failure_redoing_the_stamp_still_does_not_mask_the_shutdown(fact
     assert calls["n"] == 2, "the redo must actually have been attempted for this test to mean anything"
 
 
+def test_a_double_rollback_failure_logs_that_nothing_could_be_confirmed(factory, caplog):
+    """When BOTH the SAVEPOINT rollback and the full db.rollback() recovery fail, neither the
+    failure stamp nor the hook's own writes are confirmed in any state -- the log line must say
+    so plainly, not repeat the routine "failure stamp still recorded, hook's own partial writes
+    rolled back" claim that's only true when at least one of those rollbacks actually succeeded."""
+    from worker.tasks.common import _stamp_failed_and_run_cleanup
+
+    job_id, *_ = _make(factory, models.JobType.enrich, status=models.JobStatus.done)
+    other_job_id, *_ = _make(factory, models.JobType.generate, status=models.JobStatus.pending)
+
+    def hook(db, job, result):
+        db.query(models.Job).filter(models.Job.id == other_job_id).update(
+            {"status": models.JobStatus.failed})
+        db.flush()
+        raise RuntimeError("ordinary hook bug")
+
+    def savepoint_boom(*a, **k):
+        raise OSError("simulated dead connection during ROLLBACK TO SAVEPOINT")
+
+    db = factory()
+
+    class AlwaysDead:
+        def rollback(self):
+            raise sa_exc.OperationalError("ROLLBACK", {}, Exception("connection gone"))
+
+    with patch("sqlalchemy.dialects.sqlite.pysqlite.SQLiteDialect_pysqlite.do_rollback_to_savepoint",
+               savepoint_boom), \
+         patch.object(db, "rollback", AlwaysDead().rollback), \
+         caplog.at_level(logging.ERROR, logger="worker.tasks.common"):
+        _stamp_failed_and_run_cleanup(db, job_id, "orig failure", hook, None)
+    assert any("could NOT confirm" in r.getMessage() for r in caplog.records)
+    assert not any("failure stamp still recorded, hook's own partial writes rolled back"
+                  in r.getMessage() for r in caplog.records)
+
+
+def test_a_db_read_failure_loading_the_hook_job_is_not_blamed_on_the_hook(factory, caplog):
+    """db.get(models.Job, job_id), which builds the `job` argument passed to the cleanup hook, is
+    a read that happens before the hook runs at all -- a failure there must not be logged as
+    "after_commit_failed hook raised", which would send an operator looking at the wrong function
+    during an incident. The hook itself must never be invoked in this case."""
+    from worker.tasks.common import _stamp_failed_and_run_cleanup
+
+    hook = MagicMock()
+    job_id, *_ = _make(factory, models.JobType.enrich, status=models.JobStatus.done)
+    db = factory()
+
+    real_get = db.get
+    calls = {"n": 0}
+
+    def flaky_get(model, pk, *a, **k):
+        # _fail_job_keep_owner (called first, to mirror the CAS onto the object) also does a
+        # db.get(Job, ...); only the SECOND one -- building the hook's own `job` argument -- must
+        # fail, to isolate this from the fail-stamp write succeeding normally.
+        if model is models.Job:
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise sa_exc.OperationalError("SELECT", {}, Exception("connection gone"))
+        return real_get(model, pk, *a, **k)
+
+    with patch.object(db, "get", flaky_get), \
+         caplog.at_level(logging.ERROR, logger="worker.tasks.common"):
+        _stamp_failed_and_run_cleanup(db, job_id, "orig failure", hook, None)
+    hook.assert_not_called()
+    assert any("could not load job" in r.getMessage() for r in caplog.records)
+    assert not any("hook raised" in r.getMessage() for r in caplog.records)
+
+
 def test_a_commit_failure_while_recording_a_shutdown_does_not_mask_the_shutdown(factory):
     """If db.commit() itself fails while trying to durably record the fail-stamp after the hook's
     own BaseException, the ORIGINAL SystemExit/KeyboardInterrupt must still propagate -- not the

@@ -302,13 +302,27 @@ def _stamp_failed_and_run_cleanup(db, job_id, message: str, after_commit_failed,
     the fail-stamp CAS, and the CAS is then redone on the now-clean transaction before committing.
     """
     if _fail_job_keep_owner(db, job_id, message) and after_commit_failed:
+        try:
+            hook_job = db.get(models.Job, job_id)
+        except Exception:
+            # A read, not a write -- no SAVEPOINT needed, and nothing to blame on the hook: it
+            # never got a chance to run. Misattributing this to "the hook raised" (by putting the
+            # db.get() inside the hook's own try/except) would send an operator looking at the
+            # wrong function during an incident.
+            _log.exception("could not load job %s for the cleanup hook; hook not invoked, "
+                            "failure stamp still recorded", job_id)
+            return
         nested = db.begin_nested()
         try:
-            after_commit_failed(db, db.get(models.Job, job_id), result)
+            after_commit_failed(db, hook_job, result)
         except BaseException as hook_exc:
+            # Whether the fail-stamp write and the hook's own rollback both land is tracked
+            # explicitly, so the log line below never claims more than actually happened.
+            confirmed = True
             try:
                 nested.rollback()
             except Exception:
+                confirmed = False
                 _log.exception("SAVEPOINT rollback itself failed for job %s; discarding the hook's "
                                 "still-pending writes and redoing the failure stamp", job_id)
                 try:
@@ -326,10 +340,18 @@ def _stamp_failed_and_run_cleanup(db, job_id, message: str, after_commit_failed,
                         # sure the shutdown signal survives every failure along the way.
                         _log.exception("could not redo the failure stamp for job %s after "
                                         "discarding the poisoned transaction", job_id)
+                    else:
+                        confirmed = True
             if isinstance(hook_exc, Exception):
                 suffix = " on shutdown" if on_shutdown else ""
-                _log.exception("after_commit_failed hook raised for job %s%s; failure stamp still "
-                                "recorded, hook's own partial writes rolled back", job_id, suffix)
+                if confirmed:
+                    _log.exception("after_commit_failed hook raised for job %s%s; failure stamp "
+                                    "still recorded, hook's own partial writes rolled back",
+                                    job_id, suffix)
+                else:
+                    _log.error("after_commit_failed hook raised for job %s%s; could NOT confirm "
+                               "the failure stamp was recorded or the hook's partial writes "
+                               "rolled back -- check the database directly", job_id, suffix)
             else:
                 _log.warning("job %s failing on shutdown: cleanup hook raised %s", job_id,
                               type(hook_exc).__name__)

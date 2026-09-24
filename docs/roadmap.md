@@ -280,10 +280,14 @@ PostgreSQL 16, not just SQLite. Behaviour changes an operator should know about:
   - **One narrow gap remains, not worth a code change today**: if the hook raises BaseException
     *and* the guarded `_commit_or_log` commit *also* fails, the Job row is left at `status=done`
     with no error recorded, and the reaper's sweep only scans `running`/`pending` rows — that Job is
-    never revisited. This isn't really two independent unlucky events: the same dying connection
-    that fails the SAVEPOINT rollback (masking the shutdown, handled above) plausibly fails the very
-    next commit too, so this is one failure mode with two consecutive symptoms, not a rare
-    coincidence. `enrich_context`'s hook (`_abandon_generate`) happens to self-heal the reel anyway,
+    never revisited. Same end state if a SAVEPOINT-rollback failure's own recovery gets far enough
+    to redo the fail-stamp CAS but that redo itself fails too — a third distinct failure combination
+    reaching the identical terminal state, guarded against masking the shutdown signal (see above)
+    but not against ending up unrecorded. None of these are really independent unlucky events: the
+    same dying connection that fails the SAVEPOINT rollback (masking the shutdown, handled above)
+    plausibly fails the very next commit too, so this is one failure mode with two or three
+    consecutive symptoms, not a rare coincidence. `enrich_context`'s hook (`_abandon_generate`)
+    happens to self-heal the reel anyway,
     because its own orphaned follow-up Job stays `pending` and gets reaped after
     `PENDING_STALE_MINUTES`; that's incidental to `_abandon_generate`'s specific shape, not a
     guarantee `_stamp_failed_and_run_cleanup` makes for every hook. A future hook with no such side
