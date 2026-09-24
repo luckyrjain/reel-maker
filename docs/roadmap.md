@@ -229,92 +229,80 @@ PostgreSQL 16, not just SQLite. Behaviour changes an operator should know about:
 - **`after_commit` raising `SystemExit`/`KeyboardInterrupt`** (not just `Exception`) still runs the
   `after_commit_failed` cleanup hook; if the hook itself raises, the failure stamp it already wrote is
   still committed rather than silently rolled back with the job left looking `done` forever. The hook
-  runs inside its own `db.begin_nested()` SAVEPOINT, so a raise partway through a multi-write hook
+  runs inside its own `db.begin_nested()` SAVEPOINT (managed explicitly — `.rollback()`/`.commit()`
+  called directly, not `with db.begin_nested():`), so a raise partway through a multi-write hook
   (`_abandon_generate`'s real shape: fail the orphaned follow-up Job, then roll the reel back) undoes
   only the hook's own writes — not the failure stamp, and not a half-done cleanup either. A
   SystemExit/KeyboardInterrupt raised BY THE HOOK ITSELF (not by `after_commit`) is deliberately not
-  swallowed by the SAVEPOINT wrapper, but does commit the fail-stamp before re-raising via
-  `_commit_or_log` — without that, the exception unwinding straight to `job_task`'s `finally:
-  db.close()` would roll it back too. That commit is itself guarded: if it fails, the failure is
-  logged and the original BaseException still propagates rather than being replaced by the commit
-  error.
-  - **Verification history**: the automated test suite exercises the SAVEPOINT mechanism against
-    SQLite only. Separately checked by hand against real PostgreSQL 16: a genuine `IntegrityError`
-    raised from inside the SAVEPOINT (not just a Python-level exception) confirmed `ROLLBACK TO
-    SAVEPOINT` correctly un-poisons the transaction — the fail-stamp survived and the hook's own
-    write reverted, matching SQLite's behavior. A second check — whether the ORIGINAL BaseException
-    survives if the connection dies while the SAVEPOINT itself is rolling back on the hook's
-    exception exit — was first done with a hook that only raised (no prior write), concluded
-    `SessionTransaction.rollback()` swallows a failed DBAPI-level rollback, and was WRONG: with a
-    hook that writes first (any real hook's actual shape — `_abandon_generate`'s included), there is
-    a live SAVEPOINT to roll back, and `SessionTransaction.rollback()` (read in full this time)
-    explicitly `raise`s a failed DBAPI-level rollback rather than swallowing it — replacing the
-    hook's SystemExit/KeyboardInterrupt with an ordinary `Exception`, chained via `__context__`. Left
-    unhandled, that would be caught by the ordinary hook-failure branch and silently swallowed,
-    masking the shutdown. The first fix inferred this shape from `exc.__context__` after the fact (an
-    `Exception` whose `__context__` is a `BaseException` that isn't itself an `Exception`) — and that
-    inference turned out to have its own false-positive: `__context__` reflects whatever exception is
-    ambiently "being handled" anywhere up the call stack, not necessarily this hook's own SAVEPOINT.
-    When `_stamp_failed_and_run_cleanup` runs with `on_shutdown=True` (already inside `job_task`'s own
-    handling of a real shutdown from `after_commit`), an ordinary, unrelated bug in the cleanup hook
-    inherits that ambient shutdown as its `__context__` purely by accident of dynamic scope — and got
-    misclassified as a recovered masked shutdown, logging a false "SAVEPOINT rollback itself failed"
-    diagnostic that would point an operator at a nonexistent DB problem instead of the real hook bug.
-    Fixed by managing the hook's SAVEPOINT explicitly (`db.begin_nested()` without `with`, calling
-    `.rollback()`/`.commit()` directly) instead of inferring anything from `__context__` — the caught
-    exception is then exactly what the hook itself raised, with no ambiguity possible. Independently
-    re-verified against real PostgreSQL 16 for both `SystemExit` and `KeyboardInterrupt`. A related
-    finding in the same fix: a failed SAVEPOINT rollback means the hook's own writes were never
-    actually discarded, so committing right after (as the fix's first version did) would durably
-    persist them — breaking `_stamp_failed_and_run_cleanup`'s own guarantee that only the hook's OWN
-    writes roll back on a raise. Fixed by doing a full `db.rollback()` (which works even though the
-    savepoint-scoped one didn't) to discard everything, then redoing just the fail-stamp CAS before
-    committing — and that redo is itself guarded too: a third failure in a row (the redo's own CAS
-    write failing) must not replace the shutdown signal that survived the first two, so it's caught
-    and logged separately rather than left to propagate and mask the signal a third time. The trigger
-    condition — a worker shutdown signal landing at the same moment the DB
-    connection dies — is not two independent coincidences either: a rolling deploy is exactly when
-    workers receive SIGTERM *and* when connections get severed (a managed Postgres failover/
-    maintenance window, a load balancer connection sweep, or a future connection pooler's reload,
-    none of which are unusual during the same rollout).
-  - **One narrow gap remains, not worth a code change today**: if the hook raises BaseException
-    *and* the guarded `_commit_or_log` commit *also* fails, the Job row is left at `status=done`
-    with no error recorded, and the reaper's sweep only scans `running`/`pending` rows — that Job is
-    never revisited. Same end state if a SAVEPOINT-rollback failure's own recovery gets far enough
-    to redo the fail-stamp CAS but that redo itself fails too — a third distinct failure combination
-    reaching the identical terminal state, guarded against masking the shutdown signal (see above)
-    but not against ending up unrecorded. None of these are really independent unlucky events: the
-    same dying connection that fails the SAVEPOINT rollback (masking the shutdown, handled above)
-    plausibly fails the very next commit too, so this is one failure mode with two or three
-    consecutive symptoms, not a rare coincidence. `enrich_context`'s hook (`_abandon_generate`)
-    happens to self-heal the reel anyway,
-    because its own orphaned follow-up Job stays `pending` and gets reaped after
-    `PENDING_STALE_MINUTES`; that's incidental to `_abandon_generate`'s specific shape, not a
-    guarantee `_stamp_failed_and_run_cleanup` makes for every hook. A future hook with no such side
-    effect would leave its owner stuck in its in-flight status with no automatic recovery in this
-    specific double-fault — the cheap mitigation, if/when a second `after_commit_failed` hook is
-    added, is extending `reap_stuck_jobs` to also sweep `done` jobs whose owner is still sitting in
-    the state `JOB_IN_FLIGHT` maps to, past some staleness threshold; not done now since it would be
-    speculative hardening for a failure mode with zero live instances today.
-  - **Detecting it**: the only trace is a log line, `could not commit for job <id> (recording the
-    failure stamp during shutdown)` from logger `worker.tasks.common` — there is no alerting on it
-    (this repo has none configured for anything). A Job whose `status` is `done`, `error` is `None`,
-    and whose owner (reel/cut) is still in the in-flight state `JOB_IN_FLIGHT` maps to that job type
-    is the on-disk signature; nothing currently queries for that combination. A background SRE
-    reviewer's stronger recommendation was to alert on this function's own degraded-path log lines
-    directly (`SAVEPOINT rollback itself failed`, `could not roll back the poisoned transaction`,
-    `could not redo the failure stamp`, `could NOT confirm`, `could not load job ... for the cleanup
-    hook`, `could not record failure of job`) rather than only documenting the on-disk signature —
-    cheap once any alerting exists, moot until it does.
-  - **Extraction**: after four consecutive rounds each finding a real bug in the SAVEPOINT-rollback
-    recovery ladder specifically (rounds 10-13), the nested-try/except-plus-mutable-flag encoding of
-    that ~20-line block was pulled into its own function, `_recover_from_hook_failure(db, job_id,
-    message, nested) -> bool`, following the same extraction idiom this file already used twice
-    (`_commit_or_log`, `_commit_stamp_and_reraise`). Same behavior (confirmed: full suite green
-    before and after, byte-for-byte identical log lines), but the four recovery outcomes (savepoint
-    rollback ok / fails+full-rollback fails / fails+full-rollback ok+redo fails / fails+full-rollback
-    ok+redo ok) are now independently unit-tested against the extracted function directly, instead of
-    only reachable by also driving the outer hook-invocation and shutdown-classification logic.
+  swallowed, but does commit the fail-stamp before re-raising via `_commit_stamp_and_reraise` —
+  without that, the exception unwinding straight to `job_task`'s `finally: db.close()` would roll it
+  back too. That commit is itself guarded: if it fails, the failure is logged and the original
+  BaseException still propagates rather than being replaced by the commit error. If the SAVEPOINT
+  rollback itself fails, `_recover_from_hook_failure` (`worker/tasks/common.py`) falls back to a full
+  `db.rollback()` (discards the hook's still-pending writes, which the failed SAVEPOINT rollback never
+  actually did) and redoes the fail-stamp CAS on the now-clean transaction — and that redo is itself
+  guarded too, so a third failure in the same sequence can't replace the shutdown signal that survived
+  the first two. No log line in this whole path claims the fail-stamp is durably "recorded": neither
+  caller commits `db` until after this function returns, so every log line says "staged (not yet
+  committed)" or, when even that can't be confirmed, says so plainly and points at the database.
+  - **One narrow gap remains, not worth a code change today**: if the hook raises BaseException *and*
+    the guarded recovery commit *also* fails (at any of the several points that guard applies), the Job
+    row is left at `status=done` with no error recorded, and the reaper's sweep only scans
+    `running`/`pending` rows — that Job is never revisited. This isn't really an independent unlucky
+    coincidence: the same dying connection that fails the SAVEPOINT rollback plausibly fails the very
+    next commit too, so it's one failure mode with several consecutive symptoms, not a rare one.
+    `enrich_context`'s hook (`_abandon_generate`) happens to self-heal the reel anyway, because its own
+    orphaned follow-up Job stays `pending` and gets reaped after `PENDING_STALE_MINUTES`; that's
+    incidental to `_abandon_generate`'s specific shape, not a guarantee `_stamp_failed_and_run_cleanup`
+    makes for every hook. A future hook with no such side effect would leave its owner stuck in its
+    in-flight status with no automatic recovery in this specific double-fault — the cheap mitigation,
+    if/when a second `after_commit_failed` hook is added, is extending `reap_stuck_jobs` to also sweep
+    `done` jobs whose owner is still sitting in the state `JOB_IN_FLIGHT` maps to, past some staleness
+    threshold; not done now since it would be speculative hardening for a failure mode with zero live
+    instances today.
+  - **Detecting it**: the only trace is a handful of log lines from logger `worker.tasks.common`
+    (`SAVEPOINT rollback itself failed`, `could not roll back the poisoned transaction`, `could not
+    redo the failure stamp`, `could NOT confirm`, `could not load job ... for the cleanup hook`, `could
+    not record failure of job`) — there is no alerting on any of them (this repo has none configured
+    for anything), so this is moot until some alerting exists. A Job whose `status` is `done`, `error`
+    is `None`, and whose owner (reel/cut) is still in the in-flight state `JOB_IN_FLIGHT` maps to that
+    job type is the on-disk signature; nothing currently queries for that combination either.
+
+  <details>
+  <summary>Investigation history (rounds 10-14) — why this code looks the way it does</summary>
+
+  - **Round 10**: introduced the SAVEPOINT so a multi-write hook rolls back atomically on its own raise.
+  - **Round 11**: found that a failed SAVEPOINT rollback could mask the hook's own shutdown signal
+    (`SessionTransaction.rollback()` re-raises a failed DBAPI-level rollback rather than swallowing it,
+    replacing the propagating `SystemExit`/`KeyboardInterrupt` with an ordinary `Exception`). First fix
+    inferred this shape from `exc.__context__` after the fact.
+  - **Round 12**: found the `__context__` inference had a false-positive of its own — `__context__`
+    reflects whatever exception is ambiently "being handled" anywhere up the call stack (e.g. when this
+    function runs with `on_shutdown=True`, already inside `job_task`'s own outer shutdown handling), not
+    necessarily anything to do with the hook's own SAVEPOINT, so an ordinary unrelated hook bug could
+    misclassify as a recovered masked shutdown. Also found the round-11 fix's recovery path could commit
+    the hook's still-pending writes (never actually discarded by the failed SAVEPOINT rollback) alongside
+    the fail-stamp, breaking the "only the hook's own writes roll back" guarantee. Fixed both by managing
+    the SAVEPOINT explicitly instead of inferring from `__context__`, and by doing a full `db.rollback()`
+    + fail-stamp CAS redo when the SAVEPOINT-scoped rollback fails. Independently re-verified against
+    real PostgreSQL 16 for both fixes.
+  - **Round 13**: found the redo CAS itself could fail (a third failure in the same sequence), still
+    capable of masking the shutdown signal if left unguarded; fixed. Found the SAVEPOINT-rollback-failure
+    branch's log line claimed more than was confirmed when the recovery *also* failed; fixed (tracked
+    explicitly via a `confirmed` flag). Found `db.get(models.Job, job_id)` failures were misattributed to
+    "the hook raised" when the hook never actually ran; moved the read out of the hook's own try/except.
+    After four consecutive rounds each finding a real bug in the same ~20-line recovery ladder, extracted
+    it into `_recover_from_hook_failure(db, job_id, message, nested) -> bool`, following the same idiom
+    already used twice in this file (`_commit_or_log`, `_commit_stamp_and_reraise`) — same behavior, but
+    the four recovery outcomes are now independently unit-tested instead of only reachable by also
+    driving the outer hook-invocation and shutdown-classification logic.
+  - **Round 14**: found the wording fix from round 13 (the SAVEPOINT-rollback-failure branch saying
+    "failure stamp staged, not yet committed" instead of overclaiming "still recorded") had only been
+    applied to that one rare branch — the much more common "recovery succeeded" branch still overclaimed
+    "still recorded" for the exact same reason (neither caller commits until after this function
+    returns). Reworded both branches consistently.
+
+  </details>
 - `_generate_caption_hashtags`'s fallback path no longer swallows `SoftTimeLimitExceeded` — a timeout
   there now fails the task visibly instead of completing with a template caption.
 

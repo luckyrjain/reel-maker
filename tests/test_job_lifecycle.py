@@ -828,8 +828,9 @@ def test_a_third_failure_redoing_the_stamp_still_does_not_mask_the_shutdown(fact
 def test_a_double_rollback_failure_logs_that_nothing_could_be_confirmed(factory, caplog):
     """When BOTH the SAVEPOINT rollback and the full db.rollback() recovery fail, neither the
     failure stamp nor the hook's own writes are confirmed in any state -- the log line must say
-    so plainly, not repeat the routine "failure stamp still recorded, hook's own partial writes
-    rolled back" claim that's only true when at least one of those rollbacks actually succeeded."""
+    so plainly, not repeat the routine "failure stamp staged (not yet committed), hook's own
+    partial writes rolled back" claim that's only true when at least one of those rollbacks
+    actually succeeded."""
     from worker.tasks.common import _stamp_failed_and_run_cleanup
 
     job_id, *_ = _make(factory, models.JobType.enrich, status=models.JobStatus.done)
@@ -856,8 +857,39 @@ def test_a_double_rollback_failure_logs_that_nothing_could_be_confirmed(factory,
          caplog.at_level(logging.ERROR, logger="worker.tasks.common"):
         _stamp_failed_and_run_cleanup(db, job_id, "orig failure", hook, None)
     assert any("could NOT confirm" in r.getMessage() for r in caplog.records)
-    assert not any("failure stamp still recorded, hook's own partial writes rolled back"
+    assert not any("failure stamp staged (not yet committed), hook's own partial writes rolled back"
                   in r.getMessage() for r in caplog.records)
+
+
+def test_a_fully_recovered_savepoint_failure_does_not_overclaim_the_stamp_is_committed(factory, caplog):
+    """The SAVEPOINT rollback fails, but the full db.rollback() + fail-stamp redo both succeed
+    (confirmed=True) -- this branch's log line must not claim the failure stamp is durably
+    "recorded" either, for the same reason the sibling db.get()-failure branch was fixed: neither
+    caller commits `db` until after this function returns, so a caller's own subsequent commit
+    failing (plausible on the same connection that just made the SAVEPOINT rollback fail) would
+    make that claim false with nothing to correct it."""
+    from worker.tasks.common import _stamp_failed_and_run_cleanup
+
+    job_id, *_ = _make(factory, models.JobType.enrich, status=models.JobStatus.done)
+    other_job_id, *_ = _make(factory, models.JobType.generate, status=models.JobStatus.pending)
+
+    def hook(db, job, result):
+        db.query(models.Job).filter(models.Job.id == other_job_id).update(
+            {"status": models.JobStatus.failed})
+        db.flush()
+        raise RuntimeError("ordinary hook bug")
+
+    def savepoint_boom(*a, **k):
+        raise OSError("simulated dead connection during ROLLBACK TO SAVEPOINT")
+
+    db = factory()
+    with patch("sqlalchemy.dialects.sqlite.pysqlite.SQLiteDialect_pysqlite.do_rollback_to_savepoint",
+               savepoint_boom), \
+         caplog.at_level(logging.ERROR, logger="worker.tasks.common"):
+        _stamp_failed_and_run_cleanup(db, job_id, "orig failure", hook, None)
+    assert any("failure stamp staged (not yet committed), hook's own partial writes rolled back"
+               in r.getMessage() for r in caplog.records)
+    assert not any("still recorded" in r.getMessage() for r in caplog.records)
 
 
 def test_a_db_read_failure_loading_the_hook_job_is_not_blamed_on_the_hook(factory, caplog):
@@ -888,7 +920,10 @@ def test_a_db_read_failure_loading_the_hook_job_is_not_blamed_on_the_hook(factor
          caplog.at_level(logging.ERROR, logger="worker.tasks.common"):
         _stamp_failed_and_run_cleanup(db, job_id, "orig failure", hook, None)
     hook.assert_not_called()
-    assert any("could not load job" in r.getMessage() for r in caplog.records)
+    assert any("could not load job" in r.getMessage() and "staged but not yet committed"
+               in r.getMessage() for r in caplog.records), (
+        "must not overclaim the fail-stamp write is durably 'recorded' -- neither caller commits "
+        "until after this function returns")
     assert not any("hook raised" in r.getMessage() for r in caplog.records)
 
 

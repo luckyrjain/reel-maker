@@ -141,7 +141,7 @@ The browser never fetches JSON. All API responses to the browser are HTML fragme
 | `test_audio_text_sync.py` | 11 tests — `clean_guide()` regeneration, `_build_text_filter()` proportional timing + Whisper fallback, visual direction anchoring |
 | `test_context_enricher.py` | 13 tests — all 5 evaluator axes at boundary values, combined score, `llm_enrich` |
 | `test_enrich_context_task.py` | 14 tests — enrichment gating, LLM failure fallback, structured script guard, missing reel, owner rollback wiring, orphan cleanup |
-| `test_job_lifecycle.py` | 120 tests — `job_task` on dummy tasks: atomic claim, fenced done-stamp/heartbeat, heartbeat thread, retry/failure/owner rollback, fail-fast on shutdown/hard-kill and a refused retry, dead-connection recovery in the terminal failure recorders (incl. InterfaceError, fresh-session close on success and on a failed retry), a cleanup hook that itself raises without discarding the failure stamp (incl. a multi-write hook rolling back atomically via its own SAVEPOINT), `.delay` signature regression, per-task wiring, beat routing |
+| `test_job_lifecycle.py` | 121 tests — `job_task` on dummy tasks: atomic claim, fenced done-stamp/heartbeat, heartbeat thread, retry/failure/owner rollback, fail-fast on shutdown/hard-kill and a refused retry, dead-connection recovery in the terminal failure recorders (incl. InterfaceError, fresh-session close on success and on a failed retry), a cleanup hook that itself raises without discarding the failure stamp (incl. a multi-write hook rolling back atomically via its own SAVEPOINT), `.delay` signature regression, per-task wiring, beat routing |
 | `test_r3_proposed.py` | 38 tests — round-3 mutation-testing regressions: distinct job/reel/cut ids, transaction visibility via a second connection, `_error_text` regex boundaries, template `hx-post` assertions |
 | `test_r4_gaps.py` | 30 tests — round-4 mutation-testing regressions: heartbeat commit visibility, failure-path rollback of flushed rows, `after_commit` cleanup without a hook |
 | `test_tasks_real_db.py` | 4 tests — real tasks through `job_task`: post id durable, caption sent, enrich enqueues the real job id |
@@ -155,7 +155,7 @@ The browser never fetches JSON. All API responses to the browser are HTML fragme
 | `test_llm_judge.py` | 3 tests — neutral-score fallback on provider raise, garbage JSON, out-of-range dimension |
 | `test_tts.py` | 8 tests — provider selection, unknown-provider fallback, `SilentProvider` shared file, `synth_to_budget` clamp |
 
-**543 tests across 37 files.**
+**544 tests across 37 files.**
 
 ---
 

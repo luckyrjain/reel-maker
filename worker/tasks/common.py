@@ -324,8 +324,8 @@ def _stamp_failed_and_run_cleanup(db, job_id, message: str, after_commit_failed,
                 suffix = " on shutdown" if on_shutdown else ""
                 if confirmed:
                     _log.exception("after_commit_failed hook raised for job %s%s; failure stamp "
-                                    "still recorded, hook's own partial writes rolled back",
-                                    job_id, suffix)
+                                    "staged (not yet committed), hook's own partial writes rolled "
+                                    "back", job_id, suffix)
                 else:
                     _log.error("after_commit_failed hook raised for job %s%s; could NOT confirm "
                                "the failure stamp was recorded or the hook's partial writes "
