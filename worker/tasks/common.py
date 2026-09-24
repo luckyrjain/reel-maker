@@ -456,7 +456,13 @@ def job_task(
     ``done -> failed`` and ``after_commit_failed(db, job, result)`` alone cleans up what the body left
     behind, including the owner. The failed stamp commits even if the hook itself raises (it runs in
     its own SAVEPOINT, so a raise partway through a multi-write hook only undoes the hook's own
-    writes). A run that never claimed the job (e.g. a DB error at the guard) has
+    writes). One narrow gap a new ``after_commit_failed`` hook should know about: if the hook raises
+    BaseException AND the guarded commit that follows also fails, the Job is left at ``done`` with no
+    error recorded and no reaper coverage (it only scans ``running``/``pending``). ``_abandon_generate``
+    (enrich_context.py) happens to self-heal its owner anyway via an unrelated side effect (an
+    orphaned follow-up Job it leaves `pending`); a hook with no such side effect would not. See
+    docs/roadmap.md's Phase 3.9 section for the full investigation. A run that never claimed the job
+    (e.g. a DB error at the guard) has
     done nothing, so a transient error is retried up to PRECLAIM_MAX_RETRIES even for a task with
     ``max_retries=0``; once that is used up, or for a non-transient error, the still-pending job is
     failed and its owner freed (no message will come back for it). Errors while recording a failure

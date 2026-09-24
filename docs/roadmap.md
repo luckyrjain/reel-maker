@@ -231,30 +231,36 @@ PostgreSQL 16, not just SQLite. Behaviour changes an operator should know about:
   still committed rather than silently rolled back with the job left looking `done` forever. The hook
   runs inside its own `db.begin_nested()` SAVEPOINT, so a raise partway through a multi-write hook
   (`_abandon_generate`'s real shape: fail the orphaned follow-up Job, then roll the reel back) undoes
-  only the hook's own writes — not the failure stamp, and not a half-done cleanup either. The
-  automated test suite exercises this against SQLite only, but the mechanism was separately checked
-  by hand against real PostgreSQL 16, including a genuine `IntegrityError` raised from inside the
-  SAVEPOINT (not just a Python-level exception) to confirm `ROLLBACK TO SAVEPOINT` correctly
-  un-poisons the transaction — the fail-stamp survived and the hook's own write reverted, matching
-  SQLite's behavior. A SystemExit/KeyboardInterrupt raised BY THE HOOK ITSELF (not by `after_commit`)
-  is deliberately not swallowed by the SAVEPOINT wrapper, but does commit the fail-stamp before
-  re-raising via `_commit_or_log` — without that, the exception unwinding straight to `job_task`'s
-  `finally: db.close()` would roll it back too. That commit is itself guarded: if it fails (a DB
-  error while a shutdown is already in progress is exactly when this is likeliest), the failure is
+  only the hook's own writes — not the failure stamp, and not a half-done cleanup either. A
+  SystemExit/KeyboardInterrupt raised BY THE HOOK ITSELF (not by `after_commit`) is deliberately not
+  swallowed by the SAVEPOINT wrapper, but does commit the fail-stamp before re-raising via
+  `_commit_or_log` — without that, the exception unwinding straight to `job_task`'s `finally:
+  db.close()` would roll it back too. That commit is itself guarded: if it fails, the failure is
   logged and the original BaseException still propagates rather than being replaced by the commit
-  error. Also separately checked against real PostgreSQL 16: if the connection dies while the
-  SAVEPOINT itself is rolling back (SQLAlchemy's implicit `ROLLBACK TO SAVEPOINT` on the hook's own
-  exception exit, not the explicit commit above), the original BaseException still survives —
-  `SessionTransaction.rollback()` swallows a failed DBAPI-level rollback internally rather than
-  letting it replace whatever exception is currently propagating. One narrow gap remains, not worth
-  a code change: if the hook raises BaseException *and* the guarded `_commit_or_log` commit *also*
-  fails, the Job row is left at `status=done` with no error recorded, and the reaper's sweep only
-  scans `running`/`pending` rows — that Job is never revisited. `enrich_context`'s hook
-  (`_abandon_generate`) happens to self-heal the reel anyway, because its own orphaned follow-up
-  Job stays `pending` and gets reaped after `PENDING_STALE_MINUTES`; that's incidental to
-  `_abandon_generate`'s specific shape, not a guarantee `_stamp_failed_and_run_cleanup` makes for
-  every hook. A future hook with no such side effect would leave its owner stuck in its in-flight
-  status with no automatic recovery in this specific double-fault.
+  error.
+  - **Verification history**: the automated test suite exercises the SAVEPOINT mechanism against
+    SQLite only. Separately checked by hand against real PostgreSQL 16, twice: (1) a genuine
+    `IntegrityError` raised from inside the SAVEPOINT (not just a Python-level exception) confirmed
+    `ROLLBACK TO SAVEPOINT` correctly un-poisons the transaction — the fail-stamp survived and the
+    hook's own write reverted, matching SQLite's behavior; (2) killing the connection while the
+    SAVEPOINT itself is rolling back (SQLAlchemy's implicit `ROLLBACK TO SAVEPOINT` on the hook's own
+    exception exit, not the explicit `_commit_or_log` commit) confirmed the original BaseException
+    still survives — `SessionTransaction.rollback()` swallows a failed DBAPI-level rollback internally
+    rather than letting it replace whatever exception is currently propagating.
+  - **One narrow gap remains, not worth a code change**: if the hook raises BaseException *and* the
+    guarded `_commit_or_log` commit *also* fails, the Job row is left at `status=done` with no error
+    recorded, and the reaper's sweep only scans `running`/`pending` rows — that Job is never
+    revisited. `enrich_context`'s hook (`_abandon_generate`) happens to self-heal the reel anyway,
+    because its own orphaned follow-up Job stays `pending` and gets reaped after
+    `PENDING_STALE_MINUTES`; that's incidental to `_abandon_generate`'s specific shape, not a
+    guarantee `_stamp_failed_and_run_cleanup` makes for every hook. A future hook with no such side
+    effect would leave its owner stuck in its in-flight status with no automatic recovery in this
+    specific double-fault.
+  - **Detecting it**: the only trace is a log line, `could not commit for job <id> (recording the
+    failure stamp during shutdown)` from logger `worker.tasks.common` — there is no alerting on it
+    (this repo has none configured for anything). A Job whose `status` is `done`, `error` is `None`,
+    and whose owner (reel/cut) is still in the in-flight state `JOB_IN_FLIGHT` maps to that job type
+    is the on-disk signature; nothing currently queries for that combination.
 - `_generate_caption_hashtags`'s fallback path no longer swallows `SoftTimeLimitExceeded` — a timeout
   there now fails the task visibly instead of completing with a template caption.
 

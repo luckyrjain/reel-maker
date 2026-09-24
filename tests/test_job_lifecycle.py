@@ -690,7 +690,28 @@ def test_a_commit_failure_during_shutdown_is_actually_logged(factory, caplog):
         with caplog.at_level(logging.ERROR, logger="worker.tasks.common"):
             with pytest.raises(SystemExit):
                 _stamp_failed_and_run_cleanup(db, job_id, "orig failure", hook, None)
-    assert any(f"job {job_id}" in r.getMessage() for r in caplog.records)
+    expected = f"could not commit for job {job_id} (recording the failure stamp during shutdown)"
+    assert any(r.getMessage() == expected for r in caplog.records), (
+        "must log the specific commit-failure message with its context, not just any line "
+        f"mentioning the job id; got: {[r.getMessage() for r in caplog.records]}")
+
+
+def test_a_successful_commit_during_shutdown_logs_nothing(factory, caplog):
+    """_commit_or_log's log call is conditional on db.commit() actually failing -- the ordinary,
+    common case (hook raises, commit succeeds) must stay silent. A regression that logs
+    unconditionally would turn every routine shutdown-during-cleanup into ERROR-level noise."""
+    from worker.tasks.common import _stamp_failed_and_run_cleanup
+
+    def hook(db, job, result):
+        raise SystemExit("shutdown mid-cleanup")
+
+    job_id, *_ = _make(factory, models.JobType.enrich, status=models.JobStatus.done)
+    db = factory()
+
+    with caplog.at_level(logging.ERROR, logger="worker.tasks.common"):
+        with pytest.raises(SystemExit):
+            _stamp_failed_and_run_cleanup(db, job_id, "orig failure", hook, None)
+    assert not any("could not commit" in r.getMessage() for r in caplog.records)
 
 
 def test_a_second_shutdown_signal_during_the_commit_itself_still_propagates(factory):
