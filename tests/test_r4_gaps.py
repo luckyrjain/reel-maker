@@ -449,7 +449,7 @@ def test_render_success_moves_the_cut_to_in_review_and_records_the_video():
         patch("worker.tasks.render.get_tts_provider"),
         patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
         patch("worker.tasks.render.record_stage"),
-        patch("worker.tasks.render.composite_cut", return_value=18.0),
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"])),
     ):
         render_cut(job_id)
     cut = sf().get(models.Cut, cut_id)

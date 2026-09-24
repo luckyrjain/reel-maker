@@ -115,7 +115,7 @@ def render_cut(self, db, job, ctx):
     music_path = get_music_sourcer().find(music_cue) if music_cue else None
 
     with record_stage(db, reel.id, "composite", cut_id=cut.id) as ev:
-        duration = composite_cut(
+        duration, thumbnail_candidates = composite_cut(
             beats=beat_dicts,
             beat_video_paths=beat_video_paths,
             beat_vo_paths=beat_vo_paths,
@@ -134,6 +134,9 @@ def render_cut(self, db, job, ctx):
         raise ValueError(f"Cut {cut.id} was posted while it rendered ({cut.platform_post_id}) — discarding this render")
 
     cut.video_path = str(out_path)
-    cut.thumbnail_path = str(thumb_path)
+    # [0] is always the pre-existing single-frame choice — a re-render resets any
+    # operator pick from the previous render, same as video_path being replaced wholesale.
+    cut.thumbnail_path = str(thumbnail_candidates[0])
+    cut.thumbnail_candidates = [str(p) for p in thumbnail_candidates]
     cut.duration_s = duration
     transition(cut, "in_review", CUT_TRANSITIONS)

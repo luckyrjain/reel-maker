@@ -105,7 +105,7 @@ Numbered to extend `docs/roadmap.md`'s existing phase log (0–3.8 done). Sequen
 
 ### Phase 6 — Creative range
 
-- Hook/thumbnail variant generation (N candidates, operator — later, engagement data — picks)
+- ~~Hook/thumbnail variant generation (N candidates, operator — later, engagement data — picks)~~ ✅ Done — see `docs/roadmap.md` Phase 6a
 - Configurable TTS voice per reel (data + UI already 90% there; `voice` param just needs threading through)
 - Non-football niche validation: real test fixtures for 2–3 other niches, measure whether the "universal" evaluator patterns actually score fairly
 - Brand customization: logo/watermark, configurable text color, per-channel presets

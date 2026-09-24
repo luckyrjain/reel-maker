@@ -358,6 +358,29 @@ def _build_ffmpeg_args(
     ]
 
 
+# Extra candidate timestamps as fractions of total duration, sampled alongside the
+# original ~0.5s-in frame (kept first/unchanged so a caller that only reads
+# thumbnail_candidates[0] sees exactly the old single-frame behavior).
+_THUMBNAIL_CANDIDATE_FRACTIONS = (0.25, 0.6, 0.85)
+
+
+def _write_thumbnail_candidates(final, thumbnail_path: Path) -> list[Path]:
+    thumbnail_path.parent.mkdir(parents=True, exist_ok=True)
+    timestamps = [min(0.5, final.duration - 0.05)] + [
+        min(max(frac * final.duration, 0.1), final.duration - 0.05)
+        for frac in _THUMBNAIL_CANDIDATE_FRACTIONS
+    ]
+    paths = []
+    for i, t in enumerate(timestamps):
+        path = thumbnail_path if i == 0 else thumbnail_path.with_name(
+            f"{thumbnail_path.stem}_{i}{thumbnail_path.suffix}"
+        )
+        frame = final.get_frame(max(t, 0.0))
+        Image.fromarray(frame).save(str(path))
+        paths.append(path)
+    return paths
+
+
 def composite_cut(
     beats: list[dict],
     beat_video_paths: list[list[Path | None]],
@@ -365,10 +388,10 @@ def composite_cut(
     output_path: Path,
     thumbnail_path: Path,
     music_path: Path | None = None,
-) -> float:
+) -> tuple[float, list[Path]]:
     """
     Assemble beats into a single 9:16 MP4.
-    Returns the total duration in seconds.
+    Returns (total duration in seconds, thumbnail candidate paths — [0] is thumbnail_path itself).
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     thumbnail_path.parent.mkdir(parents=True, exist_ok=True)
@@ -404,10 +427,11 @@ def composite_cut(
     if vo_tracks:
         final = final.with_audio(CompositeAudioClip(vo_tracks))
 
-    # Thumbnail at ~0.5 s into the first beat (no text yet — that's added below)
-    thumb_t = min(0.5, final.duration - 0.05)
-    frame = final.get_frame(thumb_t)
-    Image.fromarray(frame).save(str(thumbnail_path))
+    # Candidate thumbnails at a few points across the reel (no text yet — that's
+    # added below). thumbnail_candidates[0] is always thumbnail_path itself, so a
+    # caller that ignores the rest of the list gets exactly the old single-frame
+    # behavior at exactly the old timestamp.
+    thumbnail_candidates = _write_thumbnail_candidates(final, thumbnail_path)
 
     # Write video+audio without text overlays
     notxt_path = output_path.with_suffix(".notxt.mp4")
@@ -462,4 +486,4 @@ def composite_cut(
         except Exception:
             pass
 
-    return total_duration
+    return total_duration, thumbnail_candidates
