@@ -239,14 +239,21 @@ PostgreSQL 16, not just SQLite. Behaviour changes an operator should know about:
   logged and the original BaseException still propagates rather than being replaced by the commit
   error.
   - **Verification history**: the automated test suite exercises the SAVEPOINT mechanism against
-    SQLite only. Separately checked by hand against real PostgreSQL 16, twice: (1) a genuine
-    `IntegrityError` raised from inside the SAVEPOINT (not just a Python-level exception) confirmed
-    `ROLLBACK TO SAVEPOINT` correctly un-poisons the transaction — the fail-stamp survived and the
-    hook's own write reverted, matching SQLite's behavior; (2) killing the connection while the
-    SAVEPOINT itself is rolling back (SQLAlchemy's implicit `ROLLBACK TO SAVEPOINT` on the hook's own
-    exception exit, not the explicit `_commit_or_log` commit) confirmed the original BaseException
-    still survives — `SessionTransaction.rollback()` swallows a failed DBAPI-level rollback internally
-    rather than letting it replace whatever exception is currently propagating.
+    SQLite only. Separately checked by hand against real PostgreSQL 16: a genuine `IntegrityError`
+    raised from inside the SAVEPOINT (not just a Python-level exception) confirmed `ROLLBACK TO
+    SAVEPOINT` correctly un-poisons the transaction — the fail-stamp survived and the hook's own
+    write reverted, matching SQLite's behavior. A second check — whether the ORIGINAL BaseException
+    survives if the connection dies while the SAVEPOINT itself is rolling back on the hook's
+    exception exit — was first done with a hook that only raised (no prior write), concluded
+    `SessionTransaction.rollback()` swallows a failed DBAPI-level rollback, and was WRONG: with a
+    hook that writes first (any real hook's actual shape — `_abandon_generate`'s included), there is
+    a live SAVEPOINT to roll back, and `SessionTransaction.rollback()` (read in full this time)
+    explicitly `raise`s a failed DBAPI-level rollback rather than swallowing it — replacing the
+    hook's SystemExit/KeyboardInterrupt with an ordinary `Exception`, chained via `__context__`. Left
+    unhandled, that would be caught by the ordinary hook-failure branch and silently swallowed,
+    masking the shutdown. `_stamp_failed_and_run_cleanup` now checks for exactly this shape (an
+    `Exception` whose `__context__` is a `BaseException` that isn't itself an `Exception`) and
+    recovers the original signal before committing the fail-stamp and re-raising it.
   - **One narrow gap remains, not worth a code change**: if the hook raises BaseException *and* the
     guarded `_commit_or_log` commit *also* fails, the Job row is left at `status=done` with no error
     recorded, and the reaper's sweep only scans `running`/`pending` rows — that Job is never

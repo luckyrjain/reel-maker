@@ -648,6 +648,40 @@ def test_a_shutdown_signal_inside_the_cleanup_hook_still_commits_the_failure_sta
     assert "broker down" in job.error
 
 
+def test_a_savepoint_rollback_failure_does_not_mask_a_shutdown_signal_from_the_hook(factory):
+    """If the hook does a real write before raising SystemExit/KeyboardInterrupt (like
+    _abandon_generate's real shape, not a bare raise), db.begin_nested()'s own __exit__ tries to
+    roll back the SAVEPOINT on the way out -- and SQLAlchemy's SessionTransaction.rollback()
+    RE-RAISES a failed DBAPI-level rollback rather than swallowing it. If that rollback itself
+    fails (the connection dying is exactly what a shutdown can correlate with), the resulting
+    ordinary Exception REPLACES the hook's shutdown signal as what's propagating -- caught by the
+    sibling `except Exception:` branch and silently swallowed as a routine hook failure, unless
+    recovered from exc.__context__ (which Python sets automatically). This reproduces the exact
+    scenario a background reviewer used to disprove this file's own earlier, incomplete
+    investigation (which used a hook with no prior write, so no live SAVEPOINT rollback was ever
+    actually attempted, and the masking never triggered)."""
+    from worker.tasks.common import _stamp_failed_and_run_cleanup
+
+    job_id, reel_id, cut_id = _make(factory, models.JobType.enrich, status=models.JobStatus.done)
+    other_job_id, *_ = _make(factory, models.JobType.generate, status=models.JobStatus.pending)
+
+    def hook(db, job, result):
+        db.query(models.Job).filter(models.Job.id == other_job_id).update(
+            {"status": models.JobStatus.failed})
+        db.flush()
+        raise SystemExit("shutdown mid-hook")
+
+    def boom(*a, **k):
+        raise OSError("simulated dead connection during ROLLBACK TO SAVEPOINT")
+
+    db = factory()
+    with patch("sqlalchemy.dialects.sqlite.pysqlite.SQLiteDialect_pysqlite.do_rollback_to_savepoint", boom):
+        with pytest.raises(SystemExit, match="shutdown mid-hook"):
+            _stamp_failed_and_run_cleanup(db, job_id, "orig failure", hook, None)
+    job, _, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.failed
+
+
 def test_a_commit_failure_while_recording_a_shutdown_does_not_mask_the_shutdown(factory):
     """If db.commit() itself fails while trying to durably record the fail-stamp after the hook's
     own BaseException, the ORIGINAL SystemExit/KeyboardInterrupt must still propagate -- not the

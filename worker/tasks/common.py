@@ -270,12 +270,35 @@ def _stamp_failed_and_run_cleanup(db, job_id, message: str, after_commit_failed,
     (sibling `except` clauses on the same `try` do not catch each other's escapes) -- which would roll
     the uncommitted fail-stamp back right along with the hook's already-reverted SAVEPOINT. Committing
     here, once, right before re-raising, is what keeps that from silently losing the fail-stamp again.
+
+    A subtlety in how that BaseException reaches us at all: if the hook did more than a bare raise (a
+    real write, like `_abandon_generate`'s), `db.begin_nested()`'s own `__exit__` tries to roll back the
+    SAVEPOINT on the way out, and SQLAlchemy's `SessionTransaction.rollback()` RE-RAISES a failed
+    DBAPI-level rollback rather than swallowing it (confirmed by reading its source, after this file
+    briefly and incorrectly documented the opposite following an unrepresentative no-write repro). If
+    that rollback itself fails -- the connection dying is exactly what a shutdown can correlate with --
+    the ordinary `Exception` it raises REPLACES the hook's SystemExit/KeyboardInterrupt as what's
+    propagating out of the `with` block, though the original survives as `exc.__context__` (Python sets
+    this automatically). Left unhandled, that ordinary exception would be caught by the sibling `except
+    Exception:` below, logged as a routine hook failure, and swallowed -- masking the shutdown entirely.
+    The `except Exception as exc:` clause checks for exactly this shape and recovers the original signal.
     """
     if _fail_job_keep_owner(db, job_id, message) and after_commit_failed:
         try:
             with db.begin_nested():
                 after_commit_failed(db, db.get(models.Job, job_id), result)
-        except Exception:
+        except Exception as exc:
+            masked_shutdown = exc.__context__
+            if isinstance(masked_shutdown, BaseException) and not isinstance(masked_shutdown, Exception):
+                # The hook itself raised a shutdown signal, but rolling back its SAVEPOINT on the way
+                # out then failed too, and that secondary failure replaced it (see docstring). Recover
+                # the original signal from __context__ and treat this exactly like the sibling
+                # `except BaseException:` branch below: commit the fail-stamp, then let it propagate.
+                _log.exception("SAVEPOINT rollback itself failed for job %s while a shutdown signal was "
+                                "propagating from the cleanup hook; recovering the original signal",
+                                job_id)
+                _commit_or_log(db, job_id, " (recording the failure stamp during a masked shutdown)")
+                raise masked_shutdown from exc
             suffix = " on shutdown" if on_shutdown else ""
             _log.exception("after_commit_failed hook raised for job %s%s; failure stamp still recorded, "
                             "hook's own partial writes rolled back", job_id, suffix)
