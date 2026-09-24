@@ -16,7 +16,10 @@ import subprocess
 import numpy as np
 import soundfile as sf
 
-from engine.render.compositor import _build_ffmpeg_args, _write_thumbnail_candidates, composite_cut
+from engine.render.compositor import (
+    DEFAULT_TEXT_COLOR, _build_ffmpeg_args, _build_text_filter, _write_thumbnail_candidates,
+    composite_cut,
+)
 
 
 def _has_audio_stream(path) -> bool:
@@ -94,6 +97,40 @@ def test_write_thumbnail_candidates_clamps_to_a_very_short_clip(tmp_path):
     assert len(paths) == 4
     for p in paths:
         assert p.exists()
+
+
+# ── _build_text_filter text_color — no ffmpeg, pure string building ─────────
+
+_ONE_BEAT = [{"duration_s": 5.0, "vo_script": "Test narration.", "on_screen_text": ["Test"]}]
+
+
+def test_text_filter_uses_default_color_when_none_given():
+    chain = _build_text_filter(_ONE_BEAT, [5.0])
+    assert f"fontcolor={DEFAULT_TEXT_COLOR}" in chain
+
+
+def test_text_filter_uses_a_curated_color():
+    chain = _build_text_filter(_ONE_BEAT, [5.0], text_color="yellow")
+    assert "fontcolor=yellow" in chain
+
+
+def test_text_filter_falls_back_to_default_for_an_uncurated_color():
+    """Defense in depth — api/routers/reels.py already validates against
+    CURATED_TEXT_COLORS before storing Reel.text_color, but _build_text_filter() must
+    not blindly interpolate an arbitrary string into the ffmpeg filter graph either."""
+    chain = _build_text_filter(_ONE_BEAT, [5.0], text_color="not_a_real_color")
+    assert f"fontcolor={DEFAULT_TEXT_COLOR}" in chain
+    assert "fontcolor=not_a_real_color" not in chain
+
+
+def test_text_filter_rejects_a_filter_graph_injection_attempt():
+    """The color value is interpolated into the filter string with no escaping (unlike
+    on-screen text content, which _escape_drawtext() sanitizes) — an attempted injection
+    via the color field must be caught by the same curated-set check, not just happen
+    not to break anything."""
+    chain = _build_text_filter(_ONE_BEAT, [5.0], text_color="white:enable=0,drawbox=1")
+    assert f"fontcolor={DEFAULT_TEXT_COLOR}" in chain
+    assert "drawbox" not in chain
 
 
 # ── _build_ffmpeg_args — pure function, no subprocess needed ────────────────

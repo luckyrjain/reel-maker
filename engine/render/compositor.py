@@ -202,11 +202,29 @@ def _whisper_timestamps(
 
 _FONT_SIZE = 60
 _TEXT_Y = int(TARGET_H * TEXT_Y_CENTER) - _FONT_SIZE // 2  # single centred line at 73%
+DEFAULT_TEXT_COLOR = "white"
+
+# Curated named colors ffmpeg's drawtext filter recognizes, offered on the create-reel
+# form — deliberately not a free-text/hex field. `text_color` is interpolated directly
+# into the filter string as `fontcolor={text_color}` with no escaping (unlike the text
+# content itself, which _escape_drawtext() sanitizes); an unvalidated value here would
+# be a filter-graph injection point, not just a rendering-quality one. (value, display label).
+CURATED_TEXT_COLORS: list[tuple[str, str]] = [
+    (DEFAULT_TEXT_COLOR, "White — default"),
+    ("yellow", "Yellow"),
+    ("cyan", "Cyan"),
+    ("red", "Red"),
+    ("orange", "Orange"),
+    ("black", "Black"),
+]
+_CURATED_TEXT_COLOR_NAMES = {c for c, _ in CURATED_TEXT_COLORS}
+
 
 def _build_text_filter(
     beats: list[dict],
     beat_durations: list[float],
     beat_transcripts: list[list | None] | None = None,
+    text_color: str = DEFAULT_TEXT_COLOR,
 ) -> str:
     """
     Build an FFmpeg drawtext filter chain.
@@ -215,6 +233,8 @@ def _build_text_filter(
     of the beat's duration (duration / n lines). When Whisper transcripts are
     available, _whisper_timestamps() maps lines to word-level timestamps instead.
     """
+    if text_color not in _CURATED_TEXT_COLOR_NAMES:
+        text_color = DEFAULT_TEXT_COLOR   # defense in depth — see CURATED_TEXT_COLORS' docstring
     font = _ffmpeg_font()
     font_clause = f":fontfile={font}" if font else ""
     parts: list[str] = []
@@ -267,7 +287,7 @@ def _build_text_filter(
                 f"drawtext=enable='between(t,{seg_start:.3f},{seg_end:.3f})'"
                 f":text='{escaped}'"
                 f"{font_clause}"
-                f":fontsize={_FONT_SIZE}:fontcolor=white"
+                f":fontsize={_FONT_SIZE}:fontcolor={text_color}"
                 f":shadowcolor=black@0.85:shadowx=2:shadowy=2"
                 f":x=(w-text_w)/2:y={_TEXT_Y}"
             )
@@ -388,6 +408,7 @@ def composite_cut(
     output_path: Path,
     thumbnail_path: Path,
     music_path: Path | None = None,
+    text_color: str = DEFAULT_TEXT_COLOR,
 ) -> tuple[float, list[Path]]:
     """
     Assemble beats into a single 9:16 MP4.
@@ -452,7 +473,7 @@ def composite_cut(
             (transcribe_audio(vp) or None) if vp and vp.exists() else None
             for vp in beat_vo_paths
         ]
-        text_filter = _build_text_filter(beats, beat_durations, beat_transcripts)
+        text_filter = _build_text_filter(beats, beat_durations, beat_transcripts, text_color)
         # Write to a temp path first; atomic replace so a killed process never
         # leaves a half-written servable file.
         tmp_path = output_path.with_suffix(".tmp.mp4")

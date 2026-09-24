@@ -226,6 +226,62 @@ def test_reel_tts_voice_is_passed_to_get_tts_provider():
     assert mock_get_tts.call_args.kwargs["voice"] == "en-US-JennyNeural"
 
 
+def test_reel_text_color_is_passed_to_composite_cut():
+    from worker.tasks.render import render_cut
+
+    job = _job()
+    cut = _cut()
+    reel = _reel()
+    reel.text_color = "yellow"
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else (
+        cut if model is models.Cut else reel
+    )
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.render.get_asset_sourcer"),
+        patch("worker.tasks.render.get_wiki_sourcer"),
+        patch("worker.tasks.render.get_hf_sourcer"),
+        patch("worker.tasks.render.get_hf_video_sourcer"),
+        patch("worker.tasks.render.get_tts_provider"),
+        patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
+        patch("worker.tasks.render.record_stage"),
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"])) as mock_composite,
+    ):
+        render_cut(1)
+
+    assert mock_composite.call_args.kwargs["text_color"] == "yellow"
+
+
+def test_reel_without_text_color_uses_the_default():
+    from worker.tasks.render import DEFAULT_TEXT_COLOR, render_cut
+
+    job = _job()
+    cut = _cut()
+    reel = _reel()
+    reel.text_color = None
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else (
+        cut if model is models.Cut else reel
+    )
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.render.get_asset_sourcer"),
+        patch("worker.tasks.render.get_wiki_sourcer"),
+        patch("worker.tasks.render.get_hf_sourcer"),
+        patch("worker.tasks.render.get_hf_video_sourcer"),
+        patch("worker.tasks.render.get_tts_provider"),
+        patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
+        patch("worker.tasks.render.record_stage"),
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"])) as mock_composite,
+    ):
+        render_cut(1)
+
+    assert mock_composite.call_args.kwargs["text_color"] == DEFAULT_TEXT_COLOR
+
+
 def test_no_music_cue_passes_none_without_querying_sourcer():
     from worker.tasks.render import render_cut
 

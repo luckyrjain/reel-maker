@@ -6,7 +6,7 @@ from api.state import CUT_TRANSITIONS, transition
 from engine.generation.guide_schema import PlatformGuide
 from engine.observability import record_stage
 from engine.render.asset_sourcer import get_asset_sourcer, get_hf_sourcer, get_hf_video_sourcer, get_music_sourcer, get_wiki_sourcer, resolve_or_reuse
-from engine.render.compositor import composite_cut
+from engine.render.compositor import DEFAULT_TEXT_COLOR, composite_cut
 from engine.render.tts import SilentProvider, _audio_duration, get_tts_provider
 from worker.celery_app import celery_app
 from worker.tasks.common import heartbeat, job_task, time_limits
@@ -122,6 +122,7 @@ def render_cut(self, db, job, ctx):
             output_path=out_path,
             thumbnail_path=thumb_path,
             music_path=music_path,
+            text_color=reel.text_color or DEFAULT_TEXT_COLOR,
         )
         ev.detail["duration_s"] = duration
         ev.detail["music_cue"] = music_cue

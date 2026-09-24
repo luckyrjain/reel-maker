@@ -69,6 +69,11 @@ class Reel(Base):
     # EdgeTTSProvider.DEFAULT_VOICE. Only applies when TTS_PROVIDER=edge (the default) — see
     # get_tts_provider()'s docstring for why Kokoro doesn't get a per-reel voice choice.
     tts_voice = Column(String(100), nullable=True)
+    # On-screen text color from engine/render/compositor.py::CURATED_TEXT_COLORS, or None
+    # for DEFAULT_TEXT_COLOR ("white"). Not free text/hex — see CURATED_TEXT_COLORS'
+    # docstring: an unvalidated value here is an ffmpeg drawtext filter-graph injection
+    # point, not just a rendering-quality one.
+    text_color = Column(String(20), nullable=True)
     status = Column(SAEnum(ReelStatus), default=ReelStatus.draft, nullable=False)
     created_at = Column(DateTime(timezone=True), default=_now)
     updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)

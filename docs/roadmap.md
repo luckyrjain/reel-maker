@@ -25,7 +25,7 @@ This file below is the build log (what shipped, phase by phase); that one is the
 | 4a | ✅ Done | Operator visibility (cost, latency, quality, budget cap) |
 | 4b | ✅ Done | Publishing (OAuth, safe_to_publish gate, YouTube + Instagram uploaders, TikTok platform) |
 | 5 | ✅ Done | Analytics and polish |
-| 6 | 🔲 Partial | Creative range — hook/thumbnail variant generation, per-reel TTS voice, non-football fairness fixes done; brand customization not started |
+| 6 | 🔲 Partial | Creative range — hook/thumbnail variant generation, per-reel TTS voice, non-football fairness fixes, configurable text color done; logo/watermark + per-channel presets not started |
 
 ---
 
@@ -692,9 +692,35 @@ the person-name-driven heuristic doesn't have a good non-name proxy for
 "this is sourceable" without risking new false positives for genuinely
 vague visuals.
 
-### 6d. Brand customization — not done
+### 6d. Brand customization — partial
 
-No logo/watermark, no configurable overlay text color, no per-channel presets.
+**Configurable on-screen text color — done.** `Reel.text_color` (migration
+`0009`, nullable — `None` means `compositor.py::DEFAULT_TEXT_COLOR`,
+`"white"`, the pre-existing hardcoded value) is set from a "Text color"
+selector on the create-reel form, offering
+`engine/render/compositor.py::CURATED_TEXT_COLORS` — a small curated set
+of ffmpeg-recognized named colors (white, yellow, cyan, red, orange,
+black), not a free-text or hex field. This isn't just a UX simplification
+the way the TTS voice list is: `fontcolor={text_color}` is interpolated
+directly into the ffmpeg `drawtext` filter string with **no escaping**
+(unlike the on-screen text content itself, which `_escape_drawtext()`
+sanitizes) — an unvalidated color value is a filter-graph injection point,
+not just a rendering-quality one. `api/routers/reels.py::create_reel`
+validates against the curated set and drops anything else to `None` (same
+policy as `platforms`/`tts_voice`); `_build_text_filter()` independently
+re-validates as defense in depth, and has a dedicated test
+(`test_text_filter_rejects_a_filter_graph_injection_attempt`) asserting an
+attempted `fontcolor=white:enable=0,drawbox=1`-style payload is rejected,
+not just an accidentally-safe string.
+
+**Logo/watermark overlay and per-channel presets — not done.** Both are
+materially bigger than the text-color lever: a watermark needs image
+upload/storage and a real MoviePy compositing pass (not a one-line
+`drawtext` parameter), and "per-channel presets" implies saving and naming
+multiple reusable configurations, which doesn't fit cleanly into the
+current single-`Reel`-row settings model without its own small schema
+(closer in shape to `PerformanceNote` than to `tts_voice`). Left for a
+follow-up with its own scoping pass rather than folded into this one.
 
 ---
 
