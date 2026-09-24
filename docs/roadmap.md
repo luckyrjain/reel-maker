@@ -448,9 +448,9 @@ later without disturbing this shape.
 - Surfaced on `cut_card.html` (views/likes/comments + "as of" timestamp once
   pulled, a "checked every 6h" hint before the first pull) and on
   `reels_list.html` as a Quality/Views column pair per reel (latest job's
-  `quality_score`, max `views` across the reel's cuts) — visual
-  quality-vs-engagement correlation is left to the operator eyeballing the
-  table, no computed correlation coefficient.
+  `quality_score`, max `views` across the reel's cuts). A computed
+  quality-vs-engagement correlation (not just the two eyeballed columns)
+  shipped later — see Phase 5g below.
 
 ### 5c. Music mixing — done, source differs from the original plan
 
@@ -496,6 +496,73 @@ the caption is empty) without mutating the DB-stored caption — the publish
 task passes the composed string through `Publisher.publish(..., caption=)`,
 a new required parameter every publisher now takes instead of reading
 `cut.caption` directly.
+
+### 5g. Quality↔engagement correlation + performance-informed feedback — done
+
+Closes the last two Phase 5 items from
+`docs/product-gap-analysis-and-roadmap-2026-08.md`. Full design:
+`docs/specs/2026-09-phase5-quality-engagement-feedback.md`.
+
+**Correlation** (`engine/analytics/correlation.py`, new `GET /api/insights`
+page via `api/routers/insights.py`):
+- `quality_engagement_correlation(db)` — Pearson *r* between each reel's
+  latest `quality_score` and its max-per-cut `views`, refusing to compute
+  below `MIN_SAMPLE=5` reels or when either series has zero variance
+  (`np.corrcoef` returns NaN on zero variance — guarded explicitly rather
+  than let `"nan"` leak into the UI). Reuses a newly-extracted
+  `engine/observability.py::latest_quality_scores(jobs)` helper, also now
+  used by `api/routers/reels.py::_reel_list_metrics()` — one definition of
+  "this reel's quality score," not three near-identical copies.
+- The page always shows `r` together with `sample_size` (never `r` alone),
+  and a permanent, non-dismissable caveat: quality scores cluster near the
+  acceptance threshold by construction (generation retries specifically to
+  clear it), which mechanically attenuates any correlation this number can
+  detect — a low/near-zero *r* does not mean quality doesn't matter, it
+  means this sample can't measure it well. Sampling below-threshold guides
+  on purpose to fix that would mean deliberately publishing worse content —
+  a product decision, not something this release does.
+- `top_bottom_performers(db, k=3)` — top/bottom-3 by views (one combined
+  list when `n < 6`, so the two tables never show the same reel), each row
+  including the hook beat's `vo_script` from whichever cut drew the most
+  views. Read-only: exists purely so an operator has evidence before
+  writing a note, never auto-injected into generation.
+
+**Performance-informed feedback** (`PerformanceNote` — `api/models.py`,
+migration `0007_performance_notes.py`): operator-written, plain-English
+notes ("Hooks phrased as a direct question outperform statement hooks"),
+toggleable active/inactive, CRUD via `POST/DELETE /api/insights/notes*`
+(hard-delete — cheap, operator-owned text, no undo needed). Every *active*
+note is seeded into `worker/tasks/generate.py`'s standard-path
+`prior_feedback` from attempt 1, reusing the existing
+`build_messages(prior_feedback=)` injection point rather than adding a new
+one. **Deliberately not** the literal ask read automatically ("feed high/low
+performers back into `prior_feedback`" as auto-injected few-shot examples)
+— the spec's §3.1 rejects that specifically: this codebase's enrichment/
+conflict prompts already carry an explicit topic-fence principle ("do not
+introduce matches, tournaments, scorelines, or players not mentioned in the
+beat/context") because unconstrained prior context has previously leaked
+into unrelated generations, and a single-operator/single-niche tool would be
+overfitting to a handful of reels if it auto-selected "the best one." Human
+curation stays the boundary; only the mechanical plumbing is automated.
+
+Two correctness traps were found and fixed before this shipped, both with
+dedicated regression tests written against the buggy version first (see
+CLAUDE.md's Key conventions for the full detail): the active-notes query
+must run unconditionally at the top of `generate_guide` (not inside the
+standard-path-only branch, or every structured-path success NameErrors on
+the shared `job.meta` write), and the per-attempt `feedback` reassignment
+must be additive (`active_notes + [...]`), not a plain replace, once
+`feedback` starts non-empty.
+
+**Evaluator axis weight multipliers** (`Settings.evaluator_axis_weight_multipliers`,
+default `{}` — a no-op until configured, and the first dict-typed `Settings`
+field in this codebase): `score_guide()` gains an optional `axis_multipliers`
+parameter and one small correction block immediately before its final
+`return`, reusing the `deductions` dict the function already built for its
+issue-string breakdown — none of the 23 existing `score -=` sites changed.
+A manual lever informed by the correlation data above, not an auto-tuned
+weight (see "Explicitly out of scope" in the spec for why automatic fitting
+stays out).
 
 ---
 

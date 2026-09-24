@@ -1,6 +1,6 @@
 # Data Model
 
-All tables are defined in `api/models.py`. Migrations: `0001_initial.py` (base schema) + `0002_improvements.py` (pinning, licensing, observability, heartbeat) + `0003_context_enrichment.py` (enriched_context column, enriching/enrich enum values). Video and audio files live on disk under `ASSET_STORE_DIR` / `VIDEO_STORE_DIR`; the DB stores paths, never blobs.
+All tables are defined in `api/models.py`. Migrations: `0001_initial.py` (base schema) + `0002_improvements.py` (pinning, licensing, observability, heartbeat) + `0003_context_enrichment.py` (enriched_context column, enriching/enrich enum values) + `0004_publishing.py` (tiktok platform, Credential refresh/account-id columns) + `0005_metrics.py` (Cut engagement columns) + `0006_variants.py` (Cut thumbnail/hook-variant columns) + `0007_performance_notes.py` (`performance_notes` table). Video and audio files live on disk under `ASSET_STORE_DIR` / `VIDEO_STORE_DIR`; the DB stores paths, never blobs.
 
 ---
 
@@ -112,7 +112,7 @@ Every async operation is a job row. API creates the row and enqueues the task wi
 | `attempts` | integer | Incremented once per run, after `prepare` succeeds (so a missing-row or budget failure does not count), including each retry delivery |
 | `started_at` | timestamptz | Set after `prepare`, when the body is about to run (the claim moves the job to `running` a moment earlier) |
 | `heartbeat_at` | timestamptz | Refreshed every 30 s by a background thread in `job_task` (until the task's `max_runtime_s`) and at every `heartbeat()` call; used by the stuck-job reaper |
-| `meta` | JSON | Enrich job: `{"generation_path": "auto\|structured\|standard", "context_score": N, "context_issues": [...], "enriched": bool}`. Generate job: `{"generation_path": ..., "context_score": N, "path": "structured\|standard", "stub_count": N, "quality_score": N, "structured_score": N, "structured_fallback": bool}` |
+| `meta` | JSON | Enrich job: `{"generation_path": "auto\|structured\|standard", "context_score": N, "context_issues": [...], "enriched": bool}`. Generate job: `{"generation_path": ..., "context_score": N, "path": "structured\|standard", "stub_count": N, "quality_score": N, "structured_score": N, "structured_fallback": bool, "performance_note_ids": [N, ...]}` |
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
 
@@ -162,6 +162,23 @@ OAuth tokens for publishing (Phase 4+). `token_blob` is encrypted at rest.
 | `expires_at` | timestamptz | |
 
 Set `CREDENTIALS_KEY` in `.env` (a 32-byte URL-safe base64 Fernet key). Rotating the key invalidates stored tokens — just re-auth. If the key is not set, values are stored as plaintext with a logged warning.
+
+---
+
+### `performance_notes`
+
+Operator-written, plain-English notes synthesizing past reel performance (e.g. "Hooks phrased as a direct question outperform statement hooks — lean into that"), added from the `/api/insights` page after reviewing the top/bottom performer report. A standalone table — no FK to `reels`/`cuts`; a note is a general observation, not tied to one reel.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | integer PK | |
+| `text` | text | Operator-written note; required |
+| `active` | boolean | Default `true`. Only active notes are seeded into `generate_guide`'s `prior_feedback` (standard LLM path only) — see `docs/evaluation.md`'s "Performance-informed feedback" section |
+| `created_at` | timestamptz | |
+
+Deliberately **not** automated few-shot injection of raw past-reel content — see `docs/specs/2026-09-phase5-quality-engagement-feedback.md` §3.1. CRUD is hard-delete (no soft-delete/undo — these are cheap, operator-owned free text, unlike a `Job`/`Cut` state machine): `POST /api/insights/notes` (create, `active=true`), `POST /api/insights/notes/{id}/toggle` (flip `active`), `DELETE /api/insights/notes/{id}`.
+
+`job.meta["performance_note_ids"]` on a `generate` job records which notes were active for that run — written by the same shared `job.meta` line as `quality_score` (reached by both the structured and standard generation paths).
 
 ---
 

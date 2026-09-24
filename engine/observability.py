@@ -59,6 +59,23 @@ def record_stage(
             db.rollback()
 
 
+def latest_quality_scores(jobs: list) -> dict[int, int]:
+    """Latest non-null quality_score per reel_id, from a list of Job rows spanning
+    possibly multiple reels.
+
+    'Latest' = the last one in ascending created_at order — callers must pass jobs
+    already ordered that way (last write wins). Only `generate` jobs ever set
+    `meta["quality_score"]`, but this reads any Job row passed in, so a caller
+    that queries every job type for a reel (matching the existing query shape in
+    api/routers/reels.py) works fine — the extra job types are simply never a hit.
+    """
+    by_reel: dict[int, int] = {}
+    for j in jobs:
+        if j.meta and j.meta.get("quality_score") is not None:
+            by_reel[j.reel_id] = j.meta["quality_score"]
+    return by_reel
+
+
 def paid_call_count(db, reel_id: int) -> int:
     """Count StageEvent rows for a reel that hit a metered (NVIDIA NIM) provider.
 

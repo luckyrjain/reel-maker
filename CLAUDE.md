@@ -45,7 +45,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 579 tests across 30+ files (4 test_compositor tests need ffmpeg on PATH)
+.venv/bin/pytest                            # 609 tests across 30+ files (4 test_compositor tests need ffmpeg on PATH)
 .venv/bin/pytest tests/test_foo.py::bar -s
 
 # New migration after changing models.py
@@ -99,10 +99,12 @@ In both paths, `postprocess.py` strips section-label prefixes from `vo_script` a
 ```
 api/
   main.py             FastAPI app factory; static files, Jinja2, all routers
-  config.py           pydantic-settings Settings; includes nvidia_api_key, nvidia_generation_model, use_nvidia_for_generation, pexels_api_key, huggingface_api_key, huggingface_image_model, huggingface_video_model, pixabay_api_key, credentials_key, max_paid_llm_calls_per_reel, nvidia_price_per_1m_input_tokens, nvidia_price_per_1m_output_tokens, public_base_url, youtube_oauth_client_id/secret, meta_oauth_app_id/secret, music_library_dir, huggingface_price_per_image, huggingface_price_per_video_second
+  config.py           pydantic-settings Settings; includes nvidia_api_key, nvidia_generation_model, use_nvidia_for_generation, pexels_api_key, huggingface_api_key, huggingface_image_model, huggingface_video_model, pixabay_api_key, credentials_key, max_paid_llm_calls_per_reel, nvidia_price_per_1m_input_tokens, nvidia_price_per_1m_output_tokens, public_base_url, youtube_oauth_client_id/secret, meta_oauth_app_id/secret, music_library_dir, huggingface_price_per_image, huggingface_price_per_video_second, evaluator_axis_weight_multipliers
+                      (dict[str, float], default `{}` — the first dict-typed Settings field; pydantic-settings
+                      parses its env var as JSON, e.g. `EVALUATOR_AXIS_WEIGHT_MULTIPLIERS='{"insight": 0.5}'`)
   crypto.py           Fernet seal/open_ + Encrypted SQLAlchemy TypeDecorator
   db.py               SQLAlchemy engine, SessionLocal, get_db() dependency
-  models.py           All ORM models + enums; includes StageEvent
+  models.py           All ORM models + enums; includes StageEvent, PerformanceNote
   oauth.py            Generic OAuth2 authorization-code flow — YouTubeOAuth, InstagramOAuth,
                       new_state()/consume_state() (process-local CSRF state, single-operator tool)
   schemas.py          Pydantic schemas for JSON endpoints
@@ -117,6 +119,11 @@ api/
                       (choose a candidate), POST /hook-variant (swap the hook beat's vo_script)
     credentials.py    GET /api/credentials (connect/disconnect UI), GET /{provider}/authorize,
                       GET /{provider}/callback, POST /{provider}/disconnect
+    insights.py       GET /api/insights (quality↔engagement correlation + top/bottom performer
+                      report + performance-notes UI, one page — see engine/analytics/correlation.py);
+                      POST /api/insights/notes (create), POST /api/insights/notes/{id}/toggle,
+                      DELETE /api/insights/notes/{id} — all three return the
+                      fragments/performance_notes.html partial for htmx swap
 
 worker/
   celery_app.py       Celery instance; acks_late=True, beat schedule, split queues
@@ -129,7 +136,12 @@ worker/
                       conflict injection, visuals LLM, closed-loop eval retry, observability,
                       paid-call budget cap (_enforce_paid_call_budget); after an accepted guide, one
                       best-effort extra call via generate_hook_variants() stores alt hook lines on
-                      every cut of the reel (same list — beats are normally identical across platforms)
+                      every cut of the reel (same list — beats are normally identical across platforms);
+                      queries active PerformanceNote rows unconditionally at function entry (both
+                      generation paths reach the shared job.meta write that records
+                      performance_note_ids) and seeds them into the standard path's prior_feedback
+                      from attempt 1 — see Key conventions below; passes
+                      settings.evaluator_axis_weight_multipliers to every score_guide() call (both paths)
     render.py         render_cut(job_id) — prepare (refuses an already-posted cut), resolve_or_reuse,
                       synth_to_budget, TTS-accurate timecodes, atomic MP4, observability;
                       resolves a music track via get_music_sourcer().find(music_cue) and
@@ -147,7 +159,24 @@ worker/
 
 engine/
   observability.py    record_stage() context manager — writes StageEvent rows on exit;
-                      paid_call_count() — counts nvidia-provider StageEvents for a reel (budget cap)
+                      paid_call_count() — counts nvidia-provider StageEvents for a reel (budget cap);
+                      latest_quality_scores(jobs) — latest non-null quality_score per reel_id from a
+                      list of Job rows (last write wins, ascending created_at); the single shared
+                      implementation behind api/routers/reels.py's list/detail pages AND
+                      engine/analytics/correlation.py — extracted so a third near-identical copy
+                      wasn't added for the correlation feature (see CLAUDE.md's own heartbeat() note
+                      on why this codebase avoids copy-drift)
+  analytics/
+    correlation.py    quality_engagement_correlation(db) -> CorrelationResult (Pearson r + sample_size +
+                      insufficient_variance flag; refuses to compute below MIN_SAMPLE=5 reels or when
+                      either series has zero variance — np.corrcoef returns NaN on zero variance, guarded
+                      explicitly rather than let "nan" leak into the UI string); top_bottom_performers(db, k=3)
+                      -> (top, bottom) sorted by views desc/asc, or one combined list when n < 2k. Both read
+                      `Cut.views` (max per reel, matching _reel_list_metrics()'s existing "views" definition)
+                      against latest_quality_scores() — no new schema, no cached/denormalized column, no
+                      chart library (see docs/specs/2026-09-phase5-quality-engagement-feedback.md §2.1). New
+                      package (not observability.py) — this is the first cross-reel "insights" feature,
+                      not per-reel instrumentation
   generation/
     guide_schema.py   Beat, PlatformGuide, MasterGuide Pydantic models — platform Literal includes tiktok
     llm.py            LLMProvider + OllamaProvider (captures last_usage/total_usage token counts);
@@ -159,7 +188,12 @@ engine/
     script_parser.py  BeatStub + parse() + is_structured() — structured-script extractor
     visual_fallback.py  Fallback visual_direction synthesis — section/VO keyword tables
     beat_enrichment.py  Tactical insight enrichment + conflict-beat synthesis (topic-fenced)
-    evaluator.py      score_guide() — 17-axis rule scorer (0–100); see docs/evaluation.md
+    evaluator.py      score_guide(context, guide, target_length_s, axis_multipliers=None) — 17-axis rule
+                      scorer (0–100); axis_multipliers (from Settings.evaluator_axis_weight_multipliers)
+                      scales a named axis's deduction via one small correction block immediately before
+                      the final return, reusing the deductions dict already built for the issue-string
+                      breakdown — None/empty is a byte-identical no-op to every prior test in this file;
+                      see docs/evaluation.md
     llm_judge.py      judge_guide() — LLM semantic judge; 5 dims × 0–20 = 100 pts
     postprocess.py    clean_guide() — strips label prefixes; derives up to 5 on_screen_text segments
     hook_variants.py  generate_hook_variants() — one best-effort LLM call for N_VARIANTS (3) alternate
@@ -227,9 +261,12 @@ migrations/
     0004_publishing.py  tiktok CutPlatform value; Credential.provider_account_id + refresh_token_blob
     0005_metrics.py   Cut.views/likes/comments/metrics_updated_at columns
     0006_variants.py  Cut.thumbnail_candidates + Cut.hook_variants columns
+    0007_performance_notes.py  performance_notes table (id, text, active, created_at)
 
 tests/
-  test_evaluator.py           29 tests — all 17 evaluator axes + helpers, multi-platform dedupe
+  test_evaluator.py           34 tests — all 17 evaluator axes + helpers, multi-platform dedupe,
+                              axis_multipliers no-op default (None/{} byte-identical to every existing
+                              fixture), zero/doubled/unknown-axis multiplier correction
   test_script_parser.py       11 tests — parse() routing, beat splitting, _derive_on_screen
   test_state.py               11 tests — REEL_TRANSITIONS, CUT_TRANSITIONS, invalid moves
   test_enrichment.py          15 tests — coerce_beat_type, _enrich_batch response parsing, topic fence
@@ -243,7 +280,10 @@ tests/
   test_r3_proposed.py         38 tests — regressions found by round-3 mutation testing: distinct job/reel/cut ids so an id mix-up can't hide, transaction-visibility checks via a second connection, _error_text regex boundaries, refused-retry/reaped-job edge cases, template hx-post assertions, per-type pending thresholds
   test_r4_gaps.py             30 tests — regressions found by round-4 mutation testing: heartbeat commit visibility, failure-path rollback of flushed rows, commit-failure-at-done-stamp is not "done", after_commit cleanup without a hook, pool_pre_ping, task signature
   test_tasks_real_db.py       4 tests — real tasks through job_task on SQLite: post id durable after a post-upload failure, built caption sent, enrich enqueues the real job id
-  test_generate_task.py        9 tests — missing reel, reel not generating, paid-call budget, structured-path fallback (incl. a soft-limit kill), music_cue default, caption/hashtags does not swallow a runtime-limit timeout
+  test_generate_task.py       11 tests — missing reel, reel not generating, paid-call budget, structured-path fallback (incl. a soft-limit kill), music_cue default, caption/hashtags does not swallow a runtime-limit timeout;
+                              2 regression tests (mutation-tested against the naive/buggy version first):
+                              seeded PerformanceNotes survive past attempt 1 on retry (the retry-replace bug),
+                              structured-path success doesn't NameError on performance_note_ids (the wrong-branch-query bug)
   test_render_task.py          6 tests — missing cut, already-posted cut refused, success clears stale error, music wiring
   test_hook_variants.py        9 tests — generate_hook_variants(): JSON-list/dict-wrapped parsing, excludes a variant identical to the original, caps at N_VARIANTS, empty hook skips the LLM call, malformed JSON/non-list/non-string items/provider exception all degrade to []
   test_asset_sourcer.py        7 tests — resolve_or_reuse pin, reuse, re-pin, beat isolation, commits (no open transaction on either resolve or reuse path), Wikipedia names all searched before any asset is flushed
@@ -255,6 +295,18 @@ tests/
   test_llm_provider.py         4 tests — OllamaProvider last_usage/total_usage capture
   test_estimate.py             8 tests — generation path resolution, historical cost averaging incl. structured-fallback exclusion
   test_observability.py        3 tests — paid_call_count() scoping and filtering
+  test_correlation.py         12 tests — quality_engagement_correlation() (below-MIN_SAMPLE, zero-variance
+                              quality/views, a hand-computed synthetic dataset checked to a fixed tolerance
+                              — not trusted circularly via numpy, multi-cut-per-reel uses the max-views cut,
+                              quality-without-views/views-without-quality excluded); top_bottom_performers()
+                              (n < 2k combined list, n >= 2k top/bottom no-overlap, ties, a max-views cut
+                              with no guide degrades to hook_vo=None instead of crashing)
+  test_insights_router.py      9 tests — GET /api/insights with 0/some/enough data; PerformanceNote
+                              create/toggle/delete round-trip through the DB; deleted note gone from a
+                              fresh GET; unknown-id toggle/delete (404 / no-op)
+  test_config.py               2 tests — Settings.evaluator_axis_weight_multipliers defaults to `{}`;
+                              its env var (JSON) round-trips to a real dict of floats, not a string —
+                              the first dict-typed Settings field in this codebase
   test_publish_gate.py         3 tests — safe_to_publish enforcement
   test_oauth.py               13 tests — OAuth state CSRF, YouTube/Instagram authorize+exchange, long-lived token swap, token-in-header regression
   test_credentials_router.py   9 tests — connect/callback/disconnect routes
@@ -277,6 +329,11 @@ ui/templates/
   reel.html           Page shell — pipeline cost/latency/quality panel, loops cuts, includes cut_card.html
   credentials.html    Connected-accounts page — connect/disconnect per provider, TikTok shown as
                       not-yet-available
+  insights.html       Quality↔engagement correlation (r + sample_size, always with the statistical-honesty
+                      caveat text — never r alone) + top/bottom (or combined, n<6) performer table
+                      (hook line from the max-views cut) + performance-notes form/list — GET /api/insights.
+                      Linked from index.html and reels_list.html as a plain `<a>` (no shared nav template
+                      in this app — see api/routers/insights.py)
   fragments/
     cut_card.html     Full cut card; read-only or editable (in_review); render/approve/publish actions
                       per CutStatus branch; published branch shows views/likes/comments once
@@ -286,6 +343,8 @@ ui/templates/
                       "publish-section-{cut.id}" target — do not reuse the parent's id, that
                       creates nested duplicate DOM ids on swap)
     cost_estimate.html   Pre-generation estimate fragment (POST /api/reels/estimate)
+    performance_notes.html  htmx-swappable PerformanceNote list (checkbox = active toggle, × = delete);
+                      returned by all three POST/DELETE /api/insights/notes* routes
 ui/static/main.css    Styles: badges (Job + Reel/Cut status enums both), progress bar shimmer,
                       beat table, edit fields, pipeline panel, credential cards, platform picker,
                       engagement-stats (post-publish views/likes/comments)
@@ -304,9 +363,10 @@ docs/
 - `cuts` — one row per platform (`youtube_shorts`, `instagram_reels`, or `tiktok`); holds `guide` (JSONB), `caption`, `hashtags`, `video_path`, `thumbnail_path`, `thumbnail_candidates` (JSON list of every frame `render_cut` sampled — `thumbnail_path` is whichever one is currently chosen, `[0]` by default), `hook_variants` (JSON list of alternate hook-beat lines generated once per guide, `None` if generation failed or the paid-call budget was already spent), `platform_post_id`, `published_at`, `views`, `likes`, `comments`, `metrics_updated_at` (last three populated by `pull_publish_metrics()`, `None` until the first successful pull)
 - `assets` — cached media files; deduplicated by `(source, source_ref)`; `source` is `pexels`, `wikipedia`, `huggingface`, or `huggingface_video`; `type` is `footage` or `photo`; includes `license_url`, `attribution`, `safe_to_publish`. HF-generated assets are `safe_to_publish=True`.
 - `cut_assets` — per-beat asset binding ledger; `beat_index` + `order_in_beat` identify position; `resolved_from` is `sha256(visual_direction)[:16]` for change detection; unique constraint on `(cut_id, beat_index, order_in_beat)`; `start_s`/`end_s` updated after TTS measurement
-- `jobs` — every async operation (`enrich`, `generate`, `render`, `publish`); includes `started_at`, `heartbeat_at`, `meta` (JSON — stores `generation_path`, `path`, `stub_count`, `quality_score` on success, and optionally `structured_score`/`structured_fallback` when structured path fell back to standard); `error` is `None` on success, set to exception message on failure only
+- `jobs` — every async operation (`enrich`, `generate`, `render`, `publish`); includes `started_at`, `heartbeat_at`, `meta` (JSON — stores `generation_path`, `path`, `stub_count`, `quality_score` on success, and optionally `structured_score`/`structured_fallback` when structured path fell back to standard, and `performance_note_ids` — the active `PerformanceNote` ids at the time of this generate run, written by the same shared `job.meta` line as `quality_score`); `error` is `None` on success, set to exception message on failure only
 - `stage_events` — instrumentation: one row per pipeline stage (enrich, generate, judge, visuals, enrich_conflict, caption_hashtags, context_enrich, composite, publish); stores `stage`, `provider`, `model_name`, `latency_ms`, `tokens_in`, `tokens_out`, `cost_usd`, `ok`, `detail`, `score`. `provider == "nvidia"` StageEvents are what `paid_call_count()` counts toward the budget cap.
 - `credentials` — OAuth tokens for publish-target accounts; `token_blob` and `refresh_token_blob` are encrypted at rest via `Encrypted` TypeDecorator (auto-decrypted on read — code sees plain strings); `provider_account_id` holds a provider-specific ID discovered during OAuth (e.g. the Instagram Business Account ID behind a connected Facebook Page); `provider` is `"youtube"` or `"instagram"` (not the `CutPlatform` value — see `credential_provider_for_platform()`)
+- `performance_notes` — standalone table (no FK), operator-written plain-English notes on past reel performance; `active` (default `true`) gates whether a note is seeded into `generate_guide`'s standard-path `prior_feedback`. Deliberately not automated few-shot injection of raw past-reel content — see `docs/specs/2026-09-phase5-quality-engagement-feedback.md` §3.1. CRUD is hard-delete (cheap, operator-owned free text, unlike a `Job`/`Cut` state machine).
 
 Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_DIR/wiki/`; TTS audio in `ASSET_STORE_DIR/tts/`; DB stores paths only.
 
@@ -339,6 +399,10 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 - **Beat types are coerced**: `guide_schema.py` maps unknown strings ("closing", "outro", "tactical_analysis") to "cta" or "body". Safe to add new aliases.
 - **on_screen_text**: `_derive_on_screen()` generates up to 5 segments (one per sentence, 7 words each). `clean_guide()` preserves all 5 (`deduped[:5]`). The PATCH endpoint also preserves 5 (`lines[:5]`). The compositor reads `[:5]` in `_build_text_filter()`.
 - **Closed-loop eval retry**: `build_messages()` accepts `prior_feedback: list[str] | None`. Pass `last_issues` from the previous attempt. The LLM receives the issues as a second user message. Best-of-3 is returned if nothing clears the 80/100 threshold — do not raise an error when a valid guide exists.
+- **Performance-note seeding into `prior_feedback` has two specific correctness traps** (`worker/tasks/generate.py::generate_guide`) — both caught by dedicated regression tests before this shipped, not hypothetical:
+  1. `active_notes_rows = db.query(models.PerformanceNote).filter(active.is_(True)).all()` is queried **unconditionally at the top of the function**, before the structured-vs-standard branch — never inside the `if guide is None:` (standard-path-only) block. The shared `job.meta = {..., "quality_score": ..., "performance_note_ids": [...]}` write at the end of the function is reached by **both** paths; querying it in the wrong branch is a `NameError`/`UnboundLocalError` on every structured-path success, and a standard-path-only smoke test would never catch it.
+  2. `feedback` is seeded from `active_notes` **before** attempt 1 (`feedback: list[str] = list(active_notes)`, not `[]`), so the existing per-attempt line **must be additive**: `feedback = active_notes + [i for i in last_issues if not i.startswith("Score breakdown")]`, never a plain replace. A plain replace was correct before this feature existed (nothing to lose from an empty starting list) but silently drops the seeded notes on attempt 2 and 3 once seeding is added.
+- **Active `PerformanceNote`s only reach the standard LLM path** — the structured-script path never calls `build_messages()` (only `build_visuals_messages()`, which has no `prior_feedback`-equivalent parameter), so notes have no effect there. Both paths' `score_guide()` calls DO get `axis_multipliers` (that's the scorer, not a prompt).
 - **Enrichment provider**: always use `get_enrichment_provider()` (not `get_llm_provider()`) for enrichment, conflict generation, and judging. It auto-routes to NVIDIA NIM when `NVIDIA_API_KEY` is set.
 - **Atomic file writes**: compositor writes FFmpeg output to `.tmp.mp4` then `os.replace()`. Never stream-write the final video path — a killed process must not leave a servable partial file. All asset sourcer downloads (Pexels, Wikipedia, both HuggingFace sources) go through `_atomic_write()` or a streamed `.tmp` + `os.replace()`. This is not optional: every sourcer caches by `if path.exists()`, so a truncated file is reused on every later render.
 - **Celery workers don't auto-reload**: always `pkill -f "celery.*worker"` and restart after code changes. The API server (`--reload`) hot-reloads but workers do not.
@@ -376,7 +440,8 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 - **Phase 3.5** ✅ — Hardening: acks_late reliability, idempotency guards, heartbeat + stuck-job reaper, per-beat asset pinning (deterministic re-render), observability (StageEvent), credential encryption, a substantially expanded test suite; evaluator upgraded to 17 axes (conversational tone, hook-CTA throughline, per-beat specificity, repetition)
 - **Phase 4a** ✅ — Operator visibility: reel list page, per-reel cost/latency/quality panel sourced from `StageEvent`, `StageEvent.cost_usd` implemented for every LLM call site (NVIDIA rates only — HF asset-generation cost is not tracked), pre-generation cost/time estimate from real history, hard cap on paid LLM calls per reel
 - **Phase 4b** ✅ — Publishing: OAuth connect-account flow (YouTube Data API + Instagram Graph API), `safe_to_publish` hard gate enforced at publish time, TikTok added as a third `CutPlatform` for render/review (publishing itself deliberately not implemented — see Key conventions), `scheduled`/`publishing`/`published` cut states wired end-to-end. Not done: attribution block in captions, TikTok publishing, unpublish/re-publish flows.
-- **Phase 5** ✅ — Analytics: local-library music mixing with sidechain ducking (`LocalMusicSource` + `_build_ffmpeg_args`), HF asset-generation cost tracking (`engine/render/pricing.py`, `asset_hf_video`/`asset_hf_image` StageEvents), Wikipedia attribution block appended to published captions (`engine/publish/attribution.py`), post-publish metrics pull-back every 6h (`worker/tasks/metrics.py`), quality-vs-views surfaced on the reel list and per-cut engagement stats on the cut card. Not done: correlating `quality_score` against real engagement (still an operator eyeballing the table), feeding high/low performers back into `prior_feedback`/evaluator weights.
+- **Phase 5** ✅ — Analytics: local-library music mixing with sidechain ducking (`LocalMusicSource` + `_build_ffmpeg_args`), HF asset-generation cost tracking (`engine/render/pricing.py`, `asset_hf_video`/`asset_hf_image` StageEvents), Wikipedia attribution block appended to published captions (`engine/publish/attribution.py`), post-publish metrics pull-back every 6h (`worker/tasks/metrics.py`), quality-vs-views surfaced on the reel list and per-cut engagement stats on the cut card. Quality↔engagement correlation (`engine/analytics/correlation.py`, `GET /api/insights`) and performance-informed feedback (`PerformanceNote` CRUD + seeding into `prior_feedback`, `evaluator_axis_weight_multipliers` lever) shipped after — see below.
+- **Phase 5g** ✅ — Quality↔engagement correlation + performance-informed feedback: closes the last two Phase 5 items (`docs/specs/2026-09-phase5-quality-engagement-feedback.md`). `GET /api/insights` shows a Pearson `r` (+ `sample_size`, always shown together, never `r` alone) between `quality_score` and max per-reel `views`, refusing to compute below `MIN_SAMPLE=5` reels or on zero variance in either series — with an explicit, permanent UI caveat about restriction-of-range bias (scores cluster near the acceptance threshold by construction) and "correlation, not causation." Same page shows a top/bottom-3 performer table (combined into one list when `n < 6`) with each performer's hook line, for a human operator to write `PerformanceNote`s from — **not** automatic few-shot injection of raw past-reel content, a deliberate scope decision (see the spec's §3.1: this codebase has already been burned by topic-drift from unconstrained prior context leaking into generation). Every active note is seeded into the standard LLM path's `prior_feedback` from attempt 1 onward. `evaluator_axis_weight_multipliers` (`Settings`, default `{}`) is a manual per-axis scoring lever informed by the correlation data — no code in this repo derives these values statistically.
 - **Phase 6 (partial)** — Creative range: hook/thumbnail variant generation. `render_cut` samples 4 thumbnail candidates per render (`Cut.thumbnail_candidates`); `generate_guide` generates 3 alternate hook lines once per accepted guide (`Cut.hook_variants`, best-effort — never fails the job). Operator picks either from the `in_review` cut card (`POST /cuts/{id}/thumbnail`, `POST /cuts/{id}/hook-variant`). Not done: per-reel TTS voice choice, non-football niche evaluator fixtures, brand customization (logo/watermark/text color).
 
 ## Worker queues
@@ -393,7 +458,8 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 - Multi-image collage within a single beat — currently cycles sequentially; no side-by-side layout
 - `PIXABAY_API_KEY` (`pixabay_api_key` in config) — Pixabay's public REST API has never documented a Music endpoint, so this stays unused by design; music sourcing uses `LocalMusicSource` instead (see Key conventions)
 - Unpublish / re-publish flows — a published cut has no "take down" or "publish again" action
-- Analytics beyond raw views/likes/comments — no trend charts, no engagement-rate normalization, no correlation report between `quality_score` and engagement (the reel-list Quality/Views columns are the raw inputs an operator would eyeball for that, not a computed correlation)
+- Analytics beyond raw views/likes/comments and the quality↔views correlation — no trend charts (`pull_publish_metrics()` still overwrites rather than accumulates a time series), no engagement-rate normalization, no per-axis correlation (which of the 17 evaluator axes individually predicts engagement — `score_guide()`'s internal `deductions` dict has the data but never persists it), no per-niche correlation (one niche run so far), no likes/comments composite metric (views only)
+- Automatic/statistical tuning of `evaluator_axis_weight_multipliers` from the correlation data — the multiplier lever exists so a human can act on evidence; fitting it from an n≈10–20 sample would be the same overfitting risk `PerformanceNote`s were designed to avoid on the prompt side
 
 ## Docs
 

@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Insights — Reel Maker</title>
+    <script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"></script>
+    <script src="/static/htmx-errors.js"></script>
+    <link rel="stylesheet" href="/static/main.css">
+</head>
+<body>
+<main>
+    <div class="page-nav">
+        <a href="/" class="back" style="margin-bottom:0;">← New reel</a>
+        <a href="/api/reels">All reels</a>
+    </div>
+    <h1>Insights</h1>
+
+    <section style="margin-bottom:28px;">
+        <h2 style="font-size:1.1rem;">Quality ↔ engagement correlation</h2>
+        {% if correlation.r is not none %}
+        <p class="mono" style="font-size:1.05rem;">
+            Quality ↔ views correlation: <strong>r = {{ "%.2f"|format(correlation.r) }}</strong>
+            (n = {{ correlation.sample_size }})
+        </p>
+        {% elif correlation.insufficient_variance %}
+        <p class="empty-state">Every measured reel scored the same — no relationship computable yet.</p>
+        {% else %}
+        <p class="empty-state">
+            Not enough published, measured reels yet
+            (n = {{ correlation.sample_size }} of {{ min_sample }} needed).
+        </p>
+        {% endif %}
+        <p class="form-hint">
+            Correlation, not causation. Quality scores cluster near the acceptance threshold by
+            design, which weakens any correlation this number can detect — see
+            docs/specs/2026-09-phase5-quality-engagement-feedback.md §2.4.
+        </p>
+    </section>
+
+    <section style="margin-bottom:28px;">
+        <h2 style="font-size:1.1rem;">Top / bottom performers</h2>
+        <p class="form-hint">
+            The hook line is from whichever cut of the reel drew the most views. Use these to
+            write an informed performance note below — raw reel content is never fed back into
+            generation automatically.
+        </p>
+
+        {% macro performer_table(performers, caption) %}
+        <table class="reel-list" style="margin-bottom:16px;">
+            <caption style="text-align:left;font-weight:600;margin-bottom:4px;">{{ caption }}</caption>
+            <thead>
+                <tr>
+                    <th>Reel</th>
+                    <th>Niche</th>
+                    <th>Quality</th>
+                    <th>Views</th>
+                    <th>Hook line</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for p in performers %}
+                <tr onclick="window.location='/api/reels/{{ p.reel_id }}'" class="reel-row">
+                    <td class="mono">#{{ p.reel_id }}</td>
+                    <td>{{ p.niche or "—" }}</td>
+                    <td class="mono">{{ p.quality_score }}</td>
+                    <td class="mono">{{ "{:,}".format(p.views) }}</td>
+                    <td>{{ p.hook_vo or "no hook text available" }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% endmacro %}
+
+        {% if combined_performers is not none %}
+            {% if combined_performers %}
+                {{ performer_table(combined_performers, "All measured reels (not enough yet for separate top/bottom tables)") }}
+            {% else %}
+            <p class="empty-state">No published, measured reels yet.</p>
+            {% endif %}
+        {% else %}
+            {{ performer_table(top_performers, "Top performers") }}
+            {{ performer_table(bottom_performers, "Bottom performers") }}
+        {% endif %}
+    </section>
+
+    <section>
+        <h2 style="font-size:1.1rem;">Performance notes</h2>
+        <p class="form-hint">
+            Plain-English notes on what's working, written after reviewing the table above.
+            Every <em>active</em> note is fed into future standard-path guide generation as
+            prior feedback — see CLAUDE.md's Key conventions.
+        </p>
+        <form hx-post="/api/insights/notes"
+              hx-target="#performance-notes"
+              hx-swap="outerHTML"
+              hx-on::after-request="this.reset()"
+              style="display:flex;gap:8px;margin-bottom:16px;">
+            <textarea name="text" rows="2" class="field-input" style="flex:1;"
+                      placeholder="e.g. Hooks phrased as a direct question outperform statement hooks — lean into that."
+                      required></textarea>
+            <button type="submit" class="btn-save" style="align-self:flex-start;">Add note</button>
+        </form>
+
+        {% include "fragments/performance_notes.html" %}
+    </section>
+</main>
+</body>
+</html>

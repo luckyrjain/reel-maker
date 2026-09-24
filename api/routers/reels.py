@@ -8,6 +8,7 @@ from api.db import get_db
 from api import models
 from api.state import transition, REEL_TRANSITIONS
 from engine.generation.estimate import estimate_generation
+from engine.observability import latest_quality_scores
 from worker.tasks.common import fail_unenqueued
 from worker.tasks.enrich_context import enrich_context
 
@@ -108,10 +109,7 @@ def _reel_list_metrics(db: Session, reels: list[models.Reel]) -> dict[int, dict]
         .order_by(models.Job.created_at)
         .all()
     )
-    quality_by_reel: dict[int, int] = {}
-    for j in jobs:
-        if j.meta and j.meta.get("quality_score") is not None:
-            quality_by_reel[j.reel_id] = j.meta["quality_score"]  # last write wins (asc order)
+    quality_by_reel = latest_quality_scores(jobs)
 
     metrics = {}
     for r in reels:

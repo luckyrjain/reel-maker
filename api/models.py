@@ -186,6 +186,23 @@ class StageEvent(Base):
     created_at = Column(DateTime(timezone=True), default=_now)
 
 
+class PerformanceNote(Base):
+    """Operator-written, plain-English note synthesizing past reel performance
+    (e.g. "Hooks phrased as a direct question outperform statement hooks — lean
+    into that"). Every *active* note is seeded into generate_guide's
+    prior_feedback on the standard LLM path — see worker/tasks/generate.py and
+    docs/specs/2026-09-phase5-quality-engagement-feedback.md §3. Deliberately
+    plain text, human-curated: no raw past-reel content is ever auto-injected,
+    only what the operator chose to write after reviewing the /api/insights
+    top/bottom performer report."""
+    __tablename__ = "performance_notes"
+
+    id = Column(Integer, primary_key=True)
+    text = Column(Text, nullable=False)
+    active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_now)
+
+
 class Credential(Base):
     __tablename__ = "credentials"
 
