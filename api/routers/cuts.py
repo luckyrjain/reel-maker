@@ -10,6 +10,7 @@ from api.config import settings
 from api.db import get_db
 from api.state import CUT_TRANSITIONS, transition
 from engine.generation.postprocess import _derive_on_screen
+from worker.tasks.common import fail_unenqueued
 from worker.tasks.publish import publish_cut
 from worker.tasks.render import render_cut
 
@@ -26,12 +27,19 @@ def _cut_card(request: Request, cut: models.Cut) -> HTMLResponse:
 
 @router.post("/cuts/{cut_id}/render", response_class=HTMLResponse)
 def trigger_render(cut_id: int, request: Request, db: Session = Depends(get_db)):
-    cut = db.get(models.Cut, cut_id)
+    # FOR UPDATE: a double-click (or Retry render + Retry publish) serialises on the cut row, so the
+    # second request sees the first one's status change instead of both passing the guards below.
+    cut = db.get(models.Cut, cut_id, with_for_update=True)
     if not cut:
         raise HTTPException(status_code=404, detail="Cut not found")
 
     if not cut.guide:
         raise HTTPException(status_code=422, detail="No guide yet — run guide generation first")
+
+    if cut.platform_post_id:
+        # The video is already live. Re-rendering would leave the cut pointing at that post while
+        # a later publish "finalizes" against it without ever uploading the new render.
+        raise HTTPException(status_code=409, detail="Already posted — it cannot be re-rendered")
 
     current = cut.status.value
     if current == "rendering":
@@ -52,10 +60,16 @@ def trigger_render(cut_id: int, request: Request, db: Session = Depends(get_db))
         progress=0,
     )
     db.add(job)
-    db.commit()
-    db.refresh(job)
+    db.flush()
+    job_id = job.id
+    db.commit()   # nothing may be open across .delay(): a slow broker failure would outlive an idle-in-transaction timeout
 
-    render_cut.delay(job.id)
+    try:
+        render_cut.delay(job_id)
+    except Exception as exc:
+        fail_unenqueued(db, job_id, models.JobType.render.value, exc)
+        raise HTTPException(status_code=503, detail="Could not queue the render — try again") from exc
+    db.refresh(job)
 
     return templates.TemplateResponse(
         request, "fragments/render_status.html",
@@ -79,13 +93,16 @@ def render_status_fragment(
 
 @router.patch("/cuts/{cut_id}", response_class=HTMLResponse)
 async def update_cut(cut_id: int, request: Request, db: Session = Depends(get_db)):
-    cut = db.get(models.Cut, cut_id)
+    # Read the body BEFORE taking any lock: a slow or stalled client (flaky connection, proxy hiccup —
+    # no malice needed) would otherwise hold the row lock, and a pool connection, for as long as the
+    # body trickles in. That starves every other request waiting on the same lock, not just this cut's.
+    form = await request.form()
+
+    cut = db.get(models.Cut, cut_id, with_for_update=True)   # see trigger_render
     if not cut:
         raise HTTPException(status_code=404, detail="Cut not found")
     if cut.status.value != "in_review":
         raise HTTPException(status_code=409, detail="Can only edit cuts with status 'in_review'")
-
-    form = await request.form()
 
     if form.get("caption", "").strip():
         cut.caption = form["caption"].strip()
@@ -128,7 +145,7 @@ async def update_cut(cut_id: int, request: Request, db: Session = Depends(get_db
 
 @router.post("/cuts/{cut_id}/approve", response_class=HTMLResponse)
 def approve_cut(cut_id: int, request: Request, db: Session = Depends(get_db)):
-    cut = db.get(models.Cut, cut_id)
+    cut = db.get(models.Cut, cut_id, with_for_update=True)   # see trigger_render
     if not cut:
         raise HTTPException(status_code=404, detail="Cut not found")
     if cut.status.value != "in_review":
@@ -142,7 +159,7 @@ def approve_cut(cut_id: int, request: Request, db: Session = Depends(get_db)):
 
 @router.post("/cuts/{cut_id}/publish", response_class=HTMLResponse)
 def trigger_publish(cut_id: int, request: Request, db: Session = Depends(get_db)):
-    cut = db.get(models.Cut, cut_id)
+    cut = db.get(models.Cut, cut_id, with_for_update=True)   # see trigger_render
     if not cut:
         raise HTTPException(status_code=404, detail="Cut not found")
 
@@ -171,10 +188,16 @@ def trigger_publish(cut_id: int, request: Request, db: Session = Depends(get_db)
         progress=0,
     )
     db.add(job)
-    db.commit()
-    db.refresh(job)
+    db.flush()
+    job_id = job.id
+    db.commit()   # see trigger_render
 
-    publish_cut.delay(job.id)
+    try:
+        publish_cut.delay(job_id)
+    except Exception as exc:
+        fail_unenqueued(db, job_id, models.JobType.publish.value, exc)
+        raise HTTPException(status_code=503, detail="Could not queue the publish — try again") from exc
+    db.refresh(job)
 
     return templates.TemplateResponse(
         request, "fragments/publish_status.html",

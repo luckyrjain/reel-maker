@@ -21,6 +21,7 @@ This file below is the build log (what shipped, phase by phase); that one is the
 | 3.6 | ✅ Done | Pre-generation context evaluation & enrichment |
 | 3.7 | ✅ Done | Generation quality fixes (context drift, audio gaps, prompt fences) |
 | 3.8 | ✅ Done | Repo hygiene, render-path fixes, retry semantics, task-module split |
+| 3.9 | ✅ Done | Job lifecycle consolidation (`job_task`) and reliability hardening |
 | 4a | ✅ Done | Operator visibility (cost, latency, quality, budget cap) |
 | 4b | ✅ Done | Publishing (OAuth, safe_to_publish gate, YouTube + Instagram uploaders, TikTok platform) |
 | 5 | 🔲 Planned | Analytics and polish |
@@ -186,6 +187,141 @@ Edge TTS synthesis, and the final MP4/thumbnail — worked as designed.
 
 ---
 
+### Phase 3.9 — Job lifecycle consolidation and reliability hardening
+
+The guard / stamp / retry / failure stanza had been copied into four task modules (and drifted:
+`heartbeat()` before, then the retry fix landing in three separate commits). It now lives in
+`worker/tasks/common.py::job_task`, with the owner-state table `api/state.py::JOB_IN_FLIGHT` shared
+by the tasks and the reaper. The concurrency-sensitive parts (the atomic claim, the fenced done-stamp,
+lock ordering against the reaper, idle-in-transaction across long calls) were verified against real
+PostgreSQL 16, not just SQLite. Behaviour changes an operator should know about:
+
+- **Only `pending` jobs run.** The claim is an atomic `UPDATE … WHERE status='pending'`; `failed` is
+  terminal (an operator retry creates a new Job). The done-stamp and `heartbeat()` are fenced the same
+  way, so a worker the reaper gave up on cannot commit or keep writing.
+- **The reaper now actually runs.** `reap_stuck_jobs` had no `task_routes` entry, so beat sent it to the
+  default queue that no documented worker consumes. It is now routed to `generation`, does a
+  per-job compare-and-set, and rolls back only the owner state the job's type owns. The first run after
+  deploy will fail any historic stale rows.
+- **A heartbeat thread** keeps `heartbeat_at` fresh through long LLM / ffmpeg / upload calls, and each
+  task has a `max_runtime_s` enforced as a Celery soft/hard time limit.
+- **Publishing never retries automatically** (`max_retries=0`, no release on shutdown). The post id is
+  committed the moment the upload succeeds, and a re-run with an id set finalizes without uploading.
+  A cut that already has a post id cannot be re-rendered. A timeout *inside* the upload can still lead
+  to a manual double post: the failed-cut card tells the operator to check the platform first.
+- **Routers fail fast** when `.delay()` raises (503, job failed, cut/reel rolled back) instead of
+  leaving the owner in flight until the reaper's 4 h pending threshold.
+- `OperationalError`/`InterfaceError` are transient; `pool_pre_ping` and `hide_parameters` are on;
+  `job.error` is sanitised (never empty, database row detail and bound parameters redacted, a soft
+  time-limit failure says so in plain language); task sessions use `expire_on_commit=False`.
+- **A worker shutdown (or a hard time limit) fails the job at once**, freeing its owner immediately,
+  rather than handing it back to `pending` — Celery has already acked or dropped the message by then,
+  so a `pending` job would otherwise wait for the reaper's threshold with no message coming back for it.
+- **`approve_cut` and `update_cut` also lock the cut row**, matching the trigger routes, so an approve
+  cannot race a render past its own status guard. `update_cut` reads the request body before taking
+  that lock — a slow client otherwise holds a pool connection for as long as the body trickles in.
+- **Terminal failure recorders survive a dead connection.** `_fail_interrupted`, `_fail_rejected_retry`,
+  and `fail_unenqueued` retry once on a brand-new session (`_finalize_or_reconnect`) if their own
+  `db.rollback()`/write/commit raises `OperationalError`/`InterfaceError` — plausible exactly when one
+  of these is running, since a server-side kill or the idle-in-transaction timeout can be the reason.
+- **A refused retry (`Reject`) fails the job whether or not this run ever claimed it** — an unclaimed
+  job whose retry message the broker refused was previously left `pending` until the reaper's threshold.
+- **`after_commit` raising `SystemExit`/`KeyboardInterrupt`** (not just `Exception`) still runs the
+  `after_commit_failed` cleanup hook; if the hook itself raises, the failure stamp it already wrote is
+  still committed rather than silently rolled back with the job left looking `done` forever. The hook
+  runs inside its own `db.begin_nested()` SAVEPOINT (managed explicitly — `.rollback()`/`.commit()`
+  called directly, not `with db.begin_nested():`), so a raise partway through a multi-write hook
+  (`_abandon_generate`'s real shape: fail the orphaned follow-up Job, then roll the reel back) undoes
+  only the hook's own writes — not the failure stamp, and not a half-done cleanup either. A
+  SystemExit/KeyboardInterrupt raised BY THE HOOK ITSELF (not by `after_commit`) is deliberately not
+  swallowed, but does commit the fail-stamp before re-raising via `_commit_stamp_and_reraise` —
+  without that, the exception unwinding straight to `job_task`'s `finally: db.close()` would roll it
+  back too. That commit is itself guarded: if it fails, the failure is logged and the original
+  BaseException still propagates rather than being replaced by the commit error. If the SAVEPOINT
+  rollback itself fails, `_recover_from_hook_failure` (`worker/tasks/common.py`) falls back to a full
+  `db.rollback()` (discards the hook's still-pending writes, which the failed SAVEPOINT rollback never
+  actually did) and redoes the fail-stamp CAS on the now-clean transaction — and that redo is itself
+  guarded too, so a third failure in the same sequence can't replace the shutdown signal that survived
+  the first two. No log line in this whole path claims the fail-stamp is durably "recorded": neither
+  caller commits `db` until after this function returns, so every log line says "staged (not yet
+  committed)" or, when even that can't be confirmed, says so plainly and points at the database.
+  - **One narrow gap remains, not worth a code change today**: if the hook raises BaseException *and*
+    the guarded recovery commit *also* fails (at any of the several points that guard applies), the Job
+    row is left at `status=done` with no error recorded, and the reaper's sweep only scans
+    `running`/`pending` rows — that Job is never revisited. This isn't really an independent unlucky
+    coincidence: the same dying connection that fails the SAVEPOINT rollback plausibly fails the very
+    next commit too, so it's one failure mode with several consecutive symptoms, not a rare one.
+    `enrich_context`'s hook (`_abandon_generate`) happens to self-heal the reel anyway, because its own
+    orphaned follow-up Job stays `pending` and gets reaped after `PENDING_STALE_MINUTES`; that's
+    incidental to `_abandon_generate`'s specific shape, not a guarantee `_stamp_failed_and_run_cleanup`
+    makes for every hook. A future hook with no such side effect would leave its owner stuck in its
+    in-flight status with no automatic recovery in this specific double-fault — the cheap mitigation,
+    if/when a second `after_commit_failed` hook is added, is extending `reap_stuck_jobs` to also sweep
+    `done` jobs whose owner is still sitting in the state `JOB_IN_FLIGHT` maps to, past some staleness
+    threshold; not done now since it would be speculative hardening for a failure mode with zero live
+    instances today.
+  - **Detecting it**: the only trace is a handful of log lines from logger `worker.tasks.common`
+    (`SAVEPOINT rollback itself failed`, `could not roll back the poisoned transaction`, `could not
+    redo the failure stamp`, `could NOT confirm`, `could not load job ... for the cleanup hook`, `could
+    not record failure of job`) — there is no alerting on any of them (this repo has none configured
+    for anything), so this is moot until some alerting exists. A Job whose `status` is `done`, `error`
+    is `None`, and whose owner (reel/cut) is still in the in-flight state `JOB_IN_FLIGHT` maps to that
+    job type is the on-disk signature; nothing currently queries for that combination either.
+
+  <details>
+  <summary>Investigation history (rounds 10-14) — why this code looks the way it does</summary>
+
+  - **Round 10**: introduced the SAVEPOINT so a multi-write hook rolls back atomically on its own raise.
+  - **Round 11**: found that a failed SAVEPOINT rollback could mask the hook's own shutdown signal
+    (`SessionTransaction.rollback()` re-raises a failed DBAPI-level rollback rather than swallowing it,
+    replacing the propagating `SystemExit`/`KeyboardInterrupt` with an ordinary `Exception`). First fix
+    inferred this shape from `exc.__context__` after the fact.
+  - **Round 12**: found the `__context__` inference had a false-positive of its own — `__context__`
+    reflects whatever exception is ambiently "being handled" anywhere up the call stack (e.g. when this
+    function runs with `on_shutdown=True`, already inside `job_task`'s own outer shutdown handling), not
+    necessarily anything to do with the hook's own SAVEPOINT, so an ordinary unrelated hook bug could
+    misclassify as a recovered masked shutdown. Also found the round-11 fix's recovery path could commit
+    the hook's still-pending writes (never actually discarded by the failed SAVEPOINT rollback) alongside
+    the fail-stamp, breaking the "only the hook's own writes roll back" guarantee. Fixed both by managing
+    the SAVEPOINT explicitly instead of inferring from `__context__`, and by doing a full `db.rollback()`
+    + fail-stamp CAS redo when the SAVEPOINT-scoped rollback fails. Independently re-verified against
+    real PostgreSQL 16 for both fixes.
+  - **Round 13**: found the redo CAS itself could fail (a third failure in the same sequence), still
+    capable of masking the shutdown signal if left unguarded; fixed. Found the SAVEPOINT-rollback-failure
+    branch's log line claimed more than was confirmed when the recovery *also* failed; fixed (tracked
+    explicitly via a `confirmed` flag). Found `db.get(models.Job, job_id)` failures were misattributed to
+    "the hook raised" when the hook never actually ran; moved the read out of the hook's own try/except.
+    After four consecutive rounds each finding a real bug in the same ~20-line recovery ladder, extracted
+    it into `_recover_from_hook_failure(db, job_id, message, nested) -> bool`, following the same idiom
+    already used twice in this file (`_commit_or_log`, `_commit_stamp_and_reraise`) — same behavior, but
+    the four recovery outcomes are now independently unit-tested instead of only reachable by also
+    driving the outer hook-invocation and shutdown-classification logic.
+  - **Round 14**: found the wording fix from round 13 (the SAVEPOINT-rollback-failure branch saying
+    "failure stamp staged, not yet committed" instead of overclaiming "still recorded") had only been
+    applied to that one rare branch — the much more common "recovery succeeded" branch still overclaimed
+    "still recorded" for the exact same reason (neither caller commits until after this function
+    returns). Reworded both branches consistently. Separately, `_recover_from_hook_failure`'s redo step
+    caught exceptions from `_fail_job_keep_owner` but ignored its boolean return — `False` means the CAS
+    (`WHERE status='done'`) didn't match (a sibling or the reaper moved the job on in the gap since the
+    full rollback), not an exception, so a lost CAS silently fell through to `return True`, contradicting
+    the function's own documented contract ("confirmed durable"). Fixed to check the return value too.
+    Independently verified against real PostgreSQL 16 (`pg_terminate_backend`, a real server-side trigger
+    to force the redo's `UPDATE` to fail, a second connection to check MVCC visibility of the staged
+    write) — confirmed all four original recovery outcomes hold, confirmed the "staged" wording is
+    accurate (Postgres has no working `READ UNCOMMITTED`; the write is genuinely invisible to any other
+    session until commit, and genuinely can vanish if that commit then fails), and surfaced one adjacent,
+    narrower, pre-existing gap not introduced by this ladder: `_fail_job_keep_owner`'s own internal
+    `db.get()` (a read-only ORM identity-map refresh, not the CAS itself, and not `_recover_from_hook_failure`'s call
+    to it) is unguarded — a connection death exactly there propagates raw into `job_task`'s generic
+    catch-all with none of this section's specific diagnostics, even though it's the identical
+    underlying race one statement earlier. Not fixed here (out of scope for this ladder, and
+    `_fail_job_keep_owner` is used by every job-failure path in this file, not just this one); noted for
+    a future pass.
+
+  </details>
+- `_generate_caption_hashtags`'s fallback path no longer swallows `SoftTimeLimitExceeded` — a timeout
+  there now fails the task visibly instead of completing with a template caption.
+
 ## Phase 4a — Operator visibility (done)
 
 Shipped ahead of the original Phase 5a plan below, once the product-gap-analysis
@@ -238,7 +374,8 @@ original plan below in a few ways, noted inline.
 
 **Publish task** (`worker/tasks/publish.py`, `api/routers/cuts.py::trigger_publish`)
 - `publish_cut(job_id)` follows the same idempotency-guard/heartbeat/transient-retry
-  pattern as `generate_guide`/`render_cut`. Gates on `assert_safe_to_publish()`
+  lifecycle (`job_task`) as `generate_guide`/`render_cut`, but with `max_retries=0` and no
+  release-on-shutdown (an accepted upload must never be repeated). Gates on `assert_safe_to_publish()`
   (`engine/publish/gate.py`) before ever calling a platform API — the first
   place `Asset.safe_to_publish` is actually enforced, not just computed.
 - State transitions: `approved|scheduled → publishing → published` or `failed`,
@@ -364,12 +501,16 @@ a new required parameter every publisher now takes instead of reading
 
 | Issue | Severity | Notes |
 |---|---|---|
+| `safe_to_publish` gate checks the current pins, not the video that will ship | Medium | `resolve_or_reuse()` re-pins and commits per beat as the operator edits and re-renders; a failed render never clears `cut.video_path`. If render N used a non-free asset (blocked) and a later render N+1 re-pins to a safe one but then itself fails, "Retry publish" gates against the safe N+1 pins while `video_path` still points at render N's (unsafe) video — the gate passes and the wrong video ships, with attribution built from the wrong pins too. Fix would clear `video_path` (or check a pins fingerprint) whenever a render starts or re-pins |
 | No multi-image collage in one frame | Low | Currently cycles sequentially; side-by-side layout not implemented |
 | MoviePy video readers leak until worker recycle | Low | `_build_media_sub_clip` opens `VideoFileClip`s that only `worker_max_tasks_per_child=10` reclaims; marked with a `ponytail:` comment |
 | `asset_sourcer` degrades silently to black frames | Medium | Every sourcer swallows its own exceptions and returns `None`, so a Pexels/Wikipedia outage produces a black-frame reel that reports success — and never reaches the retry branch |
+| `resolve_or_reuse()` commits the caller's session | Low | Deliberate (no transaction may sit idle across its network calls or the TTS that follows); noted in its docstring. A partial Wikipedia result (one of several names failing) is pinned and reused until `visual_direction` changes |
 | `record_stage()` commits the caller's session | Low | Benign today (all call sites sit on a commit boundary) and documented in `observability.py`, but it will bite whoever wraps a half-applied mutation |
 | `_escape_drawtext` escapes only `\ : % '` | Low | A newline or exotic character in `on_screen_text` could break the FFmpeg filter chain; not observed in practice |
 | Wikipedia licence lookup uses a percent-encoded filename | Low | `_fetch_license()` passes the raw URL segment, so accented/spaced filenames return "unknown" and default to `safe_to_publish=False`. Now live: `assert_safe_to_publish()` blocks these cuts from publishing (Phase 4b), so this under-detection means some legitimately-safe Wikipedia assets get blocked rather than the reverse (a licensing false-negative, not a false-positive) |
+| Reaper does not resume killed jobs | Medium | Under prefork, `pkill` / SIGKILL kills the child without unwinding: the job stays `running`, the redelivered message no-ops, and the reaper fails it after 5 minutes. Nothing re-runs it, so an enrich/generate job loses its (paid) work and a `failed` reel has no retry endpoint. A fix would let the reaper re-enqueue idempotent job types (never publish) a bounded number of times |
+| Failure reason is not shown after a page refresh | Low | `job.error` is rendered only in the polling fragment of the tab that started the job; the cut card and reel page show a generic "Failed" |
 | Cut page does not poll while rendering | Low | `cut_card.html` shows "refresh to update" instead of an auto-refreshing fragment — same limitation for `"publishing"` status (Phase 4b) |
 | LLM judge 60% weight can swing combined score | Low | Log per-attempt rule/judge split from `StageEvent`; tune once data accumulates |
 | Whisper `base` model is slow on CPU | Low | Switch to `faster-whisper` with `base` model for 3-4× speedup on same hardware |

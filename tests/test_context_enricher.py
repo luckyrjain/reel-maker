@@ -1,5 +1,4 @@
 """Tests for context_enricher — evaluate_context axis scoring."""
-import pytest
 from engine.generation.context_enricher import evaluate_context, llm_enrich
 
 LONG_NEUTRAL = " ".join(["the team played and worked together"] * 8)

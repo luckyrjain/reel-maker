@@ -31,6 +31,17 @@
     <p class="error" style="margin-bottom:8px;">{{ job.error }}</p>
     {% endif %}
 
+    {% if jstatus == "failed" %}
+    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="btn-render"
+            hx-post="/api/cuts/{{ cut.id }}/render"
+            hx-target="#render-section-{{ cut.id }}"
+            hx-swap="innerHTML">
+            Retry render
+        </button>
+    </div>
+    {% endif %}
+
     {% if jstatus == "done" and cut.video_path %}
     <video
         src="/api/cuts/{{ cut.id }}/video"

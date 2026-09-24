@@ -1,7 +1,5 @@
-import json
 import logging
 
-from engine.generation.guide_schema import MasterGuide
 
 _log = logging.getLogger(__name__)
 
@@ -157,14 +155,14 @@ def build_messages(
     min_beats = max(3, int(max(target_lengths.values()) / 7))
 
     field_rules = "\n".join([
-        f"Beat.type: first beat must be 'hook' (1.5–3s), last beat must be 'cta'",
+        "Beat.type: first beat must be 'hook' (1.5–3s), last beat must be 'cta'",
         f"Beat count: use AT LEAST {min_beats} beats — enough to fill the full target_length_s",
-        f"Beat.duration_s: beat durations must sum to ~target_length_s; spread content across all beats",
-        f"Beat.vo_script: write ~3 words per second of duration_s — a 2.5s beat → ~7 words, 8s beat → ~24 words, 10s beat → ~30 words. Under-filling creates dead air; over-filling causes audio cut-off.",
-        f"Beat.visual_direction: if the beat is about a specific person, start with their FULL NAME (e.g. 'Lionel Messi dribbling past defenders' — not 'footballer dribbling')",
-        f"Beat.on_screen_text: 1–3 items, max 5 words each",
-        f"Beat.transition: 'cut', 'fade', or 'slide'",
-        f"PlatformGuide.hashtags: exactly 15 tags, no # prefix",
+        "Beat.duration_s: beat durations must sum to ~target_length_s; spread content across all beats",
+        "Beat.vo_script: write ~3 words per second of duration_s — a 2.5s beat → ~7 words, 8s beat → ~24 words, 10s beat → ~30 words. Under-filling creates dead air; over-filling causes audio cut-off.",
+        "Beat.visual_direction: if the beat is about a specific person, start with their FULL NAME (e.g. 'Lionel Messi dribbling past defenders' — not 'footballer dribbling')",
+        "Beat.on_screen_text: 1–3 items, max 5 words each",
+        "Beat.transition: 'cut', 'fade', or 'slide'",
+        "PlatformGuide.hashtags: exactly 15 tags, no # prefix",
         f"Include one cuts entry for EACH platform: {', '.join(platforms)}",
         f"Voiceover: {vo_note}",
         "IMPORTANT: If the TOPIC is a script with specific lines, use those exact lines as vo_script — do not invent new ones",

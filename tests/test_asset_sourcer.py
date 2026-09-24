@@ -1,5 +1,6 @@
 """Tests for resolve_or_reuse — the per-beat asset pinning ledger."""
 import pytest
+from unittest.mock import patch
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -112,3 +113,42 @@ def test_other_beats_pins_are_untouched(db, cut, tmp_path):
     )
     assert len(beat_1) == 1
     assert beat_1[0].resolved_from == _fp("Messi through-ball")
+
+
+def test_reuse_path_leaves_no_transaction_open(db, cut, tmp_path):
+    """The caller does TTS (network) next; an idle-in-transaction session would be killed by the DB's
+    idle_in_transaction_session_timeout and pin a pooled connection."""
+    sourcer = _StubSourcer(tmp_path)
+    kwargs = dict(cut=cut, beat_index=0, visual_direction="Romero tackle", min_duration_s=5.0, sourcer=sourcer)
+    resolve_or_reuse(db, **kwargs)
+    resolve_or_reuse(db, **kwargs)          # the reuse path
+    assert not db.in_transaction()
+    assert sourcer.queries == ["Romero tackle"]
+
+
+def test_first_resolve_leaves_no_transaction_open(db, cut, tmp_path):
+    resolve_or_reuse(db, cut=cut, beat_index=0, visual_direction="Romero tackle",
+                     min_duration_s=5.0, sourcer=_StubSourcer(tmp_path))
+    assert not db.in_transaction()
+
+
+def test_wikipedia_names_are_all_searched_before_any_asset_is_flushed(db, cut, tmp_path):
+    """Flushing per name would hold a write transaction open, idle, across the sleeps and network
+    searches for the remaining names."""
+    class _Wiki:
+        def __init__(self):
+            self.open_during_search = []
+
+        def search(self, name):
+            self.open_during_search.append(db.in_transaction())
+            return SourcedAsset(source="wikipedia", source_ref=f"w-{name}", local_path=tmp_path / f"{name}.jpg",
+                                license_str="CC0", safe_to_publish=True, duration_s=0.0)
+
+    db.expire_on_commit = False   # as in job_task's sessions; otherwise cut.reel_id re-reads after each commit
+    wiki = _Wiki()
+    with patch("engine.render.asset_sourcer.time.sleep"):
+        results = resolve_or_reuse(db, cut=cut, beat_index=0,
+                                   visual_direction="Lionel Messi and Cristian Romero tackle",
+                                   min_duration_s=5.0, sourcer=_StubSourcer(tmp_path), wiki=wiki)
+    assert wiki.open_during_search == [False, False]
+    assert len(results) == 2

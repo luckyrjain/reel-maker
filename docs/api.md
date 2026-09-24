@@ -22,6 +22,9 @@ Create a reel and enqueue **context enrichment** (which in turn enqueues guide g
 
 **Response:** `text/html` — `fragments/pipeline_status.html` fragment polling `GET /api/reels/{reel_id}/active-job-fragment` every 2 s.
 
+**Errors:**
+- `503` — the job could not be queued (broker unreachable); the reel and job are rolled back to `failed` so it can be retried at once
+
 ---
 
 ### `GET /api/reels/{reel_id}/active-job-fragment`
@@ -108,13 +111,15 @@ Transition a cut from `in_review` to `approved`.
 
 Transition a cut to `rendering` and enqueue the render task.
 
-**Valid from statuses:** `draft`, `in_review` (re-render), `failed` (auto-resets to `draft` first)
+**Valid from statuses:** `draft`, `in_review` (re-render), `failed` (auto-resets to `draft` first) — except a cut that already has a `platform_post_id`, which is refused (see below)
 
 **Response:** `text/html` — `fragments/render_status.html` with HTMX polling trigger.
 
 **Errors:**
 - `404` — cut not found
-- `409` — cut is already `rendering`, or is in a non-renderable status
+- `422` — cut has no guide yet
+- `409` — cut is already `rendering`, is in a non-renderable status, or is already posted (`platform_post_id` set: re-rendering would leave the cut pointing at the live post)
+- `503` — the job could not be queued (broker unreachable); the job and cut are rolled back so it can be retried at once
 
 ---
 
@@ -125,6 +130,34 @@ HTMX polling endpoint for render progress.
 **Query params:** `job_id` (required)
 
 **Response:** `text/html` — `fragments/render_status.html`. When `done`, the fragment contains a `<video>` element. Polling stops when status is `done` or `failed`.
+
+---
+
+### `POST /api/cuts/{cut_id}/publish`
+
+Transition a cut to `publishing` and enqueue the publish task. `assert_safe_to_publish()` runs inside the task, immediately before any upload — not gated on a cut that already has a `platform_post_id` (see below), so a finalize never blocks on it.
+
+**Valid from statuses:** `approved`, `scheduled`, `failed` (auto-resets to `approved` first)
+
+If the cut already has a `platform_post_id` (a previous run posted it but did not finish recording that — reaped, or shut down before the done-stamp), the task finalizes without uploading again.
+
+**Response:** `text/html` — `fragments/publish_status.html` with HTMX polling trigger.
+
+**Errors:**
+- `404` — cut not found
+- `422` — cut has no rendered video
+- `409` — cut is already `publishing`, or is in a non-publishable status
+- `503` — the job could not be queued (broker unreachable); the job and cut are rolled back so it can be retried at once
+
+---
+
+### `GET /api/cuts/{cut_id}/publish-status`
+
+HTMX polling endpoint for publish progress.
+
+**Query params:** `job_id` (required)
+
+**Response:** `text/html` — `fragments/publish_status.html`. Polling stops when status is `done` or `failed`.
 
 ---
 
@@ -171,5 +204,5 @@ The HTML fragments use `.badge-{status}` classes for color coding:
 - Render exceptions are caught in `render_cut` and stored similarly
 - The job fragment displays `job.error` when status is `failed`
 - HTTP 4xx/5xx responses from Pexels, Wikipedia, Edge TTS, or the LLM surface as job failures (not HTTP errors to the browser)
-- Transient failures (connection errors, timeouts, HTTP 429/5xx) are retried twice with 30 s/60 s backoff before the job is failed. During backoff the job sits at `pending` with `error` set to `"transient failure, retry N: ..."`; the message is cleared if a later attempt succeeds
+- Transient failures (connection errors, timeouts, HTTP 429/5xx) are retried twice with 30 s/60 s backoff before the job is failed (`generate_guide` and `render_cut` only: `enrich_context` and `publish_cut` never retry automatically, since an enrichment retry re-runs a paid call for no gain and a publish retry after an accepted upload would post twice). During backoff the job sits at `pending` with `error` set to `"transient failure, retry N: ..."`; the message is cleared if a later attempt succeeds
 - Wikimedia CDN 429 rate-limits are handled silently (retry + thumbnail fallback) and do not fail the job; the beat falls back to Pexels stock footage

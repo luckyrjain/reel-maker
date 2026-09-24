@@ -6,7 +6,6 @@ charges StageEvent.cost_usd when a real call happened.
 """
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from api import models
 from engine.render.asset_sourcer import (

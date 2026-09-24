@@ -10,7 +10,6 @@ Pipeline:
 import logging
 import math
 import os
-import re
 import subprocess
 from pathlib import Path
 

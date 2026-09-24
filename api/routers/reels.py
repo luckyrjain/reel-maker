@@ -8,6 +8,7 @@ from api.db import get_db
 from api import models
 from api.state import transition, REEL_TRANSITIONS
 from engine.generation.estimate import estimate_generation
+from worker.tasks.common import fail_unenqueued
 from worker.tasks.enrich_context import enrich_context
 
 router = APIRouter()
@@ -62,10 +63,16 @@ def create_reel(
         meta={"generation_path": generation_path},
     )
     db.add(job)
-    db.commit()
-    db.refresh(job)
+    db.flush()
+    job_id = job.id
+    db.commit()   # nothing may be open across .delay() (see api/routers/cuts.py::trigger_render)
 
-    enrich_context.delay(job.id)
+    try:
+        enrich_context.delay(job_id)
+    except Exception as exc:
+        fail_unenqueued(db, job_id, models.JobType.enrich.value, exc)
+        raise HTTPException(status_code=503, detail="Could not queue the job — try again") from exc
+    db.refresh(job)
 
     return templates.TemplateResponse(
         request, "fragments/pipeline_status.html",

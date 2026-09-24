@@ -1,9 +1,7 @@
 """Tests for the render_cut task's failure handling and success-path cleanup."""
 from unittest.mock import MagicMock, patch
 
-import httpx
 import pytest
-from celery.exceptions import Retry
 
 from api import models
 
@@ -52,6 +50,7 @@ def _cut():
     cut.id = 5
     cut.reel_id = 10
     cut.guide = _GUIDE
+    cut.platform_post_id = None   # not posted (a bare MagicMock attribute would be truthy)
     cut.platform.value = "youtube_shorts"
     cut.status.value = "rendering"
     return cut
@@ -72,7 +71,7 @@ def test_missing_cut_fails_job_with_actionable_message():
     db = MagicMock()
     db.get.side_effect = lambda model, _id: job if model is models.Job else None
 
-    with patch("worker.tasks.render.SessionLocal", return_value=db):
+    with patch("worker.tasks.common.SessionLocal", return_value=db):
         with pytest.raises(ValueError, match="Cut 77 no longer exists"):
             render_cut(1)
 
@@ -80,27 +79,59 @@ def test_missing_cut_fails_job_with_actionable_message():
     assert "Cut 77 no longer exists" in job.error
 
 
-def test_transient_failure_retries_and_resets_status_to_pending():
+def test_an_already_posted_cut_cannot_be_re_rendered():
+    """Re-rendering would change the video while the cut still points at the old live post."""
     from worker.tasks.render import render_cut
 
     job = _job()
+    cut = _cut()
+    cut.platform_post_id = "yt-live"
     db = MagicMock()
     db.get.side_effect = lambda model, _id: job if model is models.Job else (
-        _cut() if model is models.Cut else _reel()
+        cut if model is models.Cut else _reel()
     )
 
     with (
-        patch("worker.tasks.render.SessionLocal", return_value=db),
-        patch("worker.tasks.render.get_asset_sourcer",
-              side_effect=httpx.ConnectTimeout("network down")),
-        patch.object(render_cut, "retry", side_effect=Retry()) as mock_retry,
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.render.composite_cut") as mock_composite,
     ):
-        with pytest.raises(Retry):
+        with pytest.raises(ValueError, match="already posted"):
             render_cut(1)
 
-    mock_retry.assert_called_once()
-    assert job.status == models.JobStatus.pending
-    assert job.attempts == 1
+    mock_composite.assert_not_called()
+    assert job.status == models.JobStatus.failed
+
+
+def test_a_render_that_a_publish_overtook_is_discarded():
+    """Retry render and Retry publish were both started from a failed cut; the publish posted first.
+    Recording this render would let a later finalize mark new content as the posted video."""
+    from worker.tasks.render import render_cut
+
+    job = _job()
+    cut = _cut()
+    reel = _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else (
+        cut if model is models.Cut else reel
+    )
+    db.refresh.side_effect = lambda obj: setattr(obj, "platform_post_id", "yt-posted-meanwhile") if obj is cut else None
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.render.get_asset_sourcer"),
+        patch("worker.tasks.render.get_wiki_sourcer"),
+        patch("worker.tasks.render.get_hf_sourcer"),
+        patch("worker.tasks.render.get_hf_video_sourcer"),
+        patch("worker.tasks.render.get_tts_provider"),
+        patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
+        patch("worker.tasks.render.record_stage"),
+        patch("worker.tasks.render.composite_cut", return_value=18.0),
+    ):
+        with pytest.raises(ValueError, match="posted while it rendered"):
+            render_cut(1)
+
+    assert job.status == models.JobStatus.failed
+    assert not isinstance(cut.video_path, str), "the discarded render must not be recorded on the cut"
 
 
 def test_successful_render_clears_stale_error():
@@ -116,7 +147,7 @@ def test_successful_render_clears_stale_error():
     )
 
     with (
-        patch("worker.tasks.render.SessionLocal", return_value=db),
+        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.render.get_asset_sourcer"),
         patch("worker.tasks.render.get_wiki_sourcer"),
         patch("worker.tasks.render.get_hf_sourcer"),
@@ -150,7 +181,7 @@ def test_matching_music_cue_is_passed_to_composite_cut():
     fake_sourcer.find.return_value = fake_track
 
     with (
-        patch("worker.tasks.render.SessionLocal", return_value=db),
+        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.render.get_asset_sourcer"),
         patch("worker.tasks.render.get_wiki_sourcer"),
         patch("worker.tasks.render.get_hf_sourcer"),
@@ -181,7 +212,7 @@ def test_no_music_cue_passes_none_without_querying_sourcer():
     fake_sourcer = MagicMock()
 
     with (
-        patch("worker.tasks.render.SessionLocal", return_value=db),
+        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.render.get_asset_sourcer"),
         patch("worker.tasks.render.get_wiki_sourcer"),
         patch("worker.tasks.render.get_hf_sourcer"),

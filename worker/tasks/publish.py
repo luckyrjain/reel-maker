@@ -1,49 +1,55 @@
+import logging
 from datetime import datetime, timezone
 
 from api import models
-from api.db import SessionLocal
 from api.state import CUT_TRANSITIONS, transition
 from engine.observability import record_stage
 from engine.publish.attribution import build_published_caption
 from engine.publish.gate import assert_safe_to_publish
 from engine.publish.registry import credential_provider_for_platform, get_publisher
 from worker.celery_app import celery_app
-from worker.tasks.common import heartbeat, should_retry
+from worker.tasks.common import heartbeat, job_task, time_limits
+
+_log = logging.getLogger(__name__)
 
 
-@celery_app.task(bind=True, max_retries=2)
-def publish_cut(self, job_id: int):
-    db = SessionLocal()
-    try:
-        job = db.get(models.Job, job_id)
-        if job is None:
-            return
-        # Idempotency guard: done = redelivery no-op; running = live sibling
-        if job.status in (models.JobStatus.done, models.JobStatus.running):
-            return
+def _load_cut(db, job):
+    cut = db.get(models.Cut, job.cut_id)
+    if cut is None:
+        raise ValueError(f"Cut {job.cut_id} no longer exists")
+    return cut
 
-        cut = db.get(models.Cut, job.cut_id)
-        if cut is None:
-            raise ValueError(f"Cut {job.cut_id} no longer exists")
 
-        job.status = models.JobStatus.running
-        job.started_at = datetime.now(timezone.utc)
-        job.heartbeat_at = job.started_at
-        job.attempts = (job.attempts or 0) + 1
-        job.progress = 5
-        db.commit()
+_MAX_RUNTIME_S = 60 * 60
 
-        # cut.status is set to "publishing" by the router before this task is
-        # enqueued (mirrors trigger_render / render_cut) — this task does not
-        # gate on cut.status itself. A transient failure resets job.status to
-        # pending for retry without touching cut.status, so a retried run lands
-        # back here directly rather than tripping a status guard.
-        if not cut.video_path:
-            raise ValueError("Cut has no rendered video — render and approve it before publishing")
 
-        assert_safe_to_publish(db, cut.id)
-        heartbeat(db, job, 20)
+# max_retries=0 on purpose: publishing is an irreversible external side effect. A transient
+# error (e.g. a read timeout) can arrive AFTER the platform accepted the upload, and an
+# automatic retry would then post the video twice. The operator retries via the UI instead.
+# The platform_post_id guard below only covers failures AFTER the post was recorded; a timeout
+# inside publisher.publish() happens before any id exists, so the operator should check the
+# platform before retrying (the failed-cut card says so). The same caveat applies to a shutdown or
+# the soft time limit landing mid-upload.
+@celery_app.task(bind=True, max_retries=0, **time_limits(_MAX_RUNTIME_S))
+@job_task("publish", prepare=_load_cut, max_runtime_s=_MAX_RUNTIME_S)
+def publish_cut(self, db, job, cut):
+    # cut.status is set to "publishing" by the router before this task is
+    # enqueued (mirrors trigger_render / render_cut) — this task does not
+    # gate on cut.status itself. Any failure fails the job and rolls the cut back
+    # from "publishing"; the operator retries from the UI (see max_retries above).
+    if not cut.video_path:
+        raise ValueError("Cut has no rendered video — render and approve it before publishing")
 
+    heartbeat(db, job, 20)
+
+    if cut.platform_post_id:
+        # A previous run already posted this cut but did not finish recording it (reaped, or
+        # died before the done-stamp). Finalize without uploading again. The safety gate guards
+        # what goes OUT to a platform; nothing is uploaded here, and blocking the finalize would
+        # leave a live post unrecorded with no way for the operator to clear it.
+        _log.warning("cut %s already has platform_post_id %s; skipping upload", cut.id, cut.platform_post_id)
+    else:
+        assert_safe_to_publish(db, cut.id)   # before any credential lookup or upload
         provider_name = credential_provider_for_platform(cut.platform.value)
         credential = (
             db.query(models.Credential)
@@ -60,43 +66,16 @@ def publish_cut(self, job_id: int):
 
         publisher = get_publisher(cut.platform.value)
         caption = build_published_caption(db, cut)
+        db.commit()   # end the read transaction: it would sit idle for the whole upload
         with record_stage(db, cut.reel_id, "publish", cut_id=cut.id, provider=cut.platform.value) as ev:
             result = publisher.publish(cut, credential, db, caption=caption)
             ev.detail["platform_post_id"] = result.platform_post_id
 
         cut.platform_post_id = result.platform_post_id
         cut.published_at = datetime.now(timezone.utc)
-        transition(cut, "published", CUT_TRANSITIONS)
-
-        job.progress = 100
-        job.heartbeat_at = datetime.now(timezone.utc)
-        job.status = models.JobStatus.done
-        job.error = None
+        # The one deliberate early commit: the post is live and irreversible, so record its id
+        # now rather than only in the done-stamp. If anything below fails, or the job is
+        # reaped before finishing, a retry sees this id and does not post a second time.
         db.commit()
 
-    except Exception as exc:
-        db.rollback()
-        if should_retry(exc, self.request.retries, self.max_retries):
-            job = db.get(models.Job, job_id)
-            if job:
-                # Reset to pending: the idempotency guard rejects `running`, so a
-                # retry that left the status alone would be a silent no-op.
-                job.status = models.JobStatus.pending
-                job.error = f"transient failure, retry {self.request.retries + 1}: {exc}"[:2000]
-                db.commit()
-            raise self.retry(exc=exc, countdown=30 * 2 ** self.request.retries)
-        job = db.get(models.Job, job_id)
-        if job:
-            job.status = models.JobStatus.failed
-            job.error = str(exc)[:2000]
-            if job.cut_id:
-                cut = db.get(models.Cut, job.cut_id)
-                if cut and cut.status.value == "publishing":
-                    try:
-                        transition(cut, "failed", CUT_TRANSITIONS)
-                    except ValueError:
-                        pass
-            db.commit()
-        raise
-    finally:
-        db.close()
+    transition(cut, "published", CUT_TRANSITIONS)

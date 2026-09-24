@@ -1,5 +1,4 @@
 """Tests for engine/generation/evaluator.py"""
-import pytest
 
 from engine.generation.guide_schema import Beat, MasterGuide, PlatformGuide
 from engine.generation.evaluator import score_guide, _person_names
@@ -567,7 +566,7 @@ def test_duration_mismatch_deducts():
 # ── caption & hashtag quality ──────────────────────────────────────────────────
 
 def test_short_caption_deducts():
-    from engine.generation.guide_schema import Beat, MasterGuide, PlatformGuide
+    from engine.generation.guide_schema import MasterGuide, PlatformGuide
     guide = MasterGuide(
         title="Test",
         niche="football",
@@ -588,7 +587,7 @@ def test_short_caption_deducts():
 
 
 def test_few_hashtags_deducts():
-    from engine.generation.guide_schema import Beat, MasterGuide, PlatformGuide
+    from engine.generation.guide_schema import MasterGuide, PlatformGuide
     guide = MasterGuide(
         title="Test",
         niche="football",

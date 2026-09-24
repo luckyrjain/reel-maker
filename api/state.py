@@ -22,6 +22,20 @@ CUT_TRANSITIONS: dict[str, set[str]] = {
 }
 
 
+# The owner state each job type is responsible for while it is in flight, as
+# (owner_kind, status). Deliberately explicit rather than derived from the maps
+# above: "guide_ready" also has a "failed" edge but is not in flight (and a cut
+# in "approved"/"published" must never be touched), so a job must not roll them back. Keys are JobType values, kept
+# as plain strings so this module stays free of model imports. A task's own
+# failure path and the reaper both roll back only the state their job type owns.
+JOB_IN_FLIGHT: dict[str, tuple[str, str]] = {
+    "enrich": ("reel", "enriching"),
+    "generate": ("reel", "generating"),
+    "render": ("cut", "rendering"),
+    "publish": ("cut", "publishing"),
+}
+
+
 def transition(obj, new_status: str, transitions_map: dict[str, set[str]]) -> None:
     current = obj.status.value if hasattr(obj.status, "value") else str(obj.status)
     allowed = transitions_map.get(current, set())

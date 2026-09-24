@@ -4,7 +4,7 @@ import os
 import re
 import time
 import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -510,15 +510,17 @@ def resolve_beat_assets(
     """
     if wiki:
         names = _extract_all_person_names(query)
-        wiki_results = []
+        found = []
         for i, name in enumerate(names):
             if i > 0:
                 time.sleep(0.5)  # avoid Wikimedia CDN 429s on rapid sequential downloads
             result = wiki.search(name)
             if result:
-                wiki_results.append(_cache_asset(db, result, "photo"))
-        if wiki_results:
-            return wiki_results
+                found.append(result)
+        if found:
+            # Cache (flush) only after every network call: flushing per name would hold a write
+            # transaction open, idle, across the sleeps and searches for the remaining names.
+            return [_cache_asset(db, result, "photo") for result in found]
 
     result = sourcer.search(query, min_duration_s)
     if result is not None:
@@ -576,6 +578,10 @@ def resolve_or_reuse(
 
     On first render or when the direction changed, re-resolves and updates the pin.
     This makes re-renders deterministic and skips API calls for untouched beats.
+
+    Commits the caller's session (after the read, and again once the pins are written) so no
+    transaction is left idle across the network calls it makes or the TTS/ffmpeg work the
+    caller does next.
     """
     fingerprint = _fp(visual_direction)
 
@@ -588,6 +594,7 @@ def resolve_or_reuse(
         .order_by(models.CutAsset.order_in_beat)
         .all()
     )
+    db.commit()   # end the read transaction before any network call below
 
     if pinned and all(p.resolved_from == fingerprint for p in pinned):
         # All pins are current — reuse without any API call
@@ -596,6 +603,7 @@ def resolve_or_reuse(
             asset = db.get(models.Asset, pin.asset_id)
             if asset:
                 results.append((asset, Path(asset.local_path)))
+        db.commit()   # the asset reads above opened a transaction; end it before the caller's TTS
         if results:
             return results
 
@@ -626,5 +634,5 @@ def resolve_or_reuse(
                 order_in_beat=order,
                 resolved_from=fingerprint,
             ))
-    db.flush()
+    db.commit()   # the caller goes on to TTS/ffmpeg; don't leave the pins uncommitted and idle
     return results

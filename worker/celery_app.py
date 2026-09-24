@@ -27,8 +27,9 @@ celery_app.conf.update(
     task_acks_late=True,
     task_reject_on_worker_lost=True,
 
-    # Redis visibility timeout must exceed the worst-case task duration.
-    # Renders can take 10+ min on slow machines; 2 h gives headroom.
+    # A redelivery of a still-running job is a safe no-op (the atomic claim rejects it: only a
+    # pending job runs), so this does not need to exceed every task's max_runtime_s (generate's
+    # cap is 4 h). It only needs to outlast normal broker/worker hiccups.
     broker_transport_options={"visibility_timeout": 7200},
 
     # Prevent any one worker from hoarding multiple long tasks.
@@ -46,6 +47,9 @@ celery_app.conf.update(
         # I/O-bound (network upload), not CPU-bound — belongs with generation, not rendering.
         "worker.tasks.publish.publish_cut":                 {"queue": "generation"},
         "worker.tasks.metrics.pull_publish_metrics":        {"queue": "generation"},
+        # Beat publishes this by name; without a route it lands on the default
+        # "celery" queue, which neither documented worker consumes.
+        "worker.tasks.maintenance.reap_stuck_jobs":         {"queue": "generation"},
     },
 
     # Celery beat schedule for periodic maintenance.
@@ -53,6 +57,9 @@ celery_app.conf.update(
         "reap-stuck-jobs": {
             "task": "worker.tasks.maintenance.reap_stuck_jobs",
             "schedule": 60.0,  # every 60 s
+            # It shares the generation queue with long jobs; a starved reaper must not leave an
+            # hour of stale messages to drain in a burst once a slot frees up.
+            "options": {"expires": 55},
         },
         "pull-publish-metrics": {
             "task": "worker.tasks.metrics.pull_publish_metrics",

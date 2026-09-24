@@ -1,7 +1,6 @@
 """Tests for the generate_guide task's failure handling — missing rows and retries."""
 from unittest.mock import MagicMock, patch
 
-import httpx
 import pytest
 from celery.exceptions import Retry
 
@@ -49,7 +48,7 @@ def test_missing_reel_fails_job_with_actionable_message():
     db = MagicMock()
     db.get.side_effect = lambda model, _id: job if model is models.Job else None
 
-    with patch("worker.tasks.generate.SessionLocal", return_value=db):
+    with patch("worker.tasks.common.SessionLocal", return_value=db):
         with pytest.raises(ValueError, match="Reel 99 no longer exists"):
             generate_guide(1)
 
@@ -58,29 +57,27 @@ def test_missing_reel_fails_job_with_actionable_message():
     assert "AttributeError" not in job.error
 
 
-def test_transient_failure_retries_and_resets_status_to_pending():
-    """Retry must reset status to pending, or redelivery hits the idempotency guard."""
+def test_reel_rolled_back_to_failed_is_not_generated():
+    """enrich_context rolls the reel back when it could not confirm the enqueue; a message that
+    still reached the broker must not spend paid LLM calls on a failed reel."""
     from worker.tasks.generate import generate_guide
 
     job = _job()
     reel = _reel()
+    reel.status.value = "failed"
     db = MagicMock()
     db.get.side_effect = lambda model, _id: job if model is models.Job else reel
-    db.query.return_value.filter.return_value.all.return_value = [_cut()]
 
     with (
-        patch("worker.tasks.generate.SessionLocal", return_value=db),
+        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.generate.paid_call_count", return_value=0),
-        patch("worker.tasks.generate.get_llm_provider",
-              side_effect=httpx.ConnectTimeout("LLM unreachable")),
-        patch.object(generate_guide, "retry", side_effect=Retry()) as mock_retry,
+        patch("worker.tasks.generate.get_llm_provider") as mock_llm,
     ):
-        with pytest.raises(Retry):
+        with pytest.raises(ValueError, match="not 'generating'"):
             generate_guide(1)
 
-    mock_retry.assert_called_once()
-    assert job.status == models.JobStatus.pending
-    assert job.attempts == 1, "entry already incremented attempts; the retry branch must not"
+    mock_llm.assert_not_called()
+    assert job.status == models.JobStatus.failed
 
 
 def test_paid_call_budget_exceeded_fails_without_retry():
@@ -93,7 +90,7 @@ def test_paid_call_budget_exceeded_fails_without_retry():
     db.get.side_effect = lambda model, _id: job if model is models.Job else reel
 
     with (
-        patch("worker.tasks.generate.SessionLocal", return_value=db),
+        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.generate.paid_call_count", return_value=20),
         patch.object(generate_guide, "retry", side_effect=Retry()) as mock_retry,
     ):
@@ -122,7 +119,7 @@ def test_structured_path_skipped_when_parse_disagrees_with_is_structured():
     db.query.return_value.filter.return_value.all.return_value = [_cut()]
 
     with (
-        patch("worker.tasks.generate.SessionLocal", return_value=db),
+        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.generate.paid_call_count", return_value=0),
         patch("worker.tasks.generate.script_parser.parse", return_value=None),
         patch("worker.tasks.generate.resolve_generation_path", return_value="structured"),
@@ -139,30 +136,6 @@ def test_structured_path_skipped_when_parse_disagrees_with_is_structured():
 
     mock_structured.assert_not_called()
     assert job.meta.get("path") == "standard"
-
-
-def test_deterministic_failure_does_not_retry():
-    """A bad-guide ValueError must fail once, exactly as before."""
-    from worker.tasks.generate import generate_guide
-
-    job = _job()
-    reel = _reel()
-    db = MagicMock()
-    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
-    db.query.return_value.filter.return_value.all.return_value = [_cut()]
-
-    with (
-        patch("worker.tasks.generate.SessionLocal", return_value=db),
-        patch("worker.tasks.generate.paid_call_count", return_value=0),
-        patch("worker.tasks.generate.get_llm_provider",
-              side_effect=ValueError("model not found")),
-        patch.object(generate_guide, "retry", side_effect=Retry()) as mock_retry,
-    ):
-        with pytest.raises(ValueError, match="model not found"):
-            generate_guide(1)
-
-    mock_retry.assert_not_called()
-    assert job.status == models.JobStatus.failed
 
 
 # ── _stubs_to_platform_guide — music_cue defaulting ──────────────────────────
@@ -199,3 +172,52 @@ def test_structured_path_non_hook_beats_have_no_music_cue():
     )
     assert guide.beats[1].music_cue is None
     assert guide.beats[2].music_cue is None
+
+
+def test_the_soft_time_limit_in_the_structured_path_does_not_fall_back_to_the_standard_path():
+    """The structured path catches Exception and falls back to a second, paid LLM path; that would
+    swallow the runtime limit and keep running to the hard kill."""
+    from celery.exceptions import SoftTimeLimitExceeded
+    from worker.tasks.generate import generate_guide
+
+    job = _job()
+    reel = _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
+    db.query.return_value.filter.return_value.all.return_value = [_cut()]
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.generate.paid_call_count", return_value=0),
+        patch("worker.tasks.generate.get_llm_provider"),
+        patch("worker.tasks.generate.script_parser.parse", return_value=[MagicMock()]),
+        patch("worker.tasks.generate.resolve_generation_path", return_value="structured"),
+        patch("worker.tasks.generate._generate_from_structured_script", side_effect=SoftTimeLimitExceeded()),
+        patch("worker.tasks.generate.build_messages") as standard_path,
+    ):
+        with pytest.raises(SoftTimeLimitExceeded):
+            generate_guide(1)
+
+    standard_path.assert_not_called()
+    assert job.status == models.JobStatus.failed
+
+
+def test_generate_caption_hashtags_does_not_swallow_the_soft_time_limit():
+    """A bare except Exception around the blocking llm.complete() call would silently launder a
+    runtime-limit breach into 'no caption, use the fallback template' and let the task run on to a
+    normal-looking completion instead of failing visibly."""
+    from celery.exceptions import SoftTimeLimitExceeded
+    from worker.tasks.generate import _generate_caption_hashtags
+
+    llm = MagicMock()
+    llm.complete.side_effect = SoftTimeLimitExceeded()
+    with pytest.raises(SoftTimeLimitExceeded):
+        _generate_caption_hashtags([], "football", llm)
+
+
+def test_generate_caption_hashtags_still_falls_back_on_an_ordinary_error():
+    from worker.tasks.generate import _generate_caption_hashtags
+
+    llm = MagicMock()
+    llm.complete.side_effect = ValueError("bad json")
+    assert _generate_caption_hashtags([], "football", llm) == ("", [])

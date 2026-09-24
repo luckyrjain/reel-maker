@@ -1,8 +1,7 @@
 """Tests for enrichment batch parsing — handles single-dict and malformed LLM responses."""
 import json
-import pytest
 
-from engine.generation.guide_schema import Beat, MasterGuide, PlatformGuide
+from engine.generation.guide_schema import Beat
 
 
 # ── coerce_beat_type ──────────────────────────────────────────────────────────

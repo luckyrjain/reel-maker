@@ -109,17 +109,16 @@ Every async operation is a job row. API creates the row and enqueues the task wi
 | `status` | enum `JobStatus` | `pending` → `running` → `done` \| `failed` |
 | `progress` | integer | 0–100; updated at key milestones |
 | `error` | text | Exception message (≤ 2000 chars); `null` on success |
-| `attempts` | integer | Incremented each time the worker picks up the task |
-| `started_at` | timestamptz | Set when task transitions to `running` |
-| `heartbeat_at` | timestamptz | Updated at every `heartbeat()` call; used by the stuck-job reaper |
-| `attempts` | int | Incremented once per task entry, including each retry delivery |
+| `attempts` | integer | Incremented once per run, after `prepare` succeeds (so a missing-row or budget failure does not count), including each retry delivery |
+| `started_at` | timestamptz | Set after `prepare`, when the body is about to run (the claim moves the job to `running` a moment earlier) |
+| `heartbeat_at` | timestamptz | Refreshed every 30 s by a background thread in `job_task` (until the task's `max_runtime_s`) and at every `heartbeat()` call; used by the stuck-job reaper |
 | `meta` | JSON | Enrich job: `{"generation_path": "auto\|structured\|standard", "context_score": N, "context_issues": [...], "enriched": bool}`. Generate job: `{"generation_path": ..., "context_score": N, "path": "structured\|standard", "stub_count": N, "quality_score": N, "structured_score": N, "structured_fallback": bool}` |
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
 
 **Stuck-job detection**: if `status=running` and `heartbeat_at < now() - 5 min`, the `reap_stuck_jobs` task (Celery beat, 60 s interval) marks it `failed` and rolls back the owning reel/cut.
 
-**Idempotency**: tasks check `if job.status in (done, running): return` at entry. `done` = redelivery no-op. `running` = live sibling already working (reaper handles dead ones).
+**Idempotency**: only a `pending` job runs (`job_task`'s atomic `UPDATE … WHERE status='pending'` claim). `done`/`running` = redelivery no-op (a live sibling is already working; the reaper handles dead ones). `failed` is terminal: an operator retry creates a new Job, so a late redelivery of a reaped job never runs.
 
 ---
 

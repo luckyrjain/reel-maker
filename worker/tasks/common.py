@@ -1,21 +1,70 @@
 """Shared helpers for Celery tasks.
 
 is_transient_error / should_retry decide whether a failure is worth another
-attempt. Kept as pure functions (no Celery, no db) so the decision is
+attempt. They stay pure functions (no Celery, no db session) so the decision is
 unit-testable without a broker or a task context.
+
+job_task is the one place that owns a Job's lifecycle: atomic claim, running
+heartbeat, fenced done-stamp, transient-retry reset and failure stamp with owner
+rollback. Task modules supply only the domain work as a body function.
 """
+import functools
+import logging
+import re
 import subprocess
+import threading
+import time
+from collections.abc import Collection
 from datetime import datetime, timezone
 
 import httpx
+from celery.exceptions import Reject, SoftTimeLimitExceeded
+from sqlalchemy import exc as sa_exc
+
+from api import models
+from api.db import SessionLocal
+from api.state import CUT_TRANSITIONS, JOB_IN_FLIGHT, REEL_TRANSITIONS, transition
+
+_log = logging.getLogger(__name__)
 
 _TRANSIENT_TYPES = (
     httpx.TransportError,      # connect/read/write timeouts, connection errors
     TimeoutError,
     subprocess.TimeoutExpired,
     ConnectionError,
+    sa_exc.OperationalError,   # DB connection dropped / failover
+    sa_exc.InterfaceError,
 )
 _TRANSIENT_STATUS = {429, 500, 502, 503, 504}
+
+# reap_stuck_jobs fails a running job whose heartbeat_at is older than
+# STALE_MINUTES (5). Bodies make blocking calls far longer than that (a 360 s LLM
+# call, a 10+ min render), so job_task keeps heartbeat_at fresh from a background
+# thread instead of relying on every body to call heartbeat() often enough.
+HEARTBEAT_INTERVAL_S = 30
+
+# The heartbeat thread proves the process is alive, not that the body is making progress. Each
+# task therefore declares a max_runtime_s, used twice: the thread stops beating past it (so the
+# reaper fails a wedged job's record), and the task registers it as a Celery soft_time_limit
+# (see time_limits()), which raises SoftTimeLimitExceeded inside the body and, if that is ignored,
+# kills the worker process after a grace period, which is the only thing that frees a hung slot.
+# This is best-effort, not a guarantee: it's a race against _fail_interrupted's own DB write, and
+# Celery escalates SIGTERM->SIGKILL, so a plain SIGKILL (or losing that race) skips this path
+# entirely. The reaper remains the actual backstop, not a rarely-needed fallback.
+TIME_LIMIT_GRACE_S = 120
+
+# A DB error before the job was claimed means nothing has run yet, so retrying is always safe,
+# even for tasks that must never retry automatically once they have started (enrich, publish).
+PRECLAIM_MAX_RETRIES = 3
+
+
+def time_limits(max_runtime_s: float) -> dict:
+    """Celery task options that enforce max_runtime_s: pass to ``celery_app.task(**time_limits(n))``."""
+    return {"soft_time_limit": max_runtime_s, "time_limit": max_runtime_s + TIME_LIMIT_GRACE_S}
+
+
+class JobLost(RuntimeError):
+    """This run no longer owns its Job (the reaper failed it, or a sibling took it)."""
 
 
 def is_transient_error(exc: BaseException) -> bool:
@@ -32,12 +81,646 @@ def should_retry(exc: BaseException, retries: int, max_retries: int) -> bool:
     return retries < max_retries and is_transient_error(exc)
 
 
-def heartbeat(db, job, progress: int) -> None:
-    """Record progress and prove the worker is alive.
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
-    reap_stuck_jobs fails any running job whose heartbeat_at goes stale for
-    more than STALE_MINUTES, so every long task must call this at each milestone.
+
+def _advance(db, job_id, from_status, values: dict) -> bool:
+    """Compare-and-set the Job's status; False when the row is no longer in from_status.
+
+    Every status transition goes through this, so a worker that lost the job
+    (reaped, or claimed by a sibling) never overwrites the winner's state.
     """
+    updated = (
+        db.query(models.Job)
+        .filter(models.Job.id == job_id, models.Job.status == from_status)
+        .update(values, synchronize_session=False)
+    )
+    return updated != 0
+
+
+def heartbeat(db, job, progress: int) -> None:
+    """Record progress, prove the worker is alive, and commit.
+
+    Fenced: raises JobLost when the job is no longer running (the reaper gave up on it), which
+    aborts a zombie body at its next milestone instead of letting it run on and write. Commits
+    the body's pending mutations, so call it before the final mutations, never after.
+    """
+    now = _now()
+    if not _advance(db, job.id, models.JobStatus.running,
+                    {"progress": progress, "heartbeat_at": now}):
+        db.rollback()
+        raise JobLost(f"job {job.id} is no longer running")
     job.progress = progress
-    job.heartbeat_at = datetime.now(timezone.utc)
+    job.heartbeat_at = now
     db.commit()
+
+
+def lock_job(db, job) -> None:
+    """Take the Job's row lock (no commit) before touching a reel/cut row in the same transaction.
+
+    The reaper locks the job row first and then the owner; a body that locks the owner first and
+    the job at its done-stamp can deadlock against it. Raises JobLost if the job is gone.
+    """
+    if not _advance(db, job.id, models.JobStatus.running, {"heartbeat_at": _now()}):
+        db.rollback()
+        raise JobLost(f"job {job.id} is no longer running")
+
+
+_OWNER_MODELS = {"reel": models.Reel, "cut": models.Cut}
+_OWNER_TRANSITIONS = {"reel": REEL_TRANSITIONS, "cut": CUT_TRANSITIONS}
+
+
+def rollback_owner(db, job, kind: str, states: Collection[str]) -> None:
+    """Fail the job's reel/cut when it is still in one of the given in-flight states.
+
+    The row is re-read under a row lock (FOR UPDATE), so the state check and the write
+    cannot race another writer, and the session's cached copy is never trusted. A row that
+    already moved on (or was deleted) is left alone, and an invalid transition is swallowed:
+    the failure handler must never mask the real error.
+    """
+    row_id = job.reel_id if kind == "reel" else job.cut_id
+    if not row_id:
+        return
+    row = db.get(_OWNER_MODELS[kind], row_id)
+    if row is None:
+        return
+    db.refresh(row, with_for_update=True)
+    # transition() leaves a plain str in .status until the next expire/commit.
+    if getattr(row.status, "value", row.status) not in states:
+        return
+    try:
+        transition(row, "failed", _OWNER_TRANSITIONS[kind])
+    except ValueError:
+        pass
+
+
+_PARAMETERS = re.compile(r"\[parameters:[^\n]*")
+# psycopg2 puts the offending row in the exception text ("DETAIL:  Failing row contains (...)",
+# "Key (col)=(value) already exists"), which hide_parameters does not cover. DETAIL/CONTEXT are
+# always the trailing part of the message, and libpq wraps a long "Failing row contains (...)" onto
+# a second physical line -- redact to the end of the string, not just to the end of the first line,
+# or the wrapped continuation (which can itself hold column values) leaks past a [^\n]* bound.
+_DB_DETAIL = re.compile(r"(?ms)^[ \t]*(?:DETAIL|CONTEXT):.*")
+_MAX_ERROR_INPUT = 20_000
+
+
+def _error_text(exc: BaseException) -> str:
+    """The exception text as safe to store in job.error (persisted and shown in the UI).
+
+    Linear time on any input: it is capped before the regexes run, and neither backtracks (each
+    redacts from a fixed marker to the end of its line). Never empty: the status templates show
+    an error and a Retry button only when job.error is set.
+    """
+    try:
+        text = str(exc)
+    except Exception:
+        text = f"<{type(exc).__name__}: message could not be rendered>"
+    text = text[:_MAX_ERROR_INPUT]
+    text = _PARAMETERS.sub("[parameters: <redacted>]", text)   # SQLAlchemy echoes bound values
+    text = _DB_DETAIL.sub("<database detail redacted>", text)
+    text = text.replace("\x00", "")                            # Postgres rejects NUL in text
+    text = text.encode("utf-8", "replace").decode("utf-8")     # ...and lone surrogates (psycopg2)
+    return text.strip()[:2000] or f"{type(exc).__name__} (no message)"
+
+
+def _describe(exc: BaseException, max_runtime_s: float) -> str:
+    """What to store in job.error: the scrubbed text, or a clear reason for a timeout."""
+    if isinstance(exc, SoftTimeLimitExceeded):
+        return (f"Exceeded its {max_runtime_s:g} s runtime limit (Celery soft time limit) and was "
+                "stopped. The work is not resumed: retry it, or check what it was waiting on.")
+    return _error_text(exc)
+
+
+def _retry_budget(task, owned: bool) -> int:
+    """How many retries this run may still make. A run that never claimed its job has done nothing
+    yet, so it may retry a few times even when the task itself never retries (enrich, publish)."""
+    return task.max_retries if owned else max(task.max_retries, PRECLAIM_MAX_RETRIES)
+
+
+def _heartbeat_loop(job_id: int, stop: threading.Event, max_runtime_s: float) -> None:
+    started = time.monotonic()
+    while not stop.wait(HEARTBEAT_INTERVAL_S):
+        if time.monotonic() - started > max_runtime_s:
+            _log.error("job %s ran longer than %s s; no longer beating so the reaper can fail it",
+                       job_id, max_runtime_s)
+            return
+        try:
+            db = SessionLocal()
+            try:
+                _advance(db, job_id, models.JobStatus.running, {"heartbeat_at": _now()})
+                db.commit()
+            finally:
+                db.close()
+        except Exception:
+            _log.warning("heartbeat write failed for job %s", job_id, exc_info=True)
+
+
+def _fail_job(db, job_id, from_status, message: str, owner_kind: str, owner_state: str) -> bool:
+    """Compare-and-set the Job to failed and free its owner (no commit). False if the job had moved on.
+
+    The one place a job is failed from a state we hold no claim on: a sibling that claimed it,
+    or the reaper that already failed it, makes the CAS lose and leaves job and owner alone.
+    """
+    if not _advance(db, job_id, from_status, {"status": models.JobStatus.failed, "error": message[:2000]}):
+        return False
+    job = db.get(models.Job, job_id)
+    job.status = models.JobStatus.failed   # mirror the CAS onto the loaded object
+    job.error = message[:2000]
+    rollback_owner(db, job, owner_kind, {owner_state})
+    return True
+
+
+def _commit_or_log(db, job_id, context: str) -> None:
+    """Commit; on failure, log and swallow -- never let a failure recording something replace
+    whatever exception is already propagating past this point.
+
+    Only catches ``Exception``: a second genuine ``BaseException`` (a shutdown signal landing a
+    second time, mid-commit) is deliberately let through rather than swallowed, matching this
+    file's rule that a shutdown always propagates. It replaces whatever was propagating before it
+    -- an accepted trade-off, since either way the process still exits, which is the actual goal.
+    """
+    try:
+        db.commit()
+    except Exception:
+        _log.exception("could not commit for job %s%s", job_id, context)
+
+
+def _commit_stamp_and_reraise(db, job_id, exc: BaseException, context: str, *, cause=None) -> None:
+    """Commit the fail-stamp via _commit_or_log, then propagate `exc` -- shared by both places in
+    _stamp_failed_and_run_cleanup that must let a shutdown signal through (raised directly by the
+    hook, or recovered from behind a masking SAVEPOINT-rollback failure via `cause`)."""
+    _commit_or_log(db, job_id, context)
+    if cause is not None:
+        raise exc from cause
+    raise exc
+
+
+def _stamp_failed_and_run_cleanup(db, job_id, message: str, after_commit_failed, result, *,
+                                  on_shutdown: bool = False) -> None:
+    """done -> failed stamp, then the cleanup hook (if any), for a body whose after_commit already
+    ran. Shared by _settle_failure's committed branch and job_task's inline SystemExit/
+    KeyboardInterrupt branch -- both reach this only once ``committed`` is True.
+
+    The hook runs inside its own SAVEPOINT, separate from the caller's own commit: a raise from it
+    must not roll back the fail-stamp _fail_job_keep_owner just wrote (or the job is left looking
+    `done` forever, with no error recorded and no cleanup ever having happened), and if it performs
+    more than one write and raises partway through, only ITS partial writes roll back -- not the
+    fail-stamp, and not left half-committed either.
+
+    ``on_shutdown`` only labels the exception log line (" on shutdown" appended) so a hook failure
+    during the SystemExit/KeyboardInterrupt path reads differently from one during ordinary
+    after_commit failure handling; it has no effect on the CAS, the savepoint, or what gets committed.
+
+    A SystemExit/KeyboardInterrupt raised BY THE HOOK ITSELF (a shutdown signal landing exactly while
+    it runs) is not swallowed here -- this file's own rule is that a shutdown always propagates so the
+    process actually exits. But it must not propagate WITHOUT committing first: neither caller commits
+    the fail-stamp `_fail_job_keep_owner` already wrote until after this function returns normally, and
+    a BaseException unwinding out of `job_task`'s `run()` skips straight to its `finally: db.close()`
+    (sibling `except` clauses on the same `try` do not catch each other's escapes) -- which would roll
+    the uncommitted fail-stamp back right along with the hook's already-reverted SAVEPOINT. Committing
+    here, once, right before re-raising, is what keeps that from silently losing the fail-stamp again.
+
+    A subtlety in how the hook's SAVEPOINT is managed: earlier versions used `with db.begin_nested():`
+    and inferred a masked shutdown from `exc.__context__` after the fact, but that inference is
+    unreliable -- `__context__` reflects whatever exception is ambiently "being handled" anywhere up
+    the call stack (e.g. `job_task`'s own outer SystemExit handling, when this runs with
+    ``on_shutdown=True``), not necessarily anything to do with THIS hook's SAVEPOINT. An ordinary bug
+    in the hook, raised while a shutdown was ALREADY propagating through an enclosing frame, could
+    misclassify as a masked shutdown purely by accident of dynamic scope. The nested transaction is
+    now managed explicitly instead: `hook_exc` below is exactly what `after_commit_failed` itself
+    raised, with no inference involved, so classification can never depend on unrelated ambient state.
+    Rolling back that SAVEPOINT is also done explicitly, so a failure there is unambiguous too --
+    logged in its own branch, not conflated with "the hook raised a shutdown signal."
+
+    If that explicit SAVEPOINT rollback itself fails (the connection dying is exactly what a shutdown
+    can correlate with -- see docs/roadmap.md's Phase 3.9 section for the investigation history), the
+    hook's own writes were never actually discarded and are still sitting in this transaction;
+    committing them along with the fail-stamp would break this function's own guarantee above that
+    only the hook's OWN writes roll back on a raise. A full `db.rollback()` (not scoped to the dead
+    savepoint, and it works even though the savepoint-level rollback didn't) discards them along with
+    the fail-stamp CAS, and the CAS is then redone on the now-clean transaction before committing.
+    """
+    if _fail_job_keep_owner(db, job_id, message) and after_commit_failed:
+        try:
+            hook_job = db.get(models.Job, job_id)
+        except Exception:
+            # A read, not a write -- no SAVEPOINT needed, and nothing to blame on the hook: it
+            # never got a chance to run. Misattributing this to "the hook raised" (by putting the
+            # db.get() inside the hook's own try/except) would send an operator looking at the
+            # wrong function during an incident.
+            # "staged", not "recorded": _fail_job_keep_owner's write is only pending in this
+            # session's transaction here -- neither caller commits until after this function
+            # returns, so claiming it's durable would overstate what's actually confirmed yet.
+            _log.exception("could not load job %s for the cleanup hook; hook not invoked, "
+                            "failure stamp staged but not yet committed", job_id)
+            return
+        nested = db.begin_nested()
+        try:
+            after_commit_failed(db, hook_job, result)
+        except BaseException as hook_exc:
+            confirmed = _recover_from_hook_failure(db, job_id, message, nested)
+            if isinstance(hook_exc, Exception):
+                suffix = " on shutdown" if on_shutdown else ""
+                if confirmed:
+                    _log.exception("after_commit_failed hook raised for job %s%s; failure stamp "
+                                    "staged (not yet committed), hook's own partial writes rolled "
+                                    "back", job_id, suffix)
+                else:
+                    _log.error("after_commit_failed hook raised for job %s%s; could NOT confirm "
+                               "the failure stamp was recorded or the hook's partial writes "
+                               "rolled back -- check the database directly", job_id, suffix)
+            else:
+                _log.warning("job %s failing on shutdown: cleanup hook raised %s", job_id,
+                              type(hook_exc).__name__)
+                _commit_stamp_and_reraise(db, job_id, hook_exc,
+                                          " (recording the failure stamp during shutdown)")
+        else:
+            nested.commit()
+
+
+def _recover_from_hook_failure(db, job_id, message: str, nested) -> bool:
+    """Roll back the hook's SAVEPOINT; on failure, fall back to a full rollback + fail-stamp CAS
+    redo. Returns whether the fail-stamp is confirmed durable and the hook's writes confirmed
+    discarded -- never raises for a failure along this recovery path itself (each step is caught,
+    logged, and folded into the return value), only for a fresh BaseException from a DB call.
+    """
+    try:
+        nested.rollback()
+        return True
+    except Exception:
+        _log.exception("SAVEPOINT rollback itself failed for job %s; discarding the hook's "
+                        "still-pending writes and redoing the failure stamp", job_id)
+    try:
+        db.rollback()
+    except Exception:
+        _log.exception("could not roll back the poisoned transaction for job %s; the hook's "
+                        "partial writes may still be committed alongside the fail-stamp", job_id)
+        return False
+    try:
+        redone = _fail_job_keep_owner(db, job_id, message)
+    except Exception:
+        _log.exception("could not redo the failure stamp for job %s after discarding the "
+                        "poisoned transaction", job_id)
+        return False
+    if not redone:
+        # The CAS (`WHERE status='done'`) didn't match -- a sibling or the reaper moved the job
+        # on in the gap between the full rollback and this redo. Not an exception, so it would
+        # otherwise fall through to `return True` and claim the fail-stamp is confirmed when
+        # nothing was actually written here.
+        _log.error("could not redo the failure stamp for job %s: it was no longer `done` after "
+                   "the poisoned transaction was discarded", job_id)
+        return False
+    return True
+
+
+def _settle_failure(self, db, job_id, exc, *, owned, committed, owner_kind, owner_state,
+                    result, after_commit_failed, max_runtime_s) -> bool:
+    """Record a failure. True when the caller should raise ``self.retry()``.
+
+    Every write is a compare-and-set on Job.status, so a run that lost its job (reaped, or
+    claimed by a sibling) leaves both the job and its owner alone.
+
+    Not routed through `_finalize_or_reconnect`: that helper exists for the three terminal
+    recorders that have no caller left to fall back on if they fail. This one is the hot,
+    common failure path -- every ordinary task exception reaches it -- and already has a real
+    backstop if a connection blip hits it: the caller (job_task, above) wraps the call to this
+    function in its own `except Exception`, which logs and swallows, leaving the job in
+    whatever state it was already in (`pending`, `running`, or `done`) for a sibling worker or
+    the reaper to pick up later. That backstop does not retry the write -- unlike
+    `_finalize_or_reconnect`, which opens a fresh session and tries again once -- so adding a
+    reconnect-retry here would give this path faster recovery than it has today; that's a
+    reasonable future improvement, not something this function currently does.
+    """
+    db.rollback()
+    db.expire_all()   # rollback() is a no-op when no transaction is open; never trust cached rows
+    message = _describe(exc, max_runtime_s)
+    retriable = should_retry(exc, self.request.retries, _retry_budget(self, owned))
+    if not owned:
+        if retriable:
+            return True
+        # Never claimed and never retried again: no message will come back for this job, so fail it
+        # now instead of leaving it pending (and its owner in flight) for the reaper. If a sibling
+        # did claim it, the CAS loses and it is left alone.
+        _fail_job(db, job_id, models.JobStatus.pending, f"could not start: {message}", owner_kind, owner_state)
+        db.commit()
+        return False
+    if not committed and retriable:
+        ok = _advance(db, job_id, models.JobStatus.running, {
+            "status": models.JobStatus.pending,
+            "error": f"transient failure, retry {self.request.retries + 1}: {message}"[:2000],
+        })
+        db.commit()
+        return ok              # only after the reset is durable
+    if committed:
+        # The body already ran and its owner state moved on; only the hook knows what to undo.
+        _stamp_failed_and_run_cleanup(db, job_id, message, after_commit_failed, result)
+    else:
+        _fail_job(db, job_id, models.JobStatus.running, message, owner_kind, owner_state)
+    db.commit()
+    return False
+
+
+def _fail_job_keep_owner(db, job_id, message: str) -> bool:
+    """done -> failed after a failed after_commit; the hook owns cleanup of the owner.
+
+    `_stamp_failed_and_run_cleanup` calls this BEFORE opening the cleanup hook's SAVEPOINT, so a hook
+    that raises rolls back only its own work. This is safe regardless of whether this function's own
+    write to ``job`` is an immediate bulk UPDATE or a plain ORM attribute assignment left for the next
+    flush: SQLAlchemy's ``Session.begin_nested()`` always flushes pending session state before
+    establishing the SAVEPOINT (``SessionTransaction._take_snapshot()``), so anything written here,
+    however it was written, is already durable to the SAVEPOINT before the hook's code runs -- only
+    calling this function AFTER the SAVEPOINT had opened would put its write at risk.
+    """
+    if not _advance(db, job_id, models.JobStatus.done, {"status": models.JobStatus.failed, "error": message[:2000]}):
+        return False
+    job = db.get(models.Job, job_id)
+    job.status = models.JobStatus.failed
+    job.error = message[:2000]
+    return True
+
+
+def _finalize_or_reconnect(db, job_id: int, write) -> None:
+    """Roll back, run ``write(session, job_id)``, commit. These are last-resort, one-shot failure
+    recorders with no other net: if this doesn't land, the job is stuck until the reaper (hours).
+
+    The connection `db` holds may itself be the thing that died — a server-side kill, or the
+    database's idle_in_transaction_session_timeout, can land at exactly the moment this runs, since
+    it is often called BECAUSE something just went wrong. A dead socket can't be rolled back into a
+    clean state, so `db.rollback()` itself can raise. When that (or the write, or the commit) fails
+    with a connection-level error, retry the whole sequence once on a brand-new session rather than
+    silently losing the failure this call exists to record. Any other exception (a real bug in
+    `write`) is not retried and propagates as-is.
+    """
+    def attempt(session):
+        session.rollback()
+        session.expire_all()
+        write(session, job_id)
+        session.commit()
+
+    try:
+        attempt(db)
+    except (sa_exc.OperationalError, sa_exc.InterfaceError):
+        fresh = SessionLocal()
+        try:
+            attempt(fresh)
+        finally:
+            fresh.close()
+
+
+def _fail_interrupted(db, job_id, exc: BaseException, owner_kind: str, owner_state: str) -> None:
+    """SystemExit / KeyboardInterrupt while the job was running (worker shut down or killed by a
+    Celery hard time limit): fail it now. Do NOT hand it back to pending: Celery has already
+    acked or dropped the message, so nothing would ever pick a pending job up again."""
+    message = (f"Worker was shut down while the job was running ({type(exc).__name__}). "
+               "The work was not finished; retry it.")
+    _finalize_or_reconnect(db, job_id, lambda s, jid: _fail_job(
+        s, jid, models.JobStatus.running, message, owner_kind, owner_state))
+
+
+def _fail_rejected_retry(db, job_id, exc, owner_kind, owner_state) -> None:
+    """The broker refused the retry message (Reject): it is dropped, so fail the job now
+    rather than leaving it pending until the reaper's pending threshold."""
+    message = f"could not schedule retry: {_error_text(exc)}"
+    _finalize_or_reconnect(db, job_id, lambda s, jid: _fail_job(
+        s, jid, models.JobStatus.pending, message, owner_kind, owner_state))
+
+
+def fail_unenqueued(db, job_id: int, job_type: str, exc: BaseException) -> None:
+    """A router created a Job but could not enqueue it: fail it and free its owner now.
+
+    Otherwise the cut/reel sits in flight, refusing every retry with 409, until the reaper's
+    pending threshold (hours) decides the message was lost.
+
+    Takes ``job_id``/``job_type`` as plain values, not the ORM ``Job`` object: the caller's
+    session was likely just used to commit and may use SQLAlchemy's default
+    ``expire_on_commit=True`` (unlike worker sessions), which would make ``job.type.value`` a
+    lazy-load query -- the one DB touch in this function that would run BEFORE
+    `_finalize_or_reconnect`'s dead-connection retry starts protecting it. Every caller already
+    knows its own job type statically (it just created that exact type two lines above).
+    """
+    kind, state = JOB_IN_FLIGHT[job_type]
+    message = f"could not enqueue: {_error_text(exc)}"
+    _finalize_or_reconnect(db, job_id, lambda s, jid: _fail_job(s, jid, models.JobStatus.pending, message, kind, state))
+
+
+def job_task(
+    job_type: str,
+    *,
+    prepare=None,
+    after_commit=None,
+    after_commit_failed=None,
+    max_runtime_s: float,
+    start_progress: int = 5,
+):
+    """Wrap a task body in the Job lifecycle. Apply beneath ``@celery_app.task(bind=True, ...)``.
+
+    The body is ``body(self, db, job, ctx) -> result``. It does the domain work, calls
+    ``heartbeat()`` at milestones, and raises to fail. ``heartbeat()`` COMMITS (and raises
+    ``JobLost`` if the reaper already failed the job), so it must come before the body's
+    last mutations: the done-stamp commit lands those atomically with ``status = done``.
+    The one reason to commit early is an irreversible external side effect.
+
+    Order of events:
+      1. ``job is None`` or ``status != pending`` -> return. ``done``/``running`` are a
+         redelivery no-op; ``failed`` is terminal (every retry the operator triggers
+         creates a new Job).
+      2. Atomic claim: ``UPDATE ... WHERE status = 'pending'`` -> ``running``. Losing the
+         race returns without running the body. A background thread then refreshes
+         ``heartbeat_at`` until the run ends or ``max_runtime_s`` passes.
+      3. ``prepare(db, job) -> ctx`` (optional) — load rows, null-guard, budget checks.
+         A failure here fails the job but never bumps ``attempts`` or sets ``started_at``.
+      4. ``attempts`` bump and ``started_at``, then the body.
+      5. Fenced done-stamp: ``UPDATE ... WHERE status = 'running'``. If the reaper already
+         failed the job, the body's uncommitted mutations are rolled back instead.
+      6. ``after_commit(result)`` (optional) — work that must only happen once the job is
+         durably done, e.g. enqueueing the next job. It gets the body's return value.
+
+    Failure: roll back, then either reset to ``pending`` and ``self.retry()`` (transient
+    error with retries left; ``attempts`` is NOT bumped) or stamp ``failed`` and roll the
+    owner back per ``JOB_IN_FLIGHT[job_type]``. Every STATUS write is a compare-and-set, so a
+    worker that lost the job never changes its status or its owner. ``started_at``, ``attempts``,
+    ``job.meta`` and the ``start_progress`` write are plain; ``heartbeat()`` and the done-stamp write
+    ``progress`` inside a compare-and-set. If the broker refuses the retry message the job is failed at
+    once. A failure in ``after_commit`` never retries (the body already ran): the job is flipped
+    ``done -> failed`` and ``after_commit_failed(db, job, result)`` alone cleans up what the body left
+    behind, including the owner. The failed stamp commits even if the hook itself raises (it runs in
+    its own SAVEPOINT, so a raise partway through a multi-write hook only undoes the hook's own
+    writes). One narrow gap a new ``after_commit_failed`` hook should know about: if the hook raises
+    BaseException AND the guarded commit that follows also fails, the Job is left at ``done`` with no
+    error recorded and no reaper coverage (it only scans ``running``/``pending``). ``_abandon_generate``
+    (enrich_context.py) happens to self-heal its owner anyway via an unrelated side effect (an
+    orphaned follow-up Job it leaves `pending`); a hook with no such side effect would not. See
+    docs/roadmap.md's Phase 3.9 section for the full investigation. A run that never claimed the job
+    (e.g. a DB error at the guard) has
+    done nothing, so a transient error is retried up to PRECLAIM_MAX_RETRIES even for a task with
+    ``max_retries=0``; once that is used up, or for a non-transient error, the still-pending job is
+    failed and its owner freed (no message will come back for it). Errors while recording a failure
+    are logged and never mask the original exception. ``job.error`` is never empty, has database row
+    detail and bound parameters redacted, and says so plainly when the cause was the soft time limit.
+
+    ``max_runtime_s`` (required) is the longest a body may run. Pass the same number to
+    ``time_limits()`` on ``@celery_app.task`` so Celery raises SoftTimeLimitExceeded in the body
+    and, failing that, kills the worker process: stopping the heartbeat alone only lets the
+    reaper fail the job record, it does not free a hung worker slot. A body that swallows
+    ``Exception`` around its blocking calls also swallows the soft limit (do not: re-raise it);
+    the hard limit then ends the run.
+
+    A ``BaseException`` (SystemExit, KeyboardInterrupt) means the worker is shutting down or the hard
+    time limit is killing the process. The job is FAILED at once and its owner freed. It is never handed
+    back to ``pending``: Celery has already acked or dropped the message, so nothing would pick a pending
+    job up again (the reaper would only notice hours later). A child killed with SIGKILL never gets here;
+    its job stays ``running`` and the reaper fails it after STALE_MINUTES.
+
+    ``del run.__wrapped__`` is what keeps ``.delay(job_id)`` working: functools.wraps would
+    otherwise expose the body's signature to Celery, which rejects the call with TypeError.
+
+    Adding a new job type takes several edits, not one: a JobType value, its ``JOB_IN_FLIGHT`` entry
+    (api/state.py), a ``task_routes`` entry (worker/celery_app.py), ``**time_limits(...)`` on the
+    ``@celery_app.task`` and a ``max_runtime_s``. Always set ``max_retries`` on the task: Celery's
+    default of 3 would silently enable retries. ``run.job_type`` and ``run.max_runtime_s`` exist so
+    tests can pin each task's wiring (a test fails for any registered task that lacks time limits).
+    """
+    owner_kind, owner_state = JOB_IN_FLIGHT[job_type]
+
+    def decorate(body):
+        @functools.wraps(body)
+        def run(self, job_id):
+            # expire_on_commit=False: with the default, reading reel.id after each commit
+            # opens a new transaction that stays idle-in-transaction through every long
+            # LLM / ffmpeg / upload call. Rows are owned by this run; the done-stamp fence
+            # protects against a stale view.
+            db = SessionLocal(expire_on_commit=False)
+            owned = committed = False
+            result = None
+            stop = threading.Event()
+            beat = None
+            try:
+                job = db.get(models.Job, job_id)
+                if job is None or job.status != models.JobStatus.pending:
+                    return
+
+                if not _advance(db, job_id, models.JobStatus.pending, {
+                    "status": models.JobStatus.running, "heartbeat_at": _now(),
+                }):
+                    db.rollback()
+                    return
+                job.status = models.JobStatus.running
+                job.heartbeat_at = _now()
+                db.commit()
+                owned = True
+
+                thread = threading.Thread(
+                    target=_heartbeat_loop, args=(job_id, stop, max_runtime_s),
+                    name=f"heartbeat-job-{job_id}", daemon=True,
+                )
+                thread.start()
+                beat = thread   # only once started: join() on an unstarted thread raises
+
+                ctx = prepare(db, job) if prepare else None
+
+                job.started_at = _now()
+                job.attempts = (job.attempts or 0) + 1
+                job.progress = start_progress
+                db.commit()
+
+                result = body(self, db, job, ctx)
+
+                done_at = _now()
+                if not _advance(db, job_id, models.JobStatus.running, {
+                    "status": models.JobStatus.done, "progress": 100,
+                    "heartbeat_at": done_at, "error": None,
+                }):
+                    # Reaped (or superseded) mid-run: the owner was already rolled back.
+                    db.rollback()
+                    _log.warning("job %s (%s) was no longer running at completion; result discarded",
+                                 job_id, job_type)
+                    return
+                job.status = models.JobStatus.done
+                job.progress = 100
+                job.heartbeat_at = done_at
+                job.error = None
+                db.commit()
+                committed = True
+
+                if after_commit:
+                    try:
+                        after_commit(result)
+                    except Exception:
+                        raise   # unchanged: the except Exception branch below runs the same cleanup
+                    except BaseException as hook_exc:
+                        # SystemExit/KeyboardInterrupt specifically: the job already completed
+                        # (committed=True), so only after_commit_failed can undo what after_commit
+                        # left half-done (e.g. an un-enqueued follow-up job). The except BaseException
+                        # branch further down only acts when not committed, so without this a shutdown
+                        # exactly here would skip cleanup entirely, falling back to the reaper's much
+                        # slower sweep to notice at all.
+                        try:
+                            message = _describe(hook_exc, max_runtime_s)
+                            _stamp_failed_and_run_cleanup(db, job_id, message, after_commit_failed,
+                                                          result, on_shutdown=True)
+                            db.commit()
+                        except Exception:
+                            _log.exception("could not record after_commit failure for job %s", job_id)
+                        raise
+
+            except Exception as exc:
+                retry = False
+                try:
+                    retry = _settle_failure(
+                        self, db, job_id, exc, owned=owned, committed=committed,
+                        owner_kind=owner_kind, owner_state=owner_state,
+                        result=result, after_commit_failed=after_commit_failed,
+                        max_runtime_s=max_runtime_s,
+                    )
+                except Exception:
+                    # Never let a bookkeeping failure replace the real error.
+                    _log.exception("could not record failure of job %s (%s)", job_id, job_type)
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                if retry:
+                    # The job was reset to pending above: the claim rejects `running`, so a retry
+                    # that left the status alone would be a silent no-op.
+                    try:
+                        raise self.retry(
+                            exc=exc, countdown=30 * 2 ** self.request.retries,
+                            max_retries=_retry_budget(self, owned),
+                        )
+                    except Reject:
+                        # Safe whether or not this run ever claimed the job: _fail_rejected_retry
+                        # CASes off `pending`, which is the job's real status in both cases — owned
+                        # jobs were just reset to pending above, and an unclaimed job never left it.
+                        # The same "no message is coming back" reasoning _settle_failure applies to
+                        # an unclaimed job with no retries left applies here too.
+                        try:
+                            _fail_rejected_retry(db, job_id, exc, owner_kind, owner_state)
+                        except Exception:
+                            _log.exception("could not fail job %s after a refused retry", job_id)
+                        raise
+                raise
+
+            except BaseException as exc:
+                # SystemExit / KeyboardInterrupt: the worker is shutting down, or a Celery hard time
+                # limit is killing this process. Fail the job now (see _fail_interrupted).
+                if owned and not committed:
+                    try:
+                        _fail_interrupted(db, job_id, exc, owner_kind, owner_state)
+                    except Exception:
+                        _log.exception("could not fail job %s on shutdown", job_id)
+                raise
+            finally:
+                stop.set()
+                try:
+                    if beat is not None:
+                        beat.join(timeout=5)
+                finally:
+                    db.close()
+
+        del run.__wrapped__
+        run.job_type = job_type   # exposed so tests can pin each task's wiring
+        run.max_runtime_s = max_runtime_s
+        return run
+
+    return decorate
