@@ -281,40 +281,55 @@ def _stamp_failed_and_run_cleanup(db, job_id, message: str, after_commit_failed,
     the uncommitted fail-stamp back right along with the hook's already-reverted SAVEPOINT. Committing
     here, once, right before re-raising, is what keeps that from silently losing the fail-stamp again.
 
-    A subtlety in how that BaseException reaches us at all: if the hook did more than a bare raise (a
-    real write, like `_abandon_generate`'s), `db.begin_nested()`'s own `__exit__` tries to roll back the
-    SAVEPOINT on the way out, and SQLAlchemy's `SessionTransaction.rollback()` RE-RAISES a failed
-    DBAPI-level rollback rather than swallowing it. If that rollback itself fails -- the connection
-    dying is exactly what a shutdown can correlate with (see docs/roadmap.md's Phase 3.9 section for
-    the investigation history) -- the ordinary `Exception` it raises REPLACES the hook's
-    SystemExit/KeyboardInterrupt as what's propagating out of the `with` block, though the original
-    survives as `exc.__context__` (Python sets this automatically). Left unhandled, that ordinary
-    exception would be caught by the sibling `except Exception:` below, logged as a routine hook
-    failure, and swallowed -- masking the shutdown entirely. The `except Exception as exc:` clause
-    checks for exactly this shape and recovers the original signal.
+    A subtlety in how the hook's SAVEPOINT is managed: earlier versions used `with db.begin_nested():`
+    and inferred a masked shutdown from `exc.__context__` after the fact, but that inference is
+    unreliable -- `__context__` reflects whatever exception is ambiently "being handled" anywhere up
+    the call stack (e.g. `job_task`'s own outer SystemExit handling, when this runs with
+    ``on_shutdown=True``), not necessarily anything to do with THIS hook's SAVEPOINT. An ordinary bug
+    in the hook, raised while a shutdown was ALREADY propagating through an enclosing frame, could
+    misclassify as a masked shutdown purely by accident of dynamic scope. The nested transaction is
+    now managed explicitly instead: `hook_exc` below is exactly what `after_commit_failed` itself
+    raised, with no inference involved, so classification can never depend on unrelated ambient state.
+    Rolling back that SAVEPOINT is also done explicitly, so a failure there is unambiguous too --
+    logged in its own branch, not conflated with "the hook raised a shutdown signal."
+
+    If that explicit SAVEPOINT rollback itself fails (the connection dying is exactly what a shutdown
+    can correlate with -- see docs/roadmap.md's Phase 3.9 section for the investigation history), the
+    hook's own writes were never actually discarded and are still sitting in this transaction;
+    committing them along with the fail-stamp would break this function's own guarantee above that
+    only the hook's OWN writes roll back on a raise. A full `db.rollback()` (not scoped to the dead
+    savepoint, and it works even though the savepoint-level rollback didn't) discards them along with
+    the fail-stamp CAS, and the CAS is then redone on the now-clean transaction before committing.
     """
     if _fail_job_keep_owner(db, job_id, message) and after_commit_failed:
+        nested = db.begin_nested()
         try:
-            with db.begin_nested():
-                after_commit_failed(db, db.get(models.Job, job_id), result)
-        except Exception as exc:
-            masked_shutdown = exc.__context__
-            if isinstance(masked_shutdown, BaseException) and not isinstance(masked_shutdown, Exception):
-                # The hook itself raised a shutdown signal, but rolling back its SAVEPOINT on the way
-                # out then failed too, and that secondary failure replaced it (see docstring). Recover
-                # the original signal from __context__ and treat this exactly like the sibling
-                # `except BaseException:` branch below: commit the fail-stamp, then let it propagate.
-                _log.exception("SAVEPOINT rollback itself failed for job %s while a shutdown signal was "
-                                "propagating from the cleanup hook; recovering the original signal",
-                                job_id)
-                _commit_stamp_and_reraise(db, job_id, masked_shutdown,
-                                          " (recording the failure stamp during a masked shutdown)",
-                                          cause=exc)
-            suffix = " on shutdown" if on_shutdown else ""
-            _log.exception("after_commit_failed hook raised for job %s%s; failure stamp still recorded, "
-                            "hook's own partial writes rolled back", job_id, suffix)
-        except BaseException as exc:
-            _commit_stamp_and_reraise(db, job_id, exc, " (recording the failure stamp during shutdown)")
+            after_commit_failed(db, db.get(models.Job, job_id), result)
+        except BaseException as hook_exc:
+            try:
+                nested.rollback()
+            except Exception:
+                _log.exception("SAVEPOINT rollback itself failed for job %s; discarding the hook's "
+                                "still-pending writes and redoing the failure stamp", job_id)
+                try:
+                    db.rollback()
+                except Exception:
+                    _log.exception("could not roll back the poisoned transaction for job %s; the "
+                                    "hook's partial writes may still be committed alongside the "
+                                    "fail-stamp", job_id)
+                else:
+                    _fail_job_keep_owner(db, job_id, message)
+            if isinstance(hook_exc, Exception):
+                suffix = " on shutdown" if on_shutdown else ""
+                _log.exception("after_commit_failed hook raised for job %s%s; failure stamp still "
+                                "recorded, hook's own partial writes rolled back", job_id, suffix)
+            else:
+                _log.warning("job %s failing on shutdown: cleanup hook raised %s", job_id,
+                              type(hook_exc).__name__)
+                _commit_stamp_and_reraise(db, job_id, hook_exc,
+                                          " (recording the failure stamp during shutdown)")
+        else:
+            nested.commit()
 
 
 def _settle_failure(self, db, job_id, exc, *, owned, committed, owner_kind, owner_state,

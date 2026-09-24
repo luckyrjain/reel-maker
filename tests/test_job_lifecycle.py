@@ -648,6 +648,52 @@ def test_a_shutdown_signal_inside_the_cleanup_hook_still_commits_the_failure_sta
     assert "broker down" in job.error
 
 
+def test_a_clean_shutdown_from_the_hook_gets_its_own_log_line(factory, caplog):
+    """Of the three situations this function distinguishes (ordinary hook failure, masked shutdown
+    recovered, shutdown with no masking), only the third previously had no dedicated log line --
+    an operator grepping worker.tasks.common saw identical (empty) output for "a clean hook-raised
+    shutdown occurred" and "nothing happened here"."""
+    job_id, *_ = _make(factory, models.JobType.enrich)
+
+    def hook(db, job, result):
+        raise SystemExit("shutdown mid-cleanup")
+
+    task = _task("t.clean_shutdown_log", lambda self, db, job, ctx: 1, job_type="enrich",
+                 after_commit=MagicMock(side_effect=ConnectionError("broker down")),
+                 after_commit_failed=hook)
+    with caplog.at_level(logging.WARNING, logger="worker.tasks.common"):
+        with pytest.raises(SystemExit):
+            task(job_id)
+    assert any(f"job {job_id} failing on shutdown" in r.getMessage() for r in caplog.records)
+
+
+def test_an_ordinary_hook_bug_during_an_ambient_shutdown_is_not_misclassified(factory, caplog):
+    """A hook that raises an ordinary bug (not a shutdown signal, no SAVEPOINT rollback failure)
+    must be logged and swallowed as a routine hook failure -- even when it runs with
+    on_shutdown=True because after_commit ITSELF already raised a real SystemExit/KeyboardInterrupt.
+    Python sets exc.__context__ to whatever is ambiently "being handled" anywhere up the call stack,
+    which at this exact call site is that outer shutdown -- an earlier implementation that inferred a
+    masked shutdown from __context__ would misclassify this ordinary bug as a recovered shutdown
+    signal purely by accident of dynamic scope, logging a false 'SAVEPOINT rollback itself failed'
+    diagnostic that points an operator at a nonexistent DB problem instead of the real hook bug."""
+    job_id, *_ = _make(factory, models.JobType.enrich)
+
+    def after_commit(result):
+        raise SystemExit("real shutdown from after_commit")
+
+    def hook(db, job, result):
+        raise RuntimeError("genuine unrelated bug in the hook")
+
+    task = _task("t.ordinary_bug_during_shutdown", lambda self, db, job, ctx: 1, job_type="enrich",
+                 after_commit=after_commit, after_commit_failed=hook)
+    with caplog.at_level(logging.ERROR, logger="worker.tasks.common"):
+        with pytest.raises(SystemExit, match="real shutdown from after_commit"):
+            task(job_id)
+    assert any("hook raised" in r.getMessage() and "on shutdown" in r.getMessage()
+               for r in caplog.records)
+    assert not any("SAVEPOINT rollback itself failed" in r.getMessage() for r in caplog.records)
+
+
 def test_a_savepoint_rollback_failure_does_not_mask_a_shutdown_signal_from_the_hook(factory):
     """If the hook does a real write before raising SystemExit/KeyboardInterrupt (like
     _abandon_generate's real shape, not a bare raise), db.begin_nested()'s own __exit__ tries to
@@ -684,6 +730,11 @@ def test_a_savepoint_rollback_failure_does_not_mask_a_shutdown_signal_from_the_h
     db.close()
     job, _, _ = _read(factory, job_id, reel_id, cut_id)
     assert job.status == models.JobStatus.failed
+    other_job = _read(factory, other_job_id, reel_id, cut_id)[0]
+    assert other_job.status == models.JobStatus.pending, (
+        "the failed ROLLBACK TO SAVEPOINT never actually discarded the hook's own write -- "
+        "committing anyway would durably persist it, breaking the guarantee that only the "
+        "hook's OWN writes roll back on a raise")
 
 
 def test_a_commit_failure_while_recording_a_shutdown_does_not_mask_the_shutdown(factory):
