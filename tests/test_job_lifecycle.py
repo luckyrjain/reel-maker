@@ -537,6 +537,26 @@ def test_a_failing_cleanup_hook_does_not_mask_the_after_commit_error(factory):
         task(job_id)
 
 
+def test_a_failing_cleanup_hook_does_not_discard_the_failure_stamp(factory):
+    """_fail_job_keep_owner writes the done -> failed CAS inside the same transaction as the hook
+    call; a raise from the hook, if not caught separately from the final db.commit(), would leave
+    that write uncommitted and get it rolled back by the outer handler -- so the job comes out of
+    this looking `done` forever, with no error recorded, even though after_commit failed."""
+    job_id, reel_id, cut_id = _make(factory, models.JobType.enrich)
+
+    def hook(db, job, result):
+        raise RuntimeError("cleanup blew up")
+
+    task = _task("t.hook_fail_stamp", lambda self, db, job, ctx: 1, job_type="enrich",
+                 after_commit=MagicMock(side_effect=ConnectionError("broker down")),
+                 after_commit_failed=hook)
+    with pytest.raises(ConnectionError, match="broker down"):
+        task(job_id)
+    job, _, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.failed
+    assert "broker down" in job.error
+
+
 def test_a_body_failure_does_not_run_the_cleanup_hook(factory):
     job_id, *_ = _make(factory, models.JobType.enrich)
     hook = MagicMock()
@@ -1100,7 +1120,7 @@ def test_fail_unenqueued_fails_the_job_and_frees_its_owner(factory, job_type, ow
     kwargs = {"cut_status": owner_before[1]} if owner_before[0] == "cut" else {"reel_status": owner_before[1]}
     job_id, reel_id, cut_id = _make(factory, job_type, **kwargs)
     db = factory()
-    fail_unenqueued(db, db.get(models.Job, job_id), ConnectionError("broker down"))
+    fail_unenqueued(db, job_id, job_type.value, ConnectionError("broker down"))
     job, reel, cut = _read(factory, job_id, reel_id, cut_id)
     assert job.status == models.JobStatus.failed and "could not enqueue" in job.error
     assert (cut.status if owner_after[0] == "cut" else reel.status) == owner_after[1]
@@ -1111,7 +1131,7 @@ def test_fail_unenqueued_leaves_a_job_a_worker_already_claimed_alone(factory):
     job_id, reel_id, cut_id = _make(factory, models.JobType.render, status=models.JobStatus.running,
                                     cut_status=models.CutStatus.rendering)
     db = factory()
-    fail_unenqueued(db, db.get(models.Job, job_id), ConnectionError("timeout after delivery"))
+    fail_unenqueued(db, job_id, models.JobType.render.value, ConnectionError("timeout after delivery"))
     job, _, cut = _read(factory, job_id, reel_id, cut_id)
     assert job.status == models.JobStatus.running
     assert cut.status == models.CutStatus.rendering
@@ -1228,9 +1248,8 @@ def test_fail_unenqueued_starts_from_a_clean_transaction(factory):
     job_id, reel_id, cut_id = _make(factory, models.JobType.render, cut_status=models.CutStatus.rendering,
                                     reel_status=models.ReelStatus.guide_ready)
     db = factory()
-    job = db.get(models.Job, job_id)
     db.get(models.Cut, cut_id).caption = "unflushed edit from a dead transaction"
-    fail_unenqueued(db, job, ConnectionError("broker down"))
+    fail_unenqueued(db, job_id, models.JobType.render.value, ConnectionError("broker down"))
     assert _read(factory, job_id, reel_id, cut_id)[2].caption is None
     assert _read(factory, job_id, reel_id, cut_id)[0].status == models.JobStatus.failed
 
@@ -1279,14 +1298,67 @@ def test_fail_unenqueued_recovers_when_its_own_connection_is_dead(factory):
 
     job_id, reel_id, cut_id = _make(factory)
     db = factory()
-    job = db.get(models.Job, job_id)
 
     class Dead:
         def rollback(self):
             raise sa_exc.OperationalError("ROLLBACK", {}, Exception("gone"))
 
     with patch.object(db, "rollback", Dead().rollback):
-        fail_unenqueued(db, job, ConnectionError("broker down"))
+        fail_unenqueued(db, job_id, models.JobType.generate.value, ConnectionError("broker down"))
+    job2, reel2, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job2.status == models.JobStatus.failed
+    assert reel2.status == models.ReelStatus.failed
+
+
+def test_finalize_or_reconnect_also_retries_on_interface_error(factory):
+    """The dead-connection retry catches (OperationalError, InterfaceError) as a tuple; every other
+    test in this file only exercises OperationalError, so nothing kills a mutation that narrows the
+    except clause to OperationalError alone. InterfaceError is psycopg2's own "connection already
+    closed" signal and is just as real a dead-connection case."""
+    from worker.tasks.common import _fail_interrupted
+
+    job_id, reel_id, cut_id = _make(factory, status=models.JobStatus.running)
+    db = factory()
+
+    class Dead:
+        def rollback(self):
+            raise sa_exc.InterfaceError("ROLLBACK", {}, Exception("connection already closed"))
+
+    with patch.object(db, "rollback", Dead().rollback):
+        _fail_interrupted(db, job_id, SystemExit(1), "reel", "generating")
+    job2, reel2, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job2.status == models.JobStatus.failed
+    assert reel2.status == models.ReelStatus.failed
+
+
+def test_finalize_or_reconnect_closes_the_fresh_session_it_opens(factory):
+    """The fresh session opened for the retry attempt must always be closed, success or failure,
+    or a dead-connection recovery leaks a connection every time it fires."""
+    from worker.tasks import common as common_module
+    from worker.tasks.common import _fail_interrupted
+
+    job_id, reel_id, cut_id = _make(factory, status=models.JobStatus.running)
+    db = factory()
+    opened = []
+
+    real_session_local = common_module.SessionLocal
+
+    def spying_session_local(*args, **kwargs):
+        session = real_session_local(*args, **kwargs)
+        session.close = MagicMock(wraps=session.close)
+        opened.append(session)
+        return session
+
+    class Dead:
+        def rollback(self):
+            raise sa_exc.OperationalError("ROLLBACK", {}, Exception("gone"))
+
+    with patch.object(db, "rollback", Dead().rollback), \
+         patch("worker.tasks.common.SessionLocal", spying_session_local):
+        _fail_interrupted(db, job_id, SystemExit(1), "reel", "generating")
+
+    assert len(opened) == 1, "must open exactly one fresh session for the retry"
+    opened[0].close.assert_called_once()
     job2, reel2, _ = _read(factory, job_id, reel_id, cut_id)
     assert job2.status == models.JobStatus.failed
     assert reel2.status == models.ReelStatus.failed
@@ -1332,6 +1404,26 @@ def test_after_commit_shutdown_runs_the_cleanup_hook_and_rolls_back_the_owner(fa
     job, reel, _ = _read(factory, job_id, reel_id, cut_id)
     assert job.status == models.JobStatus.failed
     assert reel.status == models.ReelStatus.failed
+
+
+def test_a_failing_cleanup_hook_does_not_discard_the_shutdown_failure_stamp(factory):
+    """Same hazard as the plain-Exception path, on the SystemExit branch: if the hook's own raise
+    is not caught separately from the final db.commit(), the fail-stamp _fail_job_keep_owner just
+    wrote is discarded and the job is left looking `done` forever."""
+    job_id, reel_id, cut_id = _make(factory, models.JobType.enrich, reel_status=models.ReelStatus.generating)
+
+    def after_commit(result):
+        raise SystemExit(1)
+
+    def after_commit_failed(db, job, result):
+        raise RuntimeError("cleanup blew up")
+
+    task = _task("t.after_shutdown_hook_fail", lambda self, db, job, ctx: 9, job_type="enrich",
+                 after_commit=after_commit, after_commit_failed=after_commit_failed)
+    with pytest.raises(SystemExit):
+        task(job_id)
+    job, _, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.failed
 
 
 def test_after_commit_exception_still_uses_the_one_cleanup_path_not_both(factory):

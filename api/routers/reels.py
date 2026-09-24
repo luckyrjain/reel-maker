@@ -70,7 +70,7 @@ def create_reel(
     try:
         enrich_context.delay(job_id)
     except Exception as exc:
-        fail_unenqueued(db, job, exc)
+        fail_unenqueued(db, job_id, models.JobType.enrich.value, exc)
         raise HTTPException(status_code=503, detail="Could not queue the job — try again") from exc
     db.refresh(job)
 

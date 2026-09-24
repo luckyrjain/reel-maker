@@ -237,6 +237,13 @@ def _settle_failure(self, db, job_id, exc, *, owned, committed, owner_kind, owne
 
     Every write is a compare-and-set on Job.status, so a run that lost its job (reaped, or
     claimed by a sibling) leaves both the job and its owner alone.
+
+    Not routed through `_finalize_or_reconnect`: that helper is for last-resort recorders with
+    no other net (a dead connection there means the failure is lost until the reaper, hours
+    later). This one runs inside job_task's own `except` block, which already has an outer
+    `except Exception` around the call to this function (job_task, above) that logs and rolls
+    back if this raises -- including a connection error. Retrying on a fresh session here too
+    would just duplicate that same safety net one level down.
     """
     db.rollback()
     db.expire_all()   # rollback() is a no-op when no transaction is open; never trust cached rows
@@ -260,8 +267,15 @@ def _settle_failure(self, db, job_id, exc, *, owned, committed, owner_kind, owne
         return ok              # only after the reset is durable
     if committed:
         # The body already ran and its owner state moved on; only the hook knows what to undo.
+        # The hook itself is wrapped separately from the commit below: a raise from it must not
+        # roll back the fail-stamp _fail_job_keep_owner already wrote, or the job is left looking
+        # `done` forever with no error recorded and no cleanup ever having happened.
         if _fail_job_keep_owner(db, job_id, message) and after_commit_failed:
-            after_commit_failed(db, db.get(models.Job, job_id), result)
+            try:
+                after_commit_failed(db, db.get(models.Job, job_id), result)
+            except Exception:
+                _log.exception("after_commit_failed hook raised for job %s; failure stamp still recorded",
+                                job_id)
     else:
         _fail_job(db, job_id, models.JobStatus.running, message, owner_kind, owner_state)
     db.commit()
@@ -324,15 +338,22 @@ def _fail_rejected_retry(db, job_id, exc, owner_kind, owner_state) -> None:
         s, jid, models.JobStatus.pending, message, owner_kind, owner_state))
 
 
-def fail_unenqueued(db, job, exc: BaseException) -> None:
+def fail_unenqueued(db, job_id: int, job_type: str, exc: BaseException) -> None:
     """A router created a Job but could not enqueue it: fail it and free its owner now.
 
     Otherwise the cut/reel sits in flight, refusing every retry with 409, until the reaper's
     pending threshold (hours) decides the message was lost.
+
+    Takes ``job_id``/``job_type`` as plain values, not the ORM ``Job`` object: the caller's
+    session was likely just used to commit and may use SQLAlchemy's default
+    ``expire_on_commit=True`` (unlike worker sessions), which would make ``job.type.value`` a
+    lazy-load query -- the one DB touch in this function that would run BEFORE
+    `_finalize_or_reconnect`'s dead-connection retry starts protecting it. Every caller already
+    knows its own job type statically (it just created that exact type two lines above).
     """
-    kind, state = JOB_IN_FLIGHT[job.type.value]
+    kind, state = JOB_IN_FLIGHT[job_type]
     message = f"could not enqueue: {_error_text(exc)}"
-    _finalize_or_reconnect(db, job.id, lambda s, jid: _fail_job(s, jid, models.JobStatus.pending, message, kind, state))
+    _finalize_or_reconnect(db, job_id, lambda s, jid: _fail_job(s, jid, models.JobStatus.pending, message, kind, state))
 
 
 def job_task(
@@ -480,8 +501,16 @@ def job_task(
                         # slower sweep to notice at all.
                         try:
                             message = _describe(hook_exc, max_runtime_s)
+                            # Same hazard as _settle_failure's committed branch: keep the hook's
+                            # own try/except separate from the commit, or a raise from it discards
+                            # the fail-stamp _fail_job_keep_owner already wrote.
                             if _fail_job_keep_owner(db, job_id, message) and after_commit_failed:
-                                after_commit_failed(db, db.get(models.Job, job_id), result)
+                                try:
+                                    after_commit_failed(db, db.get(models.Job, job_id), result)
+                                except Exception:
+                                    _log.exception(
+                                        "after_commit_failed hook raised for job %s on shutdown; "
+                                        "failure stamp still recorded", job_id)
                             db.commit()
                         except Exception:
                             _log.exception("could not record after_commit failure for job %s", job_id)

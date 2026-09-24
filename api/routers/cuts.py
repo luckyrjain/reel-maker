@@ -67,7 +67,7 @@ def trigger_render(cut_id: int, request: Request, db: Session = Depends(get_db))
     try:
         render_cut.delay(job_id)
     except Exception as exc:
-        fail_unenqueued(db, job, exc)
+        fail_unenqueued(db, job_id, models.JobType.render.value, exc)
         raise HTTPException(status_code=503, detail="Could not queue the render — try again") from exc
     db.refresh(job)
 
@@ -195,7 +195,7 @@ def trigger_publish(cut_id: int, request: Request, db: Session = Depends(get_db)
     try:
         publish_cut.delay(job_id)
     except Exception as exc:
-        fail_unenqueued(db, job, exc)
+        fail_unenqueued(db, job_id, models.JobType.publish.value, exc)
         raise HTTPException(status_code=503, detail="Could not queue the publish — try again") from exc
     db.refresh(job)
 

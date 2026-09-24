@@ -218,7 +218,19 @@ PostgreSQL 16, not just SQLite. Behaviour changes an operator should know about:
   rather than handing it back to `pending` — Celery has already acked or dropped the message by then,
   so a `pending` job would otherwise wait for the reaper's threshold with no message coming back for it.
 - **`approve_cut` and `update_cut` also lock the cut row**, matching the trigger routes, so an approve
-  cannot race a render past its own status guard.
+  cannot race a render past its own status guard. `update_cut` reads the request body before taking
+  that lock — a slow client otherwise holds a pool connection for as long as the body trickles in.
+- **Terminal failure recorders survive a dead connection.** `_fail_interrupted`, `_fail_rejected_retry`,
+  and `fail_unenqueued` retry once on a brand-new session (`_finalize_or_reconnect`) if their own
+  `db.rollback()`/write/commit raises `OperationalError`/`InterfaceError` — plausible exactly when one
+  of these is running, since a server-side kill or the idle-in-transaction timeout can be the reason.
+- **A refused retry (`Reject`) fails the job whether or not this run ever claimed it** — an unclaimed
+  job whose retry message the broker refused was previously left `pending` until the reaper's threshold.
+- **`after_commit` raising `SystemExit`/`KeyboardInterrupt`** (not just `Exception`) still runs the
+  `after_commit_failed` cleanup hook; if the hook itself raises, the failure stamp it already wrote is
+  still committed rather than silently rolled back with the job left looking `done` forever.
+- `_generate_caption_hashtags`'s fallback path no longer swallows `SoftTimeLimitExceeded` — a timeout
+  there now fails the task visibly instead of completing with a template caption.
 
 ## Phase 4a — Operator visibility (done)
 

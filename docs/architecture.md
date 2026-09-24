@@ -141,7 +141,7 @@ The browser never fetches JSON. All API responses to the browser are HTML fragme
 | `test_audio_text_sync.py` | 11 tests — `clean_guide()` regeneration, `_build_text_filter()` proportional timing + Whisper fallback, visual direction anchoring |
 | `test_context_enricher.py` | 13 tests — all 5 evaluator axes at boundary values, combined score, `llm_enrich` |
 | `test_enrich_context_task.py` | 14 tests — enrichment gating, LLM failure fallback, structured script guard, missing reel, owner rollback wiring, orphan cleanup |
-| `test_job_lifecycle.py` | 97 tests — `job_task` on dummy tasks: atomic claim, fenced done-stamp/heartbeat, heartbeat thread, retry/failure/owner rollback, fail-fast on shutdown/hard-kill and a refused retry, dead-connection recovery in the terminal failure recorders, `.delay` signature regression, per-task wiring, beat routing |
+| `test_job_lifecycle.py` | 101 tests — `job_task` on dummy tasks: atomic claim, fenced done-stamp/heartbeat, heartbeat thread, retry/failure/owner rollback, fail-fast on shutdown/hard-kill and a refused retry, dead-connection recovery in the terminal failure recorders (incl. InterfaceError, fresh-session close), a cleanup hook that itself raises without discarding the failure stamp, `.delay` signature regression, per-task wiring, beat routing |
 | `test_r3_proposed.py` | 38 tests — round-3 mutation-testing regressions: distinct job/reel/cut ids, transaction visibility via a second connection, `_error_text` regex boundaries, template `hx-post` assertions |
 | `test_r4_gaps.py` | 30 tests — round-4 mutation-testing regressions: heartbeat commit visibility, failure-path rollback of flushed rows, `after_commit` cleanup without a hook |
 | `test_tasks_real_db.py` | 4 tests — real tasks through `job_task`: post id durable, caption sent, enrich enqueues the real job id |
@@ -150,12 +150,12 @@ The browser never fetches JSON. All API responses to the browser are HTML fragme
 | `test_publish_task.py` | 10 tests — safety gate, no auto-retry, early post id, finalize without re-upload, attribution |
 | `test_render_task.py` | 6 tests — missing cut, already-posted cut refused, success clears stale error, music wiring |
 | `test_maintenance.py` | 29 tests — reaper on SQLite: per-job-type rollback and pending thresholds, compare-and-set back-off, status pin |
-| `test_cuts_publish_router.py` | 21 tests — POST /cuts/{id}/publish state-guard and enqueue; render refused for an already-posted cut; enqueue fails fast (503) and frees the cut; row lock incl. `update_cut` body-before-lock ordering; failed-cut card |
+| `test_cuts_publish_router.py` | 22 tests — POST /cuts/{id}/publish state-guard and enqueue; render refused for an already-posted cut; enqueue fails fast (503) and frees the cut; row lock incl. `update_cut` body-before-lock ordering; failed-cut card |
 | `test_asset_sourcer.py` | 7 tests — `resolve_or_reuse` pin, reuse-without-API-call, re-pin, per-beat isolation, commit behaviour, Wikipedia search-before-cache ordering |
 | `test_llm_judge.py` | 3 tests — neutral-score fallback on provider raise, garbage JSON, out-of-range dimension |
 | `test_tts.py` | 8 tests — provider selection, unknown-provider fallback, `SilentProvider` shared file, `synth_to_budget` clamp |
 
-**519 tests across 37 files.**
+**524 tests across 37 files.**
 
 ---
 

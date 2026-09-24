@@ -45,7 +45,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 519 tests across 30+ files (4 test_compositor tests need ffmpeg on PATH)
+.venv/bin/pytest                            # 524 tests across 30+ files (4 test_compositor tests need ffmpeg on PATH)
 .venv/bin/pytest tests/test_foo.py::bar -s
 
 # New migration after changing models.py
@@ -227,7 +227,7 @@ tests/
   test_maintenance.py         29 tests — reaper on in-memory SQLite: per-job-type owner rollback, stale running/pending jobs, per-job-type pending thresholds, healthy jobs untouched, updated_at keying, compare-and-set back-off, status pin = SELECT snapshot, one bad job doesn't stop the rest
   test_tts.py                  8 tests — provider selection, unknown-provider fallback, SilentProvider shared file, synth_to_budget clamp
   test_common.py              18 tests — transient-error classification (incl. DB connection errors), retry budget
-  test_job_lifecycle.py       97 tests — job_task on dummy tasks (in-memory SQLite): atomic claim/race, fenced done-stamp and heartbeat (JobLost), heartbeat thread (survives DB blips, never touches a reaped job, stops at max_runtime_s, never outlives the task), prepare-before-attempts, retry/backoff, refused retry (Reject, incl. an unclaimed job), failure stamp (NUL/surrogates/[parameters]/DETAIL/CONTEXT redacted incl. multi-line, reaped job, masked errors, discarded half-writes), DB errors, fail-fast on shutdown/hard-kill, dead-connection recovery in the terminal failure recorders, per-job-type owner rollback (fresh state), after_commit + cleanup hook (incl. a shutdown during the hook itself), `.delay` signature regression, per-task job_type/max_retries/runtime wiring, beat-task routing, pool_pre_ping
+  test_job_lifecycle.py      101 tests — job_task on dummy tasks (in-memory SQLite): atomic claim/race, fenced done-stamp and heartbeat (JobLost), heartbeat thread (survives DB blips, never touches a reaped job, stops at max_runtime_s, never outlives the task), prepare-before-attempts, retry/backoff, refused retry (Reject, incl. an unclaimed job), failure stamp (NUL/surrogates/[parameters]/DETAIL/CONTEXT redacted incl. multi-line, reaped job, masked errors, discarded half-writes), DB errors, fail-fast on shutdown/hard-kill, dead-connection recovery in the terminal failure recorders (incl. InterfaceError, fresh-session close), per-job-type owner rollback (fresh state), after_commit + cleanup hook (incl. a shutdown during the hook itself, and a hook that itself raises without discarding the failure stamp), `.delay` signature regression, per-task job_type/max_retries/runtime wiring, beat-task routing, pool_pre_ping
   test_r3_proposed.py         38 tests — regressions found by round-3 mutation testing: distinct job/reel/cut ids so an id mix-up can't hide, transaction-visibility checks via a second connection, _error_text regex boundaries, refused-retry/reaped-job edge cases, template hx-post assertions, per-type pending thresholds
   test_r4_gaps.py             30 tests — regressions found by round-4 mutation testing: heartbeat commit visibility, failure-path rollback of flushed rows, commit-failure-at-done-stamp is not "done", after_commit cleanup without a hook, pool_pre_ping, task signature
   test_tasks_real_db.py       4 tests — real tasks through job_task on SQLite: post id durable after a post-upload failure, built caption sent, enrich enqueues the real job id
@@ -247,7 +247,7 @@ tests/
   test_credentials_router.py   9 tests — connect/callback/disconnect routes
   test_publish_task.py        10 tests — publish_cut safety gate (publisher never reached, also on the finalize path), no auto-retry, post id committed early, re-run finalizes without re-upload, attribution caption
   test_publish_registry.py     7 tests — platform→publisher, platform→credential-provider, platform→metrics-fetcher mapping
-  test_cuts_publish_router.py 21 tests — POST /cuts/{id}/publish state-guard and enqueue; render refused for an already-posted cut; enqueue failure fails fast (503) and frees the cut; row lock (incl. update_cut reads its body before locking); failed-cut card
+  test_cuts_publish_router.py 22 tests — POST /cuts/{id}/publish state-guard and enqueue; render refused for an already-posted cut; enqueue failure fails fast (503) and frees the cut; row lock (incl. update_cut reads its body before locking); failed-cut card
   test_youtube_publisher.py    6 tests — resumable upload flow, token refresh, whitespace-caption fallback
   test_instagram_publisher.py  7 tests — container create/poll/publish flow, error paths, token-in-header regression
   test_attribution.py          8 tests — build_attribution_block dedup/formatting, build_published_caption
