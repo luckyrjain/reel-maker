@@ -4,7 +4,7 @@ import os
 import re
 import time
 import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx

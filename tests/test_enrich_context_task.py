@@ -1,6 +1,6 @@
 """Tests for enrich_context task logic — mocks DB and LLM."""
 import pytest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 
 def _make_job(status="pending", meta=None):
@@ -61,7 +61,7 @@ def test_enrichment_runs_when_score_below_threshold():
         patch("worker.tasks.enrich_context.evaluate_context", return_value=(40, ["context_too_short"])) as mock_eval,
         patch("worker.tasks.enrich_context.llm_enrich", return_value="Enriched context.") as mock_enrich,
         patch("worker.tasks.enrich_context.get_enrichment_provider", return_value=MagicMock()),
-        patch("worker.tasks.enrich_context.generate_guide") as mock_gen,
+        patch("worker.tasks.enrich_context.generate_guide"),
         patch("worker.tasks.enrich_context.transition"),
         patch("worker.tasks.enrich_context.record_stage"),
     ):
@@ -85,7 +85,7 @@ def test_enrichment_skipped_when_score_above_threshold():
         patch("worker.tasks.enrich_context.evaluate_context", return_value=(75, [])),
         patch("worker.tasks.enrich_context.llm_enrich") as mock_enrich,
         patch("worker.tasks.enrich_context.get_enrichment_provider", return_value=MagicMock()),
-        patch("worker.tasks.enrich_context.generate_guide") as mock_gen,
+        patch("worker.tasks.enrich_context.generate_guide"),
         patch("worker.tasks.enrich_context.transition"),
         patch("worker.tasks.enrich_context.record_stage"),
     ):

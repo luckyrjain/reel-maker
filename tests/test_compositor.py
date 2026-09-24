@@ -14,7 +14,6 @@ import json
 import subprocess
 
 import numpy as np
-import pytest
 import soundfile as sf
 
 from engine.render.compositor import _build_ffmpeg_args, composite_cut

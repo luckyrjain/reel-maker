@@ -1,5 +1,4 @@
 """Tests for script_parser — the routing heuristic and beat-splitting logic."""
-import pytest
 from engine.generation import script_parser
 
 

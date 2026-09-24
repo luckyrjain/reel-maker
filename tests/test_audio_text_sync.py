@@ -13,7 +13,7 @@ import re
 import pytest
 
 from engine.generation.guide_schema import Beat, MasterGuide, PlatformGuide
-from engine.generation.postprocess import _derive_on_screen, clean_guide
+from engine.generation.postprocess import clean_guide
 from engine.render.compositor import _build_text_filter
 
 
