@@ -95,6 +95,16 @@ Punchy closing line. Subscribe / comment / share prompt.
                 </label>
 
                 <label style="flex:1;min-width:160px;">
+                    Text color
+                    <select name="text_color">
+                        <option value="">Default</option>
+                        {% for value, label in text_colors %}
+                        <option value="{{ value }}">{{ label }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+
+                <label style="flex:1;min-width:160px;">
                     Target length
                     <select name="target_length_s">
                         <option value="30">30s</option>

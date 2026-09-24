@@ -406,6 +406,45 @@ def test_create_reel_without_tts_voice_defaults_to_none(client):
     db.close()
 
 
+def test_create_reel_honors_explicit_text_color_selection(client):
+    with patch("api.routers.reels.enrich_context"):
+        resp = client.post(
+            "/api/reels",
+            data={"context": "A" * 60, "generation_path": "structured", "text_color": "yellow"},
+        )
+    assert resp.status_code == 200
+    db = client._session_factory()
+    reel = db.query(models.Reel).order_by(models.Reel.id.desc()).first()
+    assert reel.text_color == "yellow"
+    db.close()
+
+
+def test_create_reel_ignores_unknown_text_color_value(client):
+    """Same 'drop, don't 422' policy as unknown platform/voice values — falls back to
+    None (the compositor default) rather than failing the whole submission or storing
+    an unvalidated value that would reach the ffmpeg filter graph unescaped."""
+    with patch("api.routers.reels.enrich_context"):
+        resp = client.post(
+            "/api/reels",
+            data={"context": "A" * 60, "generation_path": "structured", "text_color": "not_a_real_color"},
+        )
+    assert resp.status_code == 200
+    db = client._session_factory()
+    reel = db.query(models.Reel).order_by(models.Reel.id.desc()).first()
+    assert reel.text_color is None
+    db.close()
+
+
+def test_create_reel_without_text_color_defaults_to_none(client):
+    with patch("api.routers.reels.enrich_context"):
+        resp = client.post("/api/reels", data={"context": "A" * 60, "generation_path": "structured"})
+    assert resp.status_code == 200
+    db = client._session_factory()
+    reel = db.query(models.Reel).order_by(models.Reel.id.desc()).first()
+    assert reel.text_color is None
+    db.close()
+
+
 def test_estimate_endpoint_detects_structured_script(client):
     structured_ctx = (
         "GOALKEEPER\nMartinez saves penalties.\n"

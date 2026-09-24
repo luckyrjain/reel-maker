@@ -1,6 +1,6 @@
 # Data Model
 
-All tables are defined in `api/models.py`. Migrations: `0001_initial.py` (base schema) + `0002_improvements.py` (pinning, licensing, observability, heartbeat) + `0003_context_enrichment.py` (enriched_context column, enriching/enrich enum values) + `0004_publishing.py` (tiktok platform, Credential refresh/account-id columns) + `0005_metrics.py` (Cut engagement columns) + `0006_variants.py` (Cut thumbnail/hook-variant columns) + `0007_performance_notes.py` (`performance_notes` table) + `0008_tts_voice.py` (Reel.tts_voice column). Video and audio files live on disk under `ASSET_STORE_DIR` / `VIDEO_STORE_DIR`; the DB stores paths, never blobs.
+All tables are defined in `api/models.py`. Migrations: `0001_initial.py` (base schema) + `0002_improvements.py` (pinning, licensing, observability, heartbeat) + `0003_context_enrichment.py` (enriched_context column, enriching/enrich enum values) + `0004_publishing.py` (tiktok platform, Credential refresh/account-id columns) + `0005_metrics.py` (Cut engagement columns) + `0006_variants.py` (Cut thumbnail/hook-variant columns) + `0007_performance_notes.py` (`performance_notes` table) + `0008_tts_voice.py` (Reel.tts_voice column) + `0009_text_color.py` (Reel.text_color column). Video and audio files live on disk under `ASSET_STORE_DIR` / `VIDEO_STORE_DIR`; the DB stores paths, never blobs.
 
 ---
 
@@ -18,6 +18,7 @@ One reel = one topic/context. Owns two cuts (one per platform) and all jobs.
 | `niche` | varchar(255) | Optional category label |
 | `voiceover_mode` | varchar(50) | `voiceover` \| `music_only` \| `silent` |
 | `tts_voice` | varchar(100), nullable | Edge-tts voice name from `CURATED_EDGE_VOICES`; `None` = provider default. Ignored when `TTS_PROVIDER=kokoro`. |
+| `text_color` | varchar(20), nullable | On-screen text color from `CURATED_TEXT_COLORS`; `None` = `DEFAULT_TEXT_COLOR` ("white"). Interpolated unescaped into the ffmpeg drawtext filter — validated at both the router and `_build_text_filter()`, not just curated for UX. |
 | `status` | enum `ReelStatus` | See state machine |
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
