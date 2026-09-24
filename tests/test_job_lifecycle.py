@@ -734,12 +734,14 @@ def test_recover_from_hook_failure_is_not_confirmed_when_the_stamp_redo_fails(fa
         assert _recover_from_hook_failure(db, job_id, "orig failure", nested) is False
 
 
-def test_recover_from_hook_failure_is_not_confirmed_when_the_redo_cas_loses_the_race(factory):
+def test_recover_from_hook_failure_is_not_confirmed_when_the_redo_cas_loses_the_race(factory, caplog):
     """_fail_job_keep_owner returns False (not an exception) when its CAS doesn't match -- e.g. a
     sibling or the reaper moved the job on in the gap between the full rollback and this redo.
     That must not be silently treated the same as a successful redo: nothing was actually
     written, so returning True here would contradict this function's own documented contract
-    ("confirmed durable")."""
+    ("confirmed durable"). Also checks this branch actually logs something -- unlike its sibling
+    branches (SAVEPOINT rollback failure, full-rollback failure), a silently deleted log call here
+    would leave an operator with only a bare `False` and no record of why."""
     from worker.tasks.common import _recover_from_hook_failure
 
     job_id, *_ = _make(factory, models.JobType.enrich, status=models.JobStatus.done)
@@ -747,8 +749,11 @@ def test_recover_from_hook_failure_is_not_confirmed_when_the_redo_cas_loses_the_
     nested = MagicMock()
     nested.rollback.side_effect = sa_exc.OperationalError("ROLLBACK TO SAVEPOINT", {}, Exception("gone"))
 
-    with patch("worker.tasks.common._fail_job_keep_owner", return_value=False):
+    with patch("worker.tasks.common._fail_job_keep_owner", return_value=False), \
+         caplog.at_level(logging.ERROR, logger="worker.tasks.common"):
         assert _recover_from_hook_failure(db, job_id, "orig failure", nested) is False
+    assert any(f"job {job_id}" in r.getMessage() and "no longer" in r.getMessage()
+               for r in caplog.records)
 
 
 def test_recover_from_hook_failure_confirms_after_a_full_rollback_and_successful_redo(factory):
