@@ -26,7 +26,7 @@ This file below is the build log (what shipped, phase by phase); that one is the
 | 4b | ✅ Done | Publishing (OAuth, safe_to_publish gate, YouTube + Instagram uploaders, TikTok platform) |
 | 5 | ✅ Done | Analytics and polish |
 | 6 | 🔲 Partial | Creative range — hook/thumbnail variant generation, per-reel TTS voice, non-football fairness fixes, configurable text color done; logo/watermark + per-channel presets not started |
-| 7 | 🔲 Partial | Production hardening — asset_sourcer black-frame visibility and a real Dockerfile/deploy path done; golden-reel CI test, startup model validation, auth/rate-limit decision not started |
+| 7 | 🔲 Partial | Production hardening — asset_sourcer black-frame visibility, a real Dockerfile/deploy path, and startup LLM-model validation done; golden-reel CI test, auth/rate-limit decision not started |
 
 ---
 
@@ -776,15 +776,41 @@ mingled with each other over Redis. CI gets a new `docker-build` job
 (build only, no registry push) so a broken Dockerfile is caught on every
 push/PR, not just at deploy time.
 
+### 7c. Startup LLM-model validation — done
+
+`engine/generation/llm.py::validate_configured_models()` — called from
+`api/main.py`'s `lifespan` hook — pings both the main generation and
+enrichment/judge model endpoints' `{base_url}/models` (the
+OpenAI-compatible models-list endpoint both Ollama and NVIDIA NIM serve)
+and warns, per misconfigured model, if it isn't in the response. This is
+exactly the check that would have caught the NVIDIA model-catalog-drift
+incident documented in `docs/product-gap-analysis-and-roadmap-2026-08.md`
+(`qwen/qwen3-next-80b-a3b-instruct` returning `410 Gone`) proactively at
+startup, instead of only after the fact once every generation job had
+already failed individually.
+
+Deduped so pointing both roles at the same local Ollama model checks it
+once, not twice. **Never blocks startup on a failure** — this is
+visibility, matching the graceful-degradation precedent already set by
+`asset_sourcer`'s fallback chain and `SilentProvider`; a dead LLM endpoint
+shouldn't take down a server that's otherwise fine for browsing existing
+reels. The warning wording deliberately treats a local-Ollama miss and an
+NVIDIA-NIM miss differently: this repo's own documented dev setup starts
+the API (terminal 1) *before* `ollama serve` (terminal 5, README's
+"Running the app"), so a local-model miss at startup is routinely a false
+positive, not a real problem — the message says so. NVIDIA NIM being
+unreachable is a much stronger signal and is worded accordingly.
+
+Verified against a real local Ollama instance during development (not
+just mocked tests): correctly detected the configured default model
+(`qwen3:14b`) wasn't among the models actually installed, and listed
+what was, with no crash.
+
 ### Not started
 
 - Golden-reel smoke test in CI (would have caught the months-long silent
   zero-audio bug documented in Phase 3.9's own history — a real end-to-end
   render, not just unit tests)
-- Startup validation: ping configured LLM model endpoints, fail fast on a
-  dead model instead of failing every generation job individually one at
-  a time (this bit in practice — see the NVIDIA model-catalog-drift entry
-  in `docs/product-gap-analysis-and-roadmap-2026-08.md`)
 - Auth / rate-limiting scope decision — still the silent absence the gap
   analysis flagged, not yet an explicit "we chose not to, because X"
 
