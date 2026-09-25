@@ -33,3 +33,14 @@ jobs:
 
       - name: pytest
         run: pytest -q
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build only — no push, no registry credentials needed. Catches a broken
+      # Dockerfile (missing file in a COPY, a dependency that no longer installs
+      # cleanly) on every push/PR instead of only being discovered at deploy time.
+      - name: Build image
+        run: docker build -t reel-maker:ci .

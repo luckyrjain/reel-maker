@@ -110,6 +110,27 @@ ollama serve
 
 Open `http://localhost:8000` in your browser.
 
+### Alternative: everything in Docker
+
+`docker-compose.yml` also defines `api`, `worker-generation`, `worker-rendering`,
+and `beat` services (in addition to `postgres`/`redis`) — one image
+(`Dockerfile`), built once, run four ways via `command:` overrides. This is a
+real deploy path, not just the dev database:
+
+```bash
+cp .env.example .env              # fill in at minimum PEXELS_API_KEY + NVIDIA_API_KEY
+docker compose up -d postgres redis
+docker compose run --rm api alembic upgrade head   # once, before first `up` — see the
+                                                     # comment in docker-compose.yml for why
+                                                     # this can't be baked into a container's
+                                                     # own startup (N workers would race it)
+docker compose up -d
+```
+
+`http://localhost:8000` as above. `ollama serve` still runs on the host (skip
+entirely if using NVIDIA NIM) — it isn't containerized here, since most local
+setups already run it that way.
+
 ---
 
 ## Using the app
