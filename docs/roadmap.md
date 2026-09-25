@@ -907,6 +907,78 @@ registers the `golden` marker and sets `addopts = "-m 'not golden'"`;
 `docker-build` jobs — so it still runs on every push/PR, just not as part
 of every developer's routine local test run.
 
+### 7e. Publish-time video/pins staleness gate — done
+
+Closes the Medium-severity Open Issues row below ("`safe_to_publish` gate
+checks the current pins, not the video that will ship"). `CutAsset` pins
+commit incrementally per beat inside `render_cut`'s beat loop
+(`resolve_or_reuse()`), while `Cut.video_path` is only set once at the end
+of a successful render — so a render that re-pins a beat and then fails
+before finishing left the pins reflecting the new resolution while
+`video_path` still pointed at the old (possibly unsafe) file, and the
+`assert_safe_to_publish()` gate had no way to know the two had diverged.
+
+Fixed with a fingerprint comparison, not eager `video_path` clearing —
+eager-clearing would destroy a perfectly good, already-approved video on
+every re-render, including one that fails for a reason unrelated to asset
+safety (a transient TTS hiccup, an unrelated ffmpeg crash), which is a
+real UX regression this fix doesn't need to cause. `Cut.rendered_pins_fingerprint`
+(migration `0012`, nullable `String(64)`) snapshots
+`engine/render/asset_sourcer.py::compute_pins_fingerprint()`'s hash of the
+pins that built the currently-stored `video_path`, written by `render_cut`
+at the exact point `video_path`/`thumbnail_path`/`duration_s` are already
+assigned. `engine/publish/gate.py::assert_video_matches_pins()` recomputes
+the current fingerprint at publish time and raises an actionable
+`ValueError` on mismatch — wired into `publish_cut` in the same branch,
+same timing, as the existing `assert_safe_to_publish()` call, never on the
+finalize-without-reupload path.
+
+Rollout-safety decision: `rendered_pins_fingerprint is None` (every
+pre-migration row, or a cut not yet rendered) is treated as "unknown,
+don't block," not as a mismatch — otherwise this fix would immediately
+block publishing on every existing rendered-but-unpublished cut in the
+database the moment it shipped, regardless of whether that cut was ever
+actually affected by the bug. This is explicitly not a backfill: a
+legacy cut self-heals the moment it's next re-rendered, and the gap this
+leaves is accepted deliberately (see `docs/specs/2026-09-video-pins-
+staleness-gate-system-design.md` §7) rather than papered over with a
+backfill that couldn't distinguish an unaffected cut from one the bug had
+already hit.
+
+The end-to-end regression test in `tests/test_publish_gate.py`
+(`test_staleness_bug_sequence_...`) reproduces the exact bug sequence with
+real `resolve_or_reuse()` calls — not just each new function's isolated
+unit tests — and is mutation-verified against a reverted fix (confirmed to
+fail when `assert_video_matches_pins()` is a no-op, pass when restored).
+Does not address the separate, already-tracked, Low-severity "guide edited
+without a `visual_direction` change" staleness gap below — see the design's
+own explicit scope boundary (§1).
+
+**One real bug found and fixed by independent dual-lens review before
+merge**, distinct from the rollout gap already accepted above: the first
+version conflated two different meanings of `rendered_pins_fingerprint is
+None` — "no completed render has ever touched this cut" (the true, bounded
+legacy/rollout case) and "the most recent successful render bound zero real
+assets" (every beat black-framed — a real, documented, recurring outcome,
+not hypothetical; see `Cut.black_frame_beat_indices`). `compute_pins_fingerprint()`
+returns `None` for both, and the original write site (`render_cut`) wrote
+that raw `None` straight onto `Cut.rendered_pins_fingerprint` — so a
+genuinely successful black-frame render was indistinguishable from a
+never-rendered row, and the gate's legacy-skip branch would exempt it
+**indefinitely**, not just until a rollout window closed: any later render
+that pinned a real asset and then failed before finishing left live pins
+non-empty while the column stayed `None`, silently unprotected for as long
+as that niche/topic's asset sourcing kept failing. Fixed with a dedicated
+sentinel — `EMPTY_PINS_FINGERPRINT` (a fixed, non-hash-shaped string) — and
+a `compute_pins_fingerprint_for_render()` wrapper that both the write site
+(`render_cut`) and read site (`assert_video_matches_pins()`) now use instead
+of the raw function, so a completed render (empty pins or not) always
+writes something comparable and `None` is reserved for the true legacy
+case. Regression-guarded by
+`tests/test_publish_gate.py::test_black_frame_render_still_catches_a_later_partial_repin`,
+mutation-tested against a version that reverted both call sites back to the
+raw `compute_pins_fingerprint()`.
+
 ### Not started
 
 - Auth / rate-limiting scope decision — still the silent absence the gap
@@ -918,7 +990,7 @@ of every developer's routine local test run.
 
 | Issue | Severity | Notes |
 |---|---|---|
-| `safe_to_publish` gate checks the current pins, not the video that will ship | Medium | `resolve_or_reuse()` re-pins and commits per beat as the operator edits and re-renders; a failed render never clears `cut.video_path`. If render N used a non-free asset (blocked) and a later render N+1 re-pins to a safe one but then itself fails, "Retry publish" gates against the safe N+1 pins while `video_path` still points at render N's (unsafe) video — the gate passes and the wrong video ships, with attribution built from the wrong pins too. Fix would clear `video_path` (or check a pins fingerprint) whenever a render starts or re-pins |
+| `safe_to_publish` gate checks the current pins, not the video that will ship | ✅ Fixed | `resolve_or_reuse()` re-pins and commits per beat as the operator edits and re-renders; a failed render never clears `cut.video_path`. If render N used a non-free asset (blocked) and a later render N+1 re-pins to a safe one but then itself fails, "Retry publish" gated against the safe N+1 pins while `video_path` still pointed at render N's (unsafe) video — the gate passed and the wrong video shipped, with attribution built from the wrong pins too. Fixed via a fingerprint comparison, not eager `video_path` clearing (eager-clearing would destroy a perfectly good, already-approved video on every re-render, even one that fails for a reason unrelated to asset safety): `Cut.rendered_pins_fingerprint` (migration `0012`) snapshots the hash of the pins that built the currently-stored `video_path`, written by `render_cut` at the same point `video_path` itself is set; `engine/publish/gate.py::assert_video_matches_pins()` compares it against a freshly computed fingerprint of the current pins immediately before any upload in `publish_cut`, alongside the existing `assert_safe_to_publish()` call, and raises an actionable `ValueError` on mismatch. `rendered_pins_fingerprint is None` (a pre-migration legacy row, or not yet rendered) is treated as "unknown, don't block" rather than a mismatch — a deliberate rollout-safety decision, not a gap: it lets the check ship without retroactively blocking every already-rendered cut in the database, and self-heals the moment a legacy cut is re-rendered. See `docs/specs/2026-09-video-pins-staleness-gate-system-design.md` and CLAUDE.md's Key conventions entry. Does **not** address the separate, still-open, Low-severity "Retry publish on a failed cut can ship a stale pre-edit video" row below — that's the broader "any guide edit, not just an asset re-pin" staleness gap, explicitly out of scope for this fix. |
 | No multi-image collage in one frame | Low | Currently cycles sequentially; side-by-side layout not implemented |
 | MoviePy video readers leak until worker recycle | Low | `_build_media_sub_clip` opens `VideoFileClip`s that only `worker_max_tasks_per_child=10` reclaims; marked with a `ponytail:` comment |
 | `asset_sourcer` degrades silently to black frames | ✅ Fixed (Phase 7a) | Every sourcer still swallows its own exceptions and returns `None` internally (unchanged — a real fix there needs its own design pass), but the *visibility* half is done: `Cut.black_frame_beat_indices` (migration `0010`) records which beats got nothing from the whole Wikipedia → Pexels → HF Video → HF Image chain, written by `render_cut`, surfaced as a warning banner on the `in_review`+ cut card. A Pexels/Wikipedia outage still produces a black-frame reel and still reports `done` — but the operator now sees it on the card instead of discovering it by watching the video. See the Phase 7 section above for what's still open (the sourcers still don't retry or alert). |
