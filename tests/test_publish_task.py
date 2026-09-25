@@ -29,6 +29,11 @@ def _cut():
     cut.platform_post_id = None   # not posted yet (a bare MagicMock would be truthy)
     cut.platform.value = "youtube_shorts"
     cut.status.value = "publishing"
+    # Legacy/no-op row under assert_video_matches_pins' None-means-skip rollout rule (see
+    # engine/publish/gate.py) — a bare MagicMock would be truthy and non-None, so every test
+    # below that exercises the uploading branch would otherwise trip the NEW staleness check
+    # instead of whatever it actually means to exercise.
+    cut.rendered_pins_fingerprint = None
     return cut
 
 
@@ -99,6 +104,38 @@ def test_unsafe_asset_blocks_publish():
         patch.object(publish_cut, "retry", side_effect=Retry()) as mock_retry,
     ):
         with pytest.raises(ValueError, match="not cleared for publishing"):
+            publish_cut(1)
+
+    mock_retry.assert_not_called()
+    mock_get_publisher.assert_not_called()
+    mock_get_publisher.return_value.publish.assert_not_called()
+    assert job.status == models.JobStatus.failed
+
+
+def test_stale_video_pins_mismatch_blocks_publish():
+    """assert_video_matches_pins wiring: a cut whose rendered_pins_fingerprint no longer
+    matches the CURRENT pins must be blocked before any credential lookup or upload — the
+    exact staleness hole this task's docs/specs/2026-09-video-pins-staleness-gate-system-
+    design.md fixes. Uses its own distinct mock for compute_pins_fingerprint's query path,
+    separate from unsafe_assets' db.query(...).join(...).filter(...).all() chain stub — the
+    two must not be conflated."""
+    from worker.tasks.publish import publish_cut
+
+    job = _job()
+    cut = _cut()
+    cut.rendered_pins_fingerprint = "fingerprint-from-the-render-that-built-video-path"
+    db = _db_with(job, cut)
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.publish.get_publisher") as mock_get_publisher,
+        patch(
+            "engine.publish.gate.compute_pins_fingerprint",
+            return_value="a-different-fingerprint-from-a-later-repin",
+        ),
+        patch.object(publish_cut, "retry", side_effect=Retry()) as mock_retry,
+    ):
+        with pytest.raises(ValueError, match="Re-render before publishing"):
             publish_cut(1)
 
     mock_retry.assert_not_called()
@@ -242,6 +279,39 @@ def test_an_already_posted_cut_is_finalized_without_uploading_again():
 
     mock_get_publisher.return_value.publish.assert_not_called()
     assert cut.platform_post_id == "yt-earlier"
+    mock_transition.assert_called_once_with(cut, "published", CUT_TRANSITIONS)
+    assert job.status == models.JobStatus.done
+
+
+def test_an_already_posted_cut_with_mismatched_pins_is_still_finalized_without_blocking():
+    """Stronger version of the finalize-branch-exemption tests above: this one gives the cut
+    a REAL, genuinely mismatched rendered_pins_fingerprint (not the fixture's default None) —
+    so if assert_video_matches_pins were ever wired into the `if cut.platform_post_id:`
+    branch by mistake, THIS test would raise and fail, unlike the two above (whose
+    default None fingerprint short-circuits the check regardless of which branch it's
+    called from, so they can't by themselves distinguish correct wiring from a misplaced
+    call). Finalizing uploads nothing — a stale-pins video that's already live cannot be
+    un-published by blocking the finalize; the operator's only way out is stuck."""
+    from worker.tasks.publish import publish_cut
+
+    job = _job()
+    cut = _cut()
+    cut.platform_post_id = "yt-earlier"
+    cut.rendered_pins_fingerprint = "fingerprint-from-the-render-that-built-video-path"
+    db = _db_with(job, cut)
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.publish.get_publisher") as mock_get_publisher,
+        patch(
+            "engine.publish.gate.compute_pins_fingerprint",
+            return_value="a-different-fingerprint-from-a-later-repin",
+        ),
+        patch("worker.tasks.publish.transition") as mock_transition,
+    ):
+        publish_cut(1)
+
+    mock_get_publisher.return_value.publish.assert_not_called()
     mock_transition.assert_called_once_with(cut, "published", CUT_TRANSITIONS)
     assert job.status == models.JobStatus.done
 

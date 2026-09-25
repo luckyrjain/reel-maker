@@ -5,7 +5,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from api import models
-from engine.render.asset_sourcer import SourcedAsset, _fp, resolve_or_reuse
+from engine.render.asset_sourcer import SourcedAsset, _fp, compute_pins_fingerprint, resolve_or_reuse
 
 
 @pytest.fixture
@@ -152,3 +152,97 @@ def test_wikipedia_names_are_all_searched_before_any_asset_is_flushed(db, cut, t
                                    min_duration_s=5.0, sourcer=_StubSourcer(tmp_path), wiki=wiki)
     assert wiki.open_during_search == [False, False]
     assert len(results) == 2
+
+
+# ---------------------------------------------------------------------------
+# compute_pins_fingerprint
+# ---------------------------------------------------------------------------
+
+def _pin(db, cut, beat_index, order_in_beat, asset_id):
+    row = models.CutAsset(
+        cut_id=cut.id, asset_id=asset_id, beat_index=beat_index, order_in_beat=order_in_beat,
+        resolved_from="stub",
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def test_compute_pins_fingerprint_is_none_for_zero_pins(db, cut):
+    assert compute_pins_fingerprint(db, cut.id) is None
+
+
+def test_compute_pins_fingerprint_is_deterministic_for_a_given_pin_set(db, cut):
+    _pin(db, cut, beat_index=0, order_in_beat=0, asset_id=101)
+    _pin(db, cut, beat_index=1, order_in_beat=0, asset_id=202)
+    db.commit()
+
+    first = compute_pins_fingerprint(db, cut.id)
+    second = compute_pins_fingerprint(db, cut.id)
+    assert first is not None
+    assert first == second
+
+
+def test_compute_pins_fingerprint_is_order_independent_wrt_query_result_ordering(db, cut):
+    """Two cuts pinned with the identical (beat_index, order_in_beat, asset_id) set, but
+    inserted in a different order, must hash to the same fingerprint."""
+    reel = cut.reel
+
+    cut_a = cut
+    _pin(db, cut_a, beat_index=0, order_in_beat=0, asset_id=101)
+    _pin(db, cut_a, beat_index=1, order_in_beat=0, asset_id=202)
+    _pin(db, cut_a, beat_index=1, order_in_beat=1, asset_id=303)
+    db.commit()
+
+    cut_b = models.Cut(
+        reel_id=reel.id, platform=models.CutPlatform.instagram_reels,
+        target_length_s=45.0, status=models.CutStatus.draft,
+    )
+    db.add(cut_b)
+    db.flush()
+    # Insert in a deliberately different order than cut_a.
+    _pin(db, cut_b, beat_index=1, order_in_beat=1, asset_id=303)
+    _pin(db, cut_b, beat_index=0, order_in_beat=0, asset_id=101)
+    _pin(db, cut_b, beat_index=1, order_in_beat=0, asset_id=202)
+    db.commit()
+
+    assert compute_pins_fingerprint(db, cut_a.id) == compute_pins_fingerprint(db, cut_b.id)
+
+
+def test_compute_pins_fingerprint_changes_when_a_beats_pin_changes(db, cut):
+    _pin(db, cut, beat_index=0, order_in_beat=0, asset_id=101)
+    _pin(db, cut, beat_index=1, order_in_beat=0, asset_id=202)
+    db.commit()
+    before = compute_pins_fingerprint(db, cut.id)
+
+    # Re-pin beat 1 to a different asset, as resolve_or_reuse's re-pin path would.
+    db.query(models.CutAsset).filter(
+        models.CutAsset.cut_id == cut.id, models.CutAsset.beat_index == 1,
+    ).delete()
+    _pin(db, cut, beat_index=1, order_in_beat=0, asset_id=999)
+    db.commit()
+
+    after = compute_pins_fingerprint(db, cut.id)
+    assert after != before
+
+
+def test_compute_pins_fingerprint_unaffected_when_untouched_beats_pin_stays_the_same(db, cut):
+    _pin(db, cut, beat_index=0, order_in_beat=0, asset_id=101)
+    _pin(db, cut, beat_index=1, order_in_beat=0, asset_id=202)
+    db.commit()
+    before = compute_pins_fingerprint(db, cut.id)
+
+    # Re-fetch and recompute without touching either pin — must be byte-identical.
+    after = compute_pins_fingerprint(db, cut.id)
+    assert after == before
+
+    # Now change only beat 1; beat 0's contribution to the hash must still be present
+    # (i.e. the fingerprint isn't simply "last pin wins" or otherwise beat-0-blind) —
+    # verified indirectly: changing beat 0 alone also changes the fingerprint.
+    db.query(models.CutAsset).filter(
+        models.CutAsset.cut_id == cut.id, models.CutAsset.beat_index == 0,
+    ).delete()
+    _pin(db, cut, beat_index=0, order_in_beat=0, asset_id=888)
+    db.commit()
+    changed_beat0 = compute_pins_fingerprint(db, cut.id)
+    assert changed_beat0 != before

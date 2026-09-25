@@ -563,6 +563,34 @@ def _fp(visual_direction: str) -> str:
     return hashlib.sha256(visual_direction.encode()).hexdigest()[:16]
 
 
+def compute_pins_fingerprint(db, cut_id: int) -> str | None:
+    """Deterministic fingerprint of every CutAsset currently bound to this cut, across all
+    beats. Used by render_cut (worker/tasks/render.py) to snapshot what actually built a
+    render, and by engine/publish/gate.py::assert_video_matches_pins() to detect a later
+    re-render that re-pinned an asset and then failed before video_path caught up — see
+    docs/specs/2026-09-video-pins-staleness-gate-system-design.md.
+
+    Returns None (not an empty-string hash) when the cut has zero bound CutAsset rows —
+    "nothing to fingerprint yet" (every beat black-framed, or not rendered at all), the same
+    nullable-render-artifact semantics as black_frame_beat_indices/thumbnail_candidates.
+
+    Order-independent w.r.t. query result ordering: (beat_index, order_in_beat, asset_id) are
+    plain ints, so sorting the tuples before hashing guarantees the same pin set always
+    produces the same fingerprint regardless of how the DB returns rows — but NOT order-
+    independent in the sense of ignoring which asset plays in which beat; a genuine change to
+    any one pin changes the fingerprint.
+    """
+    rows = (
+        db.query(models.CutAsset.beat_index, models.CutAsset.order_in_beat, models.CutAsset.asset_id)
+        .filter(models.CutAsset.cut_id == cut_id)
+        .all()
+    )
+    if not rows:
+        return None
+    canonical = "|".join(f"{b}:{o}:{a}" for b, o, a in sorted(rows))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:64]
+
+
 def resolve_or_reuse(
     db,
     cut: "models.Cut",

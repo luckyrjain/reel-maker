@@ -5,7 +5,7 @@ from api.config import settings
 from api.state import CUT_TRANSITIONS, transition
 from engine.generation.guide_schema import PlatformGuide
 from engine.observability import record_stage
-from engine.render.asset_sourcer import get_asset_sourcer, get_hf_sourcer, get_hf_video_sourcer, get_music_sourcer, get_wiki_sourcer, resolve_or_reuse
+from engine.render.asset_sourcer import compute_pins_fingerprint, get_asset_sourcer, get_hf_sourcer, get_hf_video_sourcer, get_music_sourcer, get_wiki_sourcer, resolve_or_reuse
 from engine.render.compositor import DEFAULT_TEXT_COLOR, composite_cut
 from engine.render.tts import SilentProvider, _audio_duration, get_tts_provider
 from worker.celery_app import celery_app
@@ -156,4 +156,11 @@ def render_cut(self, db, job, ctx):
     # video_path/black_frame_beat_indices — None when this render produced no cues
     # (e.g. silent voiceover_mode with no VO to caption at all).
     cut.subtitle_path = str(subtitle_path) if subtitle_path else None
+    # Snapshot of the CutAsset pins that built THIS video, for
+    # engine/publish/gate.py::assert_video_matches_pins() to detect a later re-render that
+    # re-pinned an asset and then failed before video_path caught up. Reads are safe here:
+    # every beat's resolve_or_reuse() call (and its commit) for this render has already
+    # landed by this point in the function — see docs/specs/2026-09-video-pins-staleness-
+    # gate-system-design.md §6.
+    cut.rendered_pins_fingerprint = compute_pins_fingerprint(db, cut.id)
     transition(cut, "in_review", CUT_TRANSITIONS)

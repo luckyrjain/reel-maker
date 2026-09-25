@@ -108,6 +108,16 @@ class Cut(Base):
     # asset_sourcer visibility item — this is operator-visible so a black-frame reel
     # doesn't silently report `done`.
     black_frame_beat_indices = Column(JSON)
+    # Fingerprint (sha256, see engine/render/asset_sourcer.py::compute_pins_fingerprint) of
+    # the CutAsset pins that built the CURRENTLY-STORED video_path, snapshotted at the moment
+    # a render succeeds. None means either "not yet rendered" or "rendered before this column
+    # existed" (a legacy row — see the None-means-skip rollout note in Key conventions).
+    # engine/publish/gate.py::assert_video_matches_pins() compares this against a freshly
+    # computed fingerprint at publish time to detect a re-render that re-pinned assets and
+    # then failed before video_path caught up — see docs/roadmap.md's "safe_to_publish gate
+    # checks the current pins, not the video that will ship" entry and
+    # docs/specs/2026-09-video-pins-staleness-gate-system-design.md.
+    rendered_pins_fingerprint = Column(String(64))
     # Path to the SRT caption file written alongside the MP4 by composite_cut(), or None
     # when there was nothing to caption (e.g. silent voiceover_mode) or the cut predates
     # this feature. Written by render_cut; a re-render replaces it wholesale, same policy
