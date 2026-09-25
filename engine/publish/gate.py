@@ -7,7 +7,7 @@ safe_to_publish=True. Computing the field is not the same as enforcing it:
 this module is the one place that actually blocks a publish on it.
 """
 from api import models
-from engine.render.asset_sourcer import compute_pins_fingerprint
+from engine.render.asset_sourcer import compute_pins_fingerprint_for_render
 
 
 def unsafe_assets(db, cut_id: int) -> list[dict]:
@@ -56,13 +56,20 @@ def assert_video_matches_pins(db, cut: "models.Cut") -> None:
     docs/specs/2026-09-video-pins-staleness-gate-system-design.md for the full failure
     sequence this closes.
 
-    cut.rendered_pins_fingerprint is None means either "not yet rendered" or "rendered
-    before this column existed" (a legacy row) — treated as "unknown, don't block" rather
-    than a mismatch. This is a deliberate rollout-safety decision (design §7), not an
-    oversight: it lets this check ship without retroactively blocking every already-
-    rendered cut in the database, at the cost of not protecting legacy rows until their
-    next successful re-render. See CLAUDE.md's Key conventions entry for the full
-    reasoning.
+    cut.rendered_pins_fingerprint is None means "no completed render has ever written this
+    column" — either never rendered at all, or rendered before this column existed (a
+    legacy row) — treated as "unknown, don't block" rather than a mismatch. This is a
+    deliberate rollout-safety decision (design §7), not an oversight: it lets this check
+    ship without retroactively blocking every already-rendered cut in the database, at the
+    cost of not protecting legacy rows until their next successful re-render. See
+    CLAUDE.md's Key conventions entry for the full reasoning.
+
+    Deliberately NOT the same as "this cut's most recent successful render bound zero real
+    assets" (every beat black-framed) — that case must still write a real, comparable value
+    (compute_pins_fingerprint_for_render()'s EMPTY_PINS_FINGERPRINT sentinel), not None, or
+    a cut whose asset sourcing keeps failing would be permanently exempt from this check on
+    every future publish attempt, not just until its next re-render. See that function's
+    docstring for why conflating the two was a real gap caught by independent review.
 
     Takes the Cut object directly (not cut_id, unlike assert_safe_to_publish) since the
     caller already has it loaded and this avoids a redundant fetch — publish_cut is the
@@ -71,7 +78,7 @@ def assert_video_matches_pins(db, cut: "models.Cut") -> None:
     """
     if cut.rendered_pins_fingerprint is None:
         return
-    current = compute_pins_fingerprint(db, cut.id)
+    current = compute_pins_fingerprint_for_render(db, cut.id)
     if current != cut.rendered_pins_fingerprint:
         raise ValueError(
             "Cannot publish — the rendered video no longer matches the currently pinned "

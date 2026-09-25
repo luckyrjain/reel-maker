@@ -116,9 +116,9 @@ def test_stale_video_pins_mismatch_blocks_publish():
     """assert_video_matches_pins wiring: a cut whose rendered_pins_fingerprint no longer
     matches the CURRENT pins must be blocked before any credential lookup or upload — the
     exact staleness hole this task's docs/specs/2026-09-video-pins-staleness-gate-system-
-    design.md fixes. Uses its own distinct mock for compute_pins_fingerprint's query path,
-    separate from unsafe_assets' db.query(...).join(...).filter(...).all() chain stub — the
-    two must not be conflated."""
+    design.md fixes. Uses its own distinct mock for compute_pins_fingerprint_for_render's
+    query path, separate from unsafe_assets' db.query(...).join(...).filter(...).all() chain
+    stub — the two must not be conflated."""
     from worker.tasks.publish import publish_cut
 
     job = _job()
@@ -130,7 +130,7 @@ def test_stale_video_pins_mismatch_blocks_publish():
         patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.publish.get_publisher") as mock_get_publisher,
         patch(
-            "engine.publish.gate.compute_pins_fingerprint",
+            "engine.publish.gate.compute_pins_fingerprint_for_render",
             return_value="a-different-fingerprint-from-a-later-repin",
         ),
         patch.object(publish_cut, "retry", side_effect=Retry()) as mock_retry,
@@ -304,7 +304,7 @@ def test_an_already_posted_cut_with_mismatched_pins_is_still_finalized_without_b
         patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.publish.get_publisher") as mock_get_publisher,
         patch(
-            "engine.publish.gate.compute_pins_fingerprint",
+            "engine.publish.gate.compute_pins_fingerprint_for_render",
             return_value="a-different-fingerprint-from-a-later-repin",
         ),
         patch("worker.tasks.publish.transition") as mock_transition,

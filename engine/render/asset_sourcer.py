@@ -591,6 +591,37 @@ def compute_pins_fingerprint(db, cut_id: int) -> str | None:
     return hashlib.sha256(canonical.encode()).hexdigest()[:64]
 
 
+# Sentinel for "a render completed successfully but bound zero real pins" (every beat
+# black-framed — resolve_beat_assets()'s whole fallback chain came up empty). Deliberately
+# NOT a valid sha256 hexdigest shape, so it can never collide with a real fingerprint.
+#
+# Why this needs to be distinct from compute_pins_fingerprint()'s own `None` return: that
+# `None` is overloaded to mean two different things — "nothing pinned yet" and "this cut's
+# render never happened at all" — and engine/publish/gate.py::assert_video_matches_pins()
+# treats `cut.rendered_pins_fingerprint is None` as "legacy row, unknown, don't block" (see
+# that function's docstring). If render_cut wrote compute_pins_fingerprint()'s raw `None`
+# for a genuinely successful all-black-frame render, that render's cut would look
+# indistinguishable from a never-rendered/pre-migration one — and a LATER render that pins
+# one or more beats to real assets and then fails before finishing would leave live pins
+# non-empty while cut.rendered_pins_fingerprint stayed `None`, silently exempted from the
+# mismatch check forever (or until a render happens to also produce zero pins again). That
+# is not a bounded rollout gap the way the true legacy-row case is — a black-frame outcome
+# can recur indefinitely for a niche/topic where asset sourcing keeps failing, so this would
+# permanently defeat the staleness gate for exactly the cuts most likely to need it.
+EMPTY_PINS_FINGERPRINT = "no-pins-bound"
+
+
+def compute_pins_fingerprint_for_render(db, cut_id: int) -> str:
+    """Like compute_pins_fingerprint(), but never returns None — a render that completes
+    with zero bound pins gets EMPTY_PINS_FINGERPRINT instead, so a completed render is
+    always distinguishable from "never rendered." Both render_cut (writer) and
+    assert_video_matches_pins() (reader) must use THIS function, not the raw
+    compute_pins_fingerprint(), for Cut.rendered_pins_fingerprint — using the raw function
+    at either site reopens the black-frame staleness hole described above.
+    """
+    return compute_pins_fingerprint(db, cut_id) or EMPTY_PINS_FINGERPRINT
+
+
 def resolve_or_reuse(
     db,
     cut: "models.Cut",

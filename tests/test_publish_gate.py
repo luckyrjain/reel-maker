@@ -3,7 +3,13 @@ import pytest
 
 from api import models
 from engine.publish.gate import assert_safe_to_publish, assert_video_matches_pins, unsafe_assets
-from engine.render.asset_sourcer import SourcedAsset, compute_pins_fingerprint, resolve_or_reuse
+from engine.render.asset_sourcer import (
+    EMPTY_PINS_FINGERPRINT,
+    SourcedAsset,
+    compute_pins_fingerprint,
+    compute_pins_fingerprint_for_render,
+    resolve_or_reuse,
+)
 
 
 def _make_cut_with_asset(db, *, safe_to_publish: bool, source="wikipedia", license_="CC BY-SA"):
@@ -84,7 +90,7 @@ def _make_cut_with_pin(db, *, asset_source_ref="ref1"):
 def test_matching_fingerprint_does_not_raise(db_session):
     db = db_session
     cut = _make_cut_with_pin(db)
-    cut.rendered_pins_fingerprint = compute_pins_fingerprint(db, cut.id)
+    cut.rendered_pins_fingerprint = compute_pins_fingerprint_for_render(db, cut.id)
     db.commit()
 
     assert_video_matches_pins(db, cut)  # must not raise
@@ -95,7 +101,7 @@ def test_mismatched_fingerprint_raises_with_an_actionable_message(db_session):
     cut = _make_cut_with_pin(db)
     # Snapshot a fingerprint, then re-pin the beat to a different asset — simulating a
     # later render that changed the pin and then failed before video_path caught up.
-    cut.rendered_pins_fingerprint = compute_pins_fingerprint(db, cut.id)
+    cut.rendered_pins_fingerprint = compute_pins_fingerprint_for_render(db, cut.id)
     db.commit()
 
     new_asset = models.Asset(
@@ -132,6 +138,57 @@ def test_none_fingerprint_does_not_block_even_with_real_current_pins(db_session)
     assert compute_pins_fingerprint(db, cut.id) is not None
 
     assert_video_matches_pins(db, cut)  # must not raise
+
+
+def test_black_frame_render_still_catches_a_later_partial_repin(db_session, tmp_path):
+    """CRITICAL — independent review caught a real gap the first version of this fix had:
+    a genuinely SUCCESSFUL render whose every beat black-framed (resolve_beat_assets()'s
+    whole fallback chain came up empty) used to write cut.rendered_pins_fingerprint = None
+    (compute_pins_fingerprint()'s raw "zero pins" return), which is indistinguishable from
+    "never rendered" — so assert_video_matches_pins's `is None: return` legacy-skip would
+    ALSO silently skip this cut forever, even after a later render pinned real assets and
+    then crashed before finishing. That's not a bounded rollout gap like the true legacy
+    case — it can recur indefinitely for a niche/topic where asset sourcing keeps failing.
+
+    Fixed by compute_pins_fingerprint_for_render()'s EMPTY_PINS_FINGERPRINT sentinel: a
+    completed zero-pin render now writes a real, comparable value instead of None, so the
+    exact same staleness detection that already works for a normal re-pin also works here.
+    """
+    db = db_session
+    reel = models.Reel(context="x", status=models.ReelStatus.guide_ready)
+    db.add(reel)
+    db.flush()
+    cut = models.Cut(
+        reel_id=reel.id, platform=models.CutPlatform.youtube_shorts, status=models.CutStatus.approved,
+    )
+    db.add(cut)
+    db.flush()
+
+    # --- Render N "succeeds" with zero real pins (every beat black-framed) — no CutAsset
+    # rows exist for this cut at all. render_cut still writes a real fingerprint. ---
+    assert compute_pins_fingerprint(db, cut.id) is None  # sanity: genuinely zero pins
+    cut.video_path = "/video_store/1/youtube_shorts.mp4"
+    cut.rendered_pins_fingerprint = compute_pins_fingerprint_for_render(db, cut.id)
+    db.commit()
+    assert cut.rendered_pins_fingerprint == EMPTY_PINS_FINGERPRINT
+
+    # Sanity: the black-frame video passes the gate right after it "finishes."
+    assert_video_matches_pins(db, cut)  # must not raise
+
+    # --- Render N+1 pins a real asset to beat 0 (asset sourcing recovered), then "crashes"
+    # before reaching the video_path/rendered_pins_fingerprint assignment. ---
+    sourcer = _StubSourcer(tmp_path)
+    resolve_or_reuse(
+        db, cut=cut, beat_index=0, visual_direction="Messi through-ball",
+        min_duration_s=5.0, sourcer=sourcer,
+    )
+    # video_path and rendered_pins_fingerprint deliberately NOT touched.
+
+    # --- The gate must catch this: current pins are now non-empty, but the stale
+    # video_path was built from zero pins. Without the sentinel fix, both sides of this
+    # comparison would have been None and this would have wrongly passed. ---
+    with pytest.raises(ValueError, match="Re-render before publishing"):
+        assert_video_matches_pins(db, cut)
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +251,7 @@ def test_staleness_bug_sequence_a_repin_that_fails_before_video_path_updates_is_
         min_duration_s=5.0, sourcer=sourcer,
     )
     cut.video_path = "/video_store/1/youtube_shorts.mp4"
-    cut.rendered_pins_fingerprint = compute_pins_fingerprint(db, cut.id)
+    cut.rendered_pins_fingerprint = compute_pins_fingerprint_for_render(db, cut.id)
     db.commit()
 
     # Sanity: the video render N produced passes the gate right after it finishes.

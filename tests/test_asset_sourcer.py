@@ -5,7 +5,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from api import models
-from engine.render.asset_sourcer import SourcedAsset, _fp, compute_pins_fingerprint, resolve_or_reuse
+from engine.render.asset_sourcer import (
+    EMPTY_PINS_FINGERPRINT,
+    SourcedAsset,
+    _fp,
+    compute_pins_fingerprint,
+    compute_pins_fingerprint_for_render,
+    resolve_or_reuse,
+)
 
 
 @pytest.fixture
@@ -246,3 +253,26 @@ def test_compute_pins_fingerprint_unaffected_when_untouched_beats_pin_stays_the_
     db.commit()
     changed_beat0 = compute_pins_fingerprint(db, cut.id)
     assert changed_beat0 != before
+
+
+# ---------------------------------------------------------------------------
+# compute_pins_fingerprint_for_render — the wrapper render.py/gate.py must always use for
+# Cut.rendered_pins_fingerprint, never the raw compute_pins_fingerprint() above (see
+# EMPTY_PINS_FINGERPRINT's docstring in engine/render/asset_sourcer.py: using the raw
+# function at either the write or read site reopens the black-frame staleness hole
+# independent review caught).
+# ---------------------------------------------------------------------------
+
+def test_compute_pins_fingerprint_for_render_returns_sentinel_for_zero_pins(db, cut):
+    assert compute_pins_fingerprint(db, cut.id) is None  # sanity: genuinely zero pins
+    assert compute_pins_fingerprint_for_render(db, cut.id) == EMPTY_PINS_FINGERPRINT
+
+
+def test_compute_pins_fingerprint_for_render_delegates_to_the_real_hash_for_non_zero_pins(db, cut):
+    _pin(db, cut, beat_index=0, order_in_beat=0, asset_id=101)
+    db.commit()
+
+    real_hash = compute_pins_fingerprint(db, cut.id)
+    assert real_hash is not None
+    assert real_hash != EMPTY_PINS_FINGERPRINT
+    assert compute_pins_fingerprint_for_render(db, cut.id) == real_hash

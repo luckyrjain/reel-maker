@@ -954,6 +954,31 @@ Does not address the separate, already-tracked, Low-severity "guide edited
 without a `visual_direction` change" staleness gap below — see the design's
 own explicit scope boundary (§1).
 
+**One real bug found and fixed by independent dual-lens review before
+merge**, distinct from the rollout gap already accepted above: the first
+version conflated two different meanings of `rendered_pins_fingerprint is
+None` — "no completed render has ever touched this cut" (the true, bounded
+legacy/rollout case) and "the most recent successful render bound zero real
+assets" (every beat black-framed — a real, documented, recurring outcome,
+not hypothetical; see `Cut.black_frame_beat_indices`). `compute_pins_fingerprint()`
+returns `None` for both, and the original write site (`render_cut`) wrote
+that raw `None` straight onto `Cut.rendered_pins_fingerprint` — so a
+genuinely successful black-frame render was indistinguishable from a
+never-rendered row, and the gate's legacy-skip branch would exempt it
+**indefinitely**, not just until a rollout window closed: any later render
+that pinned a real asset and then failed before finishing left live pins
+non-empty while the column stayed `None`, silently unprotected for as long
+as that niche/topic's asset sourcing kept failing. Fixed with a dedicated
+sentinel — `EMPTY_PINS_FINGERPRINT` (a fixed, non-hash-shaped string) — and
+a `compute_pins_fingerprint_for_render()` wrapper that both the write site
+(`render_cut`) and read site (`assert_video_matches_pins()`) now use instead
+of the raw function, so a completed render (empty pins or not) always
+writes something comparable and `None` is reserved for the true legacy
+case. Regression-guarded by
+`tests/test_publish_gate.py::test_black_frame_render_still_catches_a_later_partial_repin`,
+mutation-tested against a version that reverted both call sites back to the
+raw `compute_pins_fingerprint()`.
+
 ### Not started
 
 - Auth / rate-limiting scope decision — still the silent absence the gap

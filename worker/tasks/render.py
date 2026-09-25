@@ -5,7 +5,7 @@ from api.config import settings
 from api.state import CUT_TRANSITIONS, transition
 from engine.generation.guide_schema import PlatformGuide
 from engine.observability import record_stage
-from engine.render.asset_sourcer import compute_pins_fingerprint, get_asset_sourcer, get_hf_sourcer, get_hf_video_sourcer, get_music_sourcer, get_wiki_sourcer, resolve_or_reuse
+from engine.render.asset_sourcer import compute_pins_fingerprint_for_render, get_asset_sourcer, get_hf_sourcer, get_hf_video_sourcer, get_music_sourcer, get_wiki_sourcer, resolve_or_reuse
 from engine.render.compositor import DEFAULT_TEXT_COLOR, composite_cut
 from engine.render.tts import SilentProvider, _audio_duration, get_tts_provider
 from worker.celery_app import celery_app
@@ -162,5 +162,10 @@ def render_cut(self, db, job, ctx):
     # every beat's resolve_or_reuse() call (and its commit) for this render has already
     # landed by this point in the function — see docs/specs/2026-09-video-pins-staleness-
     # gate-system-design.md §6.
-    cut.rendered_pins_fingerprint = compute_pins_fingerprint(db, cut.id)
+    # Always compute_pins_fingerprint_for_render(), never the raw compute_pins_fingerprint()
+    # — a successful all-black-frame render must still write a real, comparable value
+    # (EMPTY_PINS_FINGERPRINT), not None, or it becomes indistinguishable from "never
+    # rendered" and permanently exempt from the staleness check. See that function's
+    # docstring and CLAUDE.md's Key conventions entry on this gate.
+    cut.rendered_pins_fingerprint = compute_pins_fingerprint_for_render(db, cut.id)
     transition(cut, "in_review", CUT_TRANSITIONS)

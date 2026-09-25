@@ -230,10 +230,15 @@ def test_subtitle_path_is_reset_to_none_on_a_render_with_no_cues():
 def test_rendered_pins_fingerprint_is_computed_and_assigned_on_success():
     """Call-and-assign wiring only — this file is 100%-MagicMock-based (resolve_or_reuse
     itself is patched in every test here, no real CutAsset row ever exists), so the honest
-    claim this test can make is that compute_pins_fingerprint is called with the render's
-    cut.id and its return value lands on cut.rendered_pins_fingerprint. The stronger claim —
-    that the fingerprint actually reflects real pins a real render bound — is proven by the
-    real-DB end-to-end test in tests/test_publish_gate.py, not here."""
+    claim this test can make is that compute_pins_fingerprint_for_render is called with the
+    render's cut.id and its return value lands on cut.rendered_pins_fingerprint. The
+    stronger claim — that the fingerprint actually reflects real pins a real render bound —
+    is proven by the real-DB end-to-end test in tests/test_publish_gate.py, not here.
+
+    render_cut must call compute_pins_fingerprint_for_render(), NOT the raw
+    compute_pins_fingerprint() — the _for_render wrapper is what guarantees a successful
+    all-black-frame render still writes a real, comparable value instead of None (see that
+    function's docstring in engine/render/asset_sourcer.py)."""
     from worker.tasks.render import render_cut
 
     job = _job()
@@ -254,7 +259,7 @@ def test_rendered_pins_fingerprint_is_computed_and_assigned_on_success():
         patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
         patch("worker.tasks.render.record_stage"),
         patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"], _FAKE_SRT_PATH)),
-        patch("worker.tasks.render.compute_pins_fingerprint", return_value="deadbeef" * 8) as mock_fp,
+        patch("worker.tasks.render.compute_pins_fingerprint_for_render", return_value="deadbeef" * 8) as mock_fp,
     ):
         render_cut(1)
 
