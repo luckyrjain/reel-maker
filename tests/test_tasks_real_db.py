@@ -73,6 +73,146 @@ def test_a_successful_publish_persists_published_at_and_sends_the_built_caption(
     assert cut.status == models.CutStatus.published
 
 
+def test_captions_upload_failure_does_not_fail_publish_cut_or_platform_post_id(factory, tmp_path):
+    """A best-effort YouTube captions upload failure must never fail publish_cut —
+    the video is already live by the time this runs. CRITICAL (design review
+    trigger, easy to omit): the failure must still show up as a real
+    StageEvent(stage="captions_upload", ok=False, detail["error"]=...) row, not
+    silently recorded as ok=True (record_stage's default) — see
+    engine/publish/youtube.py::YouTubePublisher.publish()'s record_stage
+    composition and CLAUDE.md's Key conventions entry for this rule. Mutation-
+    tested: forcing _upload_captions to raise (below) and reading the resulting
+    row back for real, not just trusting the diff."""
+    from engine.publish.youtube import YouTubePublisher
+    from worker.tasks.publish import publish_cut
+
+    job_id, cut_id = _publish_setup(factory)
+    video_file = tmp_path / "v.mp4"
+    video_file.write_bytes(b"fake mp4 bytes")
+    db = factory()
+    cut = db.get(models.Cut, cut_id)
+    cut.video_path = str(video_file)
+    cut.subtitle_path = "/data/videos/10/youtube_shorts.srt"
+    db.commit()
+    db.close()
+
+    init_resp = MagicMock()
+    init_resp.raise_for_status.return_value = None
+    init_resp.headers = {"Location": "https://upload.example.com/session123"}
+    upload_resp = MagicMock()
+    upload_resp.raise_for_status.return_value = None
+    upload_resp.json.return_value = {"id": "yt-real-id"}
+
+    with (
+        patch("worker.tasks.publish.get_publisher", return_value=YouTubePublisher()),
+        patch("engine.publish.youtube.httpx.post", return_value=init_resp),
+        patch("engine.publish.youtube.httpx.put", return_value=upload_resp),
+        patch("engine.publish.youtube._upload_captions", side_effect=RuntimeError("captions API down")),
+    ):
+        publish_cut(job_id)  # must not raise
+
+    db = factory()
+    cut = db.get(models.Cut, cut_id)
+    job = db.get(models.Job, job_id)
+    # (a) the job succeeded — a captions-only failure never fails publish_cut.
+    assert job.status == models.JobStatus.done
+    assert job.error is None
+    # (b) the video's post id/published_at are unaffected by the captions failure.
+    assert cut.platform_post_id == "yt-real-id"
+    assert cut.published_at is not None
+    assert cut.status == models.CutStatus.published
+
+    # (c) the failure is truthfully recorded, not silently swallowed.
+    ev = (
+        db.query(models.StageEvent)
+        .filter(models.StageEvent.stage == "captions_upload", models.StageEvent.cut_id == cut_id)
+        .one()
+    )
+    assert ev.ok is False
+    assert "captions API down" in ev.detail["error"]
+    assert ev.provider == "youtube"
+
+
+def test_captions_upload_success_records_a_stage_event_with_ok_true(factory, tmp_path):
+    """Sanity-check the happy path alongside the failure test above: a successful
+    captions upload records ok=True, not just "no exception happened to propagate"."""
+    from engine.publish.youtube import YouTubePublisher
+    from worker.tasks.publish import publish_cut
+
+    job_id, cut_id = _publish_setup(factory)
+    video_file = tmp_path / "v.mp4"
+    video_file.write_bytes(b"fake mp4 bytes")
+    db = factory()
+    cut = db.get(models.Cut, cut_id)
+    cut.video_path = str(video_file)
+    cut.subtitle_path = "/data/videos/10/youtube_shorts.srt"
+    db.commit()
+    db.close()
+
+    init_resp = MagicMock()
+    init_resp.raise_for_status.return_value = None
+    init_resp.headers = {"Location": "https://upload.example.com/session123"}
+    upload_resp = MagicMock()
+    upload_resp.raise_for_status.return_value = None
+    upload_resp.json.return_value = {"id": "yt-real-id-2"}
+
+    with (
+        patch("worker.tasks.publish.get_publisher", return_value=YouTubePublisher()),
+        patch("engine.publish.youtube.httpx.post", return_value=init_resp),
+        patch("engine.publish.youtube.httpx.put", return_value=upload_resp),
+        patch("engine.publish.youtube._upload_captions", return_value=None) as mock_upload,
+    ):
+        publish_cut(job_id)
+
+    mock_upload.assert_called_once()
+    db = factory()
+    ev = (
+        db.query(models.StageEvent)
+        .filter(models.StageEvent.stage == "captions_upload", models.StageEvent.cut_id == cut_id)
+        .one()
+    )
+    assert ev.ok is True
+
+
+def test_no_captions_upload_attempted_when_subtitle_path_is_unset(factory, tmp_path):
+    """No SRT means nothing to attempt or record — no captions_upload StageEvent."""
+    from engine.publish.youtube import YouTubePublisher
+    from worker.tasks.publish import publish_cut
+
+    job_id, cut_id = _publish_setup(factory)  # subtitle_path is None by default
+    video_file = tmp_path / "v.mp4"
+    video_file.write_bytes(b"fake mp4 bytes")
+    db = factory()
+    cut = db.get(models.Cut, cut_id)
+    cut.video_path = str(video_file)
+    db.commit()
+    db.close()
+
+    init_resp = MagicMock()
+    init_resp.raise_for_status.return_value = None
+    init_resp.headers = {"Location": "https://upload.example.com/session123"}
+    upload_resp = MagicMock()
+    upload_resp.raise_for_status.return_value = None
+    upload_resp.json.return_value = {"id": "yt-real-id-3"}
+
+    with (
+        patch("worker.tasks.publish.get_publisher", return_value=YouTubePublisher()),
+        patch("engine.publish.youtube.httpx.post", return_value=init_resp),
+        patch("engine.publish.youtube.httpx.put", return_value=upload_resp),
+        patch("engine.publish.youtube._upload_captions") as mock_upload,
+    ):
+        publish_cut(job_id)
+
+    mock_upload.assert_not_called()
+    db = factory()
+    count = (
+        db.query(models.StageEvent)
+        .filter(models.StageEvent.stage == "captions_upload", models.StageEvent.cut_id == cut_id)
+        .count()
+    )
+    assert count == 0
+
+
 def test_enrich_enqueues_generate_with_the_id_of_the_job_row_it_created(factory):
     """generate_guide.delay(None) would silently break the enrich -> generate chain."""
     from worker.tasks.enrich_context import enrich_context

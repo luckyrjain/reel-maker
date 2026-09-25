@@ -235,6 +235,22 @@ def stream_video(cut_id: int, db: Session = Depends(get_db)):
     )
 
 
+@router.get("/cuts/{cut_id}/subtitles")
+def stream_subtitles(cut_id: int, db: Session = Depends(get_db)):
+    cut = db.get(models.Cut, cut_id)
+    if not cut or not cut.subtitle_path:
+        raise HTTPException(status_code=404, detail="Subtitles not found")
+    video_store = Path(settings.video_store_dir).resolve()
+    resolved = Path(cut.subtitle_path).resolve()
+    if not resolved.is_relative_to(video_store):   # see stream_video
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return FileResponse(
+        resolved,
+        media_type="application/x-subrip",
+        filename=f"reel_{cut.reel_id}_{cut.platform.value}.srt",
+    )
+
+
 @router.get("/cuts/{cut_id}/thumbnail/{index}")
 def stream_thumbnail(cut_id: int, index: int, db: Session = Depends(get_db)):
     cut = db.get(models.Cut, cut_id)

@@ -7,11 +7,16 @@ import pytest
 from engine.publish.youtube import YouTubePublisher
 
 
-def _fake_cut(video_path):
+def _fake_cut(video_path, subtitle_path=None):
     cut = MagicMock()
+    cut.id = 5
+    cut.reel_id = 10
     cut.video_path = str(video_path)
     cut.caption = "Argentina's weak spot could decide the tournament."
     cut.hashtags = ["football", "worldcup"]
+    # Explicit, not MagicMock's incidental truthiness — most tests here don't
+    # care about the captions-upload branch at all, so make its trigger opt-in.
+    cut.subtitle_path = subtitle_path
     return cut
 
 
@@ -168,3 +173,78 @@ def test_expired_token_without_refresh_token_raises(video_file):
 
     with pytest.raises(ValueError, match="no refresh token is stored"):
         YouTubePublisher().publish(cut, credential, db, caption=cut.caption)
+
+
+# ── _upload_captions() request construction (Phase 5d) ──────────────────────
+# Not exercised by the publish() tests above (subtitle_path=None there) or by
+# test_tasks_real_db.py's real-DB StageEvent coverage (which mocks
+# _upload_captions itself, never inspecting how it calls httpx.post) — this is
+# the one place the actual outgoing request shape gets checked.
+
+
+def test_upload_captions_sends_token_in_header_never_in_params(tmp_path):
+    from engine.publish.youtube import _upload_captions
+
+    srt_path = tmp_path / "cut.srt"
+    srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n")
+
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    with patch("engine.publish.youtube.httpx.post", return_value=resp) as mock_post:
+        _upload_captions("vid123", str(srt_path), "secret-access-token")
+
+    _, kwargs = mock_post.call_args
+    assert "secret-access-token" not in str(kwargs.get("params", {})), (
+        "token must not leak into the URL — see CLAUDE.md's Token-in-URL convention"
+    )
+    assert kwargs["headers"]["Authorization"] == "Bearer secret-access-token"
+
+
+def test_upload_captions_builds_a_multipart_related_body_not_form_data(tmp_path):
+    """multipart/related (RFC 2387) is what Google's uploadType=multipart protocol
+    expects — a different wire format than multipart/form-data (httpx's `files=`),
+    whose parts carry Content-Disposition/field names Google's endpoint doesn't
+    parse the same way. Assert the actual body/header shape, not just that some
+    request was sent."""
+    from engine.publish.youtube import _upload_captions
+
+    srt_path = tmp_path / "cut.srt"
+    srt_bytes = b"1\n00:00:00,000 --> 00:00:01,000\nHello\n"
+    srt_path.write_bytes(srt_bytes)
+
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    with patch("engine.publish.youtube.httpx.post", return_value=resp) as mock_post:
+        _upload_captions("vid123", str(srt_path), "tok")
+
+    _, kwargs = mock_post.call_args
+    content_type = kwargs["headers"]["Content-Type"]
+    assert content_type.startswith("multipart/related; boundary=")
+    boundary = content_type.split("boundary=", 1)[1]
+
+    body = kwargs["content"]
+    assert isinstance(body, bytes)
+    assert f"--{boundary}".encode() in body
+    assert f"--{boundary}--".encode() in body
+    assert b'"videoId": "vid123"' in body
+    assert srt_bytes in body
+    assert b"Content-Disposition" not in body, (
+        "multipart/related parts are distinguished by Content-Type alone — a "
+        "Content-Disposition header would mean this regressed to form-data framing"
+    )
+
+
+def test_build_multipart_related_format(tmp_path):
+    from engine.publish.youtube import _build_multipart_related
+
+    body = _build_multipart_related(
+        [("application/json", b'{"a": 1}'), ("application/octet-stream", b"raw bytes")],
+        boundary="BOUND",
+    )
+    assert body == (
+        b"--BOUND\r\nContent-Type: application/json\r\n\r\n"
+        b'{"a": 1}\r\n'
+        b"--BOUND\r\nContent-Type: application/octet-stream\r\n\r\n"
+        b"raw bytes\r\n"
+        b"--BOUND--"
+    )

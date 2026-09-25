@@ -14,7 +14,7 @@ import pytest
 
 from engine.generation.guide_schema import Beat, MasterGuide, PlatformGuide
 from engine.generation.postprocess import clean_guide
-from engine.render.compositor import _build_text_filter
+from engine.render.compositor import _build_beat_transcripts, _build_text_filter, _whisper_timestamps
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -245,3 +245,188 @@ def test_whisper_timing_falls_back_when_fewer_words_than_lines():
     assert len(set(starts)) == 5, "each line needs its own window, not a shared one"
     # Proportional timing fills the beat; the truncated whisper stream would stop at 1.0s
     assert float(windows[-1][1]) == pytest.approx(5.0)
+
+
+# ── engine/render/captions.py: TranscriptResult (T2 — SRT caption export) ─────
+
+class _FakeWhisperModel:
+    def __init__(self, result):
+        self._result = result
+
+    def transcribe(self, path, word_timestamps=True, fp16=False):
+        return self._result
+
+
+_FAKE_WHISPER_RESULT = {
+    "segments": [
+        {
+            "text": " Hello world.",
+            "start": 0.5,
+            "end": 1.8,
+            "words": [
+                {"word": "Hello", "start": 0.5, "end": 1.0},
+                {"word": "world.", "start": 1.0, "end": 1.8},
+            ],
+        },
+        {
+            "text": " Goodbye.",
+            "start": 2.0,
+            "end": 2.9,
+            "words": [
+                {"word": "Goodbye.", "start": 2.0, "end": 2.9},
+            ],
+        },
+    ],
+}
+
+
+def test_transcribe_audio_returns_words_and_segments_from_one_pass(monkeypatch, tmp_path):
+    """TranscriptResult.words keeps the exact pre-refactor shape/values (flattened
+    words, beat_offset_s=0.0 default); .segments is new, one full-segment
+    CaptionSegment per Whisper segment, derived from the same transcribe() call."""
+    pytest.importorskip("whisper")
+    from engine.render import captions
+
+    monkeypatch.setattr(captions, "_load_model", lambda name: _FakeWhisperModel(_FAKE_WHISPER_RESULT))
+    audio = tmp_path / "beat.wav"
+    audio.write_bytes(b"not really audio, transcribe() is mocked")
+
+    result = captions.transcribe_audio(audio)
+
+    assert [(w.text, w.start_s, w.end_s) for w in result.words] == [
+        ("Hello", 0.5, 1.0),
+        ("world.", 1.0, 1.8),
+        ("Goodbye.", 2.0, 2.9),
+    ]
+    assert [(s.text, s.start_s, s.end_s) for s in result.segments] == [
+        ("Hello world.", 0.5, 1.8),
+        ("Goodbye.", 2.0, 2.9),
+    ]
+
+
+def test_transcribe_audio_beat_offset_shifts_both_fields_identically(monkeypatch, tmp_path):
+    """beat_offset_s keeps its pre-existing beat-relative semantics for BOTH fields —
+    a non-default caller-supplied offset shifts .words and .segments the same way it
+    always shifted .words alone. (composite_cut() itself never passes a non-zero
+    value — see test_build_beat_transcripts_never_passes_a_nonzero_offset below.)"""
+    pytest.importorskip("whisper")
+    from engine.render import captions
+
+    monkeypatch.setattr(captions, "_load_model", lambda name: _FakeWhisperModel(_FAKE_WHISPER_RESULT))
+    audio = tmp_path / "beat.wav"
+    audio.write_bytes(b"x")
+
+    result = captions.transcribe_audio(audio, beat_offset_s=10.0)
+
+    assert result.words[0].start_s == pytest.approx(10.5)
+    assert result.segments[0].start_s == pytest.approx(10.5)
+
+
+def test_transcribe_audio_returns_empty_transcript_result_without_whisper(monkeypatch, tmp_path):
+    """ImportError path (openai-whisper not installed) degrades to an empty
+    TranscriptResult, not None — callers can keep doing `.words`/`.segments`
+    without a None-check, same "degrade gracefully" posture as before this change."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _fake_import(name, *args, **kwargs):
+        if name == "whisper":
+            raise ImportError("no whisper")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+
+    from engine.render import captions
+    result = captions.transcribe_audio(tmp_path / "beat.wav")
+    assert result.words == []
+    assert result.segments == []
+
+
+# ── offset-handling regression guard (design §2 — the central safety-critical rule) ──
+#
+# The original design draft would have had composite_cut() call transcribe_audio()
+# with a per-beat cumulative offset to pre-shift .words to the reel's absolute
+# timeline. That's wrong: _whisper_timestamps() (below) already adds each beat's
+# cumulative start time to .words when building the burned-in-text drawtext filter.
+# A pre-shifted .words would get that addition applied a SECOND time, silently
+# corrupting caption timing for every beat past the first. Caught in design review
+# (see docs/specs/2026-09-srt-caption-export-system-design.md §2's "Revision note")
+# and fixed by keeping .words/.segments beat-relative at the source, always. The two
+# tests below are independent guards against this regression ever coming back:
+# one on the exact call arguments compositor.py uses, one on the resulting values.
+
+def test_build_beat_transcripts_never_passes_a_nonzero_offset(monkeypatch, tmp_path):
+    """THE single most important regression test in this change (per the design's
+    own criticality rationale): compositor.py's beat-transcript builder must call
+    transcribe_audio() at its default beat_offset_s=0.0 for every beat, never a
+    per-beat cumulative offset.
+
+    Mutation-tested: temporarily changing _build_beat_transcripts() to pass a
+    non-zero per-beat offset (e.g. a running sum of beat durations) into
+    transcribe_audio() — simulating the exact bug the design review caught — makes
+    this assertion fail immediately (`calls` would be e.g. `[0.0, 5.0]` instead of
+    `[0.0, 0.0]`). Confirmed by hand during implementation, then reverted.
+    """
+    from engine.render.captions import TranscriptResult
+
+    calls = []
+
+    def fake_transcribe(path, beat_offset_s=0.0):
+        calls.append(beat_offset_s)
+        return TranscriptResult(words=[], segments=[])
+
+    monkeypatch.setattr("engine.render.captions.transcribe_audio", fake_transcribe)
+
+    vo0 = tmp_path / "beat0.wav"
+    vo1 = tmp_path / "beat1.wav"
+    vo0.write_bytes(b"x")
+    vo1.write_bytes(b"x")
+
+    _build_beat_transcripts([vo0, vo1])
+
+    assert calls == [0.0, 0.0], (
+        f"transcribe_audio() was called with offset(s) {calls} — a non-zero, "
+        "per-beat value here would double-apply _whisper_timestamps()'s own "
+        "beat_start shift"
+    )
+
+
+def test_whisper_timestamps_multi_beat_absolute_times_not_doubled():
+    """Numeric-value regression guard, complementing the call-argument guard above:
+    feeding two beats' beat-relative .words (as transcribe_audio() with
+    beat_offset_s=0.0 actually produces) through _whisper_timestamps() at their real
+    cumulative beat_start values must yield exactly beat_start + raw_word_time — not
+    beat_start applied twice. This directly re-derives the byte-identical claim the
+    system design's §3.1 makes for a multi-beat reel — beat 1's non-zero beat_start
+    is exactly where a doubling bug would become visible (beat 0's beat_start is 0,
+    so doubling it is invisible there — included for completeness, not as the
+    discriminating assertion).
+    """
+    from dataclasses import dataclass
+
+    @dataclass
+    class _Seg:
+        text: str
+        start_s: float
+        end_s: float
+
+    # Beat-relative words, exactly as transcribe_audio(beat_offset_s=0.0) produces.
+    beat0_words = [_Seg("Hello", 0.5, 1.0), _Seg("world.", 1.0, 1.8)]
+    beat1_words = [_Seg("Goodbye.", 0.2, 0.9)]
+
+    beat0_start, beat0_dur = 0.0, 5.0
+    beat1_start, beat1_dur = 5.0, 4.0  # beat 1 starts where beat 0 ends
+
+    timed0 = _whisper_timestamps(["Hello world."], beat0_words, beat0_start, beat0_dur)
+    timed1 = _whisper_timestamps(["Goodbye."], beat1_words, beat1_start, beat1_dur)
+
+    _, s0, e0 = timed0[0]
+    assert s0 == pytest.approx(0.5)   # beat0_start(0.0) + 0.5, not doubled
+    assert e0 == pytest.approx(1.8)
+
+    _, s1, e1 = timed1[0]
+    # Correct: 5.0 + 0.2 = 5.2 / 5.0 + 0.9 = 5.9. A doubling bug would instead
+    # compute 5.0 + 5.0 + 0.2 = 10.2 (clamped by beat_dur, but still visibly wrong).
+    assert s1 == pytest.approx(5.2)
+    assert e1 == pytest.approx(5.9)
