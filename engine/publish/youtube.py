@@ -8,6 +8,7 @@ two-step protocol is still followed, just with one upload request instead of man
 """
 import json
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -46,6 +47,22 @@ def get_valid_access_token(credential, db) -> str:
     return credential.token_blob
 
 
+def _build_multipart_related(parts: list[tuple[str, bytes]], boundary: str) -> bytes:
+    """Build a `multipart/related` body per RFC 2387 / Google's `uploadType=multipart`
+    upload protocol. This is NOT the same wire format as `multipart/form-data`
+    (httpx's `files=` parameter) — `multipart/related` parts are distinguished only
+    by their own `Content-Type` header, with no `Content-Disposition`/field names,
+    which is what Google's upload endpoints for this protocol expect. Each `parts`
+    entry is `(content_type, body_bytes)`."""
+    body = bytearray()
+    for content_type, content in parts:
+        body += f"--{boundary}\r\nContent-Type: {content_type}\r\n\r\n".encode()
+        body += content
+        body += b"\r\n"
+    body += f"--{boundary}--".encode()
+    return bytes(body)
+
+
 def _upload_captions(video_id: str, subtitle_path: str, access_token: str) -> None:
     """POST an SRT file to YouTube's captions.insert API for an already-uploaded
     video. Raises on any HTTP/network failure — the caller (YouTubePublisher.publish)
@@ -67,14 +84,22 @@ def _upload_captions(video_id: str, subtitle_path: str, access_token: str) -> No
             "isDraft": False,
         }
     }
+    boundary = uuid.uuid4().hex
+    body = _build_multipart_related(
+        [
+            ("application/json; charset=UTF-8", json.dumps(snippet).encode()),
+            ("application/octet-stream", srt_bytes),
+        ],
+        boundary,
+    )
     resp = httpx.post(
         _CAPTIONS_UPLOAD_URL,
         params={"uploadType": "multipart", "part": "snippet"},
-        headers={"Authorization": f"Bearer {access_token}"},
-        files={
-            "snippet": (None, json.dumps(snippet), "application/json; charset=UTF-8"),
-            "file": (Path(subtitle_path).name, srt_bytes, "application/octet-stream"),
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": f"multipart/related; boundary={boundary}",
         },
+        content=body,
         timeout=30.0,
     )
     resp.raise_for_status()

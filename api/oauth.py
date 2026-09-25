@@ -70,7 +70,16 @@ class YouTubeOAuth(OAuthProvider):
     name = "youtube"
     authorize_url = "https://accounts.google.com/o/oauth2/v2/auth"
     token_url = "https://oauth2.googleapis.com/token"
-    scope = "https://www.googleapis.com/auth/youtube.upload"
+    # youtube.upload alone is NOT sufficient for captions.insert (Phase 5d's best-effort
+    # caption-track upload, engine/publish/youtube.py::_upload_captions) — Google's Captions
+    # API documents youtube.force-ssl (or youtubepartner) as required. Widened here rather
+    # than left narrow, since a previously-connected account would otherwise 403 forever on
+    # every caption upload with no way to fix it short of reconnecting anyway — reconnecting
+    # is required either way for an already-connected account to pick up the wider scope.
+    scope = (
+        "https://www.googleapis.com/auth/youtube.upload "
+        "https://www.googleapis.com/auth/youtube.force-ssl"
+    )
 
     def authorize_redirect_url(self, state: str) -> str:
         params = httpx.QueryParams({

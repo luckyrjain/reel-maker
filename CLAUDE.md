@@ -47,7 +47,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 674 tests across 30+ files, default run (4 test_compositor tests need ffmpeg
+.venv/bin/pytest                            # 676 tests across 30+ files, default run (4 test_compositor tests need ffmpeg
                                              # on PATH; 1 kokoro voice test skips without the kokoro package; 1 golden-reel
                                              # test is deselected by default — see below)
 .venv/bin/pytest -m golden                  # the golden-reel smoke test (real edge-tts + real ffmpeg, ~20s, needs network)
@@ -302,13 +302,20 @@ engine/
                       (module-level, shared with YouTubeMetricsFetcher) refreshes an expired access
                       token via the stored refresh_token first; after a successful upload, if
                       cut.subtitle_path is set, one best-effort POST to captions.insert
-                      (_upload_captions() — multipart JSON snippet + .srt media part) (Phase 5d) —
-                      wrapped in record_stage(..., "captions_upload", ...) with the try/except
-                      placed INSIDE the with block so a failure never fails publish_cut but still
-                      lands as a real ok=False StageEvent; see this file's Key conventions entry on
-                      this record_stage composition rule, mutation-tested both wrong ways during
-                      implementation. YouTube's Captions API accepting raw SRT bytes as documented
-                      is a design-flagged assumption, not yet live-verified against a real account
+                      (_upload_captions() — multipart/related JSON snippet + .srt media part, built
+                      by _build_multipart_related() rather than httpx's files= param, which sends
+                      multipart/form-data — a different wire format captions.insert doesn't expect)
+                      (Phase 5d) — wrapped in record_stage(..., "captions_upload", ...) with the
+                      try/except placed INSIDE the with block so a failure never fails publish_cut
+                      but still lands as a real ok=False StageEvent; see this file's Key conventions
+                      entry on this record_stage composition rule, mutation-tested both wrong ways
+                      during implementation. YouTube's Captions API accepting raw SRT bytes as
+                      documented is a design-flagged assumption, not yet live-verified against a
+                      real account. YouTubeOAuth.scope (api/oauth.py) includes youtube.force-ssl
+                      alongside youtube.upload specifically for captions.insert — youtube.upload
+                      alone is documented as insufficient for it (an already-connected account
+                      needs to reconnect to pick up the wider grant; independent review caught this
+                      before merge — see docs/roadmap.md's 5d section)
     instagram.py      InstagramPublisher — container create/poll/publish (Reels). Requires
                       settings.public_base_url to be a real public HTTPS URL — Instagram
                       fetches the video itself, it does not accept an upload body
@@ -420,9 +427,11 @@ tests/
   test_publish_task.py        10 tests — publish_cut safety gate (publisher never reached, also on the finalize path), no auto-retry, post id committed early, re-run finalizes without re-upload, attribution caption
   test_publish_registry.py     7 tests — platform→publisher, platform→credential-provider, platform→metrics-fetcher mapping
   test_cuts_publish_router.py 22 tests — POST /cuts/{id}/publish state-guard and enqueue; render refused for an already-posted cut; enqueue failure fails fast (503) and frees the cut; row lock (incl. update_cut reads its body before locking); failed-cut card
-  test_youtube_publisher.py    6 tests — resumable upload flow, token refresh, whitespace-caption fallback (best-effort
+  test_youtube_publisher.py    9 tests — resumable upload flow, token refresh, whitespace-caption fallback (best-effort
                               captions-upload StageEvent coverage lives in test_tasks_real_db.py, which needs a real DB
-                              row to assert on — see below)
+                              row to assert on — see below); _upload_captions() request-construction regression tests
+                              (Phase 5d review fixes) — token stays in the Authorization header, never in params/URL,
+                              and the body is real multipart/related (no Content-Disposition), not multipart/form-data
   test_instagram_publisher.py  7 tests — container create/poll/publish flow, error paths, token-in-header regression
   test_attribution.py          8 tests — build_attribution_block dedup/formatting, build_published_caption
   test_metrics_fetcher.py      6 tests — YouTube/Instagram metrics parsing, token-in-header regression

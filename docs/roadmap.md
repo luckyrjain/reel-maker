@@ -525,6 +525,26 @@ captions in the review UI (this ships the file, not an editor). See
 explicitly-carried-forward open questions (YouTube Captions API live-verification,
 the narrow finalize-path/mid-publish-crash caption-duplication window).
 
+**Two real bugs found and fixed by independent dual-lens review before merge, both
+in `_upload_captions()`, neither surfaced by the design's own already-flagged
+"not live-verified" caveat (that one is about content acceptance; both of these are
+about the request being malformed regardless):**
+- **OAuth scope.** `YouTubeOAuth.scope` (`api/oauth.py`) was `youtube.upload` only
+  — documented as insufficient for `captions.insert`, which needs `youtube.force-ssl`
+  (or `youtubepartner`). Every caption upload would have 403'd forever, silently
+  absorbed as a best-effort `StageEvent(ok=False)`, with the headline feature
+  effectively non-functional. Fixed by widening the scope
+  (`youtube.upload youtube.force-ssl`, space-separated) — an already-connected
+  account needs to reconnect at `/api/credentials` to pick up the wider grant.
+- **Multipart wire format.** The original `httpx.post(..., files={...})` call built a
+  `multipart/form-data` body (each part gets a `Content-Disposition: form-data;
+  name="..."` header). Google's `uploadType=multipart` protocol expects
+  `multipart/related` (RFC 2387) instead — parts distinguished by `Content-Type`
+  alone, no `Content-Disposition`. Fixed with a small `_build_multipart_related()`
+  helper building the body directly (`content=` + an explicit `Content-Type:
+  multipart/related; boundary=...` header), instead of `httpx`'s `files=` parameter.
+  Both fixes are mutation-tested in `tests/test_youtube_publisher.py`.
+
 ### 5e. ~~Insight enrichment for standard LLM path~~ ✅ Done (Phase 3.6)
 
 `_enrich_standard_path_guide()` runs after `clean_guide()` in the standard path — converts beats to `BeatStub`-like objects, runs `_enrich_with_insight()`, writes enriched VO + recalculated duration + re-derived on_screen_text back.

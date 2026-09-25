@@ -284,6 +284,7 @@ def test_transcribe_audio_returns_words_and_segments_from_one_pass(monkeypatch, 
     """TranscriptResult.words keeps the exact pre-refactor shape/values (flattened
     words, beat_offset_s=0.0 default); .segments is new, one full-segment
     CaptionSegment per Whisper segment, derived from the same transcribe() call."""
+    pytest.importorskip("whisper")
     from engine.render import captions
 
     monkeypatch.setattr(captions, "_load_model", lambda name: _FakeWhisperModel(_FAKE_WHISPER_RESULT))
@@ -308,6 +309,7 @@ def test_transcribe_audio_beat_offset_shifts_both_fields_identically(monkeypatch
     a non-default caller-supplied offset shifts .words and .segments the same way it
     always shifted .words alone. (composite_cut() itself never passes a non-zero
     value — see test_build_beat_transcripts_never_passes_a_nonzero_offset below.)"""
+    pytest.importorskip("whisper")
     from engine.render import captions
 
     monkeypatch.setattr(captions, "_load_model", lambda name: _FakeWhisperModel(_FAKE_WHISPER_RESULT))
