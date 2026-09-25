@@ -1,9 +1,12 @@
 """Tests for the render_cut task's failure handling and success-path cleanup."""
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from api import models
+
+_FAKE_SRT_PATH = Path("/tmp/fake_captions.srt")
 
 _GUIDE = {
     "platform": "youtube_shorts",
@@ -125,7 +128,7 @@ def test_a_render_that_a_publish_overtook_is_discarded():
         patch("worker.tasks.render.get_tts_provider"),
         patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
         patch("worker.tasks.render.record_stage"),
-        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"])),
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"], _FAKE_SRT_PATH)),
     ):
         with pytest.raises(ValueError, match="posted while it rendered"):
             render_cut(1)
@@ -155,12 +158,73 @@ def test_successful_render_clears_stale_error():
         patch("worker.tasks.render.get_tts_provider"),
         patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
         patch("worker.tasks.render.record_stage"),
-        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"])),
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"], _FAKE_SRT_PATH)),
     ):
         render_cut(1)
 
     assert job.status == models.JobStatus.done
     assert job.error is None
+
+
+def test_subtitle_path_is_populated_on_a_successful_render():
+    """cut.subtitle_path is set from composite_cut()'s third return value, same
+    wholesale-replace-on-re-render policy as thumbnail_candidates/video_path/
+    black_frame_beat_indices."""
+    from worker.tasks.render import render_cut
+
+    job = _job()
+    cut = _cut()
+    reel = _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else (
+        cut if model is models.Cut else reel
+    )
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.render.get_asset_sourcer"),
+        patch("worker.tasks.render.get_wiki_sourcer"),
+        patch("worker.tasks.render.get_hf_sourcer"),
+        patch("worker.tasks.render.get_hf_video_sourcer"),
+        patch("worker.tasks.render.get_tts_provider"),
+        patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
+        patch("worker.tasks.render.record_stage"),
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"], _FAKE_SRT_PATH)),
+    ):
+        render_cut(1)
+
+    assert cut.subtitle_path == str(_FAKE_SRT_PATH)
+
+
+def test_subtitle_path_is_reset_to_none_on_a_render_with_no_cues():
+    """A re-render that produces zero SRT cues (e.g. silent voiceover_mode — nothing
+    to caption anywhere in the fallback chain) must reset a stale subtitle_path from
+    a previous render to None, not leave it pointing at now-orphaned content."""
+    from worker.tasks.render import render_cut
+
+    job = _job()
+    cut = _cut()
+    cut.subtitle_path = "/video_store/10/youtube_shorts.srt"  # stale, from a prior render
+    reel = _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else (
+        cut if model is models.Cut else reel
+    )
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.render.get_asset_sourcer"),
+        patch("worker.tasks.render.get_wiki_sourcer"),
+        patch("worker.tasks.render.get_hf_sourcer"),
+        patch("worker.tasks.render.get_hf_video_sourcer"),
+        patch("worker.tasks.render.get_tts_provider"),
+        patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
+        patch("worker.tasks.render.record_stage"),
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"], None)),
+    ):
+        render_cut(1)
+
+    assert cut.subtitle_path is None
 
 
 def test_matching_music_cue_is_passed_to_composite_cut():
@@ -190,7 +254,7 @@ def test_matching_music_cue_is_passed_to_composite_cut():
         patch("worker.tasks.render.get_music_sourcer", return_value=fake_sourcer),
         patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
         patch("worker.tasks.render.record_stage"),
-        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"])) as mock_composite,
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"], _FAKE_SRT_PATH)) as mock_composite,
     ):
         render_cut(1)
 
@@ -219,7 +283,7 @@ def test_reel_tts_voice_is_passed_to_get_tts_provider():
         patch("worker.tasks.render.get_tts_provider") as mock_get_tts,
         patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
         patch("worker.tasks.render.record_stage"),
-        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"])),
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"], _FAKE_SRT_PATH)),
     ):
         render_cut(1)
 
@@ -247,7 +311,7 @@ def test_reel_text_color_is_passed_to_composite_cut():
         patch("worker.tasks.render.get_tts_provider"),
         patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
         patch("worker.tasks.render.record_stage"),
-        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"])) as mock_composite,
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"], _FAKE_SRT_PATH)) as mock_composite,
     ):
         render_cut(1)
 
@@ -275,7 +339,7 @@ def test_reel_without_text_color_uses_the_default():
         patch("worker.tasks.render.get_tts_provider"),
         patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
         patch("worker.tasks.render.record_stage"),
-        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"])) as mock_composite,
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"], _FAKE_SRT_PATH)) as mock_composite,
     ):
         render_cut(1)
 
@@ -311,7 +375,7 @@ def test_black_frame_beats_are_flagged_on_the_cut():
         patch("worker.tasks.render.get_tts_provider"),
         patch("worker.tasks.render.resolve_or_reuse", side_effect=fake_resolve),
         patch("worker.tasks.render.record_stage"),
-        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"])),
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"], _FAKE_SRT_PATH)),
     ):
         render_cut(1)
 
@@ -338,7 +402,7 @@ def test_no_black_frame_flag_when_every_beat_has_real_media():
         patch("worker.tasks.render.get_tts_provider"),
         patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), MagicMock())]),
         patch("worker.tasks.render.record_stage"),
-        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"])),
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"], _FAKE_SRT_PATH)),
     ):
         render_cut(1)
 
@@ -368,7 +432,7 @@ def test_no_music_cue_passes_none_without_querying_sourcer():
         patch("worker.tasks.render.get_music_sourcer", return_value=fake_sourcer),
         patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
         patch("worker.tasks.render.record_stage"),
-        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"])) as mock_composite,
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"], _FAKE_SRT_PATH)) as mock_composite,
     ):
         render_cut(1)
 

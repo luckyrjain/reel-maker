@@ -18,6 +18,7 @@ tests/test_compositor.py's own note) and outbound network access — CI has
 both (`.github/workflows/ci.yml` installs ffmpeg and edge-tts).
 """
 import json
+import re
 import subprocess
 
 import pytest
@@ -36,6 +37,12 @@ def _ffprobe_streams(path) -> list[dict]:
         capture_output=True, text=True, timeout=10,
     )
     return json.loads(result.stdout).get("streams", [])
+
+
+def _srt_timestamp_to_seconds(ts: str) -> float:
+    h, m, rest = ts.split(":")
+    s, ms = rest.split(",")
+    return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
 
 
 def _make_test_image(path, color) -> None:
@@ -65,7 +72,7 @@ def test_golden_reel_two_beat_render_has_real_tts_audio_and_correct_dimensions(t
     out = tmp_path / "out.mp4"
     thumb = tmp_path / "thumb.jpg"
 
-    duration, thumbnail_candidates = composite_cut(
+    duration, thumbnail_candidates, subtitle_path = composite_cut(
         beats=beats,
         beat_video_paths=[[img1], [img2]],
         beat_vo_paths=vo_paths,
@@ -94,3 +101,26 @@ def test_golden_reel_two_beat_render_has_real_tts_audio_and_correct_dimensions(t
     # than each getting their own isolated unit test with synthetic inputs.
     assert 5.0 <= duration <= 7.0   # two 3s beats, TTS-length adjustment may nudge it
     assert thumbnail_candidates and thumbnail_candidates[0].exists()
+
+    # A real .srt file with real Whisper-or-fallback timing from real TTS narration —
+    # this is exactly the "no mocks anywhere in the chain" claim this test exists to
+    # back up (design doc §10 point 4), extended to the caption-export feature rather
+    # than adding a second isolated golden test for it.
+    assert subtitle_path is not None
+    assert subtitle_path.exists()
+    srt_content = subtitle_path.read_text(encoding="utf-8")
+    assert srt_content.strip(), "SRT file was written but is empty"
+    assert any(c.isalpha() for c in srt_content), "real narration should transcribe to real words"
+
+    timestamp_pairs = re.findall(
+        r"(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})", srt_content
+    )
+    assert timestamp_pairs, "no SRT timestamp lines found"
+    starts = [_srt_timestamp_to_seconds(s) for s, _ in timestamp_pairs]
+    ends = [_srt_timestamp_to_seconds(e) for _, e in timestamp_pairs]
+    assert starts == sorted(starts), "cues must be in chronological order"
+    assert all(s < e for s, e in zip(starts, ends)), "every cue must have start < end"
+    assert min(starts) >= 0.0
+    # Real timing, not garbage: the last cue shouldn't run past the reel's own duration
+    # by more than a small floating-point/clamping tolerance.
+    assert max(ends) <= duration + 0.5

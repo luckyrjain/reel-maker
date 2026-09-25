@@ -474,13 +474,56 @@ keyword-matches a beat's `music_cue` against filenames in
   previously never got a `music_cue` at all, so nothing was ever mixed in
   for that path.
 
-### 5d. Word-level caption export — not done
+### 5d. Word-level caption export — done (SRT only, see design's VTT scope call)
 
-Whisper is wired in for on-screen text timing, but a separate SRT/VTT caption file for the platform uploader is not generated.
+`transcribe_audio()` (`engine/render/captions.py`) was refactored to return a
+`TranscriptResult` dataclass instead of a bare word list: `.words` is the exact
+pre-existing output (byte-identical values, same beat-relative semantics) that
+already fed the burned-in on-screen text; `.segments` is new — one `CaptionSegment`
+per Whisper segment (full sentence text, not a single word) from the *same*
+`model.transcribe()` call, so a render still pays for transcription once per beat,
+not twice. `composite_cut()` builds SRT cues from `.segments` (falling back to the
+same proportional vo_script-sentence-split technique `_build_text_filter()` already
+used for its own no-Whisper fallback, when a beat's `.segments` came back empty),
+shifts them from beat-relative to the reel's absolute timeline via an explicit
+running sum over `beat_durations`, and writes them with the new
+`engine/render/srt.py::write_srt()` — a pure `list[CaptionSegment] -> .srt` formatter
+with no ffmpeg/network dependency of its own. `render_cut` stores the resulting path
+(or `None`, when there was nothing to caption at all) on the new `Cut.subtitle_path`
+column (migration `0011`), replaced wholesale on every re-render, same policy as
+`thumbnail_candidates`/`video_path`/`black_frame_beat_indices`.
 
-**Work:**
-- After Whisper transcription in the compositor, write per-beat segments to an SRT file alongside the MP4
-- Pass the SRT to YouTube Data API as a caption track on upload
+`GET /api/cuts/{id}/subtitles` serves the file with the same path-traversal guard as
+`stream_video`/`stream_thumbnail`; `cut_card.html` gets a "Download captions (.srt)"
+link next to the MP4 download, visible whenever `subtitle_path` is set. After a
+successful YouTube upload, `YouTubePublisher.publish()` makes one best-effort POST to
+YouTube's `captions.insert` API when `cut.subtitle_path` is set — wrapped in
+`record_stage(..., "captions_upload", ...)` with the try/except placed *inside* the
+`with` block (`record_stage()` re-raises on an uncaught exception, so a naive wrap
+would fail the whole `publish_cut` job for a captions-only failure; an equally naive
+catch-outside-the-block would leave the `StageEvent`'s `ok` at its default `True` and
+silently lose the one operator-visible signal that the upload actually failed — see
+CLAUDE.md's Key conventions entry on this composition rule, mutation-tested both ways
+during implementation).
+
+The one genuine offset-handling hazard here (`.words`/`.segments` must both stay
+beat-relative at the source, never pre-shifted by a caller-supplied
+`beat_offset_s`, since `_whisper_timestamps()` already adds each beat's cumulative
+start when consuming `.words`) was caught during this feature's own design review
+before any code was written — see the system design doc's "Revision note" and
+CLAUDE.md's Key conventions entry — and is guarded by two dedicated regression tests
+(`tests/test_audio_text_sync.py`), both independently mutation-verified against the
+exact bug the review caught.
+
+**Not done (deliberate scope, see the design doc's non-goals):** VTT export (SRT is
+the only format YouTube's Captions API requires; `srt.py`'s cue data model is
+already format-agnostic if a future consumer needs VTT); Instagram/TikTok caption
+upload (no equivalent API surface in either publisher integration — the `.srt` file
+is still downloadable for every platform's cut, just not auto-attached); editing
+captions in the review UI (this ships the file, not an editor). See
+`docs/specs/2026-09-srt-caption-export-system-design.md` for the full design and its
+explicitly-carried-forward open questions (YouTube Captions API live-verification,
+the narrow finalize-path/mid-publish-crash caption-duplication window).
 
 ### 5e. ~~Insight enrichment for standard LLM path~~ ✅ Done (Phase 3.6)
 

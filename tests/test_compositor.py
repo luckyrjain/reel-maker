@@ -36,6 +36,20 @@ def _mean_abs_amplitude(path) -> float:
     return float(np.abs(data).mean())
 
 
+def _assert_valid_srt_with_cues(path):
+    """A real .srt file: sequential numbering, `-->` timestamp lines, at least one cue.
+    Doesn't assert exact cue text/timing — that depends on real Whisper's transcription
+    of the test's synthesized audio (or the proportional vo_script fallback if Whisper
+    produces no segments for it), either of which is a legitimate "real
+    Whisper-or-fallback timing" outcome per the design."""
+    assert path is not None
+    assert path.exists()
+    content = path.read_text(encoding="utf-8")
+    assert content.strip(), "SRT file was written but is empty"
+    assert "1\n" in content
+    assert " --> " in content
+
+
 def test_composite_cut_preserves_vo_audio(tmp_path):
     vo_path = tmp_path / "beat0.wav"
     sf.write(str(vo_path), np.zeros(24000 * 2, dtype=np.float32), 24000)  # 2s of audio
@@ -48,7 +62,7 @@ def test_composite_cut_preserves_vo_audio(tmp_path):
     out = tmp_path / "out.mp4"
     thumb = tmp_path / "thumb.jpg"
 
-    composite_cut(
+    duration, thumbnail_candidates, subtitle_path = composite_cut(
         beats=[beat],
         beat_video_paths=[[None]],
         beat_vo_paths=[vo_path],
@@ -61,6 +75,10 @@ def test_composite_cut_preserves_vo_audio(tmp_path):
         "rendered video has no audio stream — the VO track builder silently "
         "dropped every beat's audio (see module docstring)"
     )
+    # A beat with non-empty vo_script always produces at least a fallback cue, even
+    # if this synthesized (silent) WAV makes real Whisper return no segments for it.
+    _assert_valid_srt_with_cues(subtitle_path)
+    assert subtitle_path == out.with_suffix(".srt")
 
 
 # ── _write_thumbnail_candidates — no ffmpeg, a fake clip object is enough ───
@@ -193,7 +211,7 @@ def test_composite_cut_mixes_music_under_vo(tmp_path):
     out = tmp_path / "out.mp4"
     thumb = tmp_path / "thumb.jpg"
 
-    composite_cut(
+    duration, thumbnail_candidates, subtitle_path = composite_cut(
         beats=[beat], beat_video_paths=[[None]], beat_vo_paths=[vo_path],
         output_path=out, thumbnail_path=thumb, music_path=music_path,
     )
@@ -203,6 +221,7 @@ def test_composite_cut_mixes_music_under_vo(tmp_path):
     wav_out = tmp_path / "out.wav"
     subprocess.run(["ffmpeg", "-y", "-i", str(out), str(wav_out)], capture_output=True, check=True)
     assert _mean_abs_amplitude(wav_out) > 0.001, "mixed output should not be silent"
+    _assert_valid_srt_with_cues(subtitle_path)
 
 
 def test_composite_cut_mixes_music_with_no_vo(tmp_path):
@@ -213,7 +232,7 @@ def test_composite_cut_mixes_music_with_no_vo(tmp_path):
     out = tmp_path / "out.mp4"
     thumb = tmp_path / "thumb.jpg"
 
-    composite_cut(
+    duration, thumbnail_candidates, subtitle_path = composite_cut(
         beats=[beat], beat_video_paths=[[None]], beat_vo_paths=[None],
         output_path=out, thumbnail_path=thumb, music_path=music_path,
     )
@@ -223,6 +242,9 @@ def test_composite_cut_mixes_music_with_no_vo(tmp_path):
     wav_out = tmp_path / "out.wav"
     subprocess.run(["ffmpeg", "-y", "-i", str(out), str(wav_out)], capture_output=True, check=True)
     assert _mean_abs_amplitude(wav_out) > 0.001, "music-only output should not be silent"
+    # No VO audio and an empty vo_script — nothing to caption anywhere in the fallback
+    # chain either, so subtitle_path must be None (write_srt writes nothing for []).
+    assert subtitle_path is None
 
 
 def test_composite_cut_without_music_path_is_unaffected(tmp_path):
@@ -232,10 +254,11 @@ def test_composite_cut_without_music_path_is_unaffected(tmp_path):
     out = tmp_path / "out.mp4"
     thumb = tmp_path / "thumb.jpg"
 
-    composite_cut(
+    duration, thumbnail_candidates, subtitle_path = composite_cut(
         beats=[beat], beat_video_paths=[[None]], beat_vo_paths=[vo_path],
         output_path=out, thumbnail_path=thumb,
     )
 
     assert out.exists()
     assert _has_audio_stream(out)
+    _assert_valid_srt_with_cues(subtitle_path)

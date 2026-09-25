@@ -200,6 +200,26 @@ def _whisper_timestamps(
     return result
 
 
+def _build_beat_transcripts(beat_vo_paths: list[Path | None]) -> list:
+    """One `transcribe_audio()` call per beat with VO audio — `None` for beats with
+    no/missing audio. Always called at `transcribe_audio()`'s default
+    `beat_offset_s=0.0` for every beat, never a per-beat cumulative offset: this list
+    (via `.words`) feeds `_build_text_filter()` -> `_whisper_timestamps()`, which
+    itself adds each beat's cumulative start time to convert beat-relative ->
+    absolute. Passing a non-zero offset here would double-apply that shift and
+    silently corrupt burned-in-text timing for every beat past the first — see
+    `engine/render/captions.py::TranscriptResult`'s docstring and CLAUDE.md's Key
+    conventions entry for this exact rule. `composite_cut()` also reads `.segments`
+    off this same list to build SRT cues, shifting those itself at that call site
+    (never inside `transcribe_audio()`) for the identical reason.
+    """
+    from engine.render.captions import transcribe_audio
+    return [
+        transcribe_audio(vp) if vp and vp.exists() else None
+        for vp in beat_vo_paths
+    ]
+
+
 _FONT_SIZE = 60
 _TEXT_Y = int(TARGET_H * TEXT_Y_CENTER) - _FONT_SIZE // 2  # single centred line at 73%
 DEFAULT_TEXT_COLOR = "white"
@@ -378,6 +398,43 @@ def _build_ffmpeg_args(
     ]
 
 
+def _proportional_caption_cues(vo_script: str, duration: float) -> list:
+    """Fallback per-beat SRT cues when a beat's Whisper `.segments` came back empty
+    (Whisper not installed, or the beat has no VO audio at all). Reuses the exact
+    same proportional word-count-based timing technique `_build_text_filter()`
+    already uses for its own no-Whisper fallback (`re.split(r"[.!?—]+", vo)`) — not a
+    second implementation — applied to every VO sentence rather than only the
+    (5-line-capped) `on_screen_text` summary: a real caption track should cover the
+    full VO, not a truncated highlight reel of it (see
+    docs/specs/2026-09-srt-caption-export-system-design.md §3.2). Returns
+    beat-relative `CaptionSegment` cues — the caller shifts to absolute time.
+    """
+    import re as _re
+
+    from engine.render.captions import CaptionSegment
+
+    sentences = [s.strip() for s in _re.split(r"[.!?—]+", vo_script or "") if s.strip()]
+    if not sentences:
+        return []
+
+    word_counts = [len(s.split()) for s in sentences]
+    total_words = sum(word_counts) or len(sentences)
+
+    cues: list[CaptionSegment] = []
+    t = 0.0
+    for sentence, wc in zip(sentences, word_counts):
+        seg = max(0.3, duration * wc / total_words)
+        seg_end = min(t + seg, duration)
+        if t < duration:
+            cues.append(CaptionSegment(text=sentence, start_s=t, end_s=seg_end))
+        t += seg
+        if t >= duration:
+            break
+    if cues:
+        cues[-1].end_s = duration
+    return cues
+
+
 # Extra candidate timestamps as fractions of total duration, sampled alongside the
 # original ~0.5s-in frame (kept first/unchanged so a caller that only reads
 # thumbnail_candidates[0] sees exactly the old single-frame behavior).
@@ -409,10 +466,12 @@ def composite_cut(
     thumbnail_path: Path,
     music_path: Path | None = None,
     text_color: str = DEFAULT_TEXT_COLOR,
-) -> tuple[float, list[Path]]:
+) -> tuple[float, list[Path], Path | None]:
     """
     Assemble beats into a single 9:16 MP4.
-    Returns (total duration in seconds, thumbnail candidate paths — [0] is thumbnail_path itself).
+    Returns (total duration in seconds, thumbnail candidate paths — [0] is
+    thumbnail_path itself, subtitle .srt path or None if there was nothing to
+    caption — e.g. every beat's vo_script is empty, as in silent voiceover_mode).
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     thumbnail_path.parent.mkdir(parents=True, exist_ok=True)
@@ -466,12 +525,12 @@ def composite_cut(
         )
         total_duration = float(final.duration)
 
-        # Attempt Whisper transcription per beat for word-level text timing.
-        # Falls back to proportional timing if Whisper is not installed.
-        from engine.render.captions import transcribe_audio
+        # Attempt Whisper transcription per beat — one call serves both the
+        # burned-in-text timing below (.words) and the SRT cues built after it
+        # (.segments). Falls back to proportional timing if Whisper is not installed.
+        transcripts = _build_beat_transcripts(beat_vo_paths)
         beat_transcripts: list[list | None] = [
-            (transcribe_audio(vp) or None) if vp and vp.exists() else None
-            for vp in beat_vo_paths
+            (tr.words or None) if tr else None for tr in transcripts
         ]
         text_filter = _build_text_filter(beats, beat_durations, beat_transcripts, text_color)
         # Write to a temp path first; atomic replace so a killed process never
@@ -490,6 +549,40 @@ def composite_cut(
                 + result.stderr.decode(errors="replace")
             )
         os.replace(tmp_path, output_path)
+
+        # Build SRT cues from the same Whisper pass: each beat's .segments (or, when
+        # Whisper produced none for that beat — not installed, or the beat has no VO
+        # audio — the same proportional vo_script-sentence-split fallback
+        # _build_text_filter() already uses above) shifted from beat-relative to the
+        # reel's absolute timeline via an EXPLICIT running sum over beat_durations.
+        # This deliberately does NOT reuse the `t` loop variable from the first loop
+        # above — that loop has already run to completion by this point and `t` holds
+        # only the reel's final total duration, not a per-beat cumulative offset.
+        # This mirrors exactly what _whisper_timestamps() already does for .words,
+        # just performed here instead of inside transcribe_audio() — see
+        # engine/render/captions.py::TranscriptResult's docstring and CLAUDE.md's Key
+        # conventions entry for this offset-handling rule.
+        from engine.render import srt as srt_writer
+        from engine.render.captions import CaptionSegment
+
+        srt_cues: list[CaptionSegment] = []
+        cue_offset = 0.0
+        for bi, (beat, duration) in enumerate(zip(beats, beat_durations)):
+            tr = transcripts[bi] if bi < len(transcripts) else None
+            beat_segments = tr.segments if tr else []
+            if not beat_segments:
+                beat_segments = _proportional_caption_cues(beat.get("vo_script", ""), duration)
+            for cue in beat_segments:
+                srt_cues.append(
+                    CaptionSegment(
+                        text=cue.text,
+                        start_s=cue_offset + cue.start_s,
+                        end_s=cue_offset + cue.end_s,
+                    )
+                )
+            cue_offset += duration
+
+        subtitle_path = srt_writer.write_srt(srt_cues, output_path.with_suffix(".srt"))
     finally:
         notxt_path.unlink(missing_ok=True)
         # Each AudioFileClip holds an open ffmpeg reader; without this a long
@@ -507,4 +600,4 @@ def composite_cut(
         except Exception:
             pass
 
-    return total_duration, thumbnail_candidates
+    return total_duration, thumbnail_candidates, subtitle_path

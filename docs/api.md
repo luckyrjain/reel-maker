@@ -172,6 +172,22 @@ Stream the rendered MP4 file.
 
 ---
 
+### `GET /api/cuts/{cut_id}/subtitles`
+
+Stream the SRT caption file `composite_cut()` writes alongside the MP4 (word-level
+Whisper transcription, or the proportional vo_script-sentence-split fallback when
+Whisper isn't installed). Same path-traversal guard as `GET /api/cuts/{cut_id}/video`
+and `GET /api/cuts/{cut_id}/thumbnail/{index}` — the resolved path must fall under
+`VIDEO_STORE_DIR`.
+
+**Response:** `application/x-subrip` — `FileResponse` with `Content-Disposition: attachment` header.
+
+**Errors:**
+- `404` — cut not found or `subtitle_path` unset (not yet rendered under this feature, or the render produced no captionable content — e.g. silent voiceover_mode)
+- `403` — resolved path falls outside `VIDEO_STORE_DIR`
+
+---
+
 ## UI routes (not prefixed with `/api`)
 
 ### `GET /`

@@ -6,15 +6,21 @@ Reel videos are short (well under YouTube's resumable-upload chunk-size concerns
 so this does a single init-then-PUT rather than true multi-chunk resuming — the
 two-step protocol is still followed, just with one upload request instead of many.
 """
+import json
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
 
 from api.oauth import get_oauth_provider
+from engine.observability import record_stage
 from engine.publish.base import Publisher, PublishResult
 
+_log = logging.getLogger(__name__)
+
 _UPLOAD_URL = "https://www.googleapis.com/upload/youtube/v3/videos"
+_CAPTIONS_UPLOAD_URL = "https://www.googleapis.com/upload/youtube/v3/captions"
 
 
 def get_valid_access_token(credential, db) -> str:
@@ -38,6 +44,40 @@ def get_valid_access_token(credential, db) -> str:
         )
         db.commit()
     return credential.token_blob
+
+
+def _upload_captions(video_id: str, subtitle_path: str, access_token: str) -> None:
+    """POST an SRT file to YouTube's captions.insert API for an already-uploaded
+    video. Raises on any HTTP/network failure — the caller (YouTubePublisher.publish)
+    is responsible for treating this as best-effort and never letting it fail the
+    publish job; see that call site's record_stage() wrapper.
+
+    Assumption flagged, not live-verified as of this implementation (see
+    docs/specs/2026-09-srt-caption-export-system-design.md §3.3/§9.2): YouTube's
+    Captions API is documented to accept raw SRT bytes as the media part with the
+    format auto-detected from content. One real call against a real connected
+    account is still needed before fully trusting this in production.
+    """
+    srt_bytes = Path(subtitle_path).read_bytes()
+    snippet = {
+        "snippet": {
+            "videoId": video_id,
+            "language": "en",
+            "name": "",
+            "isDraft": False,
+        }
+    }
+    resp = httpx.post(
+        _CAPTIONS_UPLOAD_URL,
+        params={"uploadType": "multipart", "part": "snippet"},
+        headers={"Authorization": f"Bearer {access_token}"},
+        files={
+            "snippet": (None, json.dumps(snippet), "application/json; charset=UTF-8"),
+            "file": (Path(subtitle_path).name, srt_bytes, "application/octet-stream"),
+        },
+        timeout=30.0,
+    )
+    resp.raise_for_status()
 
 
 class YouTubePublisher(Publisher):
@@ -91,6 +131,32 @@ class YouTubePublisher(Publisher):
         )
         upload_resp.raise_for_status()
         video_id = upload_resp.json()["id"]
+
+        # Best-effort captions upload — the video is already live by this point.
+        # MUST NOT fail this method: a captions-only failure must never surface as
+        # "publish failed" for a post that, in fact, succeeded. record_stage() sets
+        # ev.ok=False and commits a StageEvent on an exception raised inside its
+        # `with` block, but then RE-RAISES — so the try/except goes INSIDE the
+        # block and explicitly sets ev.ok/ev.detail on failure, rather than
+        # wrapping the call with no inner try/except (which would let the
+        # re-raise propagate and fail this publish) or catching outside the block
+        # without touching ev (which would silently record a failed upload as the
+        # default ok=True). See CLAUDE.md's Key conventions entry on this
+        # record_stage composition rule and
+        # docs/specs/2026-09-srt-caption-export-system-design.md §7.
+        if cut.subtitle_path:
+            with record_stage(
+                db, cut.reel_id, "captions_upload", cut_id=cut.id, provider="youtube"
+            ) as ev:
+                try:
+                    _upload_captions(video_id, cut.subtitle_path, access_token)
+                except Exception as exc:
+                    ev.ok = False
+                    ev.detail["error"] = repr(exc)
+                    _log.exception(
+                        "caption upload failed for cut %s (video is live, video_id=%s)",
+                        cut.id, video_id,
+                    )
 
         return PublishResult(
             platform_post_id=video_id,

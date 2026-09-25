@@ -108,6 +108,12 @@ class Cut(Base):
     # asset_sourcer visibility item — this is operator-visible so a black-frame reel
     # doesn't silently report `done`.
     black_frame_beat_indices = Column(JSON)
+    # Path to the SRT caption file written alongside the MP4 by composite_cut(), or None
+    # when there was nothing to caption (e.g. silent voiceover_mode) or the cut predates
+    # this feature. Written by render_cut; a re-render replaces it wholesale, same policy
+    # as thumbnail_candidates/video_path/black_frame_beat_indices. See
+    # engine/render/srt.py and docs/roadmap.md Phase 5 item 5d.
+    subtitle_path = Column(String(500))
     duration_s = Column(Float)
     status = Column(SAEnum(CutStatus), default=CutStatus.draft, nullable=False)
     published_at = Column(DateTime(timezone=True))

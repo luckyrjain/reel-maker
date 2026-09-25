@@ -159,6 +159,9 @@
     <p style="font-size:0.8rem;color:#6b7280;margin-top:6px;">
       {{ "%.1f" | format(cut.duration_s or 0) }}s ·
       <a href="/api/cuts/{{ cut.id }}/video" download style="color:#6366f1;">Download MP4</a>
+      {% if cut.subtitle_path %}
+      · <a href="/api/cuts/{{ cut.id }}/subtitles" download style="color:#6366f1;">Download captions (.srt)</a>
+      {% endif %}
     </p>
     {% endif %}
 

@@ -47,7 +47,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 651 tests across 30+ files, default run (4 test_compositor tests need ffmpeg
+.venv/bin/pytest                            # 674 tests across 30+ files, default run (4 test_compositor tests need ffmpeg
                                              # on PATH; 1 kokoro voice test skips without the kokoro package; 1 golden-reel
                                              # test is deselected by default — see below)
 .venv/bin/pytest -m golden                  # the golden-reel smoke test (real edge-tts + real ffmpeg, ~20s, needs network)
@@ -123,7 +123,9 @@ api/
     jobs.py           GET /api/jobs/{id} (JSON + HTML fragment)
     cuts.py           POST /render, PATCH, POST /approve, POST /publish, render-status,
                       publish-status, video stream, thumbnail stream + POST /thumbnail
-                      (choose a candidate), POST /hook-variant (swap the hook beat's vo_script)
+                      (choose a candidate), POST /hook-variant (swap the hook beat's vo_script),
+                      GET /subtitles (SRT caption file, same path-traversal guard as the video/
+                      thumbnail streams — Phase 5d)
     credentials.py    GET /api/credentials (connect/disconnect UI), GET /{provider}/authorize,
                       GET /{provider}/callback, POST /{provider}/disconnect
     insights.py       GET /api/insights (quality↔engagement correlation + top/bottom performer
@@ -157,7 +159,10 @@ worker/
                       tracks which beats' resolve_or_reuse() call returned no real media at all
                       ([(None, None)], resolve_beat_assets()'s "nothing found anywhere in the
                       chain" sentinel) and writes the list to cut.black_frame_beat_indices
-                      (Phase 7a) — a re-render replaces it wholesale, same as thumbnail_candidates
+                      (Phase 7a) — a re-render replaces it wholesale, same as thumbnail_candidates;
+                      unpacks composite_cut()'s 3rd return value onto cut.subtitle_path (Phase 5d),
+                      None when the render produced nothing to caption — same wholesale-replace
+                      policy
     publish.py        publish_cut(job_id) — safe_to_publish gate, builds caption via
                       build_published_caption() (appends attribution block), dispatches to
                       engine/publish/registry.py, commits platform_post_id the moment the post is
@@ -234,9 +239,24 @@ engine/
                       asset-generation cost, mirrors engine/generation/pricing.py's honesty policy
                       (0.0 until the operator sets a real per-unit price)
     tts.py            EdgeTTSProvider.synthesize() + .synth_to_budget(); _audio_duration() helper
-    captions.py       transcribe_audio() — Whisper word-level timestamps; no-op if not installed
+    captions.py       transcribe_audio() -> TranscriptResult (Phase 5d, was a bare
+                      list[CaptionSegment]) — one Whisper model.transcribe() call now serves both
+                      .words (existing shape/values, byte-identical, still beat-relative) and
+                      .segments (new — one CaptionSegment per Whisper segment, full sentence text)
+                      so a render doesn't pay for transcription twice; no-op (empty
+                      TranscriptResult) if openai-whisper isn't installed. beat_offset_s keeps its
+                      pre-existing beat-relative meaning for BOTH fields — see this file's Key
+                      conventions entry on offset handling, this is the single most safety-critical
+                      rule in this module
+    srt.py            write_srt(cues, path) -> Path | None (Phase 5d, new module) — pure
+                      list[CaptionSegment] -> .srt formatter (sequential numbering, HH:MM:SS,mmm
+                      timestamps), no ffmpeg/network; None (writes nothing) for empty cues, same
+                      "degrade gracefully" posture as the rest of this package. Input is already
+                      shifted to the reel's absolute timeline by the caller (compositor.py) — this
+                      module does no offset math of its own
     compositor.py     composite_cut() — MoviePy stage + FFmpeg drawtext stage; returns
-                      (duration, thumbnail_candidates) — _write_thumbnail_candidates() samples 4 frames
+                      (duration, thumbnail_candidates, subtitle_path) — a 3-tuple as of Phase 5d,
+                      was a 2-tuple. _write_thumbnail_candidates() samples 4 frames
                       across the reel (the original ~0.5s-in frame first, at thumbnail_path itself, plus
                       3 more at thumbnail_path's stem + `_1`/`_2`/`_3`) so a caller that only reads
                       candidates[0] sees the exact pre-existing single-frame behavior;
@@ -247,7 +267,16 @@ engine/
                       string, since unlike the text content it is NOT run through _escape_drawtext();
                       accepts music_path — _build_ffmpeg_args() adds a sidechain-ducked (VO present) or
                       plain-volume (no VO) music mix, always atrim'd to the render's total_duration;
-                      atomic final write via os.replace()
+                      atomic final write via os.replace(); _build_beat_transcripts() (Phase 5d) is the
+                      one call site for transcribe_audio(), always at its default beat_offset_s=0.0 —
+                      see this file's Key conventions entry, this is a mutation-tested regression
+                      guard, not just a docstring claim; after the MP4 write, builds SRT cues from
+                      each beat's TranscriptResult.segments (falling back to
+                      _proportional_caption_cues() — the same vo_script-sentence-split regex
+                      _build_text_filter()'s own no-Whisper fallback already uses — when a beat's
+                      .segments came back empty), shifts them to the reel's absolute timeline via an
+                      explicit running sum over beat_durations (NOT the first loop's `t`, which has
+                      already run to completion by that point), and calls srt.write_srt()
   publish/
     base.py           Publisher interface + PublishResult dataclass; publish() takes an explicit
                       caption: str param (not cut.caption) so attribution text can be injected
@@ -271,7 +300,15 @@ engine/
                       httpx.HTTPStatusError.__str__() → job.error/logs)
     youtube.py        YouTubePublisher — resumable upload (init POST + PUT); get_valid_access_token()
                       (module-level, shared with YouTubeMetricsFetcher) refreshes an expired access
-                      token via the stored refresh_token first
+                      token via the stored refresh_token first; after a successful upload, if
+                      cut.subtitle_path is set, one best-effort POST to captions.insert
+                      (_upload_captions() — multipart JSON snippet + .srt media part) (Phase 5d) —
+                      wrapped in record_stage(..., "captions_upload", ...) with the try/except
+                      placed INSIDE the with block so a failure never fails publish_cut but still
+                      lands as a real ok=False StageEvent; see this file's Key conventions entry on
+                      this record_stage composition rule, mutation-tested both wrong ways during
+                      implementation. YouTube's Captions API accepting raw SRT bytes as documented
+                      is a design-flagged assumption, not yet live-verified against a real account
     instagram.py      InstagramPublisher — container create/poll/publish (Reels). Requires
                       settings.public_base_url to be a real public HTTPS URL — Instagram
                       fetches the video itself, it does not accept an upload body
@@ -290,6 +327,7 @@ migrations/
     0008_tts_voice.py   Reel.tts_voice column
     0009_text_color.py  Reel.text_color column
     0010_black_frame_visibility.py  Cut.black_frame_beat_indices column
+    0011_subtitle_caption_export.py  Cut.subtitle_path column
 
 tests/
   test_evaluator.py           41 tests — all 17 evaluator axes + helpers, multi-platform dedupe,
@@ -311,7 +349,15 @@ tests/
   test_script_parser.py       11 tests — parse() routing, beat splitting, _derive_on_screen
   test_state.py               11 tests — REEL_TRANSITIONS, CUT_TRANSITIONS, invalid moves
   test_enrichment.py          15 tests — coerce_beat_type, _enrich_batch response parsing, topic fence
-  test_audio_text_sync.py     11 tests — clean_guide() regeneration, _build_text_filter() proportional timing + whisper fallback, PATCH re-derivation, visual direction anchoring
+  test_audio_text_sync.py     16 tests — clean_guide() regeneration, _build_text_filter() proportional timing + whisper fallback, PATCH re-derivation, visual direction anchoring;
+                              TranscriptResult (Phase 5d) — .words/.segments derived from one transcribe() call, beat_offset_s shifts
+                              both fields identically, empty-without-whisper degrade; offset-handling regression guard —
+                              _build_beat_transcripts() never passes a non-zero per-beat offset into transcribe_audio() (mutation-
+                              tested against the exact double-shift bug the design review caught) and a companion numeric-value
+                              test confirming _whisper_timestamps() output for a multi-beat reel is not doubled
+  test_srt.py                  8 tests — write_srt() (Phase 5d): timestamp formatting incl. hour-boundary and
+                              millisecond-rounding, sequential numbering, empty-cues returns None with no file written,
+                              multi-cue/multi-beat concatenation with pre-shifted absolute offsets, parent-dir creation
   test_context_enricher.py    13 tests — evaluate_context axes, llm_enrich
   test_enrich_context_task.py 14 tests — enrichment gating, LLM failure fallback, structured script guard, missing reel, owner rollback wiring, orphan generate-job cleanup (only when it claimed the orphan)
   test_maintenance.py         40 tests — reaper on in-memory SQLite: per-job-type owner rollback, stale running/pending jobs, per-job-type pending thresholds, healthy jobs untouched, updated_at keying, compare-and-set back-off, status pin = SELECT snapshot, one bad job doesn't stop the rest, done-orphan sweep (lost after_commit_failed fail-stamp) per job type, existing-error/freshness exclusions
@@ -327,12 +373,20 @@ tests/
   test_job_lifecycle.py      122 tests — job_task on dummy tasks (in-memory SQLite): atomic claim/race, fenced done-stamp and heartbeat (JobLost), heartbeat thread (survives DB blips, never touches a reaped job, stops at max_runtime_s, never outlives the task), prepare-before-attempts, retry/backoff, refused retry (Reject, incl. an unclaimed job), failure stamp (NUL/surrogates/[parameters]/DETAIL/CONTEXT redacted incl. multi-line, reaped job, masked errors, discarded half-writes), DB errors, fail-fast on shutdown/hard-kill, dead-connection recovery in the terminal failure recorders (incl. InterfaceError, fresh-session close on both a successful and a failed retry attempt), per-job-type owner rollback (fresh state), after_commit + cleanup hook (incl. a shutdown during the hook itself, a hook that itself raises without discarding the failure stamp, and a multi-write hook rolling back atomically via its own SAVEPOINT), `.delay` signature regression, per-task job_type/max_retries/runtime wiring, beat-task routing, pool_pre_ping
   test_r3_proposed.py         38 tests — regressions found by round-3 mutation testing: distinct job/reel/cut ids so an id mix-up can't hide, transaction-visibility checks via a second connection, _error_text regex boundaries, refused-retry/reaped-job edge cases, template hx-post assertions, per-type pending thresholds
   test_r4_gaps.py             30 tests — regressions found by round-4 mutation testing: heartbeat commit visibility, failure-path rollback of flushed rows, commit-failure-at-done-stamp is not "done", after_commit cleanup without a hook, pool_pre_ping, task signature
-  test_tasks_real_db.py       4 tests — real tasks through job_task on SQLite: post id durable after a post-upload failure, built caption sent, enrich enqueues the real job id
+  test_tasks_real_db.py       7 tests — real tasks through job_task on SQLite: post id durable after a post-upload failure, built caption sent, enrich enqueues the real job id;
+                              YouTube captions-upload best-effort behavior (Phase 5d, real DB — this is the row a mocked
+                              db can't give you) — a forced captions.insert failure does not fail publish_cut or affect
+                              platform_post_id/published_at AND produces a real StageEvent(stage="captions_upload",
+                              ok=False, detail.error=...) row (mutation-tested against both wrong-composition bugs:
+                              no inner try/except propagating the failure, and catching without setting ev.ok); success
+                              path records ok=True; no subtitle_path means no captions_upload attempt or StageEvent at all
   test_generate_task.py       11 tests — missing reel, reel not generating, paid-call budget, structured-path fallback (incl. a soft-limit kill), music_cue default, caption/hashtags does not swallow a runtime-limit timeout;
                               2 regression tests (mutation-tested against the naive/buggy version first):
                               seeded PerformanceNotes survive past attempt 1 on retry (the retry-replace bug),
                               structured-path success doesn't NameError on performance_note_ids (the wrong-branch-query bug)
-  test_render_task.py          11 tests — missing cut, already-posted cut refused, success clears stale error, music wiring, reel.tts_voice/text_color threaded into get_tts_provider()/composite_cut(), black_frame_beat_indices flagged when a beat resolves no real media and stays None when every beat does
+  test_render_task.py          13 tests — missing cut, already-posted cut refused, success clears stale error, music wiring, reel.tts_voice/text_color threaded into get_tts_provider()/composite_cut(), black_frame_beat_indices flagged when a beat resolves no real media and stays None when every beat does;
+                              subtitle_path (Phase 5d) — populated from composite_cut()'s 3rd return value on a successful
+                              render, reset to None (not left stale) on a re-render that produces zero cues
   test_hook_variants.py        9 tests — generate_hook_variants(): JSON-list/dict-wrapped parsing, excludes a variant identical to the original, caps at N_VARIANTS, empty hook skips the LLM call, malformed JSON/non-list/non-string items/provider exception all degrade to []
   test_asset_sourcer.py        7 tests — resolve_or_reuse pin, reuse, re-pin, beat isolation, commits (no open transaction on either resolve or reuse path), Wikipedia names all searched before any asset is flushed
   test_asset_sourcer_cost.py   9 tests — HF cost StageEvents charged only on real generation, not cache hits
@@ -366,18 +420,26 @@ tests/
   test_publish_task.py        10 tests — publish_cut safety gate (publisher never reached, also on the finalize path), no auto-retry, post id committed early, re-run finalizes without re-upload, attribution caption
   test_publish_registry.py     7 tests — platform→publisher, platform→credential-provider, platform→metrics-fetcher mapping
   test_cuts_publish_router.py 22 tests — POST /cuts/{id}/publish state-guard and enqueue; render refused for an already-posted cut; enqueue failure fails fast (503) and frees the cut; row lock (incl. update_cut reads its body before locking); failed-cut card
-  test_youtube_publisher.py    6 tests — resumable upload flow, token refresh, whitespace-caption fallback
+  test_youtube_publisher.py    6 tests — resumable upload flow, token refresh, whitespace-caption fallback (best-effort
+                              captions-upload StageEvent coverage lives in test_tasks_real_db.py, which needs a real DB
+                              row to assert on — see below)
   test_instagram_publisher.py  7 tests — container create/poll/publish flow, error paths, token-in-header regression
   test_attribution.py          8 tests — build_attribution_block dedup/formatting, build_published_caption
   test_metrics_fetcher.py      6 tests — YouTube/Instagram metrics parsing, token-in-header regression
   test_metrics_task.py         6 tests — pull_publish_metrics fetcher/credential skip paths, per-cut failure isolation
-  test_compositor.py           14 tests — _build_ffmpeg_args no-music/sidechain/no-VO branches, real ffmpeg music-mixing end-to-end (4 of these need ffmpeg on PATH), _write_thumbnail_candidates (no ffmpeg — a fake clip object) covering first-candidate-is-original-path, distinct sibling files, short-clip clamping; _build_text_filter text_color — default, a curated color, an uncurated value falling back to default, a filter-graph-injection attempt rejected
+  test_compositor.py           14 tests — _build_ffmpeg_args no-music/sidechain/no-VO branches, real ffmpeg music-mixing end-to-end (4 of these need ffmpeg on PATH), _write_thumbnail_candidates (no ffmpeg — a fake clip object) covering first-candidate-is-original-path, distinct sibling files, short-clip clamping; _build_text_filter text_color — default, a curated color, an uncurated value falling back to default, a filter-graph-injection attempt rejected;
+                              the 4 real-ffmpeg composite_cut() tests also assert a real .srt file is produced with real
+                              Whisper-or-fallback timing (Phase 5d) — the no-VO/no-vo_script case asserts subtitle_path
+                              is None instead (nothing anywhere in the fallback chain to caption)
   test_golden_reel.py          1 test (marked `golden`, deselected by default — see Commands) — real edge-tts synthesis
                               + real ffmpeg composite_cut(), no mocks anywhere in the chain; asserts real video+audio
                               streams at the correct dimensions; mutation-verified against the real historical
                               zero-audio bug (reintroduced .audio_fadein()/.audio_fadeout(), confirmed this test fails
                               with the same error the live incident produced, restored the fix)
-  test_variants_router.py      11 tests — POST /cuts/{id}/hook-variant (swap + rederive on_screen_text, wrong status, out-of-range index, no variants), POST /cuts/{id}/thumbnail (choose, wrong status, out-of-range, no candidates), GET /cuts/{id}/thumbnail/{index} (serves file, 404 out-of-range, 403 outside VIDEO_STORE_DIR)
+  test_variants_router.py      15 tests — POST /cuts/{id}/hook-variant (swap + rederive on_screen_text, wrong status, out-of-range index, no variants), POST /cuts/{id}/thumbnail (choose, wrong status, out-of-range, no candidates), GET /cuts/{id}/thumbnail/{index} (serves file, 404 out-of-range, 403 outside VIDEO_STORE_DIR);
+                              GET /cuts/{id}/subtitles (Phase 5d) — serves the .srt file with the correct Content-Type,
+                              404 when subtitle_path is unset or the cut doesn't exist, 403 outside VIDEO_STORE_DIR
+                              (same path-traversal guard as stream_video/stream_thumbnail)
 
 ui/templates/
   index.html          Context-entry form; niche/platform picker + target_length + voiceover_mode +
@@ -395,7 +457,9 @@ ui/templates/
   fragments/
     cut_card.html     Full cut card; read-only or editable (in_review); render/approve/publish actions
                       per CutStatus branch; published branch shows views/likes/comments once
-                      metrics_updated_at is set, else a "checked every 6h" hint
+                      metrics_updated_at is set, else a "checked every 6h" hint; "Download captions
+                      (.srt)" link next to the MP4 download, visible whenever cut.subtitle_path is
+                      set (Phase 5d) — not gated to in_review, same visibility as the video download
     render_status.html   Polling fragment; video + Approve/Re-render when done
     publish_status.html  Polling fragment (id="publish-status-{cut.id}", distinct from its parent
                       "publish-section-{cut.id}" target — do not reuse the parent's id, that
@@ -418,7 +482,7 @@ docs/
 ## Data model
 
 - `reels` — master concept; `status` tracks generation phase; `tts_voice` (nullable) is a per-reel edge-tts voice override, `None` = provider default; `text_color` (nullable) is a per-reel on-screen text color override, `None` = `"white"` (see Key conventions for both — `text_color` in particular is validated as a filter-injection guard, not just a UX curation)
-- `cuts` — one row per platform (`youtube_shorts`, `instagram_reels`, or `tiktok`); holds `guide` (JSONB), `caption`, `hashtags`, `video_path`, `thumbnail_path`, `thumbnail_candidates` (JSON list of every frame `render_cut` sampled — `thumbnail_path` is whichever one is currently chosen, `[0]` by default), `hook_variants` (JSON list of alternate hook-beat lines generated once per guide, `None` if generation failed or the paid-call budget was already spent), `black_frame_beat_indices` (JSON list of 0-indexed beats that got no real media anywhere in the asset-sourcer fallback chain and rendered as a black frame; `None` when every beat resolved something — Phase 7a operator visibility, see Key conventions), `platform_post_id`, `published_at`, `views`, `likes`, `comments`, `metrics_updated_at` (last three populated by `pull_publish_metrics()`, `None` until the first successful pull)
+- `cuts` — one row per platform (`youtube_shorts`, `instagram_reels`, or `tiktok`); holds `guide` (JSONB), `caption`, `hashtags`, `video_path`, `thumbnail_path`, `thumbnail_candidates` (JSON list of every frame `render_cut` sampled — `thumbnail_path` is whichever one is currently chosen, `[0]` by default), `hook_variants` (JSON list of alternate hook-beat lines generated once per guide, `None` if generation failed or the paid-call budget was already spent), `black_frame_beat_indices` (JSON list of 0-indexed beats that got no real media anywhere in the asset-sourcer fallback chain and rendered as a black frame; `None` when every beat resolved something — Phase 7a operator visibility, see Key conventions), `subtitle_path` (path to the SRT caption file `composite_cut()` writes alongside the MP4; `None` when the render produced nothing to caption, e.g. silent `voiceover_mode` — Phase 5d, replaced wholesale on re-render like the other render-artifact columns above), `platform_post_id`, `published_at`, `views`, `likes`, `comments`, `metrics_updated_at` (last three populated by `pull_publish_metrics()`, `None` until the first successful pull)
 - `assets` — cached media files; deduplicated by `(source, source_ref)`; `source` is `pexels`, `wikipedia`, `huggingface`, or `huggingface_video`; `type` is `footage` or `photo`; includes `license_url`, `attribution`, `safe_to_publish`. HF-generated assets are `safe_to_publish=True`.
 - `cut_assets` — per-beat asset binding ledger; `beat_index` + `order_in_beat` identify position; `resolved_from` is `sha256(visual_direction)[:16]` for change detection; unique constraint on `(cut_id, beat_index, order_in_beat)`; `start_s`/`end_s` updated after TTS measurement
 - `jobs` — every async operation (`enrich`, `generate`, `render`, `publish`); includes `started_at`, `heartbeat_at`, `meta` (JSON — stores `generation_path`, `path`, `stub_count`, `quality_score` on success, and optionally `structured_score`/`structured_fallback` when structured path fell back to standard, and `performance_note_ids` — the active `PerformanceNote` ids at the time of this generate run, written by the same shared `job.meta` line as `quality_score`); `error` is `None` on success, set to exception message on failure only
@@ -473,7 +537,9 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 - **Audio fade in compositor**: `composite_cut()` applies `.with_effects([AudioFadeIn(0.12), AudioFadeOut(0.12)])` to each beat's `AudioFileClip`. Order: subclip if too long → fade → `.with_start(t)`. Fade before `with_start` is required — fades compute against the clip's own timeline, not the composite. `AudioFileClip` has no `.audio_fadein()`/`.audio_fadeout()` methods in MoviePy 2.x — fades are effects, not chainable methods. The exception from calling the non-existent methods was caught by a bare `except Exception: pass` around the VO track builder, so this shipped for months rendering every video with zero audio before a live end-to-end run caught it; the handler now logs via `_log.exception()` instead of swallowing silently.
 - **Topic fence in enrichment prompts**: `_enrich_batch()` and `_make_conflict_stub()` include an explicit "Do not introduce matches, tournaments, scorelines, or players not mentioned in the beat/context" constraint. Prevents LLM from drifting into unrelated events.
 - **Visual direction prompt anchoring**: `build_visuals_messages()` system prompt instructs the LLM to derive `visual_direction` ONLY from the specific players, actions, and events named in that beat's VO — not from the global context.
-- **Video streaming path guard**: `stream_video` validates `cut.video_path` is under `VIDEO_STORE_DIR` via `Path.resolve().is_relative_to()` before serving — never bypass this. `stream_thumbnail` applies the identical guard to `cut.thumbnail_candidates[index]`.
+- **Video streaming path guard**: `stream_video` validates `cut.video_path` is under `VIDEO_STORE_DIR` via `Path.resolve().is_relative_to()` before serving — never bypass this. `stream_thumbnail` applies the identical guard to `cut.thumbnail_candidates[index]`, and `stream_subtitles` (Phase 5d) applies the identical guard to `cut.subtitle_path`.
+- **Caption/subtitle offset handling — `.words`/`.segments` must both stay beat-relative at the source, always** (Phase 5d): `engine/render/captions.py::transcribe_audio()` returns a `TranscriptResult` with `.words` (the pre-existing burned-in-text input) and `.segments` (new, feeds SRT export) from one Whisper pass. Both fields are computed with `beat_offset_s` staying at its default `0.0` — `engine/render/compositor.py::_build_beat_transcripts()` is the one call site and never passes a non-zero value. Why this matters: `compositor.py::_whisper_timestamps()` already adds each beat's cumulative start time to `.words` to convert beat-relative → absolute for the drawtext overlay. If a caller pre-shifted `.words` (or `.segments`) by passing a non-zero `beat_offset_s` into `transcribe_audio()`, that addition would double-apply and silently corrupt caption timing for every beat past the first — a real bug the first draft of this feature's design introduced and an adversarial design review caught before any code was written (see `docs/specs/2026-09-srt-caption-export-system-design.md` §2's "Revision note"). `composite_cut()` instead shifts `.segments` to the reel's absolute timeline itself, at the SRT-cue-building call site, via an **explicit running sum over `beat_durations`** — deliberately not the first loop's `t` variable, which has already run to completion (and holds only the reel's total duration) by the time that step runs. Two dedicated, independently mutation-tested regression tests guard this in `tests/test_audio_text_sync.py`: one asserts `transcribe_audio()` is always called with `beat_offset_s=0.0` for every beat, the other re-derives that `_whisper_timestamps()`'s resulting absolute times for a multi-beat reel are not doubled.
+- **`record_stage()` composition for a "never fail the job, but still tell the truth" side effect** (Phase 5d, `engine/publish/youtube.py::YouTubePublisher.publish()`'s best-effort captions upload is the concrete example — generalize this pattern to any future best-effort step wrapped in `record_stage`): `engine/observability.py::record_stage()` does **not** swallow exceptions — it sets `ev.ok = False` and commits a `StageEvent` on an exception raised inside its `with` block, but then **re-raises**. A step that must never fail its enclosing job (the video is already live; a captions-only failure surfacing as "publish failed" would be actively wrong) cannot simply wrap the risky call in `record_stage(...)` with no inner handling — the re-raise would still fail the job. It also cannot catch the exception *outside* the `with` block, or *inside* it without touching `ev` — either way leaves `ev.ok` at its default `True`, silently recording a failed call as successful and losing the only operator-visible signal that it didn't happen. The one composition that satisfies both requirements: put the `try`/`except` **inside** the `with record_stage(...) as ev:` block, and on exception explicitly set `ev.ok = False` and `ev.detail["error"] = repr(exc)` before letting the function return normally. Both wrong compositions were mutation-tested during implementation (temporarily reintroduced, confirmed the dedicated `ok=False`-assertion test in `tests/test_tasks_real_db.py` fails for each, then reverted) — this is not a hypothetical concern, it's the design's own documented "must-fix" finding from its adversarial review pass.
 - **Hook variants and thumbnail candidates are generated once per reel/render, not tunable per request**: `generate_hook_variants()` runs a single best-effort call after the guide already cleared the quality gate — it never fails the generate job, and the same variant list is copied onto every cut of the reel (platform guides normally share identical beats). `render_cut` always writes all 4 thumbnail candidates; there's no config to change the count or sample points other than editing `engine/render/compositor.py::_THUMBNAIL_CANDIDATE_FRACTIONS`. Both `POST /cuts/{id}/hook-variant` and `POST /cuts/{id}/thumbnail` are gated to `in_review` only, same as the PATCH beat-edit endpoint — a re-render replaces `thumbnail_candidates` wholesale (any prior operator pick is lost, same as `video_path`).
 - **safe_to_publish is enforced exactly once**: `engine/publish/gate.py::assert_safe_to_publish()`, called in `publish_cut` immediately before any credential lookup or upload. It guards what goes OUT to a platform, so the finalize path (a cut that already has a `platform_post_id`, which uploads nothing) is not gated: blocking it would leave a live post unrecorded with no operator way out. Nowhere else checks it — computing the field (asset_sourcer.py) is not the same as enforcing it.
 - **Paid-call budget cap**: `_enforce_paid_call_budget()` in `generate.py` checks `paid_call_count(db, reel.id) < Settings.max_paid_llm_calls_per_reel` at task entry and before each standard-path retry attempt. It's a lifetime-per-reel count (no per-job scoping) — not exploitable today since nothing re-triggers a `generate` Job for a reel that already has one, but a future "regenerate guide" flow would need an explicit reset path, not just raising the global setting.
@@ -498,7 +564,7 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 - **Phase 3.5** ✅ — Hardening: acks_late reliability, idempotency guards, heartbeat + stuck-job reaper, per-beat asset pinning (deterministic re-render), observability (StageEvent), credential encryption, a substantially expanded test suite; evaluator upgraded to 17 axes (conversational tone, hook-CTA throughline, per-beat specificity, repetition)
 - **Phase 4a** ✅ — Operator visibility: reel list page, per-reel cost/latency/quality panel sourced from `StageEvent`, `StageEvent.cost_usd` implemented for every LLM call site (NVIDIA rates only — HF asset-generation cost is not tracked), pre-generation cost/time estimate from real history, hard cap on paid LLM calls per reel
 - **Phase 4b** ✅ — Publishing: OAuth connect-account flow (YouTube Data API + Instagram Graph API), `safe_to_publish` hard gate enforced at publish time, TikTok added as a third `CutPlatform` for render/review (publishing itself deliberately not implemented — see Key conventions), `scheduled`/`publishing`/`published` cut states wired end-to-end. Not done: attribution block in captions, TikTok publishing, unpublish/re-publish flows.
-- **Phase 5** ✅ — Analytics: local-library music mixing with sidechain ducking (`LocalMusicSource` + `_build_ffmpeg_args`), HF asset-generation cost tracking (`engine/render/pricing.py`, `asset_hf_video`/`asset_hf_image` StageEvents), Wikipedia attribution block appended to published captions (`engine/publish/attribution.py`), post-publish metrics pull-back every 6h (`worker/tasks/metrics.py`), quality-vs-views surfaced on the reel list and per-cut engagement stats on the cut card. Quality↔engagement correlation (`engine/analytics/correlation.py`, `GET /api/insights`) and performance-informed feedback (`PerformanceNote` CRUD + seeding into `prior_feedback`, `evaluator_axis_weight_multipliers` lever) shipped after — see below.
+- **Phase 5** ✅ — Analytics: local-library music mixing with sidechain ducking (`LocalMusicSource` + `_build_ffmpeg_args`), HF asset-generation cost tracking (`engine/render/pricing.py`, `asset_hf_video`/`asset_hf_image` StageEvents), Wikipedia attribution block appended to published captions (`engine/publish/attribution.py`), post-publish metrics pull-back every 6h (`worker/tasks/metrics.py`), quality-vs-views surfaced on the reel list and per-cut engagement stats on the cut card. Quality↔engagement correlation (`engine/analytics/correlation.py`, `GET /api/insights`) and performance-informed feedback (`PerformanceNote` CRUD + seeding into `prior_feedback`, `evaluator_axis_weight_multipliers` lever) shipped after — see below. Word-level SRT caption export (item 5d) shipped last, after 5g — see its own roadmap entry and the `docs/roadmap.md` "5d" section for the offset-handling and `record_stage` composition rules it introduced.
 - **Phase 5g** ✅ — Quality↔engagement correlation + performance-informed feedback: closes the last two Phase 5 items (`docs/specs/2026-09-phase5-quality-engagement-feedback.md`). `GET /api/insights` shows a Pearson `r` (+ `sample_size`, always shown together, never `r` alone) between `quality_score` and max per-reel `views`, refusing to compute below `MIN_SAMPLE=5` reels or on zero variance in either series — with an explicit, permanent UI caveat about restriction-of-range bias (scores cluster near the acceptance threshold by construction) and "correlation, not causation." Same page shows a top/bottom-3 performer table (combined into one list when `n < 6`) with each performer's hook line, for a human operator to write `PerformanceNote`s from — **not** automatic few-shot injection of raw past-reel content, a deliberate scope decision (see the spec's §3.1: this codebase has already been burned by topic-drift from unconstrained prior context leaking into generation). Every active note is seeded into the standard LLM path's `prior_feedback` from attempt 1 onward. `evaluator_axis_weight_multipliers` (`Settings`, default `{}`) is a manual per-axis scoring lever informed by the correlation data — no code in this repo derives these values statistically.
 - **Phase 6 (partial)** — Creative range: hook/thumbnail variant generation, per-reel TTS voice choice, non-football niche evaluator fairness fixes, and per-reel text color. `render_cut` samples 4 thumbnail candidates per render (`Cut.thumbnail_candidates`); `generate_guide` generates 3 alternate hook lines once per accepted guide (`Cut.hook_variants`, best-effort — never fails the job). Operator picks either from the `in_review` cut card (`POST /cuts/{id}/thumbnail`, `POST /cuts/{id}/hook-variant`). `Reel.tts_voice` (create-reel form, curated edge-tts voice list) lets each reel sound different — edge provider only, see Key conventions. Investigating the evaluator's "universal" niche vocabulary found 2 real fairness bugs (Script→Visual Alignment collapsing to a flat max deduction, Visual Variety being unconditionally football-only with no niche gate at all) — both fixed, see the `evaluator.py` module-layout entry and `docs/roadmap.md` Phase 6c. `Reel.text_color` (create-reel form, curated color list) is the first slice of brand customization (Phase 6d) — done as a security-validated lever (unescaped ffmpeg filter interpolation), not just a UX one. Not done: logo/watermark overlay, per-channel presets.
 - **Phase 7 (partial)** — Production hardening: `asset_sourcer` black-frame visibility, and a real Dockerfile/deploy path. `render_cut` now tracks which beats got no real media anywhere in the Wikipedia → Pexels → HF Video → HF Image fallback chain and writes the list to `Cut.black_frame_beat_indices` (migration `0010`), surfaced as a warning banner on the `in_review`+ cut card. The sourcers themselves still swallow exceptions and degrade silently *internally* — this only stops the *result* from being silent to the operator; a real retry/alerting fix is a separate, larger design pass. `Dockerfile` (one image, ffmpeg + edge-tts installed, non-root user) is run four ways via `docker-compose.yml`'s `api`/`worker-generation`/`worker-rendering`/`beat` services and command overrides — migrations are a deliberate one-off (`docker compose run --rm api alembic upgrade head`), never baked into a container's own startup (N worker replicas would race it). Verified end-to-end (full stack up, real migration chain, `GET /` 200 from inside the container, both workers registered all 6 tasks), not just `docker build` — see `docs/roadmap.md` Phase 7b. CI gained a `docker-build` job. `engine/generation/llm.py::validate_configured_models()` (called from `api/main.py`'s `lifespan` hook, Phase 7c) pings both configured LLM models' `{base_url}/models` at startup and warns per misconfigured model — this is exactly the check that would have caught the NVIDIA model-catalog-drift incident proactively instead of after every job failed individually; never blocks startup on a failure. Verified against a real local Ollama instance, not just mocks. `tests/test_golden_reel.py` (Phase 7d) is one mocks-free test — real edge-tts synthesis, real ffmpeg — that runs the TTS→compositor→ffmpeg chain end to end; marked `golden` and excluded from the default `pytest` run (real network call, ~20s) but run explicitly by CI's new `golden-reel` job on every push/PR. Mutation-verified against the actual historical zero-audio bug, not a synthetic stand-in for it. Not done: auth/rate-limiting scope decision.

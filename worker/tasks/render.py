@@ -124,7 +124,7 @@ def render_cut(self, db, job, ctx):
     music_path = get_music_sourcer().find(music_cue) if music_cue else None
 
     with record_stage(db, reel.id, "composite", cut_id=cut.id) as ev:
-        duration, thumbnail_candidates = composite_cut(
+        duration, thumbnail_candidates, subtitle_path = composite_cut(
             beats=beat_dicts,
             beat_video_paths=beat_video_paths,
             beat_vo_paths=beat_vo_paths,
@@ -152,4 +152,8 @@ def render_cut(self, db, job, ctx):
     # A re-render replaces this wholesale, same as thumbnail_candidates/video_path — a
     # beat that was black last render but resolves fine this time must not stay flagged.
     cut.black_frame_beat_indices = black_frame_beats or None
+    # A re-render replaces this wholesale too, same policy as thumbnail_candidates/
+    # video_path/black_frame_beat_indices — None when this render produced no cues
+    # (e.g. silent voiceover_mode with no VO to caption at all).
+    cut.subtitle_path = str(subtitle_path) if subtitle_path else None
     transition(cut, "in_review", CUT_TRANSITIONS)

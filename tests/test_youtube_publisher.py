@@ -7,11 +7,16 @@ import pytest
 from engine.publish.youtube import YouTubePublisher
 
 
-def _fake_cut(video_path):
+def _fake_cut(video_path, subtitle_path=None):
     cut = MagicMock()
+    cut.id = 5
+    cut.reel_id = 10
     cut.video_path = str(video_path)
     cut.caption = "Argentina's weak spot could decide the tournament."
     cut.hashtags = ["football", "worldcup"]
+    # Explicit, not MagicMock's incidental truthiness — most tests here don't
+    # care about the captions-upload branch at all, so make its trigger opt-in.
+    cut.subtitle_path = subtitle_path
     return cut
 
 

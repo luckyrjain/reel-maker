@@ -54,7 +54,7 @@ def client():
 
 
 def _make_cut(session_factory, status, *, guide=None, hook_variants=None, thumbnail_candidates=None,
-              thumbnail_path=None):
+              thumbnail_path=None, subtitle_path=None):
     db = session_factory()
     try:
         reel = models.Reel(context="x", status=models.ReelStatus.guide_ready)
@@ -64,6 +64,7 @@ def _make_cut(session_factory, status, *, guide=None, hook_variants=None, thumbn
             reel_id=reel.id, platform=models.CutPlatform.youtube_shorts, status=status,
             guide=guide, hook_variants=hook_variants,
             thumbnail_candidates=thumbnail_candidates, thumbnail_path=thumbnail_path,
+            subtitle_path=subtitle_path,
         )
         db.add(cut)
         db.commit()
@@ -194,4 +195,48 @@ def test_stream_thumbnail_rejects_a_path_outside_the_video_store(client, tmp_pat
     store_dir.mkdir()
     with patch("api.routers.cuts.settings.video_store_dir", str(store_dir)):
         resp = client.get(f"/api/cuts/{cut_id}/thumbnail/0")
+    assert resp.status_code == 403
+
+
+# ── GET /cuts/{id}/subtitles ──────────────────────────────────────────────────
+
+def test_stream_subtitles_serves_the_srt_file(client, tmp_path):
+    srt = tmp_path / "1" / "youtube_shorts.srt"
+    srt.parent.mkdir(parents=True)
+    srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello.\n", encoding="utf-8")
+    cut_id = _make_cut(
+        client._session_factory, models.CutStatus.in_review, subtitle_path=str(srt),
+    )
+    with patch("api.routers.cuts.settings.video_store_dir", str(tmp_path)):
+        resp = client.get(f"/api/cuts/{cut_id}/subtitles")
+    assert resp.status_code == 200
+    assert resp.content == b"1\n00:00:00,000 --> 00:00:01,000\nHello.\n"
+    assert resp.headers["content-type"].startswith("application/x-subrip")
+
+
+def test_stream_subtitles_404s_when_subtitle_path_unset(client, tmp_path):
+    cut_id = _make_cut(client._session_factory, models.CutStatus.in_review, subtitle_path=None)
+    with patch("api.routers.cuts.settings.video_store_dir", str(tmp_path)):
+        resp = client.get(f"/api/cuts/{cut_id}/subtitles")
+    assert resp.status_code == 404
+
+
+def test_stream_subtitles_404s_for_a_missing_cut(client, tmp_path):
+    with patch("api.routers.cuts.settings.video_store_dir", str(tmp_path)):
+        resp = client.get("/api/cuts/999999/subtitles")
+    assert resp.status_code == 404
+
+
+def test_stream_subtitles_rejects_a_path_outside_the_video_store(client, tmp_path):
+    """Same path-guard as stream_video/stream_thumbnail — subtitle_path can never
+    point outside VIDEO_STORE_DIR."""
+    outside = tmp_path.parent / "outside_captions.srt"
+    outside.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello.\n", encoding="utf-8")
+    cut_id = _make_cut(
+        client._session_factory, models.CutStatus.in_review, subtitle_path=str(outside),
+    )
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    with patch("api.routers.cuts.settings.video_store_dir", str(store_dir)):
+        resp = client.get(f"/api/cuts/{cut_id}/subtitles")
     assert resp.status_code == 403
