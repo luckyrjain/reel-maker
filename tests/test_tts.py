@@ -6,6 +6,8 @@ every beat, render_cut's "override duration_s with measured audio length" step
 then collapsed a 45 s reel to ~1 s per beat — a silent, truncated video that the
 pipeline still reported as `done`.
 """
+import asyncio
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -122,3 +124,100 @@ def test_unmeasurable_audio_returns_first_take(tmp_path):
     with patch("engine.render.tts._audio_duration", return_value=None):
         provider.synth_to_budget("some narration", target_s=10.0)
     assert calls == ["+0%"]
+
+
+# ── synthesize() network hang/failure hardening ──────────────────────────
+
+
+def test_synthesize_writes_atomically_no_tmp_file_left_behind(tmp_path):
+    pytest.importorskip("edge_tts")
+    provider = EdgeTTSProvider(tmp_path)
+
+    class FakeCommunicate:
+        def __init__(self, text, voice, rate="+0%"):
+            pass
+
+        async def save(self, path):
+            Path(path).write_bytes(b"fake-mp3")
+
+    with patch("edge_tts.Communicate", FakeCommunicate):
+        out = provider.synthesize("hello world")
+
+    assert out.exists()
+    assert out.read_bytes() == b"fake-mp3"
+    assert not out.with_suffix(out.suffix + ".tmp").exists()
+
+
+def test_synthesize_cleans_up_tmp_file_when_the_final_replace_fails(tmp_path):
+    """A successful download followed by a failed rename (disk full, permission
+    error) must not leak the `.tmp` file — `tmp.replace(out)` has to be inside
+    the same try/except as the write, not after it. Discriminates true atomic
+    write from a version that only guards the download step: on a version where
+    `tmp.replace(out)` sits outside the try/except, this scenario leaks the
+    `.tmp` file because nothing ever cleans it up."""
+    pytest.importorskip("edge_tts")
+    provider = EdgeTTSProvider(tmp_path)
+
+    class FakeCommunicate:
+        def __init__(self, text, voice, rate="+0%"):
+            pass
+
+        async def save(self, path):
+            Path(path).write_bytes(b"fake-mp3")
+
+    with patch("edge_tts.Communicate", FakeCommunicate), \
+         patch("pathlib.Path.replace", side_effect=OSError("disk full")):
+        with pytest.raises(OSError):
+            provider.synthesize("hello world")
+
+    leftovers = list(tmp_path.glob("*.mp3")) + list(tmp_path.glob("*.tmp"))
+    assert leftovers == [], f"leftover file(s) after a failed rename: {leftovers}"
+
+
+def test_synthesize_retries_once_after_a_timeout(tmp_path):
+    """A hung connection to the edge-tts endpoint must not block forever —
+    it gets one retry after SYNTH_TIMEOUT_S, not an indefinite stall."""
+    pytest.importorskip("edge_tts")
+    provider = EdgeTTSProvider(tmp_path)
+    provider.SYNTH_TIMEOUT_S = 0.05
+    attempts = []
+
+    class FakeCommunicate:
+        def __init__(self, text, voice, rate="+0%"):
+            pass
+
+        async def save(self, path):
+            attempts.append(1)
+            if len(attempts) == 1:
+                await asyncio.sleep(1)  # exceeds SYNTH_TIMEOUT_S, forces a timeout
+            Path(path).write_bytes(b"fake-mp3")
+
+    with patch("edge_tts.Communicate", FakeCommunicate):
+        out = provider.synthesize("hello world")
+
+    assert len(attempts) == 2, "expected exactly one retry after the timeout"
+    assert out.exists()
+
+
+def test_synthesize_failed_attempt_does_not_cache_a_truncated_file(tmp_path):
+    """A write failure must not leave a partial file at the cache path — the
+    `if out.exists()` cache check above would otherwise reuse that corrupt file
+    forever, the same failure class this codebase already guards against for
+    every other downloader (see CLAUDE.md's Atomic file writes convention)."""
+    pytest.importorskip("edge_tts")
+    provider = EdgeTTSProvider(tmp_path)
+
+    class FailingCommunicate:
+        def __init__(self, text, voice, rate="+0%"):
+            pass
+
+        async def save(self, path):
+            Path(path).write_bytes(b"partial-garbage")
+            raise RuntimeError("network dropped mid-write")
+
+    with patch("edge_tts.Communicate", FailingCommunicate):
+        with pytest.raises(RuntimeError):
+            provider.synthesize("hello world")
+
+    leftovers = list(tmp_path.glob("*.mp3")) + list(tmp_path.glob("*.tmp"))
+    assert leftovers == [], f"leftover cache-poisoning file(s): {leftovers}"
