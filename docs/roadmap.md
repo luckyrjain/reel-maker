@@ -26,7 +26,7 @@ This file below is the build log (what shipped, phase by phase); that one is the
 | 4b | ✅ Done | Publishing (OAuth, safe_to_publish gate, YouTube + Instagram uploaders, TikTok platform) |
 | 5 | ✅ Done | Analytics and polish |
 | 6 | 🔲 Partial | Creative range — hook/thumbnail variant generation, per-reel TTS voice, non-football fairness fixes, configurable text color done; logo/watermark + per-channel presets not started |
-| 7 | 🔲 Partial | Production hardening — asset_sourcer black-frame visibility, a real Dockerfile/deploy path, and startup LLM-model validation done; golden-reel CI test, auth/rate-limit decision not started |
+| 7 | 🔲 Partial | Production hardening — asset_sourcer black-frame visibility, a real Dockerfile/deploy path, startup LLM-model validation, and a golden-reel CI test done; only the auth/rate-limit scope decision not started |
 
 ---
 
@@ -806,11 +806,46 @@ just mocked tests): correctly detected the configured default model
 (`qwen3:14b`) wasn't among the models actually installed, and listed
 what was, with no crash.
 
+### 7d. Golden-reel smoke test in CI — done
+
+`tests/test_golden_reel.py` — one test, marked `@pytest.mark.golden`, that
+runs the pipeline's actual TTS → compositor → ffmpeg chain with **no
+mocks**: real `EdgeTTSProvider.synth_to_budget()` calls (free, no API
+key — edge-tts's public endpoint) against two real beats, real local test
+images as media, through the real `composite_cut()`, asserting the output
+MP4 has both a video stream at the correct `TARGET_W`×`TARGET_H` and a
+real (>1s, non-silent) audio stream.
+
+This closes a real gap `tests/test_compositor.py`'s existing real-ffmpeg
+tests didn't: those prove the compositor correctly mixes in a *given*
+audio file (that's what caught the original zero-audio bug, documented in
+Phase 3.9's history), but every one of them hands the compositor a
+synthetic WAV it already knows is good — none of them call
+`EdgeTTSProvider.synthesize()` itself. A regression in
+`_normalize_for_tts()`, in how `synthesize()` writes its output file, or
+in the edge-tts library/service, would still produce a silent or broken
+render that every existing test would miss.
+
+Mutation-verified against the real historical bug, not a synthetic one:
+temporarily reintroduced the exact original mistake
+(`.audio_fadein()`/`.audio_fadeout()`, methods that don't exist on
+`AudioFileClip` in MoviePy 2.x, in place of `.with_effects([AudioFadeIn,
+AudioFadeOut])`) and confirmed this test fails with the same error the
+live incident produced, then restored the fix and confirmed it passes
+again.
+
+**Excluded from the default `pytest` run** — a real network TTS call adds
+~20s, and every other environment-dependent test in this suite (the
+`test_compositor.py` real-ffmpeg tests) only needs a binary on PATH and
+runs in well under a second, not a network round-trip. `pyproject.toml`
+registers the `golden` marker and sets `addopts = "-m 'not golden'"`;
+`.github/workflows/ci.yml` gets a new `golden-reel` job that runs
+`pytest -m golden -v` explicitly, alongside the existing `test` and
+`docker-build` jobs — so it still runs on every push/PR, just not as part
+of every developer's routine local test run.
+
 ### Not started
 
-- Golden-reel smoke test in CI (would have caught the months-long silent
-  zero-audio bug documented in Phase 3.9's own history — a real end-to-end
-  render, not just unit tests)
 - Auth / rate-limiting scope decision — still the silent absence the gap
   analysis flagged, not yet an explicit "we chose not to, because X"
 

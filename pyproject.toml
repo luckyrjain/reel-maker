@@ -34,6 +34,17 @@ captions = [
     "openai-whisper>=20231117",
 ]
 
+[tool.pytest.ini_options]
+markers = [
+    "golden: end-to-end smoke test — real edge-tts synthesis + real ffmpeg render, no mocks. Slow (~20s, dominated by a real TTS network call) and needs network access, unlike the rest of the suite (which only needs ffmpeg on PATH, no network). Excluded from the default run by addopts below; see tests/test_golden_reel.py and .github/workflows/ci.yml's golden-reel job, which runs it explicitly.",
+]
+# Default run skips `golden` tests — every other slow/environment-dependent test in this
+# suite (test_compositor.py's real-ffmpeg tests) only needs a binary on PATH and runs in
+# well under a second; this one makes a real network call and adds ~20s to every routine
+# `pytest -q` a developer runs locally. `pytest -m golden` (or CI's dedicated job) runs it
+# explicitly instead.
+addopts = "-m 'not golden'"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
