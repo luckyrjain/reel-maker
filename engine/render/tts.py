@@ -166,6 +166,12 @@ class EdgeTTSProvider:
     # British male voice suits football commentary; adjust as needed
     DEFAULT_VOICE = "en-GB-RyanNeural"
 
+    # A hung connection to Microsoft's endpoint must not block a Celery task
+    # indefinitely — `job_task`'s soft_time_limit is the real backstop, but that's
+    # measured in hours, not seconds, so a single stalled TTS call would otherwise
+    # sit silently for the entire generate/render runtime budget.
+    SYNTH_TIMEOUT_S = 60.0
+
     def __init__(self, cache_dir: Path, voice: str = DEFAULT_VOICE):
         self.cache_dir = cache_dir
         self.voice = voice
@@ -183,10 +189,30 @@ class EdgeTTSProvider:
 
         import edge_tts
 
-        async def _run() -> None:
-            await edge_tts.Communicate(text, self.voice, rate=rate).save(str(out))
+        tmp = out.with_suffix(out.suffix + ".tmp")
 
-        asyncio.run(_run())
+        async def _run() -> None:
+            # Atomic write: a timeout or dropped connection must never leave a
+            # truncated file at `out` — the cache check above (`if out.exists()`)
+            # would then reuse that corrupt file forever, the same failure class
+            # documented for every other downloader in this codebase.
+            try:
+                await asyncio.wait_for(
+                    edge_tts.Communicate(text, self.voice, rate=rate).save(str(tmp)),
+                    timeout=self.SYNTH_TIMEOUT_S,
+                )
+            except Exception:
+                tmp.unlink(missing_ok=True)
+                raise
+            tmp.replace(out)
+
+        try:
+            asyncio.run(_run())
+        except (TimeoutError, asyncio.TimeoutError):
+            _log.warning(
+                "edge-tts synth timed out after %.0fs, retrying once", self.SYNTH_TIMEOUT_S
+            )
+            asyncio.run(_run())
         return out
 
     def synth_to_budget(self, text: str, target_s: float, tol: float = 0.15) -> Path:

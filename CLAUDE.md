@@ -47,7 +47,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 647 tests across 30+ files, default run (4 test_compositor tests need ffmpeg
+.venv/bin/pytest                            # 650 tests across 30+ files, default run (4 test_compositor tests need ffmpeg
                                              # on PATH; 1 kokoro voice test skips without the kokoro package; 1 golden-reel
                                              # test is deselected by default — see below)
 .venv/bin/pytest -m golden                  # the golden-reel smoke test (real edge-tts + real ffmpeg, ~20s, needs network)
@@ -315,7 +315,11 @@ tests/
   test_context_enricher.py    13 tests — evaluate_context axes, llm_enrich
   test_enrich_context_task.py 14 tests — enrichment gating, LLM failure fallback, structured script guard, missing reel, owner rollback wiring, orphan generate-job cleanup (only when it claimed the orphan)
   test_maintenance.py         40 tests — reaper on in-memory SQLite: per-job-type owner rollback, stale running/pending jobs, per-job-type pending thresholds, healthy jobs untouched, updated_at keying, compare-and-set back-off, status pin = SELECT snapshot, one bad job doesn't stop the rest, done-orphan sweep (lost after_commit_failed fail-stamp) per job type, existing-error/freshness exclusions
-  test_tts.py                  8 tests — provider selection, unknown-provider fallback, SilentProvider shared file, synth_to_budget clamp
+  test_tts.py                  11 tests — provider selection, unknown-provider fallback, SilentProvider shared file, synth_to_budget
+                              clamp; synthesize() network hardening (Phase 7d follow-up) — atomic tmp-then-replace write so a failed
+                              or timed-out synth never leaves a truncated file at the cache path (the `if out.exists()` cache check
+                              would otherwise reuse it forever), one retry after a 60s timeout on the edge-tts network call rather
+                              than an indefinite stall; mutation-verified against the pre-fix direct-write/no-timeout code
   test_common.py              18 tests — transient-error classification (incl. DB connection errors), retry budget
   test_job_lifecycle.py      122 tests — job_task on dummy tasks (in-memory SQLite): atomic claim/race, fenced done-stamp and heartbeat (JobLost), heartbeat thread (survives DB blips, never touches a reaped job, stops at max_runtime_s, never outlives the task), prepare-before-attempts, retry/backoff, refused retry (Reject, incl. an unclaimed job), failure stamp (NUL/surrogates/[parameters]/DETAIL/CONTEXT redacted incl. multi-line, reaped job, masked errors, discarded half-writes), DB errors, fail-fast on shutdown/hard-kill, dead-connection recovery in the terminal failure recorders (incl. InterfaceError, fresh-session close on both a successful and a failed retry attempt), per-job-type owner rollback (fresh state), after_commit + cleanup hook (incl. a shutdown during the hook itself, a hook that itself raises without discarding the failure stamp, and a multi-write hook rolling back atomically via its own SAVEPOINT), `.delay` signature regression, per-task job_type/max_retries/runtime wiring, beat-task routing, pool_pre_ping
   test_r3_proposed.py         38 tests — regressions found by round-3 mutation testing: distinct job/reel/cut ids so an id mix-up can't hide, transaction-visibility checks via a second connection, _error_text regex boundaries, refused-retry/reaped-job edge cases, template hx-post assertions, per-type pending thresholds
