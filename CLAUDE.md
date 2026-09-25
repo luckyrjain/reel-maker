@@ -47,7 +47,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 635 tests across 30+ files (4 test_compositor tests need ffmpeg on PATH; 1 kokoro voice test skips without the kokoro package)
+.venv/bin/pytest                            # 645 tests across 30+ files (4 test_compositor tests need ffmpeg on PATH; 1 kokoro voice test skips without the kokoro package)
 .venv/bin/pytest tests/test_foo.py::bar -s
 
 # New migration after changing models.py
@@ -100,7 +100,9 @@ In both paths, `postprocess.py` strips section-label prefixes from `vo_script` a
 
 ```
 api/
-  main.py             FastAPI app factory; static files, Jinja2, all routers
+  main.py             FastAPI app factory; static files, Jinja2, all routers; lifespan hook
+                      runs validate_configured_models() at startup (best-effort, never blocks —
+                      see engine/generation/llm.py)
   config.py           pydantic-settings Settings; includes nvidia_api_key, nvidia_generation_model, use_nvidia_for_generation, pexels_api_key, huggingface_api_key, huggingface_image_model, huggingface_video_model, pixabay_api_key, credentials_key, max_paid_llm_calls_per_reel, nvidia_price_per_1m_input_tokens, nvidia_price_per_1m_output_tokens, public_base_url, youtube_oauth_client_id/secret, meta_oauth_app_id/secret, music_library_dir, huggingface_price_per_image, huggingface_price_per_video_second, evaluator_axis_weight_multipliers
                       (dict[str, float], default `{}` — the first dict-typed Settings field; pydantic-settings
                       parses its env var as JSON, e.g. `EVALUATOR_AXIS_WEIGHT_MULTIPLIERS='{"insight": 0.5}'`)
@@ -186,7 +188,11 @@ engine/
   generation/
     guide_schema.py   Beat, PlatformGuide, MasterGuide Pydantic models — platform Literal includes tiktok
     llm.py            LLMProvider + OllamaProvider (captures last_usage/total_usage token counts);
-                      get_llm_provider(), get_enrichment_provider(), is_nvidia_generation()
+                      get_llm_provider(), get_enrichment_provider(), is_nvidia_generation();
+                      check_model_available()/validate_configured_models() — best-effort startup
+                      ping of {base_url}/models for both configured models, deduped by
+                      (base_url, model); called from api/main.py's lifespan hook, never raises,
+                      never blocks startup (Phase 7c)
     pricing.py        llm_cost_usd() — NVIDIA per-token cost from Settings rates (0 until configured)
     estimate.py       estimate_generation() — pre-generation call-count/time/cost estimate for the
                       create-reel form, cost sourced from this operator's own StageEvent history
@@ -324,7 +330,12 @@ tests/
   test_llm_judge.py            3 tests — neutral-score fallback on raise, garbage, out-of-range
   test_reels_router.py        25 tests — reel list/detail routes, platform-selection form, pipeline panel, htmx id/target consistency, quality/views columns, published-cut engagement stats, enqueue failure fails fast (503) instead of polling forever, no transaction open across .delay(); tts_voice/text_color selection — explicit choice stored, unknown value dropped to None, omitted defaults to None
   test_pricing.py              4 tests — llm_cost_usd() rate application, zero-rate default
-  test_llm_provider.py         4 tests — OllamaProvider last_usage/total_usage capture
+  test_llm_provider.py         12 tests — OllamaProvider last_usage/total_usage capture;
+                              check_model_available()/validate_configured_models() — model listed/
+                              not listed/timeout/network error/non-2xx, dedup by (base_url, model),
+                              local-Ollama vs NVIDIA-NIM warning wording
+  test_main.py                 2 tests — lifespan hook logs a warning per misconfigured model,
+                              never crashes startup when every model checks out
   test_estimate.py             8 tests — generation path resolution, historical cost averaging incl. structured-fallback exclusion
   test_observability.py        3 tests — paid_call_count() scoping and filtering
   test_correlation.py         12 tests — quality_engagement_correlation() (below-MIN_SAMPLE, zero-variance
@@ -475,7 +486,7 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 - **Phase 5** ✅ — Analytics: local-library music mixing with sidechain ducking (`LocalMusicSource` + `_build_ffmpeg_args`), HF asset-generation cost tracking (`engine/render/pricing.py`, `asset_hf_video`/`asset_hf_image` StageEvents), Wikipedia attribution block appended to published captions (`engine/publish/attribution.py`), post-publish metrics pull-back every 6h (`worker/tasks/metrics.py`), quality-vs-views surfaced on the reel list and per-cut engagement stats on the cut card. Quality↔engagement correlation (`engine/analytics/correlation.py`, `GET /api/insights`) and performance-informed feedback (`PerformanceNote` CRUD + seeding into `prior_feedback`, `evaluator_axis_weight_multipliers` lever) shipped after — see below.
 - **Phase 5g** ✅ — Quality↔engagement correlation + performance-informed feedback: closes the last two Phase 5 items (`docs/specs/2026-09-phase5-quality-engagement-feedback.md`). `GET /api/insights` shows a Pearson `r` (+ `sample_size`, always shown together, never `r` alone) between `quality_score` and max per-reel `views`, refusing to compute below `MIN_SAMPLE=5` reels or on zero variance in either series — with an explicit, permanent UI caveat about restriction-of-range bias (scores cluster near the acceptance threshold by construction) and "correlation, not causation." Same page shows a top/bottom-3 performer table (combined into one list when `n < 6`) with each performer's hook line, for a human operator to write `PerformanceNote`s from — **not** automatic few-shot injection of raw past-reel content, a deliberate scope decision (see the spec's §3.1: this codebase has already been burned by topic-drift from unconstrained prior context leaking into generation). Every active note is seeded into the standard LLM path's `prior_feedback` from attempt 1 onward. `evaluator_axis_weight_multipliers` (`Settings`, default `{}`) is a manual per-axis scoring lever informed by the correlation data — no code in this repo derives these values statistically.
 - **Phase 6 (partial)** — Creative range: hook/thumbnail variant generation, per-reel TTS voice choice, non-football niche evaluator fairness fixes, and per-reel text color. `render_cut` samples 4 thumbnail candidates per render (`Cut.thumbnail_candidates`); `generate_guide` generates 3 alternate hook lines once per accepted guide (`Cut.hook_variants`, best-effort — never fails the job). Operator picks either from the `in_review` cut card (`POST /cuts/{id}/thumbnail`, `POST /cuts/{id}/hook-variant`). `Reel.tts_voice` (create-reel form, curated edge-tts voice list) lets each reel sound different — edge provider only, see Key conventions. Investigating the evaluator's "universal" niche vocabulary found 2 real fairness bugs (Script→Visual Alignment collapsing to a flat max deduction, Visual Variety being unconditionally football-only with no niche gate at all) — both fixed, see the `evaluator.py` module-layout entry and `docs/roadmap.md` Phase 6c. `Reel.text_color` (create-reel form, curated color list) is the first slice of brand customization (Phase 6d) — done as a security-validated lever (unescaped ffmpeg filter interpolation), not just a UX one. Not done: logo/watermark overlay, per-channel presets.
-- **Phase 7 (partial)** — Production hardening: `asset_sourcer` black-frame visibility, and a real Dockerfile/deploy path. `render_cut` now tracks which beats got no real media anywhere in the Wikipedia → Pexels → HF Video → HF Image fallback chain and writes the list to `Cut.black_frame_beat_indices` (migration `0010`), surfaced as a warning banner on the `in_review`+ cut card. The sourcers themselves still swallow exceptions and degrade silently *internally* — this only stops the *result* from being silent to the operator; a real retry/alerting fix is a separate, larger design pass. `Dockerfile` (one image, ffmpeg + edge-tts installed, non-root user) is run four ways via `docker-compose.yml`'s `api`/`worker-generation`/`worker-rendering`/`beat` services and command overrides — migrations are a deliberate one-off (`docker compose run --rm api alembic upgrade head`), never baked into a container's own startup (N worker replicas would race it). Verified end-to-end (full stack up, real migration chain, `GET /` 200 from inside the container, both workers registered all 6 tasks), not just `docker build` — see `docs/roadmap.md` Phase 7b. CI gained a `docker-build` job. Not done: golden-reel smoke test in CI, startup LLM-model validation, auth/rate-limiting scope decision.
+- **Phase 7 (partial)** — Production hardening: `asset_sourcer` black-frame visibility, and a real Dockerfile/deploy path. `render_cut` now tracks which beats got no real media anywhere in the Wikipedia → Pexels → HF Video → HF Image fallback chain and writes the list to `Cut.black_frame_beat_indices` (migration `0010`), surfaced as a warning banner on the `in_review`+ cut card. The sourcers themselves still swallow exceptions and degrade silently *internally* — this only stops the *result* from being silent to the operator; a real retry/alerting fix is a separate, larger design pass. `Dockerfile` (one image, ffmpeg + edge-tts installed, non-root user) is run four ways via `docker-compose.yml`'s `api`/`worker-generation`/`worker-rendering`/`beat` services and command overrides — migrations are a deliberate one-off (`docker compose run --rm api alembic upgrade head`), never baked into a container's own startup (N worker replicas would race it). Verified end-to-end (full stack up, real migration chain, `GET /` 200 from inside the container, both workers registered all 6 tasks), not just `docker build` — see `docs/roadmap.md` Phase 7b. CI gained a `docker-build` job. `engine/generation/llm.py::validate_configured_models()` (called from `api/main.py`'s `lifespan` hook, Phase 7c) pings both configured LLM models' `{base_url}/models` at startup and warns per misconfigured model — this is exactly the check that would have caught the NVIDIA model-catalog-drift incident proactively instead of after every job failed individually; never blocks startup on a failure. Verified against a real local Ollama instance, not just mocks. Not done: golden-reel smoke test in CI, auth/rate-limiting scope decision.
 
 ## Worker queues
 
