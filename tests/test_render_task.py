@@ -282,6 +282,69 @@ def test_reel_without_text_color_uses_the_default():
     assert mock_composite.call_args.kwargs["text_color"] == DEFAULT_TEXT_COLOR
 
 
+def test_black_frame_beats_are_flagged_on_the_cut():
+    """resolve_beat_assets()'s sentinel for 'nothing found anywhere in the fallback
+    chain' is [(None, None)] — a beat whose paths are all None got no real footage and
+    rendered as a black frame for its full duration. Beat 1 (of 0/1/2) is the one
+    flagged here; 0 and 2 resolve normally."""
+    from worker.tasks.render import render_cut
+
+    job = _job()
+    cut = _cut()
+    reel = _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else (
+        cut if model is models.Cut else reel
+    )
+
+    def fake_resolve(db, cut, beat_index, **kwargs):
+        if beat_index == 1:
+            return [(None, None)]
+        return [(MagicMock(), MagicMock())]
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.render.get_asset_sourcer"),
+        patch("worker.tasks.render.get_wiki_sourcer"),
+        patch("worker.tasks.render.get_hf_sourcer"),
+        patch("worker.tasks.render.get_hf_video_sourcer"),
+        patch("worker.tasks.render.get_tts_provider"),
+        patch("worker.tasks.render.resolve_or_reuse", side_effect=fake_resolve),
+        patch("worker.tasks.render.record_stage"),
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"])),
+    ):
+        render_cut(1)
+
+    assert cut.black_frame_beat_indices == [1]
+
+
+def test_no_black_frame_flag_when_every_beat_has_real_media():
+    from worker.tasks.render import render_cut
+
+    job = _job()
+    cut = _cut()
+    reel = _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else (
+        cut if model is models.Cut else reel
+    )
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.render.get_asset_sourcer"),
+        patch("worker.tasks.render.get_wiki_sourcer"),
+        patch("worker.tasks.render.get_hf_sourcer"),
+        patch("worker.tasks.render.get_hf_video_sourcer"),
+        patch("worker.tasks.render.get_tts_provider"),
+        patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), MagicMock())]),
+        patch("worker.tasks.render.record_stage"),
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"])),
+    ):
+        render_cut(1)
+
+    assert cut.black_frame_beat_indices is None
+
+
 def test_no_music_cue_passes_none_without_querying_sourcer():
     from worker.tasks.render import render_cut
 

@@ -162,6 +162,16 @@
     </p>
     {% endif %}
 
+    {% if cut.black_frame_beat_indices %}
+    <p class="error" style="margin-top:6px;">
+      ⚠ Beat{{ "s" if cut.black_frame_beat_indices | length > 1 else "" }}
+      {{ cut.black_frame_beat_indices | map("string") | join(", ") }}
+      rendered with no footage found (black frame) — Wikipedia, Pexels, and the
+      HuggingFace fallbacks all came up empty. Check API keys/quota, or edit that
+      beat's visual direction and re-render.
+    </p>
+    {% endif %}
+
     {% if cut.thumbnail_candidates %}
     <div class="thumbnail-candidates" style="margin-top:8px;">
       <span class="field-hint" style="display:block;margin-bottom:4px;">Thumbnail</span>

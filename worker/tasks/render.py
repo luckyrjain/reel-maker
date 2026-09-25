@@ -49,6 +49,12 @@ def render_cut(self, db, job, ctx):
     beat_asset_pairs: list[list] = []
     beat_video_paths: list[list[Path | None]] = []
     beat_vo_paths: list[Path | None] = []
+    # Beats where every source in the Wikipedia -> Pexels -> HF Video -> HF Image chain
+    # (resolve_beat_assets()) came up empty — the compositor renders these as a black
+    # frame for their full duration, but the job still reports `done`. Recorded on the
+    # Cut so this is operator-visible without digging through Asset.source per beat —
+    # see docs/roadmap.md's Phase 7 asset_sourcer visibility item.
+    black_frame_beats: list[int] = []
 
     for i, beat in enumerate(beats):
         # resolve_or_reuse: reuses pinned assets when visual_direction hasn't
@@ -65,7 +71,10 @@ def render_cut(self, db, job, ctx):
             hf=hf,
         )
         beat_asset_pairs.append(pairs)
-        beat_video_paths.append([p for _, p in pairs])
+        paths = [p for _, p in pairs]
+        beat_video_paths.append(paths)
+        if not any(p is not None for p in paths):
+            black_frame_beats.append(beat.index)
 
         # Synthesize VO and nudge speaking rate toward beat target duration
         if reel.voiceover_mode == "voiceover" and beat.vo_script.strip():
@@ -140,4 +149,7 @@ def render_cut(self, db, job, ctx):
     cut.thumbnail_path = str(thumbnail_candidates[0])
     cut.thumbnail_candidates = [str(p) for p in thumbnail_candidates]
     cut.duration_s = duration
+    # A re-render replaces this wholesale, same as thumbnail_candidates/video_path — a
+    # beat that was black last render but resolves fine this time must not stay flagged.
+    cut.black_frame_beat_indices = black_frame_beats or None
     transition(cut, "in_review", CUT_TRANSITIONS)

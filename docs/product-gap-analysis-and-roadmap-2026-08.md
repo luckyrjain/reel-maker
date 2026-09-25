@@ -115,7 +115,7 @@ Numbered to extend `docs/roadmap.md`'s existing phase log (0–3.8 done). Sequen
 - Golden-reel smoke test in CI (would have caught today's audio bug same-day instead of silently for months)
 - CI pipeline: run the 146 tests + the golden-reel test on every push
 - Startup validation: ping configured LLM model endpoints, fail fast on a dead model instead of failing every job individually
-- Close the `asset_sourcer` silent-degradation gap: surface "used fallback footage" on the `Cut` so a black-frame reel is visible, not silently `done`
+- ~~Close the `asset_sourcer` silent-degradation gap: surface "used fallback footage" on the `Cut` so a black-frame reel is visible, not silently `done`~~ ✅ Done — `Cut.black_frame_beat_indices`, see `docs/roadmap.md` Phase 7a (the sourcers themselves still degrade silently at the source; this only stops the *result* from being silent)
 - Dockerfile for API + workers; a real deploy path
 - Decide auth/rate-limiting scope explicitly — even "we chose not to, because X" is better than the current silent absence
 

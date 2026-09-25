@@ -100,6 +100,14 @@ class Cut(Base):
     # Alternate opening-line text for the hook beat, generated once per guide
     # (worker/tasks/generate.py) so the operator can swap it in without a full regeneration.
     hook_variants = Column(JSON)
+    # 0-indexed beat indices where resolve_beat_assets()'s whole Wikipedia -> Pexels ->
+    # HF Video -> HF Image chain came up empty and the compositor rendered a black frame
+    # for that beat's full duration. None/empty when every beat got real footage.
+    # Written by render_cut; a re-render replaces it wholesale. See
+    # engine/render/asset_sourcer.py's fallback chain and docs/roadmap.md's Phase 7
+    # asset_sourcer visibility item — this is operator-visible so a black-frame reel
+    # doesn't silently report `done`.
+    black_frame_beat_indices = Column(JSON)
     duration_s = Column(Float)
     status = Column(SAEnum(CutStatus), default=CutStatus.draft, nullable=False)
     published_at = Column(DateTime(timezone=True))
