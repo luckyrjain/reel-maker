@@ -201,10 +201,10 @@ class EdgeTTSProvider:
                     edge_tts.Communicate(text, self.voice, rate=rate).save(str(tmp)),
                     timeout=self.SYNTH_TIMEOUT_S,
                 )
+                tmp.replace(out)
             except Exception:
                 tmp.unlink(missing_ok=True)
                 raise
-            tmp.replace(out)
 
         try:
             asyncio.run(_run())

@@ -148,6 +148,32 @@ def test_synthesize_writes_atomically_no_tmp_file_left_behind(tmp_path):
     assert not out.with_suffix(out.suffix + ".tmp").exists()
 
 
+def test_synthesize_cleans_up_tmp_file_when_the_final_replace_fails(tmp_path):
+    """A successful download followed by a failed rename (disk full, permission
+    error) must not leak the `.tmp` file — `tmp.replace(out)` has to be inside
+    the same try/except as the write, not after it. Discriminates true atomic
+    write from a version that only guards the download step: on a version where
+    `tmp.replace(out)` sits outside the try/except, this scenario leaks the
+    `.tmp` file because nothing ever cleans it up."""
+    pytest.importorskip("edge_tts")
+    provider = EdgeTTSProvider(tmp_path)
+
+    class FakeCommunicate:
+        def __init__(self, text, voice, rate="+0%"):
+            pass
+
+        async def save(self, path):
+            Path(path).write_bytes(b"fake-mp3")
+
+    with patch("edge_tts.Communicate", FakeCommunicate), \
+         patch("pathlib.Path.replace", side_effect=OSError("disk full")):
+        with pytest.raises(OSError):
+            provider.synthesize("hello world")
+
+    leftovers = list(tmp_path.glob("*.mp3")) + list(tmp_path.glob("*.tmp"))
+    assert leftovers == [], f"leftover file(s) after a failed rename: {leftovers}"
+
+
 def test_synthesize_retries_once_after_a_timeout(tmp_path):
     """A hung connection to the edge-tts endpoint must not block forever —
     it gets one retry after SYNTH_TIMEOUT_S, not an indefinite stall."""
