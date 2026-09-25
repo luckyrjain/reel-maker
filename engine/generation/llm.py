@@ -105,7 +105,7 @@ def check_model_available(base_url: str, model: str, headers: dict, timeout: flo
         return False, f"{base_url}/models unreachable ({exc})"
     if model in ids:
         return True, ""
-    sample = ", ".join(sorted(i for i in ids if i)[:5]) or "(none)"
+    sample = ", ".join(sorted(i for i in ids if isinstance(i, str))[:5]) or "(none)"
     return False, f"{model!r} not found at {base_url}/models — currently lists: {sample}"
 
 

@@ -22,3 +22,15 @@ def test_startup_does_not_crash_when_every_model_checks_out():
         with TestClient(app) as client:
             resp = client.get("/")
     assert resp.status_code == 200
+
+
+def test_startup_survives_validate_configured_models_raising(caplog):
+    """validate_configured_models() is documented as never-raising, but the lifespan
+    hook must not trust that promise alone — a startup check must never be able to
+    crash the app it's checking."""
+    with patch("api.main.validate_configured_models", side_effect=TypeError("boom")):
+        with caplog.at_level("ERROR"):
+            with TestClient(app) as client:
+                resp = client.get("/")
+    assert resp.status_code == 200
+    assert any("Startup model check failed" in r.message for r in caplog.records)

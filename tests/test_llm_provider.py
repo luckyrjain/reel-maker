@@ -110,6 +110,19 @@ def test_check_model_available_false_on_non_2xx():
     assert ok is False
 
 
+def test_check_model_available_handles_non_string_ids_without_raising():
+    """A nonstandard OpenAI-compatible proxy can return a non-string `id` (e.g. an
+    int). This must degrade to (False, reason) like every other failure mode, not
+    raise TypeError out of the sorted()/join() call building the sample list."""
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {"data": [{"id": 12345}, {"id": "qwen3:14b"}, {"id": None}]}
+    with patch("engine.generation.llm.httpx.get", return_value=resp):
+        ok, detail = check_model_available("http://x", "missing-model", {})
+    assert ok is False
+    assert "qwen3:14b" in detail
+
+
 def test_validate_configured_models_empty_when_both_available():
     with (
         patch("engine.generation.llm.get_llm_provider",

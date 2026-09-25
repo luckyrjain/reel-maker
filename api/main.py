@@ -23,8 +23,14 @@ async def lifespan(app: FastAPI):
     # the app already has plenty of graceful-degradation precedent (asset_sourcer's
     # fallback chain, SilentProvider) and a dead LLM endpoint shouldn't take down a
     # server that's otherwise fine for browsing/reviewing existing reels.
-    for warning in validate_configured_models():
-        _log.warning("Startup model check: %s", warning)
+    try:
+        for warning in validate_configured_models():
+            _log.warning("Startup model check: %s", warning)
+    except Exception:
+        # validate_configured_models() is documented as never-raising, but this is
+        # a startup check — it must never be able to take the app down even if that
+        # promise is broken again in the future.
+        _log.exception("Startup model check failed unexpectedly — continuing startup")
     yield
 
 
