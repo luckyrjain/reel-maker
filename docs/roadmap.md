@@ -26,7 +26,7 @@ This file below is the build log (what shipped, phase by phase); that one is the
 | 4b | ✅ Done | Publishing (OAuth, safe_to_publish gate, YouTube + Instagram uploaders, TikTok platform) |
 | 5 | ✅ Done | Analytics and polish |
 | 6 | 🔲 Partial | Creative range — hook/thumbnail variant generation, per-reel TTS voice, non-football fairness fixes, configurable text color done; logo/watermark + per-channel presets not started |
-| 7 | 🔲 Partial | Production hardening — asset_sourcer black-frame visibility done; golden-reel CI test, startup model validation, Dockerfile, auth/rate-limit decision not started |
+| 7 | 🔲 Partial | Production hardening — asset_sourcer black-frame visibility and a real Dockerfile/deploy path done; golden-reel CI test, startup model validation, auth/rate-limit decision not started |
 
 ---
 
@@ -745,18 +745,46 @@ when the list is non-empty. See the Open Issues table below for what's
 still not addressed (the sourcers themselves still degrade silently at
 the source — this only stops the *result* from being silent).
 
+### 7b. Dockerfile for the API + workers — done
+
+One `Dockerfile` (python:3.12-slim + ffmpeg via apt, matching
+`.github/workflows/ci.yml`'s own ffmpeg install so what passes CI is what
+this image runs), one image, run four ways: `docker-compose.yml` now
+defines `api`, `worker-generation`, `worker-rendering`, and `beat`
+services alongside the existing `postgres`/`redis`, each overriding
+`command:` for its role rather than each getting its own Dockerfile (they
+share the exact same dependency set — a second image would just double
+the build and the chance for the two to drift). Runs as a non-root user.
+`edge-tts` is installed as a separate `pip install` step matching this
+repo's own documented local setup (`CLAUDE.md`'s Commands section) exactly,
+since `TTS_PROVIDER` defaults to `"edge"` but `edge-tts` isn't in
+`pyproject.toml`'s dependency list.
+
+Migrations are deliberately **not** run automatically by any service's
+startup — with up to 4 worker replicas potentially starting at once, that
+would mean N containers racing the same `alembic upgrade head`. It's a
+documented one-off: `docker compose run --rm api alembic upgrade head`
+before first `up` (see the README's Docker section and the comment in
+`docker-compose.yml` itself).
+
+Verified end-to-end, not just `docker build`: brought up the full stack
+(`postgres`, `redis`, `api`, `worker-generation`, `worker-rendering`,
+`beat`) via `docker compose`, ran the real migration chain through the
+`api` container, confirmed `GET /` returns 200 from inside the running
+`api` container, and confirmed both workers registered all 6 tasks and
+mingled with each other over Redis. CI gets a new `docker-build` job
+(build only, no registry push) so a broken Dockerfile is caught on every
+push/PR, not just at deploy time.
+
 ### Not started
 
 - Golden-reel smoke test in CI (would have caught the months-long silent
   zero-audio bug documented in Phase 3.9's own history — a real end-to-end
   render, not just unit tests)
-- CI pipeline currently runs pytest + ruff only, no golden-reel job
 - Startup validation: ping configured LLM model endpoints, fail fast on a
   dead model instead of failing every generation job individually one at
   a time (this bit in practice — see the NVIDIA model-catalog-drift entry
   in `docs/product-gap-analysis-and-roadmap-2026-08.md`)
-- Dockerfile for the API + workers — `docker-compose.yml` only defines
-  `postgres`/`redis` today, no deploy path beyond a local venv
 - Auth / rate-limiting scope decision — still the silent absence the gap
   analysis flagged, not yet an explicit "we chose not to, because X"
 

@@ -25,5 +25,85 @@ services:
       timeout: 3s
       retries: 5
 
+  # api / worker-generation / worker-rendering / beat all build from the same image
+  # (Dockerfile) — see its own comment for why one image, not four. Each overrides
+  # `command:` for its role; `environment:` is repeated per service rather than
+  # factored into a single `x-app-env` YAML anchor so `docker compose config` stays
+  # simple to read for anyone debugging one service's env in isolation.
+  #
+  # Migrations are NOT run automatically by any of these services — with 4 worker
+  # replicas potentially starting at once, baking `alembic upgrade head` into a
+  # container's own startup means N containers racing the same migration
+  # concurrently. Run it once, explicitly, before first `up` (or after pulling a new
+  # image that adds a migration):
+  #   docker compose run --rm api alembic upgrade head
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://reelmaker:reelmaker@postgres:5432/reelmaker
+      REDIS_URL: redis://redis:6379/0
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker-generation:
+    build: .
+    command: celery -A worker.celery_app worker -Q generation -c 4 -l info
+    environment:
+      DATABASE_URL: postgresql+psycopg2://reelmaker:reelmaker@postgres:5432/reelmaker
+      REDIS_URL: redis://redis:6379/0
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker-rendering:
+    build: .
+    # --concurrency=1 and worker_max_tasks_per_child=10 (set in worker/celery_app.py,
+    # not here) both matter for this queue specifically — see CLAUDE.md's Worker
+    # queues section.
+    command: celery -A worker.celery_app worker -Q rendering --concurrency=1 -l info
+    environment:
+      DATABASE_URL: postgresql+psycopg2://reelmaker:reelmaker@postgres:5432/reelmaker
+      REDIS_URL: redis://redis:6379/0
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  beat:
+    build: .
+    command: celery -A worker.celery_app beat -l info
+    environment:
+      DATABASE_URL: postgresql+psycopg2://reelmaker:reelmaker@postgres:5432/reelmaker
+      REDIS_URL: redis://redis:6379/0
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
 volumes:
   postgres_data:
