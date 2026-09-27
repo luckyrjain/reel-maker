@@ -57,15 +57,24 @@ def _enforce_paid_call_budget(db, reel_id: int) -> None:
         )
 
 
-# Reaper-resume cost note (design §7, Red-Team review): a resumed `generate` job can run
-# concurrently with a genuinely-alive "zombie" for at most one attempt's worth of paid LLM
-# calls before that zombie's own next heartbeat() call raises JobLost and unwinds it. This is
-# an EMERGENT side effect of where heartbeat() is called inside the attempt loop above
-# (once per attempt, before that attempt's LLM/enrichment/judge calls) — not a designed or
-# enforced invariant. record_stage() and paid_call_count() (engine/observability.py) have zero
-# fencing/claim_token-awareness at all: nothing stops a zombie's StageEvent writes or a
-# concurrent _enforce_paid_call_budget() read from happening mid-attempt. generate's resume
-# budget is capped at 1 (not enrich/render's 2) specifically because of this — see
+# Reaper-resume cost note (design §7; corrected after a second review pass found the first
+# version of this comment too optimistic): the "resumed job runs concurrently with a live
+# zombie for at most one attempt's worth of paid calls" bound below is an EMERGENT side effect
+# of heartbeat() placement, not a designed or enforced invariant — and it only holds for the
+# STANDARD path's attempt loop (heartbeat(db, job, 20 + attempt * 20) once per iteration,
+# immediately below). It does NOT hold for the structured-script fast path above: there is
+# exactly one heartbeat() call (`heartbeat(db, job, 20)`) before
+# _generate_from_structured_script() runs an unfenced enrich call, an optional conflict-stub
+# call, and its own internal visuals-LLM retries, followed by an unfenced judge call in
+# _combined_score() — no fencing checkpoint anywhere in that stretch. A zombie on the
+# structured path can therefore burn several paid calls, not "one attempt's worth," before its
+# next heartbeat() (the standard path's first iteration, reached only on fallback, or the
+# final heartbeat(db, job, 80) near the end of this function) raises JobLost. generate's resume
+# budget is capped at 1 (not enrich/render's 2) partly because of this — but that number is a
+# conservative choice given the uncertainty here, not a value derived from a proven bound.
+# record_stage() and paid_call_count() (engine/observability.py) have zero fencing/claim_token-
+# awareness at all: nothing stops a zombie's StageEvent writes or a concurrent
+# _enforce_paid_call_budget() read from happening at any point in either path. See
 # _RESUMABLE_TASKS in worker/tasks/maintenance.py.
 
 

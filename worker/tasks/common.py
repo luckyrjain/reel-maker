@@ -117,10 +117,20 @@ def heartbeat(db, job, progress: int) -> None:
     "prove" the RESUMED run's row alive instead, defeating fencing entirely. Either case aborts a
     zombie body at its next milestone instead of letting it run on and write. Commits the body's
     pending mutations, so call it before the final mutations, never after.
+
+    Reads ``job._run_claim_token`` (a plain, unmapped instance attribute `job_task`'s `run()` sets
+    once right after this run's own claim), not the mapped ``job.claim_token`` column attribute --
+    the mapped one is exactly what a LATER ``db.rollback()`` on this session (e.g. from a swallowed
+    commit failure inside `record_stage()`, called between two heartbeat()/lock_job() calls in
+    every resumable task body) silently resyncs to whatever claim_token the row holds *now* on next
+    read, which could be a fresher, superseding claim -- defeating this exact check. Falls back to
+    the mapped attribute when the pin is absent (a `job` loaded and passed in directly, outside
+    `job_task`'s `run()`, e.g. some tests call this function standalone).
     """
     now = _now()
+    token = getattr(job, "_run_claim_token", job.claim_token)
     if not _advance(db, job.id, models.JobStatus.running,
-                    {"progress": progress, "heartbeat_at": now}, token=job.claim_token):
+                    {"progress": progress, "heartbeat_at": now}, token=token):
         db.rollback()
         raise JobLost(f"job {job.id} is no longer running (or was resumed by a fresher claim)")
     job.progress = progress
@@ -134,9 +144,11 @@ def lock_job(db, job) -> None:
     The reaper locks the job row first and then the owner; a body that locks the owner first and
     the job at its done-stamp can deadlock against it. Raises JobLost if the job is gone, or if a
     fresher claim has superseded this run — see heartbeat()'s docstring for why the token check
-    matters here too, not just the status check.
+    matters here too, not just the status check, and for why this reads
+    ``job._run_claim_token`` rather than the mapped ``job.claim_token`` column attribute.
     """
-    if not _advance(db, job.id, models.JobStatus.running, {"heartbeat_at": _now()}, token=job.claim_token):
+    token = getattr(job, "_run_claim_token", job.claim_token)
+    if not _advance(db, job.id, models.JobStatus.running, {"heartbeat_at": _now()}, token=token):
         db.rollback()
         raise JobLost(f"job {job.id} is no longer running (or was resumed by a fresher claim)")
 
@@ -674,23 +686,32 @@ def job_task(
                 # explicit refresh(), which always re-fetches regardless.
                 db.refresh(job)
                 # Captured as a plain, immutable int -- NOT re-read from job.claim_token after this
-                # point anywhere in run() itself. heartbeat()/lock_job() (called from within the
-                # body) read job.claim_token directly, which is safe there because nothing has
-                # touched this session yet when they first fire; but heartbeat()'s and lock_job()'s
-                # own failure paths call db.rollback(), and SQLAlchemy's rollback() always expires
-                # every object in the session's identity map (there is no expire_on_rollback=False
-                # escape hatch) -- so a LATER read of job.claim_token, e.g. in this function's own
-                # except handler below, would silently trigger a fresh SELECT and hand back
-                # whatever claim_token the row holds *now* (a fresher, superseding claim), not the
-                # stale one this run captured. That would defeat exactly the fencing the token
-                # exists for: the except handler needs the token THIS run claimed with, not
-                # whatever the row currently says.
+                # point anywhere in run() itself, and not trusted as a live attribute read from
+                # heartbeat()/lock_job() either (see job._run_claim_token below). SQLAlchemy's
+                # rollback() always expires every object in the session's identity map (there is
+                # no expire_on_rollback=False escape hatch) -- so a LATER read of job.claim_token
+                # after ANY rollback on this session, e.g. in this function's own except handler
+                # below, or inside heartbeat()/lock_job() after some earlier call already rolled
+                # back (record_stage()'s own swallowed-commit-failure rollback is one such path --
+                # an independent review found this exact gap: heartbeat()/lock_job() reading the
+                # live job.claim_token attribute, not this captured local, meant they were NOT
+                # actually honoring "capture once" the way every other fenced call site does),
+                # would silently trigger a fresh SELECT and hand back whatever claim_token the row
+                # holds *now* (a fresher, superseding claim), not the stale one this run captured.
+                # That would defeat exactly the fencing the token exists for.
                 #
-                # Captured BEFORE `owned = True`, not after: an exception raised between the two
-                # statements (however narrow) would otherwise reach the BaseException handler with
-                # owned=True but claim_token still None, forwarding token=None to _fail_interrupted
-                # and losing this run's own fencing at the exact moment it starts mattering.
+                # job._run_claim_token is a plain, unmapped instance attribute (not an ORM column),
+                # so Session.expire()/rollback() -- which only expires MAPPED attributes -- can
+                # never reset it. Setting it here, once, is what lets heartbeat()/lock_job() read a
+                # value that survives every rollback for the rest of this run, without threading an
+                # explicit token parameter through every task body in every task module that calls
+                # them.
+                #
+                # Captured before `owned = True` for consistency with every other "capture then
+                # use" step in this function, not because anything can raise between two adjacent
+                # pure-Python statements separated only by comments.
                 claim_token = job.claim_token
+                job._run_claim_token = claim_token
                 owned = True
 
                 thread = threading.Thread(

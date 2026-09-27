@@ -191,35 +191,49 @@ def _reap_one(db, job_id: int, seen_status, reason: str, stale_clause, job_type:
     ordering here is load-bearing (a worker's own atomic claim, WHERE status='pending', must never
     race a not-yet-durable update from this transaction's point of view).
     """
-    if seen_status == models.JobStatus.running and job_type in _RESUMABLE_TASKS:
-        task, max_resumes = _RESUMABLE_TASKS[job_type]
-        resumed = (
-            db.query(models.Job)
-            .filter(
-                models.Job.id == job_id, models.Job.status == seen_status, stale_clause,
-                models.Job.reaper_resumes < max_resumes,
+    resumes_so_far = 0
+    if job_type in _RESUMABLE_TASKS:
+        # Read BEFORE the update, not after commit: this run is the only writer that could ever
+        # increment reaper_resumes for this row in this pass, so old_resumes + 1 is exactly the
+        # post-update value -- no need for a second, post-commit round trip whose own failure
+        # would otherwise land in this function's caller's broad `except Exception` (which logs
+        # "could not reap job %s; will retry on the next pass") even though the resume itself,
+        # and the already-fired task.delay(), succeeded. A misleading "still stuck, will retry"
+        # log line during an incident is worse than a slightly earlier query.
+        old_resumes = db.query(models.Job.reaper_resumes).filter(models.Job.id == job_id).scalar() or 0
+        resumes_so_far = old_resumes
+        if seen_status == models.JobStatus.running:
+            task, max_resumes = _RESUMABLE_TASKS[job_type]
+            resumed = (
+                db.query(models.Job)
+                .filter(
+                    models.Job.id == job_id, models.Job.status == seen_status, stale_clause,
+                    models.Job.reaper_resumes < max_resumes,
+                )
+                .update(
+                    {"status": models.JobStatus.pending, "reaper_resumes": models.Job.reaper_resumes + 1},
+                    synchronize_session=False,
+                )
             )
-            .update(
-                {"status": models.JobStatus.pending, "reaper_resumes": models.Job.reaper_resumes + 1},
-                synchronize_session=False,
-            )
-        )
-        if resumed:
-            db.commit()   # durable BEFORE the re-enqueue -- see this function's own docstring
-            task.delay(job_id)
-            resume_count = db.query(models.Job.reaper_resumes).filter(models.Job.id == job_id).scalar()
-            _log.warning("job %s (%s) resumed after a missed heartbeat (attempt %s/%s)",
-                        job_id, job_type, resume_count, max_resumes)
-            return True
-        db.rollback()
-        # Falls through to the unchanged fail-CAS below: either the row is no longer stale (lost
-        # the race to a real heartbeat, a sibling's claim, or the reaper itself), or this type's
-        # resume budget is exhausted -- either way, today's existing fail behavior applies.
+            if resumed:
+                db.commit()   # durable BEFORE the re-enqueue -- see this function's own docstring
+                task.delay(job_id)
+                _log.warning("job %s (%s) resumed after a missed heartbeat (attempt %s/%s)",
+                            job_id, job_type, old_resumes + 1, max_resumes)
+                return True
+            db.rollback()
+            # Falls through to the unchanged fail-CAS below: either the row is no longer stale
+            # (lost the race to a real heartbeat, a sibling's claim, or the reaper itself), or
+            # this type's resume budget is exhausted -- either way, today's existing fail
+            # behavior applies.
 
     # Informational only (never changes the CAS filter below): a budget-exhausted resumable
     # type's failure message should say so, rather than reading identical to a first-attempt
-    # failure that was never resumed at all.
-    resumes_so_far = db.query(models.Job.reaper_resumes).filter(models.Job.id == job_id).scalar() or 0
+    # failure that was never resumed at all. Gated to resumable types above: a non-resumable
+    # type (or a pending-stale/done-orphan candidate, neither of which reach the resume branch)
+    # can never have a nonzero reaper_resumes, so skipping this read for them is a pure win, not
+    # a behavior change -- it just avoids a wasted round trip on the overwhelmingly common
+    # non-resumable fail path.
     if resumes_so_far:
         reason = (f"{reason} Already auto-resumed {resumes_so_far} "
                   f"time{'s' if resumes_so_far != 1 else ''} by the reaper.")

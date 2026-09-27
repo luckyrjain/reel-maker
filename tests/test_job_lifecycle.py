@@ -2275,3 +2275,38 @@ def test_fail_rejected_retry_cas_does_not_clobber_a_fresher_runs_own_pending_res
     assert reel.status == models.ReelStatus.generating, (
         "the fresher run's owner must not be rolled back by the stale _fail_rejected_retry CAS"
     )
+
+
+def test_heartbeat_uses_the_pinned_run_token_not_the_live_attribute_after_a_rollback(factory):
+    """A ninth gap, found by a Concurrency Specialist review pass: heartbeat()/lock_job() read
+    job.claim_token -- a mapped ORM column attribute -- not the plain local `claim_token` this
+    run captured once at its own claim. That's only safe for the FIRST call in a run: any earlier
+    db.rollback() on this session (e.g. record_stage()'s own swallowed-commit-failure rollback,
+    which sits between heartbeat() calls in every resumable task body) unconditionally expires
+    the whole identity map, so the next read of job.claim_token triggers a fresh SELECT and hands
+    back whatever the row holds *now* -- a fresher, superseding claim, if a reaper resume + a
+    second worker landed in the meantime. A zombie's own heartbeat() would then "prove" the
+    RESUMED run's row alive instead of raising JobLost, defeating fencing entirely. Fixed by
+    pinning job._run_claim_token (a plain, unmapped instance attribute -- Session.expire()/
+    rollback() only expire MAPPED attributes, so it survives every rollback for the rest of this
+    run) once in job_task's run(), and reading that instead. Mutation-tested by temporarily
+    reverting heartbeat()'s token lookup to plain `job.claim_token` and confirming this test fails
+    (no JobLost raised -- the zombie's heartbeat wrongly succeeds)."""
+    job_id, reel_id, cut_id = _make(factory)
+    seen = {}
+
+    def zombie_body(self, db, job, ctx):
+        db.query(models.Job).filter(models.Job.id == job_id).first()   # opens a transaction
+        db.rollback()   # simulates record_stage()'s swallowed-commit-failure rollback: expires
+                         # the identity map, including job.claim_token, with no exception raised
+        seen["resumed_token"] = _bump_claim_token(factory, job_id)   # a fresher claim lands
+        heartbeat(db, job, 50)   # must still raise: the PINNED token, not the (now silently
+                                 # resynced, if read live) job.claim_token attribute
+
+    with pytest.raises(JobLost):
+        _task("t.pinned_token_survives_rollback", zombie_body)(job_id)
+
+    job, *_ = _read(factory, job_id, reel_id, cut_id)
+    assert job.claim_token == seen["resumed_token"], (
+        "the zombie's fenced heartbeat() must not have advanced the RESUMED run's row"
+    )
