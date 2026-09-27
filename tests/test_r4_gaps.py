@@ -355,7 +355,10 @@ def test_the_reaper_records_why_it_failed_a_running_job(factory):
     db.query(models.Job).filter(models.Job.id == job_id).update(
         {"heartbeat_at": long_ago, "updated_at": long_ago}, synchronize_session=False)
     db.commit()
-    with patch("worker.tasks.maintenance.SessionLocal", factory):
+    # render is resumable; disable it here so this stays a test of the (unchanged) fail path's
+    # recorded error message, not a real Celery .delay() call this test has no business making.
+    with patch("worker.tasks.maintenance.SessionLocal", factory), \
+            patch("worker.tasks.maintenance._RESUMABLE_TASKS", {}):
         reap_stuck_jobs()
     assert "Worker stopped responding" in _read(factory, job_id, reel_id, cut_id)[0].error
 

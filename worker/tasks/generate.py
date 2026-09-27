@@ -345,6 +345,23 @@ _MAX_RUNTIME_S = 4 * 60 * 60
 def generate_guide(self, db, job, reel):
     effective_context = reel.enriched_context or reel.context
 
+    # A killed or ordinarily-retried attempt of this SAME Job row may have already committed
+    # "structured_fallback"/"structured_score"/"path" from a prior run (e.g. one that took the
+    # structured path, failed its quality gate, and fell through to standard, then got SIGKILLed
+    # before finishing). job.meta is always merged additively below, never reset, so those stale
+    # keys would otherwise survive into this run's final job.meta even when THIS run's structured
+    # path succeeds cleanly with no fallback at all — corrupting
+    # engine/generation/estimate.py::estimate_generation()'s structured_fallback-exclusion bucketing
+    # for every future reel on this path. Reaper-resume turns this from a rare, barely-reachable
+    # edge case into an operationally common one, which is why the fix lands here rather than being
+    # filed separately — see CLAUDE.md's Key conventions entry on the fencing-token/resume
+    # mechanism. Only these three keys are stripped: never context_score, performance_note_ids, or
+    # any other legitimately-persisted key.
+    stale_meta_keys = {"structured_fallback", "structured_score", "path"}
+    if job.meta and stale_meta_keys & job.meta.keys():
+        job.meta = {k: v for k, v in job.meta.items() if k not in stale_meta_keys}
+        db.commit()
+
     # Queried once, unconditionally, before the structured-vs-standard branch below —
     # the shared job.meta write at the end of this function (reached by BOTH paths)
     # records performance_note_ids, and the standard path's prior_feedback seed also

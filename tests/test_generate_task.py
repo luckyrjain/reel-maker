@@ -379,3 +379,143 @@ def test_structured_path_success_does_not_nameerror_on_performance_notes():
     assert job.status == models.JobStatus.done
     assert job.meta.get("performance_note_ids") == [7]
     assert job.meta.get("quality_score") == 90
+
+
+# ── reaper-resume design §7 — job.meta staleness-across-retry regression ────
+# A killed (or ordinarily retried) attempt of this SAME Job row may have already
+# committed structured_fallback=True/structured_score from a prior run that took
+# the structured path, failed its quality gate, and fell through to standard.
+# job.meta is always merged additively, never reset, so those stale keys must
+# not survive into a SUBSEQUENT clean structured-path success's final job.meta
+# (a real bug: it would misclassify that reel's cost history in
+# estimate_generation()'s structured_fallback-exclusion bucket). Written first
+# against the naive/buggy version (no strip at function entry), confirmed to
+# fail, then confirmed to pass against the fix — this file's established
+# mutation-testing convention (see the §3.5 regressions above).
+
+def test_stale_structured_fallback_does_not_leak_into_a_clean_success():
+    from worker.tasks.generate import generate_guide
+
+    job = _job()
+    # Seed job.meta as if a prior, killed/retried attempt of this exact Job row
+    # had already committed a structured-path fallback, alongside keys that must
+    # NEVER be stripped (context_score, performance_note_ids — legitimately
+    # persisted, unrelated to this leak).
+    job.meta = {
+        "structured_fallback": True,
+        "structured_score": 40,
+        "path": "standard",
+        "context_score": 55,
+        "performance_note_ids": [999],
+    }
+    reel = _reel()
+    db = MagicMock()
+    notes = [SimpleNamespace(id=7, text="Some performance note.")]
+    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
+    db.query.side_effect = _query_dispatch(notes=notes, cuts=[_cut()])
+
+    structured_guide = MasterGuide(
+        title="Structured guide",
+        niche="football",
+        cuts=[PlatformGuide(
+            platform="youtube_shorts",
+            target_length_s=45.0,
+            caption="Caption",
+            hashtags=["football"] * 6,
+            beats=[
+                Beat(index=0, type="hook", duration_s=5, visual_direction="v",
+                     on_screen_text=["h"], vo_script="Could this be the biggest upset yet?"),
+                Beat(index=1, type="body", duration_s=10, visual_direction="v",
+                     on_screen_text=["b"], vo_script="Body content here."),
+                Beat(index=2, type="cta", duration_s=5, visual_direction="v",
+                     on_screen_text=["c"], vo_script="Drop your prediction below."),
+            ],
+        )],
+    )
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.generate.paid_call_count", return_value=0),
+        patch("worker.tasks.generate.get_llm_provider"),
+        patch("worker.tasks.generate.script_parser.parse", return_value=[MagicMock()]),
+        patch("worker.tasks.generate.resolve_generation_path", return_value="structured"),
+        patch("worker.tasks.generate._generate_from_structured_script", return_value=structured_guide),
+        patch("worker.tasks.generate.score_guide", return_value=(90, [])),
+        patch("worker.tasks.generate._combined_score", return_value=(90, [])),
+        patch("worker.tasks.generate.generate_hook_variants", return_value=[]),
+        patch("worker.tasks.generate.build_messages") as mock_build_messages,
+    ):
+        generate_guide(1)
+
+    mock_build_messages.assert_not_called()  # never falls through to the standard path
+    assert job.status == models.JobStatus.done
+    assert "structured_fallback" not in job.meta, (
+        "stale structured_fallback from a prior killed/retried attempt leaked into a "
+        "clean structured-path success"
+    )
+    assert "structured_score" not in job.meta
+    assert job.meta.get("path") == "structured"
+    # Legitimately-persisted keys, unrelated to the leak, must survive the strip.
+    assert job.meta.get("context_score") == 55
+    assert job.meta.get("performance_note_ids") == [7]
+
+
+def test_genuine_structured_fallback_still_recorded_after_the_strip():
+    """The strip-then-rebuild at function entry must not suppress a REAL fallback
+    signal from THIS run — only a stale one carried over from a prior attempt.
+    Force the structured path to score below threshold so it genuinely falls
+    through to (and succeeds on) the standard path, and assert job.meta still
+    ends up with structured_fallback=True / structured_score set from this run,
+    exactly as estimate_generation()'s exclusion logic depends on."""
+    from worker.tasks.generate import generate_guide
+
+    job = _job()
+    reel = _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
+    db.query.side_effect = _query_dispatch(notes=[], cuts=[_cut()])
+
+    structured_guide = MasterGuide(
+        title="Structured guide",
+        niche="football",
+        cuts=[PlatformGuide(
+            platform="youtube_shorts",
+            target_length_s=45.0,
+            caption="Caption",
+            hashtags=["football"] * 6,
+            beats=[
+                Beat(index=0, type="hook", duration_s=5, visual_direction="v",
+                     on_screen_text=["h"], vo_script="Could this be the biggest upset yet?"),
+                Beat(index=1, type="body", duration_s=10, visual_direction="v",
+                     on_screen_text=["b"], vo_script="Body content here."),
+                Beat(index=2, type="cta", duration_s=5, visual_direction="v",
+                     on_screen_text=["c"], vo_script="Drop your prediction below."),
+            ],
+        )],
+    )
+
+    def _combined_score_side_effect(rule_s, rule_i, guide, context, db=None, reel_id=None, attempt=None):
+        if attempt == 1:
+            return 30, ["Weak hook — add a question or direct address"]
+        return 90, []
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.generate.paid_call_count", return_value=0),
+        patch("worker.tasks.generate.get_llm_provider") as mock_get_llm,
+        patch("worker.tasks.generate.script_parser.parse", return_value=[MagicMock()]),
+        patch("worker.tasks.generate.resolve_generation_path", return_value="structured"),
+        patch("worker.tasks.generate._generate_from_structured_script", return_value=structured_guide),
+        patch("worker.tasks.generate.score_guide", return_value=(0, [])),
+        patch("worker.tasks.generate._combined_score", side_effect=_combined_score_side_effect),
+        patch("worker.tasks.generate.build_messages", return_value=[{"role": "system", "content": "x"}]),
+        patch("worker.tasks.generate._enrich_standard_path_guide"),
+        patch("worker.tasks.generate.generate_hook_variants", return_value=[]),
+    ):
+        mock_get_llm.return_value.complete.return_value = _valid_guide_raw()
+        generate_guide(1)
+
+    assert job.status == models.JobStatus.done
+    assert job.meta.get("structured_fallback") is True
+    assert job.meta.get("structured_score") == 30
+    assert job.meta.get("path") == "standard"
