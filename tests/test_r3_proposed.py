@@ -103,7 +103,10 @@ def test_reaper_uses_the_job_id_not_the_reel_id(factory):
     """kills M9d."""
     from test_maintenance import _make as mk, _state
     from worker.tasks.maintenance import reap_stuck_jobs
-    with patch("worker.tasks.maintenance.SessionLocal", factory):
+    # generate is resumable; disable it here so this stays a test of the (unchanged) fail path,
+    # not a real Celery .delay() call this test has no business making.
+    with patch("worker.tasks.maintenance.SessionLocal", factory), \
+            patch("worker.tasks.maintenance._RESUMABLE_TASKS", {}):
         _offset_ids(factory)
         ids = mk(factory, models.JobType.generate, job_status=models.JobStatus.running)
         _ids_differ(*ids)
@@ -280,10 +283,10 @@ def test_a_transient_error_on_the_done_stamp_commit_is_retried_not_treated_as_do
     state = {"stamped": False, "raised": False}
     real_advance = common._advance
 
-    def spy(db, jid, frm, values):
+    def spy(db, jid, frm, values, token=None):
         if values.get("status") == models.JobStatus.done:
             state["stamped"] = True
-        return real_advance(db, jid, frm, values)
+        return real_advance(db, jid, frm, values, token=token)
 
     class Flaky(sessionmaker(bind=factory.kw["bind"]).class_):
         def commit(self):
@@ -347,17 +350,18 @@ def test_reap_stuck_jobs_passes_a_clause_that_backs_off_from_a_job_that_beat_aft
     """kills M2c (running clause not re-checked in the UPDATE)."""
     from test_maintenance import _make as mk, _state
     from worker.tasks import maintenance
-    with patch("worker.tasks.maintenance.SessionLocal", factory):
+    with patch("worker.tasks.maintenance.SessionLocal", factory), \
+            patch("worker.tasks.maintenance._RESUMABLE_TASKS", {}):
         ids = mk(factory, models.JobType.render, job_status=models.JobStatus.running,
                  cut_status=models.CutStatus.rendering, reel_status=models.ReelStatus.guide_ready)
         real = maintenance._reap_one
 
-        def beat_first(db, job_id, seen, reason, clause):
+        def beat_first(db, job_id, seen, reason, clause, job_type):
             o = factory()
             o.query(models.Job).filter(models.Job.id == job_id).update(
                 {"heartbeat_at": datetime.now(timezone.utc)}, synchronize_session=False)
             o.commit()
-            return real(db, job_id, seen, reason, clause)
+            return real(db, job_id, seen, reason, clause, job_type)
 
         with patch.object(maintenance, "_reap_one", side_effect=beat_first):
             maintenance.reap_stuck_jobs()
@@ -373,12 +377,12 @@ def test_reap_stuck_jobs_passes_a_clause_that_backs_off_from_a_pending_job_that_
         ids = mk(factory, models.JobType.generate, job_status=models.JobStatus.pending)
         real = maintenance._reap_one
 
-        def touch_first(db, job_id, seen, reason, clause):
+        def touch_first(db, job_id, seen, reason, clause, job_type):
             o = factory()
             o.query(models.Job).filter(models.Job.id == job_id).update(
                 {"updated_at": datetime.now(timezone.utc)}, synchronize_session=False)
             o.commit()
-            return real(db, job_id, seen, reason, clause)
+            return real(db, job_id, seen, reason, clause, job_type)
 
         with patch.object(maintenance, "_reap_one", side_effect=touch_first):
             maintenance.reap_stuck_jobs()
@@ -391,7 +395,10 @@ def test_running_threshold_is_about_five_minutes(factory, minutes_ago, reaped):
     from test_maintenance import _make as mk, _state
     from worker.tasks.maintenance import reap_stuck_jobs
     now = datetime.now(timezone.utc)
-    with patch("worker.tasks.maintenance.SessionLocal", factory):
+    # render is resumable; disable it here so this stays a test of the STALE_MINUTES threshold
+    # alone, not a real Celery .delay() call this test has no business making.
+    with patch("worker.tasks.maintenance.SessionLocal", factory), \
+            patch("worker.tasks.maintenance._RESUMABLE_TASKS", {}):
         ids = mk(factory, models.JobType.render, job_status=models.JobStatus.running,
                  heartbeat_at=now - timedelta(minutes=minutes_ago), updated_at=now)
         reap_stuck_jobs()
@@ -404,7 +411,11 @@ def test_reap_one_returns_true_when_it_failed_the_job(factory):
     from worker.tasks.maintenance import _reap_one
     ids = mk(factory, models.JobType.render, job_status=models.JobStatus.running)
     cutoff = datetime.now(timezone.utc) - 5 * _MIN
-    assert _reap_one(factory(), ids[0], models.JobStatus.running, "r", models.Job.heartbeat_at < cutoff) is True
+    # render is resumable; disable it here so this stays a test of the (unchanged) fail path's
+    # return value, not a real Celery .delay() call this test has no business making.
+    with patch("worker.tasks.maintenance._RESUMABLE_TASKS", {}):
+        assert _reap_one(factory(), ids[0], models.JobStatus.running, "r",
+                          models.Job.heartbeat_at < cutoff, "render") is True
 
 
 # --- enrich abandon blast radius ---------------------------------------------------------

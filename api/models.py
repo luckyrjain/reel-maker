@@ -189,6 +189,12 @@ class Job(Base):
     progress = Column(Integer, default=0)
     error = Column(Text)
     attempts = Column(Integer, default=0)
+    # How many times the reaper has resumed this row (worker/tasks/maintenance.py's
+    # _RESUMABLE_TASKS budget check) and the fencing counter bumped on every pending->running
+    # claim (worker/tasks/common.py's job_task) — see CLAUDE.md's Key conventions entry on the
+    # fencing-token mechanism for why both are server_default="0", not a nullable legacy column.
+    reaper_resumes = Column(Integer, default=0, nullable=False, server_default="0")
+    claim_token = Column(Integer, default=0, nullable=False, server_default="0")
     started_at = Column(DateTime(timezone=True))
     heartbeat_at = Column(DateTime(timezone=True))
     meta = Column(JSON, default=dict)

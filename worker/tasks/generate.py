@@ -57,6 +57,27 @@ def _enforce_paid_call_budget(db, reel_id: int) -> None:
         )
 
 
+# Reaper-resume cost note (design §7; corrected after a second review pass found the first
+# version of this comment too optimistic): the "resumed job runs concurrently with a live
+# zombie for at most one attempt's worth of paid calls" bound below is an EMERGENT side effect
+# of heartbeat() placement, not a designed or enforced invariant — and it only holds for the
+# STANDARD path's attempt loop (heartbeat(db, job, 20 + attempt * 20) once per iteration,
+# immediately below). It does NOT hold for the structured-script fast path above: there is
+# exactly one heartbeat() call (`heartbeat(db, job, 20)`) before
+# _generate_from_structured_script() runs an unfenced enrich call, an optional conflict-stub
+# call, and its own internal visuals-LLM retries, followed by an unfenced judge call in
+# _combined_score() — no fencing checkpoint anywhere in that stretch. A zombie on the
+# structured path can therefore burn several paid calls, not "one attempt's worth," before its
+# next heartbeat() (the standard path's first iteration, reached only on fallback, or the
+# final heartbeat(db, job, 80) near the end of this function) raises JobLost. generate's resume
+# budget is capped at 1 (not enrich/render's 2) partly because of this — but that number is a
+# conservative choice given the uncertainty here, not a value derived from a proven bound.
+# record_stage() and paid_call_count() (engine/observability.py) have zero fencing/claim_token-
+# awareness at all: nothing stops a zombie's StageEvent writes or a concurrent
+# _enforce_paid_call_budget() read from happening at any point in either path. See
+# _RESUMABLE_TASKS in worker/tasks/maintenance.py.
+
+
 
 def _combined_score(
     rule: int,
@@ -344,6 +365,23 @@ _MAX_RUNTIME_S = 4 * 60 * 60
 @job_task("generate", prepare=_prepare_generate, start_progress=10, max_runtime_s=_MAX_RUNTIME_S)
 def generate_guide(self, db, job, reel):
     effective_context = reel.enriched_context or reel.context
+
+    # A killed or ordinarily-retried attempt of this SAME Job row may have already committed
+    # "structured_fallback"/"structured_score"/"path" from a prior run (e.g. one that took the
+    # structured path, failed its quality gate, and fell through to standard, then got SIGKILLed
+    # before finishing). job.meta is always merged additively below, never reset, so those stale
+    # keys would otherwise survive into this run's final job.meta even when THIS run's structured
+    # path succeeds cleanly with no fallback at all — corrupting
+    # engine/generation/estimate.py::estimate_generation()'s structured_fallback-exclusion bucketing
+    # for every future reel on this path. Reaper-resume turns this from a rare, barely-reachable
+    # edge case into an operationally common one, which is why the fix lands here rather than being
+    # filed separately — see CLAUDE.md's Key conventions entry on the fencing-token/resume
+    # mechanism. Only these three keys are stripped: never context_score, performance_note_ids, or
+    # any other legitimately-persisted key.
+    stale_meta_keys = {"structured_fallback", "structured_score", "path"}
+    if job.meta and stale_meta_keys & job.meta.keys():
+        job.meta = {k: v for k, v in job.meta.items() if k not in stale_meta_keys}
+        db.commit()
 
     # Queried once, unconditionally, before the structured-vs-standard branch below —
     # the shared job.meta write at the end of this function (reached by BOTH paths)

@@ -4,7 +4,7 @@ Runs against in-memory SQLite: the reaper's correctness lives in its compare-and
 UPDATEs, which a mocked session cannot exercise.
 """
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
@@ -13,8 +13,14 @@ from sqlalchemy.pool import StaticPool
 
 from api import models
 from worker.tasks.maintenance import (
-    PENDING_STALE_MINUTES, STALE_MINUTES, _reap_one, _revert_owner, reap_stuck_jobs,
+    PENDING_STALE_MINUTES, STALE_MINUTES, _check_publish_excluded, _reap_one, _revert_owner,
+    reap_stuck_jobs,
 )
+# The REAL _RESUMABLE_TASKS, captured before the `factory` fixture below ever patches the module
+# attribute to {} for the rest of this file's tests -- `patch()` swaps the attribute binding, not
+# this dict object, so this reference stays valid and real throughout. Only the dedicated
+# publish-safety test below needs it (see that test's own docstring for why).
+from worker.tasks.maintenance import _RESUMABLE_TASKS as _REAL_RESUMABLE_TASKS
 
 _MINUTE = timedelta(minutes=1)
 
@@ -23,10 +29,21 @@ _LONG_AGO = datetime.now(timezone.utc) - timedelta(hours=6)
 
 @pytest.fixture
 def factory():
+    """Every pre-existing test in this file predates the reaper-resume feature and exercises the
+    ordinary fail-and-roll-back-owner path for a `running`-stale job -- including for enrich/
+    render/generate types that are now resumable under their own budget. Disabling
+    `_RESUMABLE_TASKS` here (rather than in each of those ~15 test bodies) keeps every one of them
+    passing completely unmodified: with no type resumable, a `running`-stale candidate always
+    falls straight through to the unchanged fail-CAS, exactly as before this feature existed. The
+    dedicated resume tests below locally re-patch `_RESUMABLE_TASKS` (with mock task objects, so
+    no test here ever risks a real Celery `.delay()` / broker round trip) for the duration of their
+    own test body only.
+    """
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     models.Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine, autoflush=False)
-    with patch("worker.tasks.maintenance.SessionLocal", session_factory):
+    with patch("worker.tasks.maintenance.SessionLocal", session_factory), \
+            patch("worker.tasks.maintenance._RESUMABLE_TASKS", {}):
         yield session_factory
 
 
@@ -261,7 +278,8 @@ def test_reap_one_backs_off_when_the_job_beat_after_it_was_selected(factory):
     worker.commit()
 
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_MINUTES)
-    assert _reap_one(factory(), job_id, models.JobStatus.running, "stale", models.Job.heartbeat_at < cutoff) is False
+    assert _reap_one(factory(), job_id, models.JobStatus.running, "stale",
+                      models.Job.heartbeat_at < cutoff, "render") is False
 
     job, _, cut = _state(factory, job_id, reel_id, cut_id)
     assert job.status == models.JobStatus.running
@@ -276,7 +294,8 @@ def test_reap_one_does_not_overwrite_a_job_that_finished_after_it_was_selected(f
     worker.commit()
 
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_MINUTES)
-    assert _reap_one(factory(), job_id, models.JobStatus.running, "stale", models.Job.heartbeat_at < cutoff) is False
+    assert _reap_one(factory(), job_id, models.JobStatus.running, "stale",
+                      models.Job.heartbeat_at < cutoff, "render") is False
     assert _state(factory, job_id, reel_id, cut_id)[0].status == models.JobStatus.done
 
 
@@ -288,7 +307,7 @@ def test_the_status_pin_is_the_select_snapshot_not_a_later_re_read(factory):
     real = _reap_one
     calls = []
 
-    def racing(db, job_id, seen_status, reason, clause):
+    def racing(db, job_id, seen_status, reason, clause, job_type):
         if not calls:   # after the first reap commits, the second job's worker fails it for real
             other = factory()
             other.query(models.Job).filter(models.Job.id == second[0]).update(
@@ -296,7 +315,7 @@ def test_the_status_pin_is_the_select_snapshot_not_a_later_re_read(factory):
                 synchronize_session=False)
             other.commit()
         calls.append(job_id)
-        return real(db, job_id, seen_status, reason, clause)
+        return real(db, job_id, seen_status, reason, clause, job_type)
 
     with patch("worker.tasks.maintenance._reap_one", side_effect=racing):
         reap_stuck_jobs()
@@ -423,3 +442,228 @@ def test_a_running_job_is_judged_by_heartbeat_at_not_updated_at(factory):
                 heartbeat_at=now, updated_at=now - timedelta(hours=2))
     reap_stuck_jobs()
     assert _state(factory, *ids)[0].status == models.JobStatus.running
+
+
+# ── reaper resume (reaper-resume-killed-jobs design) ──────────────────────────
+# _RESUMABLE_TASKS is disabled by the `factory` fixture above for every test that came before this
+# section (none of them care about resume); these tests locally re-enable it with mock task
+# objects, so no test anywhere in this file ever risks a real Celery .delay()/broker round trip.
+
+@pytest.mark.parametrize("job_type_str, job_type_enum, reel_status", [
+    ("enrich", models.JobType.enrich, models.ReelStatus.enriching),
+    ("render", models.JobType.render, models.ReelStatus.guide_ready),
+])
+def test_a_stale_running_job_under_its_budget_resumes(factory, job_type_str, job_type_enum, reel_status):
+    """enrich/render both get a budget of 2 -- a first stale detection resumes: status back to
+    pending, reaper_resumes incremented, and the correct task's .delay() called with the job id.
+    The owner is left exactly where it durably is (a resume is not a failure)."""
+    job_id, reel_id, cut_id = _make(factory, job_type_enum, job_status=models.JobStatus.running,
+                                    reel_status=reel_status, cut_status=models.CutStatus.rendering)
+    mock_task = MagicMock()
+    with patch("worker.tasks.maintenance._RESUMABLE_TASKS", {job_type_str: (mock_task, 2)}):
+        reap_stuck_jobs()
+
+    job, reel, cut = _state(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.pending
+    assert job.reaper_resumes == 1
+    assert job.error is None
+    mock_task.delay.assert_called_once_with(job_id)
+    assert reel.status == reel_status
+    assert cut.status == models.CutStatus.rendering
+
+
+def test_resume_log_line_reports_the_attempt_count_and_budget(factory, caplog):
+    """design §7 promised the resume log line would include the resume count and budget, not
+    just a generic 'resumed' message with no way to tell a first resume from a last-chance one
+    apart in the logs."""
+    job_id, reel_id, cut_id = _make(factory, models.JobType.render, job_status=models.JobStatus.running,
+                                    reel_status=models.ReelStatus.guide_ready,
+                                    cut_status=models.CutStatus.rendering)
+    mock_task = MagicMock()
+    with (
+        patch("worker.tasks.maintenance._RESUMABLE_TASKS", {"render": (mock_task, 2)}),
+        caplog.at_level("WARNING", logger="worker.tasks.maintenance"),
+    ):
+        reap_stuck_jobs()
+    assert any("attempt 1/2" in r.message for r in caplog.records), (
+        f"expected an 'attempt 1/2' resume log line, got: {[r.message for r in caplog.records]}"
+    )
+
+
+def test_generate_resumes_only_once_budget_one_then_fails_normally(factory):
+    """generate's own budget is DELIBERATELY 1, not enrich/render's 2 -- a distinct test from
+    their budget-2 case (not a parametrized variant), so the differentiated-budget requirement
+    can't be silently dropped without a test noticing. A second stale detection after the resumed
+    run also gets stuck falls straight through to the ordinary, unchanged fail-and-roll-back path
+    -- exactly today's existing behavior for a budget-exhausted resumable type."""
+    job_id, reel_id, cut_id = _make(factory, models.JobType.generate, job_status=models.JobStatus.running,
+                                    reel_status=models.ReelStatus.generating)
+    mock_task = MagicMock()
+
+    with patch("worker.tasks.maintenance._RESUMABLE_TASKS", {"generate": (mock_task, 1)}):
+        reap_stuck_jobs()
+    job, reel, _ = _state(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.pending
+    assert job.reaper_resumes == 1
+    mock_task.delay.assert_called_once_with(job_id)
+    assert reel.status == models.ReelStatus.generating
+
+    # The resumed run also gets stuck: back to running, stale heartbeat again.
+    db = factory()
+    db.query(models.Job).filter(models.Job.id == job_id).update(
+        {"status": models.JobStatus.running, "heartbeat_at": _LONG_AGO, "updated_at": _LONG_AGO},
+        synchronize_session=False)
+    db.commit()
+
+    with patch("worker.tasks.maintenance._RESUMABLE_TASKS", {"generate": (mock_task, 1)}):
+        reap_stuck_jobs()
+    job, reel, _ = _state(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.failed, "budget (1) already exhausted -- ordinary fail path"
+    assert job.reaper_resumes == 1, "the fail-CAS does not touch reaper_resumes"
+    mock_task.delay.assert_called_once_with(job_id), "no second resume -- only ever called once"
+    assert reel.status == models.ReelStatus.failed
+    assert "already auto-resumed 1 time" in job.error.lower(), (
+        "a budget-exhausted job's failure message should say it was already resumed, not read "
+        "identical to a first-attempt failure that was never resumed at all"
+    )
+
+
+def test_enrich_resumes_twice_budget_two_then_fails_normally(factory):
+    """enrich/render's budget is 2, unlike generate's deliberately-lower 1 -- this is the
+    boundary case the generate-only test above never exercised: resume, get stuck again, resume
+    a second time, get stuck a third time, THEN fall through to the ordinary fail-and-roll-back
+    path once the budget (2) is actually exhausted. Without this, a bug that let a budget-2 type
+    resume a third time (or stop resuming after only one) would pass every existing test."""
+    job_id, reel_id, cut_id = _make(factory, models.JobType.enrich, job_status=models.JobStatus.running,
+                                    reel_status=models.ReelStatus.enriching)
+    mock_task = MagicMock()
+
+    with patch("worker.tasks.maintenance._RESUMABLE_TASKS", {"enrich": (mock_task, 2)}):
+        reap_stuck_jobs()
+    job, reel, _ = _state(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.pending
+    assert job.reaper_resumes == 1
+    assert mock_task.delay.call_count == 1
+    assert reel.status == models.ReelStatus.enriching
+
+    # Stuck again: back to running, stale heartbeat again.
+    db = factory()
+    db.query(models.Job).filter(models.Job.id == job_id).update(
+        {"status": models.JobStatus.running, "heartbeat_at": _LONG_AGO, "updated_at": _LONG_AGO},
+        synchronize_session=False)
+    db.commit()
+
+    with patch("worker.tasks.maintenance._RESUMABLE_TASKS", {"enrich": (mock_task, 2)}):
+        reap_stuck_jobs()
+    job, reel, _ = _state(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.pending, "budget (2) not yet exhausted -- second resume"
+    assert job.reaper_resumes == 2
+    assert mock_task.delay.call_count == 2
+    assert reel.status == models.ReelStatus.enriching
+
+    # Stuck a third time: budget is now exhausted.
+    db = factory()
+    db.query(models.Job).filter(models.Job.id == job_id).update(
+        {"status": models.JobStatus.running, "heartbeat_at": _LONG_AGO, "updated_at": _LONG_AGO},
+        synchronize_session=False)
+    db.commit()
+
+    with patch("worker.tasks.maintenance._RESUMABLE_TASKS", {"enrich": (mock_task, 2)}):
+        reap_stuck_jobs()
+    job, reel, _ = _state(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.failed, "budget (2) exhausted -- ordinary fail path"
+    assert job.reaper_resumes == 2, "the fail-CAS does not touch reaper_resumes"
+    assert mock_task.delay.call_count == 2, "no third resume -- budget exhausted"
+    assert reel.status == models.ReelStatus.failed
+    assert "already auto-resumed 2 time" in job.error.lower()
+
+
+@pytest.mark.parametrize("reaper_resumes", [0, 1, 2, 99])
+def test_a_stale_publish_job_is_never_resumed_regardless_of_reaper_resumes(factory, reaper_resumes):
+    """The hard-safety negative case: publish is structurally absent from _RESUMABLE_TASKS (the
+    dict omission), so a stale running publish job always falls through to the unchanged fail-CAS,
+    no matter what reaper_resumes already holds. Uses the REAL _RESUMABLE_TASKS (not the {} the
+    `factory` fixture patches in for every other test here) precisely so this test would catch a
+    future regression that accidentally added "publish" to that dict -- an empty-dict version of
+    this test could never detect that, since publish would trivially fall through either way."""
+    job_id, reel_id, cut_id = _make(factory, models.JobType.publish, job_status=models.JobStatus.running,
+                                    reel_status=models.ReelStatus.guide_ready,
+                                    cut_status=models.CutStatus.publishing)
+    db = factory()
+    db.query(models.Job).filter(models.Job.id == job_id).update(
+        {"reaper_resumes": reaper_resumes}, synchronize_session=False)
+    db.commit()
+
+    with patch("worker.tasks.maintenance._RESUMABLE_TASKS", _REAL_RESUMABLE_TASKS):
+        assert "publish" not in _REAL_RESUMABLE_TASKS   # the invariant this test locks in
+        reap_stuck_jobs()
+
+    job, reel, cut = _state(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.failed
+    assert job.reaper_resumes == reaper_resumes   # the fail-CAS does not touch this column
+    assert reel.status == models.ReelStatus.guide_ready
+    assert cut.status == models.CutStatus.failed
+
+
+def test_the_real_resumable_tasks_dict_has_the_documented_differentiated_budgets():
+    """Guards the ACTUAL worker/tasks/maintenance.py::_RESUMABLE_TASKS dict (not a test-local mock)
+    directly: generate must stay capped at 1, not simplified back to match enrich/render's shared
+    2 -- design §7's cost-multiplication arithmetic for generate_guide's paid-call budget depends
+    on this exact, deliberately-lower number."""
+    assert _REAL_RESUMABLE_TASKS["enrich"][1] == 2
+    assert _REAL_RESUMABLE_TASKS["render"][1] == 2
+    assert _REAL_RESUMABLE_TASKS["generate"][1] == 1
+    assert "publish" not in _REAL_RESUMABLE_TASKS
+
+
+def test_the_structural_publish_safeguard_actually_fires():
+    """worker/tasks/maintenance.py calls `_check_publish_excluded(_RESUMABLE_TASKS)` at module
+    level, a second, structural safeguard beyond the dict's own omission. Calling the real helper
+    against a dict that includes "publish" -- not a locally-asserted literal -- is what proves the
+    actual production safeguard fires, not just that Python's `assert` statement works."""
+    with pytest.raises(AssertionError):
+        _check_publish_excluded({"publish": (MagicMock(), 1)})
+
+    # And the real, unmodified module-level dict must still pass it.
+    _check_publish_excluded(_REAL_RESUMABLE_TASKS)
+
+
+def test_commit_before_enqueue_ordering_is_durable_before_delay_is_called(factory):
+    """Commit-before-enqueue ordering is load-bearing (design §6): a worker's own atomic claim
+    (WHERE status='pending') must never race a not-yet-durable update from this transaction's
+    point of view.
+
+    In-memory SQLite under StaticPool shares one physical connection across every session this
+    fixture produces, so a second session reading the row cannot, by itself, distinguish
+    "committed" from "merely flushed in an open transaction" here -- unlike real Postgres, where
+    a separate connection would only see the committed value. This test instead directly records
+    the ORDER of the two operations (commit vs. .delay()), which is a faithful test regardless of
+    backend: patching the session class's own commit() to append to the same shared list
+    mock_task.delay()'s side_effect appends to.
+    """
+    job_id, reel_id, cut_id = _make(factory, models.JobType.enrich, job_status=models.JobStatus.running,
+                                    reel_status=models.ReelStatus.enriching)
+    mock_task = MagicMock()
+    calls = []
+    mock_task.delay.side_effect = lambda jid: calls.append("delay")
+
+    class Tracking(sessionmaker(bind=factory.kw["bind"]).class_):
+        def commit(self):
+            calls.append("commit")
+            return super().commit()
+
+    tracked = sessionmaker(bind=factory.kw["bind"], class_=Tracking, autoflush=False)
+
+    with patch("worker.tasks.maintenance.SessionLocal", tracked), \
+            patch("worker.tasks.maintenance._RESUMABLE_TASKS", {"enrich": (mock_task, 2)}):
+        reap_stuck_jobs()
+
+    mock_task.delay.assert_called_once_with(job_id)
+    assert "commit" in calls and "delay" in calls
+    assert calls.index("commit") < calls.index("delay"), (
+        "the resume CAS must commit before the task is enqueued -- reversing this risks a "
+        "worker's own atomic claim racing a not-yet-durable update"
+    )
+    job, *_ = _state(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.pending
+    assert job.reaper_resumes == 1

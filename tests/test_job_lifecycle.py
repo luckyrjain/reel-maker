@@ -16,7 +16,7 @@ import httpx
 import pytest
 from celery import Celery
 from celery.exceptions import Reject, Retry
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy import exc as sa_exc
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -68,6 +68,20 @@ def _set_job(factory, job_id, **values):
         setattr(db.get(models.Job, job_id), key, value)
     db.commit()
     db.close()
+
+
+def _bump_claim_token(factory, job_id) -> int:
+    """Simulate an external, fresher claim landing on the same row while a run is still alive —
+    a reaper resume (running -> pending) immediately followed by a second worker's own claim
+    (pending -> running), whose net observable effect on the row is exactly this: claim_token
+    increments and status ends up back at 'running'. Returns the new token value."""
+    db = factory()
+    db.query(models.Job).filter(models.Job.id == job_id).update(
+        {"claim_token": models.Job.claim_token + 1}, synchronize_session=False)
+    db.commit()
+    new_token = db.get(models.Job, job_id).claim_token
+    db.close()
+    return new_token
 
 
 def _task(name, body, job_type="generate", max_retries=2, **kwargs):
@@ -1997,3 +2011,335 @@ def test_error_text_redacts_a_multi_line_wrapped_database_detail_block():
     assert "SECRET_CONTINUATION_LINE" not in text
     assert "PREFIX_TOKEN" not in text
     assert "violates not-null constraint" in text
+
+
+# ── fencing token (reaper-resume design) ─────────────────────────────────────
+# Once the reaper can resume a `running`-stale job (worker/tasks/maintenance.py), `status`
+# alone stops proving a run still owns its row: a stale heartbeat can mean a genuinely dead
+# process, or a live one whose heartbeat thread hit a transient DB blip while the body kept
+# working. Job.claim_token (bumped on every pending->running claim) is the structural fix —
+# see CLAUDE.md's Key conventions entry and docs/specs/2026-09-reaper-resume-killed-jobs-
+# system-design.md §2 for the full reasoning, including the two round-two gaps below.
+
+def test_a_claim_bumps_claim_token_and_later_calls_in_the_same_run_use_it(factory):
+    job_id, reel_id, cut_id = _make(factory)
+    initial = factory().get(models.Job, job_id).claim_token
+    seen = {}
+
+    def body(self, db, job, ctx):
+        seen["token_in_body"] = job.claim_token
+        heartbeat(db, job, 50)   # would raise JobLost if it used the wrong token
+        lock_job(db, job)        # ditto
+        db.commit()
+
+    _task("t.claim_bump", body)(job_id)
+
+    assert seen["token_in_body"] == initial + 1
+    job, *_ = _read(factory, job_id, reel_id, cut_id)
+    assert job.claim_token == initial + 1
+
+
+def test_a_resumed_while_still_alive_zombie_is_fenced_at_heartbeat(factory):
+    """THE CORE REGRESSION this whole design revision exists for: simulate a reaper resume +
+    second claim landing (bumping claim_token) while the original run is still alive. The
+    zombie's own heartbeat() must raise JobLost even though `status` alone still reads
+    'running' throughout — and its uncommitted mutation up to that point must be discarded.
+
+    Mutation-tested: temporarily removing the `token` predicate from _advance() (or dropping
+    `token=job.claim_token` from heartbeat()'s own call) makes this test fail — confirmed by
+    hand during implementation, per this file's own convention.
+    """
+    job_id, reel_id, cut_id = _make(factory)
+    seen = {}
+
+    def zombie_body(self, db, job, ctx):
+        seen["token"] = job.claim_token
+        seen["resumed_token"] = _bump_claim_token(factory, job_id)   # a fresher claim lands
+        db.get(models.Reel, reel_id).status = models.ReelStatus.guide_ready   # uncommitted
+        heartbeat(db, job, 77)   # must raise: the token this run captured is now stale
+
+    with pytest.raises(JobLost):
+        _task("t.zombie_heartbeat", zombie_body)(job_id)
+
+    job, reel, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.running, "the resumed run's row, untouched by the zombie"
+    assert job.claim_token == seen["resumed_token"]
+    assert reel.status == models.ReelStatus.generating, "the zombie's uncommitted mutation is discarded"
+
+
+def test_a_resumed_while_still_alive_zombie_is_fenced_at_lock_job(factory):
+    """Same core regression as above, at the second of the three checkpoints: lock_job()."""
+    job_id, reel_id, cut_id = _make(factory)
+    seen = {}
+
+    def zombie_body(self, db, job, ctx):
+        seen["token"] = job.claim_token
+        seen["resumed_token"] = _bump_claim_token(factory, job_id)
+        db.get(models.Reel, reel_id).status = models.ReelStatus.guide_ready   # uncommitted
+        lock_job(db, job)   # must raise: the token this run captured is now stale
+
+    with pytest.raises(JobLost):
+        _task("t.zombie_lock_job", zombie_body)(job_id)
+
+    job, reel, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.running
+    assert job.claim_token == seen["resumed_token"]
+    assert reel.status == models.ReelStatus.generating, "the zombie's uncommitted mutation is discarded"
+
+
+def test_a_resumed_while_still_alive_zombie_is_fenced_at_the_done_stamp(factory):
+    """Same core regression, at the third checkpoint: the done-stamp CAS job_task itself runs
+    after the body returns normally (no exception raised — the zombie never happened to hit a
+    heartbeat()/lock_job() call before finishing) must still fail to match, discarding the
+    zombie's uncommitted mutation and leaving the resumed run's row exactly as the fresher
+    claim left it — job_task's own pre-existing 'reaped (or superseded) mid-run' log line."""
+    job_id, reel_id, cut_id = _make(factory)
+    seen = {}
+
+    def zombie_body(self, db, job, ctx):
+        seen["token"] = job.claim_token
+        seen["resumed_token"] = _bump_claim_token(factory, job_id)
+        db.get(models.Reel, reel_id).status = models.ReelStatus.guide_ready   # uncommitted
+        # returns normally: no heartbeat()/lock_job() call happens to fire before completion
+
+    _task("t.zombie_done_stamp", zombie_body)(job_id)   # must not raise: the CAS just no-ops
+
+    job, reel, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.running, "the resumed run's row, untouched by the zombie"
+    assert job.claim_token == seen["resumed_token"], "the zombie's done-stamp CAS must not match"
+    assert reel.status == models.ReelStatus.generating, "the zombie's 'successful' mutation is discarded"
+
+
+def test_round_two_gap_1_retry_reset_cas_does_not_clobber_a_resumed_run(factory):
+    """Round-two gap #1 (retriable branch): a zombie reaching _settle_failure's retry-reset CAS
+    after a fresher claim has landed must not bounce the RESUMED run's row back to `pending` —
+    that would let the zombie schedule a THIRD concurrent execution via its own self.retry().
+    Mutation-tested by temporarily dropping `token=token` from this CAS call in _settle_failure
+    and confirming this test fails."""
+    job_id, reel_id, cut_id = _make(factory)
+    seen = {}
+
+    def zombie_body(self, db, job, ctx):
+        seen["token"] = job.claim_token
+        seen["resumed_token"] = _bump_claim_token(factory, job_id)
+        raise ConnectionError("blip")   # transient: would normally reset status to pending + retry
+
+    task = _task("t.zombie_retry_reset", zombie_body)
+    with patch.object(task, "retry", side_effect=Retry()) as retry:
+        with pytest.raises(ConnectionError):
+            task(job_id)
+
+    retry.assert_not_called()
+    job, *_ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.running, (
+        "the zombie's retry-reset CAS must not bounce the RESUMED run's row back to pending"
+    )
+    assert job.claim_token == seen["resumed_token"]
+
+
+def test_round_two_gap_1_fail_cas_does_not_clobber_a_resumed_run(factory):
+    """Round-two gap #1 (non-retriable branch, via _fail_job): a zombie reaching the fail-CAS
+    after a fresher claim has landed must not flip the RESUMED run's row to `failed` and roll
+    its owner back — worse than the retriable case, since the resumed run may still be
+    legitimately working (or have already succeeded) and would have its result silently
+    discarded for no reason. Mutation-tested by temporarily dropping `token=token` from
+    _fail_job's forwarded _advance() call (or from _settle_failure's call to _fail_job) and
+    confirming this test fails."""
+    job_id, reel_id, cut_id = _make(factory)
+    seen = {}
+
+    def zombie_body(self, db, job, ctx):
+        seen["token"] = job.claim_token
+        seen["resumed_token"] = _bump_claim_token(factory, job_id)
+        raise ValueError("deterministic boom")   # non-transient: would normally fail-CAS to failed
+
+    task = _task("t.zombie_fail_cas", zombie_body)
+    with patch.object(task, "retry", side_effect=Retry()) as retry:
+        with pytest.raises(ValueError):
+            task(job_id)
+
+    retry.assert_not_called()
+    job, reel, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.running, (
+        "the zombie's fail-CAS must not flip the RESUMED run's row to failed out from under it"
+    )
+    assert job.claim_token == seen["resumed_token"]
+    assert reel.status == models.ReelStatus.generating, (
+        "the resumed run's owner must not be rolled back by the superseded zombie"
+    )
+
+
+def test_round_two_gap_2_heartbeat_loop_does_not_advance_a_superseded_runs_row(file_factory):
+    """Round-two gap #2: _heartbeat_loop's own independent, periodic _advance() call (a third,
+    separate CAS site from the heartbeat() function above, on its own freshly-opened session)
+    must not keep proving a RESUMED run's row alive once its captured claim_token goes stale —
+    otherwise a superseded zombie's orphaned thread masks real staleness detection for up to the
+    task's full max_runtime_s. Mutation-tested by temporarily omitting `token=claim_token` from
+    _heartbeat_loop's own _advance() call (or the `claim_token` argument at its thread-start call
+    site in job_task) and confirming this test fails."""
+    job_id, *_ = _make(file_factory)
+    seen = {}
+
+    def body(self, db, job, ctx):
+        seen["token"] = job.claim_token
+        seen["before"] = file_factory().get(models.Job, job_id).heartbeat_at
+        _bump_claim_token(file_factory, job_id)   # a fresher claim lands underneath this run
+        time.sleep(0.5)   # long enough for >=1 heartbeat_loop tick at the patched interval
+        seen["after"] = file_factory().get(models.Job, job_id).heartbeat_at
+
+    with patch("worker.tasks.common.SessionLocal", file_factory), \
+            patch("worker.tasks.common.HEARTBEAT_INTERVAL_S", 0.1):
+        _task("t.superseded_beat", body)(job_id)
+
+    assert seen["after"] == seen["before"], (
+        "a superseded background thread's own _advance() call must not advance heartbeat_at "
+        "once its captured claim_token is stale"
+    )
+
+
+def test_a_seventh_gap_shutdown_signal_does_not_clobber_a_resumed_run(factory):
+    """A seventh checkpoint, missed by both design-stage reviews and the first implementation
+    pass, found only when an independent reviewer read _fail_interrupted (the SystemExit/
+    KeyboardInterrupt shutdown path) against the actual merged code: it is reachable by a zombie
+    exactly like _settle_failure's retry-reset/fail-CAS calls are (always owned=True — job_task's
+    run() only ever invokes it `if owned and not committed`), and its _fail_job call had no token
+    at all. A zombie hit by a graceful shutdown signal (SIGTERM before a hard time limit's
+    SIGKILL, or a worker restart — a real, catchable-in-Python event this codebase already treats
+    as first-class, not the SIGKILL case this whole design is about) after a fresher claim has
+    landed would flip the RESUMED run's row to failed and roll its owner back on its way out,
+    identical in kind to round-two gap #1's fail-CAS. Mutation-tested by temporarily dropping
+    `token=claim_token` from _fail_interrupted's call site in job_task's run() (or `token=token`
+    from _fail_interrupted's own forwarded _fail_job call) and confirming this test fails."""
+    job_id, reel_id, cut_id = _make(factory)
+    seen = {}
+
+    def zombie_body(self, db, job, ctx):
+        seen["token"] = job.claim_token
+        seen["resumed_token"] = _bump_claim_token(factory, job_id)
+        raise SystemExit("shutdown hits the zombie after it was superseded")
+
+    with pytest.raises(SystemExit):
+        _task("t.zombie_shutdown", zombie_body)(job_id)
+
+    job, reel, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.running, (
+        "the zombie's shutdown-triggered fail must not flip the RESUMED run's row to failed"
+    )
+    assert job.claim_token == seen["resumed_token"]
+    assert reel.status == models.ReelStatus.generating, (
+        "the resumed run's owner must not be rolled back by the superseded zombie's shutdown path"
+    )
+
+
+def test_fail_rejected_retry_cas_does_not_clobber_a_fresher_runs_own_pending_reset(factory):
+    """An eighth gap, found by a Concurrency Specialist review pass: _fail_rejected_retry's CAS
+    (reached when this run's own retriable failure resets the row to `pending` under its own
+    claim_token, and self.retry() then comes back Reject because the broker is down) filtered
+    only on status, not token. Status alone cannot tell two different 'pending' rows apart: a
+    second worker can claim the now-pending row (bump token, running), hit its own transient
+    failure, and reset it back to pending again under ITS OWN token, all before this run's
+    self.retry() call returns. Without a token check, this run's stale _fail_rejected_retry CAS
+    would still match on status=pending and incorrectly flip that fresher run's row to failed,
+    clobbering its error message and rolling its owner back. Mutation-tested by temporarily
+    dropping `token=token` from _fail_rejected_retry's forwarded _fail_job call (or
+    `token=(claim_token if owned else None)` from its call site in job_task's run()) and
+    confirming this test fails."""
+    job_id, reel_id, cut_id = _make(factory)
+    fresher = {}
+
+    def reject_after_a_fresher_run_also_reset_to_pending(*a, **k):
+        db = factory()
+        db.query(models.Job).filter(models.Job.id == job_id).update(
+            {"claim_token": models.Job.claim_token + 1, "status": models.JobStatus.pending,
+             "error": "a fresher run's own transient retry-reset"},
+            synchronize_session=False,
+        )
+        db.commit()
+        fresher["token"] = db.get(models.Job, job_id).claim_token
+        db.close()
+        raise Reject(ConnectionError("broker down"), requeue=False)
+
+    task = _task("t.reject_race", _raises(ConnectionError("blip")))
+    with patch.object(task, "retry", side_effect=reject_after_a_fresher_run_also_reset_to_pending):
+        with pytest.raises(Reject):
+            task(job_id)
+
+    job, reel, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.pending, (
+        "the stale _fail_rejected_retry CAS must not flip the fresher run's pending row to failed"
+    )
+    assert job.claim_token == fresher["token"]
+    assert job.error == "a fresher run's own transient retry-reset", (
+        "the fresher run's own error message must survive the stale _fail_rejected_retry CAS"
+    )
+    assert reel.status == models.ReelStatus.generating, (
+        "the fresher run's owner must not be rolled back by the stale _fail_rejected_retry CAS"
+    )
+
+
+def test_heartbeat_uses_the_pinned_run_token_not_the_live_attribute_after_a_rollback(factory):
+    """A ninth gap, found by a Concurrency Specialist review pass: heartbeat()/lock_job() read
+    job.claim_token -- a mapped ORM column attribute -- not the plain local `claim_token` this
+    run captured once at its own claim. That's only safe for the FIRST call in a run: any earlier
+    db.rollback() on this session (e.g. record_stage()'s own swallowed-commit-failure rollback,
+    which sits between heartbeat() calls in every resumable task body) unconditionally expires
+    the whole identity map, so the next read of job.claim_token triggers a fresh SELECT and hands
+    back whatever the row holds *now* -- a fresher, superseding claim, if a reaper resume + a
+    second worker landed in the meantime. A zombie's own heartbeat() would then "prove" the
+    RESUMED run's row alive instead of raising JobLost, defeating fencing entirely. Fixed by
+    pinning job._run_claim_token (a plain, unmapped instance attribute -- Session.expire()/
+    rollback() only expire MAPPED attributes, so it survives every rollback for the rest of this
+    run) once in job_task's run(), and reading that instead. Mutation-tested by temporarily
+    reverting heartbeat()'s token lookup to plain `job.claim_token` and confirming this test fails
+    (no JobLost raised -- the zombie's heartbeat wrongly succeeds)."""
+    job_id, reel_id, cut_id = _make(factory)
+    seen = {}
+
+    def zombie_body(self, db, job, ctx):
+        db.query(models.Job).filter(models.Job.id == job_id).first()   # opens a transaction
+        db.rollback()   # simulates record_stage()'s swallowed-commit-failure rollback: expires
+                         # the identity map, including job.claim_token, with no exception raised
+        seen["resumed_token"] = _bump_claim_token(factory, job_id)   # a fresher claim lands
+        heartbeat(db, job, 50)   # must still raise: the PINNED token, not the (now silently
+                                 # resynced, if read live) job.claim_token attribute
+
+    with pytest.raises(JobLost):
+        _task("t.pinned_token_survives_rollback", zombie_body)(job_id)
+
+    job, *_ = _read(factory, job_id, reel_id, cut_id)
+    assert job.claim_token == seen["resumed_token"], (
+        "the zombie's fenced heartbeat() must not have advanced the RESUMED run's row"
+    )
+
+
+def test_heartbeat_never_reloads_the_mapped_claim_token_column_when_the_pin_is_present(factory):
+    """A review pass on the fix above caught a second, subtler bug in its first version:
+    `getattr(job, "_run_claim_token", job.claim_token)` still evaluates `job.claim_token` as the
+    default argument every single call -- Python always eagerly evaluates a function call's
+    arguments, including a discarded default -- so it silently reopened the exact identity-map
+    round trip (and DB-availability dependency) the pin exists to remove. Fixed with a genuine
+    `if`/`else` via `hasattr`, which only probes for `_run_claim_token` and never touches
+    `job.claim_token` when it's present. Verified here by counting SQLAlchemy's `refresh` event,
+    which fires exactly when an expired mapped attribute is reloaded from the database: expire
+    `claim_token` mid-body, then confirm heartbeat() triggers zero refreshes of it."""
+    job_id, reel_id, cut_id = _make(factory)
+    refreshed_attrs: list = []
+
+    def on_refresh(target, context, attrs):
+        if target.id == job_id:
+            refreshed_attrs.append(attrs)
+
+    def body(self, db, job, ctx):
+        db.expire(job, ["claim_token"])   # force a fresh SELECT on next access to this column
+        event.listen(models.Job, "refresh", on_refresh)
+        try:
+            heartbeat(db, job, 50)
+        finally:
+            event.remove(models.Job, "refresh", on_refresh)
+
+    _task("t.no_claim_token_reload", body)(job_id)
+
+    assert refreshed_attrs == [], (
+        "heartbeat() must not reload the expired claim_token column -- "
+        f"got refresh events: {refreshed_attrs}"
+    )

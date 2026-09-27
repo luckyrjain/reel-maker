@@ -85,32 +85,62 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _advance(db, job_id, from_status, values: dict) -> bool:
+def _advance(db, job_id, from_status, values: dict, token: int | None = None) -> bool:
     """Compare-and-set the Job's status; False when the row is no longer in from_status.
 
     Every status transition goes through this, so a worker that lost the job
     (reaped, or claimed by a sibling) never overwrites the winner's state.
+
+    ``token``, when given, ALSO requires ``Job.claim_token == token`` — the fencing check a
+    resumable job type needs once the reaper can put a `running`-stale job back to `pending`
+    for a second worker to claim: `status='running'` alone stops proving THIS run still owns
+    the row, because a live process whose heartbeat merely stalled can be resumed underneath
+    it. See CLAUDE.md's Key conventions entry on the fencing-token mechanism for which five
+    call sites pass a token and why the other two (`_fail_job_keep_owner`, the reaper's own
+    resume-CAS) provably don't need one.
     """
-    updated = (
-        db.query(models.Job)
-        .filter(models.Job.id == job_id, models.Job.status == from_status)
-        .update(values, synchronize_session=False)
-    )
+    filters = [models.Job.id == job_id, models.Job.status == from_status]
+    if token is not None:
+        filters.append(models.Job.claim_token == token)
+    updated = db.query(models.Job).filter(*filters).update(values, synchronize_session=False)
     return updated != 0
 
 
 def heartbeat(db, job, progress: int) -> None:
     """Record progress, prove the worker is alive, and commit.
 
-    Fenced: raises JobLost when the job is no longer running (the reaper gave up on it), which
-    aborts a zombie body at its next milestone instead of letting it run on and write. Commits
-    the body's pending mutations, so call it before the final mutations, never after.
+    Fenced: raises JobLost when the job is no longer running (the reaper gave up on it) OR when
+    a fresher claim (a reaper resume + a second worker) has since bumped `claim_token` past the
+    value this run captured at its own claim — a stale heartbeat can mean a genuinely dead
+    process, but it can also mean a live one whose heartbeat thread hit a transient DB blip while
+    the body kept working; without the token check, that live run's own heartbeat() would
+    "prove" the RESUMED run's row alive instead, defeating fencing entirely. Either case aborts a
+    zombie body at its next milestone instead of letting it run on and write. Commits the body's
+    pending mutations, so call it before the final mutations, never after.
+
+    Reads ``job._run_claim_token`` (a plain, unmapped instance attribute `job_task`'s `run()` sets
+    once right after this run's own claim), not the mapped ``job.claim_token`` column attribute --
+    the mapped one is exactly what a LATER ``db.rollback()`` on this session (e.g. from a swallowed
+    commit failure inside `record_stage()`, called between two heartbeat()/lock_job() calls in
+    every resumable task body) silently resyncs to whatever claim_token the row holds *now* on next
+    read, which could be a fresher, superseding claim -- defeating this exact check. Falls back to
+    the mapped attribute when the pin is absent (a `job` loaded and passed in directly, outside
+    `job_task`'s `run()`, e.g. some tests call this function standalone).
+
+    The fallback is a genuine ``if``/``else``, not ``getattr(job, "_run_claim_token",
+    job.claim_token)`` -- a review pass caught that the DEFAULT argument to ``getattr`` is always
+    evaluated eagerly by Python before the call, even when the attribute exists and the default is
+    discarded, so that form would still touch the mapped column attribute on every call and
+    silently reopen the exact identity-map round trip (and DB-availability dependency) this fix
+    exists to remove. ``hasattr`` only probes for ``_run_claim_token`` itself and never touches
+    ``job.claim_token`` when it's present.
     """
     now = _now()
+    token = job._run_claim_token if hasattr(job, "_run_claim_token") else job.claim_token
     if not _advance(db, job.id, models.JobStatus.running,
-                    {"progress": progress, "heartbeat_at": now}):
+                    {"progress": progress, "heartbeat_at": now}, token=token):
         db.rollback()
-        raise JobLost(f"job {job.id} is no longer running")
+        raise JobLost(f"job {job.id} is no longer running (or was resumed by a fresher claim)")
     job.progress = progress
     job.heartbeat_at = now
     db.commit()
@@ -120,11 +150,17 @@ def lock_job(db, job) -> None:
     """Take the Job's row lock (no commit) before touching a reel/cut row in the same transaction.
 
     The reaper locks the job row first and then the owner; a body that locks the owner first and
-    the job at its done-stamp can deadlock against it. Raises JobLost if the job is gone.
+    the job at its done-stamp can deadlock against it. Raises JobLost if the job is gone, or if a
+    fresher claim has superseded this run — see heartbeat()'s docstring for why the token check
+    matters here too, not just the status check, and for why this reads
+    ``job._run_claim_token`` rather than the mapped ``job.claim_token`` column attribute -- and
+    why the fallback is a genuine ``if``/``else`` via ``hasattr``, not a ``getattr(..., default)``
+    (see heartbeat()'s docstring: the default argument to ``getattr`` is always eagerly evaluated).
     """
-    if not _advance(db, job.id, models.JobStatus.running, {"heartbeat_at": _now()}):
+    token = job._run_claim_token if hasattr(job, "_run_claim_token") else job.claim_token
+    if not _advance(db, job.id, models.JobStatus.running, {"heartbeat_at": _now()}, token=token):
         db.rollback()
-        raise JobLost(f"job {job.id} is no longer running")
+        raise JobLost(f"job {job.id} is no longer running (or was resumed by a fresher claim)")
 
 
 _OWNER_MODELS = {"reel": models.Reel, "cut": models.Cut}
@@ -198,7 +234,16 @@ def _retry_budget(task, owned: bool) -> int:
     return task.max_retries if owned else max(task.max_retries, PRECLAIM_MAX_RETRIES)
 
 
-def _heartbeat_loop(job_id: int, stop: threading.Event, max_runtime_s: float) -> None:
+def _heartbeat_loop(job_id: int, stop: threading.Event, max_runtime_s: float, claim_token: int) -> None:
+    """Refreshes heartbeat_at on its own cadence, from its own freshly-opened session each time —
+    a THIRD, independent `WHERE status='running'` CAS site, separate from the heartbeat()
+    function above. ``claim_token`` is captured once at thread-start (job_task passes
+    job.claim_token when it starts this thread) and threaded into this loop's own periodic
+    _advance() call for the same reason heartbeat()/lock_job() need it: without it, a superseded
+    zombie's orphaned thread (still alive because its main thread hasn't unwound yet) would keep
+    refreshing heartbeat_at on a RESUMED run's row indefinitely, masking real staleness detection
+    for up to that task's full max_runtime_s if the resumed run itself later gets stuck.
+    """
     started = time.monotonic()
     while not stop.wait(HEARTBEAT_INTERVAL_S):
         if time.monotonic() - started > max_runtime_s:
@@ -208,7 +253,7 @@ def _heartbeat_loop(job_id: int, stop: threading.Event, max_runtime_s: float) ->
         try:
             db = SessionLocal()
             try:
-                _advance(db, job_id, models.JobStatus.running, {"heartbeat_at": _now()})
+                _advance(db, job_id, models.JobStatus.running, {"heartbeat_at": _now()}, token=claim_token)
                 db.commit()
             finally:
                 db.close()
@@ -216,13 +261,26 @@ def _heartbeat_loop(job_id: int, stop: threading.Event, max_runtime_s: float) ->
             _log.warning("heartbeat write failed for job %s", job_id, exc_info=True)
 
 
-def _fail_job(db, job_id, from_status, message: str, owner_kind: str, owner_state: str) -> bool:
+def _fail_job(db, job_id, from_status, message: str, owner_kind: str, owner_state: str,
+              token: int | None = None) -> bool:
     """Compare-and-set the Job to failed and free its owner (no commit). False if the job had moved on.
 
     The one place a job is failed from a state we hold no claim on: a sibling that claimed it,
     or the reaper that already failed it, makes the CAS lose and leaves job and owner alone.
+
+    ``token`` is forwarded to the underlying _advance() call. _settle_failure's non-retriable,
+    already-owned branch and _fail_interrupted pass this run's own claim_token, guarding against a
+    zombie flipping a RESUMED run's row out from under it. _fail_rejected_retry also passes its own
+    claim_token when owned (the retry-reset just before it succeeded under that same token, so the
+    job was still this run's at that point) — even though the resulting window before the CAS below
+    runs is narrow (nothing re-claims a `pending` job with no message ever sent for it), fencing it
+    matches every other post-claim CAS in this file rather than leaving one exception to explain.
+    fail_unenqueued and _settle_failure's own not-owned branch keep passing none: neither ever
+    captured a claim_token for this run in the first place (fail_unenqueued's job was never even
+    claimed by this process; the not-owned branch runs before any claim exists to guard).
     """
-    if not _advance(db, job_id, from_status, {"status": models.JobStatus.failed, "error": message[:2000]}):
+    if not _advance(db, job_id, from_status, {"status": models.JobStatus.failed, "error": message[:2000]},
+                    token=token):
         return False
     job = db.get(models.Job, job_id)
     job.status = models.JobStatus.failed   # mirror the CAS onto the loaded object
@@ -375,11 +433,23 @@ def _recover_from_hook_failure(db, job_id, message: str, nested) -> bool:
 
 
 def _settle_failure(self, db, job_id, exc, *, owned, committed, owner_kind, owner_state,
-                    result, after_commit_failed, max_runtime_s) -> bool:
+                    result, after_commit_failed, max_runtime_s, token: int | None = None) -> bool:
     """Record a failure. True when the caller should raise ``self.retry()``.
 
     Every write is a compare-and-set on Job.status, so a run that lost its job (reaped, or
     claimed by a sibling) leaves both the job and its owner alone.
+
+    ``token`` fences the two CAS sites below that are reachable by a run that has NOT yet had
+    its own claim_token checked by heartbeat()/lock_job()/the done-stamp — the retry-reset branch
+    and the fail-CAS (via _fail_job) — because a body can raise straight into this function
+    without ever calling either of those first. Without gating these two as well, a zombie
+    reaching this function after a resume has landed underneath it could still bounce the
+    RESUMED run's row back to `pending` (and schedule a THIRD concurrent execution via its own
+    self.retry()) or straight to `failed` (discarding the resumed run's still-in-progress or
+    already-completed work) — reopening the exact concurrent-execution hazard the token exists
+    to close, through a door neither of those two functions covers. `token` is only ever
+    non-None when `owned` is True: an unclaimed run never captured a claim_token, and its
+    existing (unchanged) behavior needs none, since it was never the row's owner to begin with.
 
     Not routed through `_finalize_or_reconnect`: that helper exists for the three terminal
     recorders that have no caller left to fall back on if they fail. This one is the hot,
@@ -409,14 +479,14 @@ def _settle_failure(self, db, job_id, exc, *, owned, committed, owner_kind, owne
         ok = _advance(db, job_id, models.JobStatus.running, {
             "status": models.JobStatus.pending,
             "error": f"transient failure, retry {self.request.retries + 1}: {message}"[:2000],
-        })
+        }, token=token)
         db.commit()
         return ok              # only after the reset is durable
     if committed:
         # The body already ran and its owner state moved on; only the hook knows what to undo.
         _stamp_failed_and_run_cleanup(db, job_id, message, after_commit_failed, result)
     else:
-        _fail_job(db, job_id, models.JobStatus.running, message, owner_kind, owner_state)
+        _fail_job(db, job_id, models.JobStatus.running, message, owner_kind, owner_state, token=token)
     db.commit()
     return False
 
@@ -468,22 +538,34 @@ def _finalize_or_reconnect(db, job_id: int, write) -> None:
             fresh.close()
 
 
-def _fail_interrupted(db, job_id, exc: BaseException, owner_kind: str, owner_state: str) -> None:
+def _fail_interrupted(db, job_id, exc: BaseException, owner_kind: str, owner_state: str,
+                       token: int | None = None) -> None:
     """SystemExit / KeyboardInterrupt while the job was running (worker shut down or killed by a
     Celery hard time limit): fail it now. Do NOT hand it back to pending: Celery has already
-    acked or dropped the message, so nothing would ever pick a pending job up again."""
+    acked or dropped the message, so nothing would ever pick a pending job up again.
+
+    Reachable by a live, superseded run exactly like _settle_failure's retry-reset/fail-CAS
+    calls are (a graceful shutdown signal, e.g. SIGTERM before a hard time limit's SIGKILL, is a
+    real, catchable-in-Python event this codebase already treats as first-class -- not the SIGKILL
+    case this whole design's resume mechanism is built around). Always called with owned=True (the
+    one caller in job_task's run() only invokes this `if owned and not committed`), so `token` is
+    always this run's own claim_token here -- without it, a zombie superseded by a resumed claim
+    could still flip the RESUMED run's row to failed and roll back its owner on its way out."""
     message = (f"Worker was shut down while the job was running ({type(exc).__name__}). "
                "The work was not finished; retry it.")
     _finalize_or_reconnect(db, job_id, lambda s, jid: _fail_job(
-        s, jid, models.JobStatus.running, message, owner_kind, owner_state))
+        s, jid, models.JobStatus.running, message, owner_kind, owner_state, token=token))
 
 
-def _fail_rejected_retry(db, job_id, exc, owner_kind, owner_state) -> None:
+def _fail_rejected_retry(db, job_id, exc, owner_kind, owner_state, token: int | None = None) -> None:
     """The broker refused the retry message (Reject): it is dropped, so fail the job now
-    rather than leaving it pending until the reaper's pending threshold."""
+    rather than leaving it pending until the reaper's pending threshold.
+
+    ``token`` is this run's own claim_token when it owned the job (None otherwise), forwarded to
+    _fail_job's CAS -- see _fail_job's own docstring for why this call passes one at all."""
     message = f"could not schedule retry: {_error_text(exc)}"
     _finalize_or_reconnect(db, job_id, lambda s, jid: _fail_job(
-        s, jid, models.JobStatus.pending, message, owner_kind, owner_state))
+        s, jid, models.JobStatus.pending, message, owner_kind, owner_state, token=token))
 
 
 def fail_unenqueued(db, job_id: int, job_type: str, exc: BaseException) -> None:
@@ -520,6 +602,13 @@ def job_task(
     ``JobLost`` if the reaper already failed the job), so it must come before the body's
     last mutations: the done-stamp commit lands those atomically with ``status = done``.
     The one reason to commit early is an irreversible external side effect.
+
+    The body must never reassign its own ``job`` parameter to a freshly-queried instance (e.g.
+    ``job = db.query(models.Job).get(job_id)`` mid-body) — a Concurrency Specialist review noted
+    this as a fragile invariant, not yet a live bug: ``heartbeat()``/``lock_job()`` read
+    ``job._run_claim_token``, a plain unmapped attribute this decorator pins onto the ORIGINAL
+    `job` object right after the claim (see that assignment below), which a fresh query would not
+    carry. Always reuse the `job` object this decorator hands the body.
 
     Order of events:
       1. ``job is None`` or ``status != pending`` -> return. ``done``/``running`` are a
@@ -593,6 +682,7 @@ def job_task(
             db = SessionLocal(expire_on_commit=False)
             owned = committed = False
             result = None
+            claim_token: int | None = None
             stop = threading.Event()
             beat = None
             try:
@@ -602,16 +692,47 @@ def job_task(
 
                 if not _advance(db, job_id, models.JobStatus.pending, {
                     "status": models.JobStatus.running, "heartbeat_at": _now(),
+                    "claim_token": models.Job.claim_token + 1,   # SQL-side increment — the fencing counter
                 }):
                     db.rollback()
                     return
-                job.status = models.JobStatus.running
-                job.heartbeat_at = _now()
                 db.commit()
+                # Load the real post-increment claim_token (and status/heartbeat_at) onto the
+                # in-memory object. expire_on_commit=False (used for every Job session in this
+                # file) only suppresses AUTOMATIC expiration on commit; it has no effect on an
+                # explicit refresh(), which always re-fetches regardless.
+                db.refresh(job)
+                # Captured as a plain, immutable int -- NOT re-read from job.claim_token after this
+                # point anywhere in run() itself, and not trusted as a live attribute read from
+                # heartbeat()/lock_job() either (see job._run_claim_token below). SQLAlchemy's
+                # rollback() always expires every object in the session's identity map (there is
+                # no expire_on_rollback=False escape hatch) -- so a LATER read of job.claim_token
+                # after ANY rollback on this session, e.g. in this function's own except handler
+                # below, or inside heartbeat()/lock_job() after some earlier call already rolled
+                # back (record_stage()'s own swallowed-commit-failure rollback is one such path --
+                # an independent review found this exact gap: heartbeat()/lock_job() reading the
+                # live job.claim_token attribute, not this captured local, meant they were NOT
+                # actually honoring "capture once" the way every other fenced call site does),
+                # would silently trigger a fresh SELECT and hand back whatever claim_token the row
+                # holds *now* (a fresher, superseding claim), not the stale one this run captured.
+                # That would defeat exactly the fencing the token exists for.
+                #
+                # job._run_claim_token is a plain, unmapped instance attribute (not an ORM column),
+                # so Session.expire()/rollback() -- which only expires MAPPED attributes -- can
+                # never reset it. Setting it here, once, is what lets heartbeat()/lock_job() read a
+                # value that survives every rollback for the rest of this run, without threading an
+                # explicit token parameter through every task body in every task module that calls
+                # them.
+                #
+                # Captured before `owned = True` for consistency with every other "capture then
+                # use" step in this function, not because anything can raise between two adjacent
+                # pure-Python statements separated only by comments.
+                claim_token = job.claim_token
+                job._run_claim_token = claim_token
                 owned = True
 
                 thread = threading.Thread(
-                    target=_heartbeat_loop, args=(job_id, stop, max_runtime_s),
+                    target=_heartbeat_loop, args=(job_id, stop, max_runtime_s, claim_token),
                     name=f"heartbeat-job-{job_id}", daemon=True,
                 )
                 thread.start()
@@ -630,7 +751,7 @@ def job_task(
                 if not _advance(db, job_id, models.JobStatus.running, {
                     "status": models.JobStatus.done, "progress": 100,
                     "heartbeat_at": done_at, "error": None,
-                }):
+                }, token=claim_token):
                     # Reaped (or superseded) mid-run: the owner was already rolled back.
                     db.rollback()
                     _log.warning("job %s (%s) was no longer running at completion; result discarded",
@@ -672,6 +793,7 @@ def job_task(
                         owner_kind=owner_kind, owner_state=owner_state,
                         result=result, after_commit_failed=after_commit_failed,
                         max_runtime_s=max_runtime_s,
+                        token=(claim_token if owned else None),
                     )
                 except Exception:
                     # Never let a bookkeeping failure replace the real error.
@@ -695,7 +817,8 @@ def job_task(
                         # The same "no message is coming back" reasoning _settle_failure applies to
                         # an unclaimed job with no retries left applies here too.
                         try:
-                            _fail_rejected_retry(db, job_id, exc, owner_kind, owner_state)
+                            _fail_rejected_retry(db, job_id, exc, owner_kind, owner_state,
+                                                  token=(claim_token if owned else None))
                         except Exception:
                             _log.exception("could not fail job %s after a refused retry", job_id)
                         raise
@@ -706,7 +829,7 @@ def job_task(
                 # limit is killing this process. Fail the job now (see _fail_interrupted).
                 if owned and not committed:
                     try:
-                        _fail_interrupted(db, job_id, exc, owner_kind, owner_state)
+                        _fail_interrupted(db, job_id, exc, owner_kind, owner_state, token=claim_token)
                     except Exception:
                         _log.exception("could not fail job %s on shutdown", job_id)
                 raise
