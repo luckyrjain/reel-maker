@@ -246,12 +246,16 @@ def _fail_job(db, job_id, from_status, message: str, owner_kind: str, owner_stat
     The one place a job is failed from a state we hold no claim on: a sibling that claimed it,
     or the reaper that already failed it, makes the CAS lose and leaves job and owner alone.
 
-    ``token`` is forwarded to the underlying _advance() call. Only _settle_failure's non-retriable,
-    already-owned branch ever passes one (this run's own claim_token, guarding against a zombie
-    flipping a RESUMED run's row to failed out from under it) — every other existing caller
-    (_fail_interrupted, _fail_rejected_retry, fail_unenqueued, and _settle_failure's own
-    not-owned branch) keeps passing none, unaffected: none of them ever captured a claim_token
-    for this run in the first place.
+    ``token`` is forwarded to the underlying _advance() call. _settle_failure's non-retriable,
+    already-owned branch and _fail_interrupted pass this run's own claim_token, guarding against a
+    zombie flipping a RESUMED run's row out from under it. _fail_rejected_retry also passes its own
+    claim_token when owned (the retry-reset just before it succeeded under that same token, so the
+    job was still this run's at that point) — even though the resulting window before the CAS below
+    runs is narrow (nothing re-claims a `pending` job with no message ever sent for it), fencing it
+    matches every other post-claim CAS in this file rather than leaving one exception to explain.
+    fail_unenqueued and _settle_failure's own not-owned branch keep passing none: neither ever
+    captured a claim_token for this run in the first place (fail_unenqueued's job was never even
+    claimed by this process; the not-owned branch runs before any claim exists to guard).
     """
     if not _advance(db, job_id, from_status, {"status": models.JobStatus.failed, "error": message[:2000]},
                     token=token):
@@ -531,12 +535,15 @@ def _fail_interrupted(db, job_id, exc: BaseException, owner_kind: str, owner_sta
         s, jid, models.JobStatus.running, message, owner_kind, owner_state, token=token))
 
 
-def _fail_rejected_retry(db, job_id, exc, owner_kind, owner_state) -> None:
+def _fail_rejected_retry(db, job_id, exc, owner_kind, owner_state, token: int | None = None) -> None:
     """The broker refused the retry message (Reject): it is dropped, so fail the job now
-    rather than leaving it pending until the reaper's pending threshold."""
+    rather than leaving it pending until the reaper's pending threshold.
+
+    ``token`` is this run's own claim_token when it owned the job (None otherwise), forwarded to
+    _fail_job's CAS -- see _fail_job's own docstring for why this call passes one at all."""
     message = f"could not schedule retry: {_error_text(exc)}"
     _finalize_or_reconnect(db, job_id, lambda s, jid: _fail_job(
-        s, jid, models.JobStatus.pending, message, owner_kind, owner_state))
+        s, jid, models.JobStatus.pending, message, owner_kind, owner_state, token=token))
 
 
 def fail_unenqueued(db, job_id: int, job_type: str, exc: BaseException) -> None:
@@ -666,7 +673,6 @@ def job_task(
                 # file) only suppresses AUTOMATIC expiration on commit; it has no effect on an
                 # explicit refresh(), which always re-fetches regardless.
                 db.refresh(job)
-                owned = True
                 # Captured as a plain, immutable int -- NOT re-read from job.claim_token after this
                 # point anywhere in run() itself. heartbeat()/lock_job() (called from within the
                 # body) read job.claim_token directly, which is safe there because nothing has
@@ -679,7 +685,13 @@ def job_task(
                 # stale one this run captured. That would defeat exactly the fencing the token
                 # exists for: the except handler needs the token THIS run claimed with, not
                 # whatever the row currently says.
+                #
+                # Captured BEFORE `owned = True`, not after: an exception raised between the two
+                # statements (however narrow) would otherwise reach the BaseException handler with
+                # owned=True but claim_token still None, forwarding token=None to _fail_interrupted
+                # and losing this run's own fencing at the exact moment it starts mattering.
                 claim_token = job.claim_token
+                owned = True
 
                 thread = threading.Thread(
                     target=_heartbeat_loop, args=(job_id, stop, max_runtime_s, claim_token),
@@ -767,7 +779,8 @@ def job_task(
                         # The same "no message is coming back" reasoning _settle_failure applies to
                         # an unclaimed job with no retries left applies here too.
                         try:
-                            _fail_rejected_retry(db, job_id, exc, owner_kind, owner_state)
+                            _fail_rejected_retry(db, job_id, exc, owner_kind, owner_state,
+                                                  token=(claim_token if owned else None))
                         except Exception:
                             _log.exception("could not fail job %s after a refused retry", job_id)
                         raise

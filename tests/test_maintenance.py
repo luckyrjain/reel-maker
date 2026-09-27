@@ -13,7 +13,8 @@ from sqlalchemy.pool import StaticPool
 
 from api import models
 from worker.tasks.maintenance import (
-    PENDING_STALE_MINUTES, STALE_MINUTES, _reap_one, _revert_owner, reap_stuck_jobs,
+    PENDING_STALE_MINUTES, STALE_MINUTES, _check_publish_excluded, _reap_one, _revert_owner,
+    reap_stuck_jobs,
 )
 # The REAL _RESUMABLE_TASKS, captured before the `factory` fixture below ever patches the module
 # attribute to {} for the rest of this file's tests -- `patch()` swaps the attribute binding, not
@@ -471,6 +472,24 @@ def test_a_stale_running_job_under_its_budget_resumes(factory, job_type_str, job
     assert cut.status == models.CutStatus.rendering
 
 
+def test_resume_log_line_reports_the_attempt_count_and_budget(factory, caplog):
+    """design §7 promised the resume log line would include the resume count and budget, not
+    just a generic 'resumed' message with no way to tell a first resume from a last-chance one
+    apart in the logs."""
+    job_id, reel_id, cut_id = _make(factory, models.JobType.render, job_status=models.JobStatus.running,
+                                    reel_status=models.ReelStatus.guide_ready,
+                                    cut_status=models.CutStatus.rendering)
+    mock_task = MagicMock()
+    with (
+        patch("worker.tasks.maintenance._RESUMABLE_TASKS", {"render": (mock_task, 2)}),
+        caplog.at_level("WARNING", logger="worker.tasks.maintenance"),
+    ):
+        reap_stuck_jobs()
+    assert any("attempt 1/2" in r.message for r in caplog.records), (
+        f"expected an 'attempt 1/2' resume log line, got: {[r.message for r in caplog.records]}"
+    )
+
+
 def test_generate_resumes_only_once_budget_one_then_fails_normally(factory):
     """generate's own budget is DELIBERATELY 1, not enrich/render's 2 -- a distinct test from
     their budget-2 case (not a parametrized variant), so the differentiated-budget requirement
@@ -503,6 +522,60 @@ def test_generate_resumes_only_once_budget_one_then_fails_normally(factory):
     assert job.reaper_resumes == 1, "the fail-CAS does not touch reaper_resumes"
     mock_task.delay.assert_called_once_with(job_id), "no second resume -- only ever called once"
     assert reel.status == models.ReelStatus.failed
+    assert "already auto-resumed 1 time" in job.error.lower(), (
+        "a budget-exhausted job's failure message should say it was already resumed, not read "
+        "identical to a first-attempt failure that was never resumed at all"
+    )
+
+
+def test_enrich_resumes_twice_budget_two_then_fails_normally(factory):
+    """enrich/render's budget is 2, unlike generate's deliberately-lower 1 -- this is the
+    boundary case the generate-only test above never exercised: resume, get stuck again, resume
+    a second time, get stuck a third time, THEN fall through to the ordinary fail-and-roll-back
+    path once the budget (2) is actually exhausted. Without this, a bug that let a budget-2 type
+    resume a third time (or stop resuming after only one) would pass every existing test."""
+    job_id, reel_id, cut_id = _make(factory, models.JobType.enrich, job_status=models.JobStatus.running,
+                                    reel_status=models.ReelStatus.enriching)
+    mock_task = MagicMock()
+
+    with patch("worker.tasks.maintenance._RESUMABLE_TASKS", {"enrich": (mock_task, 2)}):
+        reap_stuck_jobs()
+    job, reel, _ = _state(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.pending
+    assert job.reaper_resumes == 1
+    assert mock_task.delay.call_count == 1
+    assert reel.status == models.ReelStatus.enriching
+
+    # Stuck again: back to running, stale heartbeat again.
+    db = factory()
+    db.query(models.Job).filter(models.Job.id == job_id).update(
+        {"status": models.JobStatus.running, "heartbeat_at": _LONG_AGO, "updated_at": _LONG_AGO},
+        synchronize_session=False)
+    db.commit()
+
+    with patch("worker.tasks.maintenance._RESUMABLE_TASKS", {"enrich": (mock_task, 2)}):
+        reap_stuck_jobs()
+    job, reel, _ = _state(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.pending, "budget (2) not yet exhausted -- second resume"
+    assert job.reaper_resumes == 2
+    assert mock_task.delay.call_count == 2
+    assert reel.status == models.ReelStatus.enriching
+
+    # Stuck a third time: budget is now exhausted.
+    db = factory()
+    db.query(models.Job).filter(models.Job.id == job_id).update(
+        {"status": models.JobStatus.running, "heartbeat_at": _LONG_AGO, "updated_at": _LONG_AGO},
+        synchronize_session=False)
+    db.commit()
+
+    with patch("worker.tasks.maintenance._RESUMABLE_TASKS", {"enrich": (mock_task, 2)}):
+        reap_stuck_jobs()
+    job, reel, _ = _state(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.failed, "budget (2) exhausted -- ordinary fail path"
+    assert job.reaper_resumes == 2, "the fail-CAS does not touch reaper_resumes"
+    assert mock_task.delay.call_count == 2, "no third resume -- budget exhausted"
+    assert reel.status == models.ReelStatus.failed
+    assert "already auto-resumed 2 time" in job.error.lower()
 
 
 @pytest.mark.parametrize("reaper_resumes", [0, 1, 2, 99])
@@ -544,12 +617,15 @@ def test_the_real_resumable_tasks_dict_has_the_documented_differentiated_budgets
 
 
 def test_the_structural_publish_safeguard_actually_fires():
-    """worker/tasks/maintenance.py carries `assert "publish" not in _RESUMABLE_TASKS` at module
-    level, a second, structural safeguard beyond the dict's own omission. Directly proving that
-    exact expression raises when violated -- not just that today's real dict happens to omit
-    "publish" (the test above already covers that) -- is what this test is for."""
+    """worker/tasks/maintenance.py calls `_check_publish_excluded(_RESUMABLE_TASKS)` at module
+    level, a second, structural safeguard beyond the dict's own omission. Calling the real helper
+    against a dict that includes "publish" -- not a locally-asserted literal -- is what proves the
+    actual production safeguard fires, not just that Python's `assert` statement works."""
     with pytest.raises(AssertionError):
-        assert "publish" not in {"publish": (MagicMock(), 1)}, "publish must never be auto-resumed"
+        _check_publish_excluded({"publish": (MagicMock(), 1)})
+
+    # And the real, unmodified module-level dict must still pass it.
+    _check_publish_excluded(_REAL_RESUMABLE_TASKS)
 
 
 def test_commit_before_enqueue_ordering_is_durable_before_delay_is_called(factory):

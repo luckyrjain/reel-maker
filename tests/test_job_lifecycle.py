@@ -2229,3 +2229,49 @@ def test_a_seventh_gap_shutdown_signal_does_not_clobber_a_resumed_run(factory):
     assert reel.status == models.ReelStatus.generating, (
         "the resumed run's owner must not be rolled back by the superseded zombie's shutdown path"
     )
+
+
+def test_fail_rejected_retry_cas_does_not_clobber_a_fresher_runs_own_pending_reset(factory):
+    """An eighth gap, found by a Concurrency Specialist review pass: _fail_rejected_retry's CAS
+    (reached when this run's own retriable failure resets the row to `pending` under its own
+    claim_token, and self.retry() then comes back Reject because the broker is down) filtered
+    only on status, not token. Status alone cannot tell two different 'pending' rows apart: a
+    second worker can claim the now-pending row (bump token, running), hit its own transient
+    failure, and reset it back to pending again under ITS OWN token, all before this run's
+    self.retry() call returns. Without a token check, this run's stale _fail_rejected_retry CAS
+    would still match on status=pending and incorrectly flip that fresher run's row to failed,
+    clobbering its error message and rolling its owner back. Mutation-tested by temporarily
+    dropping `token=token` from _fail_rejected_retry's forwarded _fail_job call (or
+    `token=(claim_token if owned else None)` from its call site in job_task's run()) and
+    confirming this test fails."""
+    job_id, reel_id, cut_id = _make(factory)
+    fresher = {}
+
+    def reject_after_a_fresher_run_also_reset_to_pending(*a, **k):
+        db = factory()
+        db.query(models.Job).filter(models.Job.id == job_id).update(
+            {"claim_token": models.Job.claim_token + 1, "status": models.JobStatus.pending,
+             "error": "a fresher run's own transient retry-reset"},
+            synchronize_session=False,
+        )
+        db.commit()
+        fresher["token"] = db.get(models.Job, job_id).claim_token
+        db.close()
+        raise Reject(ConnectionError("broker down"), requeue=False)
+
+    task = _task("t.reject_race", _raises(ConnectionError("blip")))
+    with patch.object(task, "retry", side_effect=reject_after_a_fresher_run_also_reset_to_pending):
+        with pytest.raises(Reject):
+            task(job_id)
+
+    job, reel, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.pending, (
+        "the stale _fail_rejected_retry CAS must not flip the fresher run's pending row to failed"
+    )
+    assert job.claim_token == fresher["token"]
+    assert job.error == "a fresher run's own transient retry-reset", (
+        "the fresher run's own error message must survive the stale _fail_rejected_retry CAS"
+    )
+    assert reel.status == models.ReelStatus.generating, (
+        "the fresher run's owner must not be rolled back by the stale _fail_rejected_retry CAS"
+    )

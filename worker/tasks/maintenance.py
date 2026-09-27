@@ -56,13 +56,17 @@ _log = logging.getLogger(__name__)
 # comment documents for a transient error), so it must never be auto-resumed. The assert below is
 # a second, structural safeguard beyond the dict's own omission — this is a hard safety
 # requirement, not a simplification a future edit should be able to silently reopen.
+def _check_publish_excluded(tasks: dict) -> None:
+    assert "publish" not in tasks, "publish must never be auto-resumed — see design §1"
+
+
 _RESUMABLE_TASKS: dict[str, tuple["object", int]] = {
     "enrich": (enrich_context, 2),
     "render": (render_cut, 2),
     "generate": (generate_guide, 1),
     # "publish" deliberately absent.
 }
-assert "publish" not in _RESUMABLE_TASKS, "publish must never be auto-resumed — see design §1"
+_check_publish_excluded(_RESUMABLE_TASKS)
 
 STALE_MINUTES = 5           # job_task beats every HEARTBEAT_INTERVAL_S (30 s), so >> that
 
@@ -203,12 +207,22 @@ def _reap_one(db, job_id: int, seen_status, reason: str, stale_clause, job_type:
         if resumed:
             db.commit()   # durable BEFORE the re-enqueue -- see this function's own docstring
             task.delay(job_id)
-            _log.warning("job %s (%s) resumed after a missed heartbeat", job_id, job_type)
+            resume_count = db.query(models.Job.reaper_resumes).filter(models.Job.id == job_id).scalar()
+            _log.warning("job %s (%s) resumed after a missed heartbeat (attempt %s/%s)",
+                        job_id, job_type, resume_count, max_resumes)
             return True
         db.rollback()
         # Falls through to the unchanged fail-CAS below: either the row is no longer stale (lost
         # the race to a real heartbeat, a sibling's claim, or the reaper itself), or this type's
         # resume budget is exhausted -- either way, today's existing fail behavior applies.
+
+    # Informational only (never changes the CAS filter below): a budget-exhausted resumable
+    # type's failure message should say so, rather than reading identical to a first-attempt
+    # failure that was never resumed at all.
+    resumes_so_far = db.query(models.Job.reaper_resumes).filter(models.Job.id == job_id).scalar() or 0
+    if resumes_so_far:
+        reason = (f"{reason} Already auto-resumed {resumes_so_far} "
+                  f"time{'s' if resumes_so_far != 1 else ''} by the reaper.")
 
     claimed = (
         db.query(models.Job)

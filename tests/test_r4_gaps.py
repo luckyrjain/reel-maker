@@ -334,12 +334,12 @@ def test_a_pending_job_reset_for_retry_after_the_select_is_not_reaped(factory):
     db.commit()
     real = maintenance._reap_one
 
-    def racing(db_, jid, seen, reason, clause):
+    def racing(db_, jid, seen, reason, clause, job_type):
         other = factory()          # between the SELECT and the UPDATE: claimed, failed transiently, reset
         other.query(models.Job).filter(models.Job.id == jid).update(
             {"updated_at": datetime.now(timezone.utc)}, synchronize_session=False)
         other.commit()
-        return real(db_, jid, seen, reason, clause)
+        return real(db_, jid, seen, reason, clause, job_type)
 
     with patch("worker.tasks.maintenance.SessionLocal", factory), patch("worker.tasks.maintenance._reap_one", side_effect=racing):
         reap_stuck_jobs()

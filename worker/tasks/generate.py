@@ -57,6 +57,18 @@ def _enforce_paid_call_budget(db, reel_id: int) -> None:
         )
 
 
+# Reaper-resume cost note (design §7, Red-Team review): a resumed `generate` job can run
+# concurrently with a genuinely-alive "zombie" for at most one attempt's worth of paid LLM
+# calls before that zombie's own next heartbeat() call raises JobLost and unwinds it. This is
+# an EMERGENT side effect of where heartbeat() is called inside the attempt loop above
+# (once per attempt, before that attempt's LLM/enrichment/judge calls) — not a designed or
+# enforced invariant. record_stage() and paid_call_count() (engine/observability.py) have zero
+# fencing/claim_token-awareness at all: nothing stops a zombie's StageEvent writes or a
+# concurrent _enforce_paid_call_budget() read from happening mid-attempt. generate's resume
+# budget is capped at 1 (not enrich/render's 2) specifically because of this — see
+# _RESUMABLE_TASKS in worker/tasks/maintenance.py.
+
+
 
 def _combined_score(
     rule: int,
