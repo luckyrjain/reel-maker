@@ -16,7 +16,7 @@ import httpx
 import pytest
 from celery import Celery
 from celery.exceptions import Reject, Retry
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy import exc as sa_exc
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -2309,4 +2309,37 @@ def test_heartbeat_uses_the_pinned_run_token_not_the_live_attribute_after_a_roll
     job, *_ = _read(factory, job_id, reel_id, cut_id)
     assert job.claim_token == seen["resumed_token"], (
         "the zombie's fenced heartbeat() must not have advanced the RESUMED run's row"
+    )
+
+
+def test_heartbeat_never_reloads_the_mapped_claim_token_column_when_the_pin_is_present(factory):
+    """A review pass on the fix above caught a second, subtler bug in its first version:
+    `getattr(job, "_run_claim_token", job.claim_token)` still evaluates `job.claim_token` as the
+    default argument every single call -- Python always eagerly evaluates a function call's
+    arguments, including a discarded default -- so it silently reopened the exact identity-map
+    round trip (and DB-availability dependency) the pin exists to remove. Fixed with a genuine
+    `if`/`else` via `hasattr`, which only probes for `_run_claim_token` and never touches
+    `job.claim_token` when it's present. Verified here by counting SQLAlchemy's `refresh` event,
+    which fires exactly when an expired mapped attribute is reloaded from the database: expire
+    `claim_token` mid-body, then confirm heartbeat() triggers zero refreshes of it."""
+    job_id, reel_id, cut_id = _make(factory)
+    refreshed_attrs: list = []
+
+    def on_refresh(target, context, attrs):
+        if target.id == job_id:
+            refreshed_attrs.append(attrs)
+
+    def body(self, db, job, ctx):
+        db.expire(job, ["claim_token"])   # force a fresh SELECT on next access to this column
+        event.listen(models.Job, "refresh", on_refresh)
+        try:
+            heartbeat(db, job, 50)
+        finally:
+            event.remove(models.Job, "refresh", on_refresh)
+
+    _task("t.no_claim_token_reload", body)(job_id)
+
+    assert refreshed_attrs == [], (
+        "heartbeat() must not reload the expired claim_token column -- "
+        f"got refresh events: {refreshed_attrs}"
     )

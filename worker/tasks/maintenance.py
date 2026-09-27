@@ -229,11 +229,17 @@ def _reap_one(db, job_id: int, seen_status, reason: str, stale_clause, job_type:
 
     # Informational only (never changes the CAS filter below): a budget-exhausted resumable
     # type's failure message should say so, rather than reading identical to a first-attempt
-    # failure that was never resumed at all. Gated to resumable types above: a non-resumable
-    # type (or a pending-stale/done-orphan candidate, neither of which reach the resume branch)
-    # can never have a nonzero reaper_resumes, so skipping this read for them is a pure win, not
-    # a behavior change -- it just avoids a wasted round trip on the overwhelmingly common
-    # non-resumable fail path.
+    # failure that was never resumed at all. Gated to `job_type in _RESUMABLE_TASKS` above --
+    # not to `seen_status`, so a pending-stale or done-orphan candidate of a CURRENTLY resumable
+    # type still gets this read (its reaper_resumes can genuinely be nonzero: it may have been
+    # resumed once, then gone stale again as a different candidate kind). A type that has NEVER
+    # been in _RESUMABLE_TASKS can never have a nonzero reaper_resumes (the column is written
+    # only inside the `if resumed:` branch above, itself gated the same way), so skipping this
+    # read for a non-resumable type is a pure win today. Asymmetric case worth knowing about: if a
+    # type is ever REMOVED from _RESUMABLE_TASKS after some of its rows already carry a nonzero
+    # count from when it WAS resumable, this gate silently stops surfacing that history in the
+    # fail message for those rows -- the DB column is untouched, only this annotation goes quiet.
+    # Not reachable today (the map has never shrunk) but worth knowing if it ever does.
     if resumes_so_far:
         reason = (f"{reason} Already auto-resumed {resumes_so_far} "
                   f"time{'s' if resumes_so_far != 1 else ''} by the reaper.")

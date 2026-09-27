@@ -126,9 +126,17 @@ def heartbeat(db, job, progress: int) -> None:
     read, which could be a fresher, superseding claim -- defeating this exact check. Falls back to
     the mapped attribute when the pin is absent (a `job` loaded and passed in directly, outside
     `job_task`'s `run()`, e.g. some tests call this function standalone).
+
+    The fallback is a genuine ``if``/``else``, not ``getattr(job, "_run_claim_token",
+    job.claim_token)`` -- a review pass caught that the DEFAULT argument to ``getattr`` is always
+    evaluated eagerly by Python before the call, even when the attribute exists and the default is
+    discarded, so that form would still touch the mapped column attribute on every call and
+    silently reopen the exact identity-map round trip (and DB-availability dependency) this fix
+    exists to remove. ``hasattr`` only probes for ``_run_claim_token`` itself and never touches
+    ``job.claim_token`` when it's present.
     """
     now = _now()
-    token = getattr(job, "_run_claim_token", job.claim_token)
+    token = job._run_claim_token if hasattr(job, "_run_claim_token") else job.claim_token
     if not _advance(db, job.id, models.JobStatus.running,
                     {"progress": progress, "heartbeat_at": now}, token=token):
         db.rollback()
@@ -145,9 +153,11 @@ def lock_job(db, job) -> None:
     the job at its done-stamp can deadlock against it. Raises JobLost if the job is gone, or if a
     fresher claim has superseded this run — see heartbeat()'s docstring for why the token check
     matters here too, not just the status check, and for why this reads
-    ``job._run_claim_token`` rather than the mapped ``job.claim_token`` column attribute.
+    ``job._run_claim_token`` rather than the mapped ``job.claim_token`` column attribute -- and
+    why the fallback is a genuine ``if``/``else`` via ``hasattr``, not a ``getattr(..., default)``
+    (see heartbeat()'s docstring: the default argument to ``getattr`` is always eagerly evaluated).
     """
-    token = getattr(job, "_run_claim_token", job.claim_token)
+    token = job._run_claim_token if hasattr(job, "_run_claim_token") else job.claim_token
     if not _advance(db, job.id, models.JobStatus.running, {"heartbeat_at": _now()}, token=token):
         db.rollback()
         raise JobLost(f"job {job.id} is no longer running (or was resumed by a fresher claim)")
@@ -592,6 +602,13 @@ def job_task(
     ``JobLost`` if the reaper already failed the job), so it must come before the body's
     last mutations: the done-stamp commit lands those atomically with ``status = done``.
     The one reason to commit early is an irreversible external side effect.
+
+    The body must never reassign its own ``job`` parameter to a freshly-queried instance (e.g.
+    ``job = db.query(models.Job).get(job_id)`` mid-body) — a Concurrency Specialist review noted
+    this as a fragile invariant, not yet a live bug: ``heartbeat()``/``lock_job()`` read
+    ``job._run_claim_token``, a plain unmapped attribute this decorator pins onto the ORIGINAL
+    `job` object right after the claim (see that assignment below), which a fresh query would not
+    carry. Always reuse the `job` object this decorator hands the body.
 
     Order of events:
       1. ``job is None`` or ``status != pending`` -> return. ``done``/``running`` are a
