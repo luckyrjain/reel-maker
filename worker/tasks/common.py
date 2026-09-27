@@ -512,14 +512,23 @@ def _finalize_or_reconnect(db, job_id: int, write) -> None:
             fresh.close()
 
 
-def _fail_interrupted(db, job_id, exc: BaseException, owner_kind: str, owner_state: str) -> None:
+def _fail_interrupted(db, job_id, exc: BaseException, owner_kind: str, owner_state: str,
+                       token: int | None = None) -> None:
     """SystemExit / KeyboardInterrupt while the job was running (worker shut down or killed by a
     Celery hard time limit): fail it now. Do NOT hand it back to pending: Celery has already
-    acked or dropped the message, so nothing would ever pick a pending job up again."""
+    acked or dropped the message, so nothing would ever pick a pending job up again.
+
+    Reachable by a live, superseded run exactly like _settle_failure's retry-reset/fail-CAS
+    calls are (a graceful shutdown signal, e.g. SIGTERM before a hard time limit's SIGKILL, is a
+    real, catchable-in-Python event this codebase already treats as first-class -- not the SIGKILL
+    case this whole design's resume mechanism is built around). Always called with owned=True (the
+    one caller in job_task's run() only invokes this `if owned and not committed`), so `token` is
+    always this run's own claim_token here -- without it, a zombie superseded by a resumed claim
+    could still flip the RESUMED run's row to failed and roll back its owner on its way out."""
     message = (f"Worker was shut down while the job was running ({type(exc).__name__}). "
                "The work was not finished; retry it.")
     _finalize_or_reconnect(db, job_id, lambda s, jid: _fail_job(
-        s, jid, models.JobStatus.running, message, owner_kind, owner_state))
+        s, jid, models.JobStatus.running, message, owner_kind, owner_state, token=token))
 
 
 def _fail_rejected_retry(db, job_id, exc, owner_kind, owner_state) -> None:
@@ -769,7 +778,7 @@ def job_task(
                 # limit is killing this process. Fail the job now (see _fail_interrupted).
                 if owned and not committed:
                     try:
-                        _fail_interrupted(db, job_id, exc, owner_kind, owner_state)
+                        _fail_interrupted(db, job_id, exc, owner_kind, owner_state, token=claim_token)
                     except Exception:
                         _log.exception("could not fail job %s on shutdown", job_id)
                 raise

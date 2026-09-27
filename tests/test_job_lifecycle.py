@@ -2195,3 +2195,37 @@ def test_round_two_gap_2_heartbeat_loop_does_not_advance_a_superseded_runs_row(f
         "a superseded background thread's own _advance() call must not advance heartbeat_at "
         "once its captured claim_token is stale"
     )
+
+
+def test_a_seventh_gap_shutdown_signal_does_not_clobber_a_resumed_run(factory):
+    """A seventh checkpoint, missed by both design-stage reviews and the first implementation
+    pass, found only when an independent reviewer read _fail_interrupted (the SystemExit/
+    KeyboardInterrupt shutdown path) against the actual merged code: it is reachable by a zombie
+    exactly like _settle_failure's retry-reset/fail-CAS calls are (always owned=True — job_task's
+    run() only ever invokes it `if owned and not committed`), and its _fail_job call had no token
+    at all. A zombie hit by a graceful shutdown signal (SIGTERM before a hard time limit's
+    SIGKILL, or a worker restart — a real, catchable-in-Python event this codebase already treats
+    as first-class, not the SIGKILL case this whole design is about) after a fresher claim has
+    landed would flip the RESUMED run's row to failed and roll its owner back on its way out,
+    identical in kind to round-two gap #1's fail-CAS. Mutation-tested by temporarily dropping
+    `token=claim_token` from _fail_interrupted's call site in job_task's run() (or `token=token`
+    from _fail_interrupted's own forwarded _fail_job call) and confirming this test fails."""
+    job_id, reel_id, cut_id = _make(factory)
+    seen = {}
+
+    def zombie_body(self, db, job, ctx):
+        seen["token"] = job.claim_token
+        seen["resumed_token"] = _bump_claim_token(factory, job_id)
+        raise SystemExit("shutdown hits the zombie after it was superseded")
+
+    with pytest.raises(SystemExit):
+        _task("t.zombie_shutdown", zombie_body)(job_id)
+
+    job, reel, _ = _read(factory, job_id, reel_id, cut_id)
+    assert job.status == models.JobStatus.running, (
+        "the zombie's shutdown-triggered fail must not flip the RESUMED run's row to failed"
+    )
+    assert job.claim_token == seen["resumed_token"]
+    assert reel.status == models.ReelStatus.generating, (
+        "the resumed run's owner must not be rolled back by the superseded zombie's shutdown path"
+    )
