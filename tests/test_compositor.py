@@ -10,6 +10,7 @@ job still reporting `done`. This test synthesizes a real WAV, renders one
 beat, and asserts the output actually has an audio stream — the assertion
 that would have caught the regression before it shipped.
 """
+import hashlib
 import json
 import subprocess
 from unittest.mock import patch
@@ -162,6 +163,28 @@ def test_text_filter_rejects_a_filter_graph_injection_attempt():
     chain = _build_text_filter(_ONE_BEAT, [5.0], text_color="white:enable=0,drawbox=1")
     assert f"fontcolor={DEFAULT_TEXT_COLOR}" in chain
     assert "drawbox" not in chain
+
+
+def test_text_filter_disables_drawtext_expansion():
+    """See the real-ffmpeg regression below (test_composite_cut_renders_on_screen_text_
+    containing_a_percent_sign) for why: drawtext's own `%`-expansion engine, left at its
+    default, treats a lone `%` as a "Stray %" parse error regardless of backslash-escaping
+    -- confirmed against real ffmpeg that `%`, `\\%`, and `%%` all fail identically.
+    `:expansion=none` on the filter itself is the actual fix; this just pins that the
+    option is always present, since the real-ffmpeg test below only proves the combined
+    behavior, not which half of the fix supplied it."""
+    chain = _build_text_filter(_ONE_BEAT, [5.0])
+    assert ":expansion=none" in chain
+
+
+def test_escape_drawtext_leaves_percent_untouched():
+    """`_escape_drawtext()` must not backslash-escape `%` -- with `expansion=none` on the
+    filter (see above), a bare `%` already renders correctly, and `\\%`/`%` render
+    byte-identical against real ffmpeg (verified separately in
+    test_composite_cut_percent_expansion_stays_literal_not_expanded below), so there is
+    nothing left for a `%`-specific escape to accomplish."""
+    from engine.render.compositor import _escape_drawtext
+    assert _escape_drawtext("50% off") == "50% off"
 
 
 # ── _build_ffmpeg_args — pure function, no subprocess needed ────────────────
@@ -495,3 +518,64 @@ def test_composite_cut_closes_a_vo_track_opened_but_not_fully_built(tmp_path):
         )
 
     tracker.assert_every_opened_reader_was_closed()
+
+
+def test_composite_cut_renders_on_screen_text_containing_a_percent_sign(tmp_path):
+    """Real-ffmpeg regression for the drawtext `%`-escaping bug: `_escape_drawtext()`
+    used to backslash-escape `%` as `\\%`, but ffmpeg's own generic option-value parser
+    strips that single backslash before drawtext's `%`-expansion engine (left at its
+    default) ever sees it -- so `\\%` reached drawtext indistinguishable from a bare `%`,
+    which is itself a "Stray %" parse error. Confirmed against real ffmpeg that a literal
+    `%`, the old `\\%` escape, and `%%` all failed identically. Any beat whose
+    on_screen_text contained a percent sign (plausible in this app's sports/stats niche --
+    "50% pass completion") crashed the whole render, not just a cosmetic glitch. Fixed
+    with `:expansion=none` on the filter itself (disables drawtext's %-expansion engine
+    wholesale, including its `%{eif:...}` expression evaluator -- a real, if low-severity,
+    injection surface for LLM-generated caption text that this closes as a side effect)
+    plus removing the now-unnecessary `\\%` escape. This test fails against the pre-fix
+    code with a RuntimeError ("FFmpeg text/audio pass failed (exit 234)") raised from
+    composite_cut()'s ffmpeg subprocess call, not from MoviePy's write_videofile (there is
+    no separate MoviePy write step in this pass -- see _build_ffmpeg_args())."""
+    beats = [{"duration_s": 2.0, "vo_script": "", "on_screen_text": ["Win rate: 50% today"]}]
+    out = tmp_path / "out.mp4"
+    thumb = tmp_path / "thumb.jpg"
+
+    composite_cut(
+        beats=beats, beat_video_paths=[[None]], beat_vo_paths=[None],
+        output_path=out, thumbnail_path=thumb,
+    )
+
+    assert out.exists()
+
+
+def _frame_md5(filter_chain: str, duration_s: float, t: float, out_path) -> str:
+    """Render one frame at time `t` through `filter_chain` on a plain color source and
+    return its content hash, for byte-level before/after comparison of a drawtext
+    rendering -- used to prove *what* a filter did, not just that ffmpeg didn't error."""
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=black:s=320x240:d={duration_s}",
+         "-vf", filter_chain, "-ss", str(t), "-frames:v", "1", "-update", "1", str(out_path)],
+        capture_output=True, check=True,
+    )
+    return hashlib.md5(out_path.read_bytes()).hexdigest()
+
+
+def test_composite_cut_percent_expansion_stays_literal_not_expanded(tmp_path):
+    """The security property `:expansion=none` exists for, proven rather than assumed:
+    with expansion left at its default, `%{pts}` is drawtext's own syntax for expanding
+    to the filter's current timestamp, so a rendered frame at t=0.5s would visibly differ
+    from one at t=2.5s. With expansion=none, on_screen_text containing `%{pts}` (a stand-in
+    for an LLM-generated caption that happens to contain, or is crafted to contain, a
+    `%{...}`-shaped substring) must render as the literal, unchanging text `%{pts}` at
+    every timestamp -- i.e. the two frames must be byte-identical. This is a stronger
+    guarantee than "ffmpeg doesn't error" (already covered by the sibling percent-sign
+    test above): it confirms expansion is actually OFF, not just that this particular
+    string happens not to trip a parse error."""
+    chain = _build_text_filter(
+        [{"duration_s": 3.0, "vo_script": "", "on_screen_text": ["%{pts}"]}], [3.0],
+    )
+
+    frame_early = _frame_md5(chain, 3.0, 0.5, tmp_path / "early.png")
+    frame_late = _frame_md5(chain, 3.0, 2.5, tmp_path / "late.png")
+
+    assert frame_early == frame_late

@@ -190,11 +190,25 @@ def _ffmpeg_font() -> str:
 
 
 def _escape_drawtext(text: str) -> str:
-    """Escape text for FFmpeg drawtext filter."""
+    """Escape text for FFmpeg drawtext filter.
+
+    No `%` handling here on purpose — drawtext's `%`-expansion engine is
+    disabled wholesale via `:expansion=none` on the filter itself (see
+    _build_text_filter()), not per-character escaping. The old `\\%`
+    escape never actually reached drawtext as an escape: ffmpeg's own
+    generic option-value parser strips a single backslash before
+    drawtext's `%`-expansion parser sees the value, so `\\%` arrived
+    there indistinguishable from a bare `%` — itself a "Stray %" parse
+    error with expansion left at its default. Confirmed against real
+    ffmpeg that a bare `%`, the old `\\%` escape, and `%%` all fail
+    identically. With expansion=none, `\\%` and `%` render byte-identical
+    (verified by real-ffmpeg frame comparison) — either would work, but a
+    bare `%` is simpler and matches every other unescaped character this
+    function leaves alone.
+    """
     text = text.replace("\\", "\\\\")
     text = text.replace("'", "’")   # curly apostrophe — safe in filter string
     text = text.replace(":", "\\:")
-    text = text.replace("%", "\\%")
     return text
 
 
@@ -332,6 +346,7 @@ def _build_text_filter(
             parts.append(
                 f"drawtext=enable='between(t,{seg_start:.3f},{seg_end:.3f})'"
                 f":text='{escaped}'"
+                f":expansion=none"
                 f"{font_clause}"
                 f":fontsize={_FONT_SIZE}:fontcolor={text_color}"
                 f":shadowcolor=black@0.85:shadowx=2:shadowy=2"
