@@ -224,8 +224,10 @@ directly and ran a raw ffmpeg command, never calling `composite_cut()`) were als
 was renamed from `test_composite_cut_percent_expansion_stays_literal_not_expanded` to
 `test_text_filter_percent_expansion_stays_literal_not_expanded` to match what it actually exercises.
 
-The same review round also caught three wording defects introduced by the corrections above, none
-of them affecting the fix's correctness, all now fixed in §2/§3/§4 above: (a) §2 said the roadmap's
+The same review round also caught three wording defects in this document's earlier text (defects
+(a) and (c) were present since the first draft; only (b) was introduced by Correction 1 itself
+missing a second occurrence), none of them affecting the fix's correctness, all now fixed in
+§2/§3/§4 above: (a) §2 said the roadmap's
 severity rating was "downgraded to Low" — it was already Low; nothing was downgraded, only reworded
 to remove that implication; (b) §3 item 2 still carried the original, disproven "would print a
 stray visible backslash" claim after Correction 1 rewrote §2 to say the opposite — Correction 1
@@ -240,13 +242,14 @@ narrower escape could have fixed both at once.
 **Bonus finding (Security/Red-Team round, not itself a blocker) — this fix incidentally closes a
 live hang/DoS vector on `main` today.** `%{e:while(1,0)}` (drawtext's `e:` expression-evaluation
 expansion, reachable through the same `%{...}` syntax as `%{eif:...}`) makes ffmpeg hang
-indefinitely on the pre-fix code — confirmed with a 15s timeout against real ffmpeg. On the
-`rendering` queue (`worker_max_tasks_per_child`, `--concurrency=1`, see CLAUDE.md's Worker queues
-section), an LLM-generated `on_screen_text` string containing this substring would hang the single
-rendering worker until Celery's soft time limit (60 min, `render`'s `max_runtime_s`) escalates to
-SIGTERM/SIGKILL — a full hour of the rendering queue stalled behind one bad beat, not merely a
-failed render. Under `expansion=none` (the PR's fix), the identical string renders instantly as
-literal text. No exhaustive fuzz/injection search (400 randomized payloads, 24 hand-built
+indefinitely on the pre-fix code — confirmed with a 15s timeout against real ffmpeg. This app's
+`rendering` queue runs at `--concurrency=1` (see CLAUDE.md's Worker queues section), so an
+LLM-generated `on_screen_text` string containing this substring would hang the single rendering
+worker for up to `render`'s full `max_runtime_s` soft time limit (60 min) — `SoftTimeLimitExceeded`
+would interrupt the blocked `subprocess.run()` call at that point (escalating to SIGTERM/SIGKILL
+only if that exception were somehow ignored, per CLAUDE.md's Reliability features section) — so a
+full hour of the rendering queue stalled behind one bad beat, not merely a failed render. Under
+`expansion=none` (the PR's fix), the identical string renders instantly as literal text. No exhaustive fuzz/injection search (400 randomized payloads, 24 hand-built
 adversarial ones, targeted lookalike-quote and control-byte cases) found any way to achieve
 filter-graph injection (breaking `text='...'` to inject a second filter/option) on either the
 pre-fix or fixed code — the `'`→curly-quote and `\`→`\\` escaping were already sufficient for that
