@@ -21,7 +21,8 @@ import soundfile as sf
 from moviepy import AudioFileClip, VideoFileClip
 
 from engine.render.compositor import (
-    DEFAULT_TEXT_COLOR, _build_ffmpeg_args, _build_text_filter, _write_thumbnail_candidates,
+    DEFAULT_TEXT_COLOR, TARGET_H, TARGET_W, _build_ffmpeg_args, _build_text_filter,
+    _write_thumbnail_candidates,
     composite_cut,
 )
 
@@ -179,10 +180,10 @@ def test_text_filter_disables_drawtext_expansion():
 
 def test_escape_drawtext_leaves_percent_untouched():
     """`_escape_drawtext()` must not backslash-escape `%` -- with `expansion=none` on the
-    filter (see above), a bare `%` already renders correctly, and `\\%`/`%` render
-    byte-identical against real ffmpeg (verified separately in
-    test_composite_cut_percent_expansion_stays_literal_not_expanded below), so there is
-    nothing left for a `%`-specific escape to accomplish."""
+    filter (see above), a bare `%` already renders correctly, and separate manual
+    real-ffmpeg frame-byte comparison (not itself a permanent test here -- see the design
+    doc's Correction 1) confirmed `\\%` and `%` render identically under expansion=none,
+    so there is nothing left for a `%`-specific escape to accomplish."""
     from engine.render.compositor import _escape_drawtext
     assert _escape_drawtext("50% off") == "50% off"
 
@@ -548,19 +549,23 @@ def test_composite_cut_renders_on_screen_text_containing_a_percent_sign(tmp_path
     assert out.exists()
 
 
-def _frame_md5(filter_chain: str, duration_s: float, t: float, out_path) -> str:
-    """Render one frame at time `t` through `filter_chain` on a plain color source and
-    return its content hash, for byte-level before/after comparison of a drawtext
-    rendering -- used to prove *what* a filter did, not just that ffmpeg didn't error."""
-    subprocess.run(
-        ["ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=black:s=320x240:d={duration_s}",
-         "-vf", filter_chain, "-ss", str(t), "-frames:v", "1", "-update", "1", str(out_path)],
-        capture_output=True, check=True,
-    )
+def _frame_md5(filter_chain: str | None, duration_s: float, t: float, out_path) -> str:
+    """Render one frame at time `t` on a plain black source at this app's real target
+    9:16 dimensions (drawtext's fixed y-position, _TEXT_Y, is computed from TARGET_H and
+    lands off-screen on an arbitrary small test frame -- a 320x240 source would make any
+    frame-comparison test pass vacuously regardless of what the filter did), through
+    `filter_chain` if given, and return its content hash. `filter_chain=None` renders the
+    plain color source with no drawtext filter at all, as a "definitely no text" baseline
+    for proving text was actually drawn, not just that two frames happened to match."""
+    cmd = ["ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=black:s={TARGET_W}x{TARGET_H}:d={duration_s}"]
+    if filter_chain:
+        cmd += ["-vf", filter_chain]
+    cmd += ["-ss", str(t), "-frames:v", "1", "-update", "1", str(out_path)]
+    subprocess.run(cmd, capture_output=True, check=True)
     return hashlib.md5(out_path.read_bytes()).hexdigest()
 
 
-def test_composite_cut_percent_expansion_stays_literal_not_expanded(tmp_path):
+def test_text_filter_percent_expansion_stays_literal_not_expanded(tmp_path):
     """The security property `:expansion=none` exists for, proven rather than assumed:
     with expansion left at its default, `%{pts}` is drawtext's own syntax for expanding
     to the filter's current timestamp, so a rendered frame at t=0.5s would visibly differ
@@ -570,12 +575,24 @@ def test_composite_cut_percent_expansion_stays_literal_not_expanded(tmp_path):
     every timestamp -- i.e. the two frames must be byte-identical. This is a stronger
     guarantee than "ffmpeg doesn't error" (already covered by the sibling percent-sign
     test above): it confirms expansion is actually OFF, not just that this particular
-    string happens not to trip a parse error."""
+    string happens not to trip a parse error.
+
+    Caught by an independent test-quality audit: the first version of this test rendered
+    onto a small 320x240 color source while drawtext's y-position is computed from this
+    app's real 1080x1920 target frame (_TEXT_Y = int(TARGET_H * TEXT_Y_CENTER) - ... =
+    1371px down) -- the text landed entirely below the visible 240px-tall test frame, so
+    BOTH "frames" were identical plain black regardless of the expansion setting, and the
+    test passed even with :expansion=none removed. Fixed by rendering at this app's real
+    TARGET_W x TARGET_H (matching what `_build_text_filter()`'s `_TEXT_Y` actually assumes)
+    and by asserting the text-bearing frame differs from a genuinely textless baseline
+    frame, so a future off-screen-text regression fails loudly instead of passing quietly."""
     chain = _build_text_filter(
         [{"duration_s": 3.0, "vo_script": "", "on_screen_text": ["%{pts}"]}], [3.0],
     )
 
     frame_early = _frame_md5(chain, 3.0, 0.5, tmp_path / "early.png")
     frame_late = _frame_md5(chain, 3.0, 2.5, tmp_path / "late.png")
+    frame_no_text = _frame_md5(None, 3.0, 0.5, tmp_path / "no_text.png")
 
+    assert frame_early != frame_no_text   # text is actually visible in the frame
     assert frame_early == frame_late

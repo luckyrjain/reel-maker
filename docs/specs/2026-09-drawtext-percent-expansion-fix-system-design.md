@@ -52,8 +52,9 @@ ffmpeg subprocess call in `_build_ffmpeg_args()`'s drawtext pass (not from Movie
 separate `write_videofile()` step in this pass), failing the entire render job. This is not the
 "not observed in practice" cosmetic edge case the roadmap entry describes; it is a live,
 unconditional crash on a realistic input the evaluator/prompt layer has no reason to avoid
-producing. Severity is downgraded to Low in the roadmap only because it apparently hadn't been hit
-yet in this operator's own usage — the code path itself is unconditionally broken.
+producing. The roadmap's Low severity rating was never downgraded or upgraded by this fix — it is
+noted here only because it apparently hadn't been hit yet in this operator's own usage, despite the
+code path itself being unconditionally broken.
 
 ## 3. Fix
 
@@ -75,10 +76,13 @@ that `%{...}` would otherwise trigger is off entirely, not merely escaped-and-ho
 Two changes, both in `engine/render/compositor.py`:
 
 1. `_build_text_filter()`'s per-line `drawtext=...` clause gains `:expansion=none`.
-2. `_escape_drawtext()` no longer touches `%` at all. Leaving the `\%` replacement in place after
-   adding `expansion=none` would be actively wrong in the other direction: with expansion off, a
-   bare `%` is already literal, so `\%` would print a visible, spurious backslash in the rendered
-   caption.
+2. `_escape_drawtext()` no longer touches `%` at all. **Correction (see §7, Correction 1):** the
+   first draft of this document claimed leaving the `\%` replacement in place after adding
+   `expansion=none` "would print a visible, spurious backslash in the rendered caption." Real-ffmpeg
+   frame-byte comparison disproved this — `\%` and `%` render byte-identical under `expansion=none`
+   (ffmpeg's generic option-value parser strips the backslash regardless of the expansion setting).
+   Removing the `%` handling is still correct, just for the accurate reason given in §2: it was
+   never doing anything, not that keeping it would actively break rendering.
 
 No other call site interpolates `on_screen_text` (or any other freeform string) into a `drawtext`
 clause — `_escape_drawtext()` has exactly one call site (`_build_text_filter()`), and
@@ -89,10 +93,16 @@ clause — `_escape_drawtext()` has exactly one call site (`_build_text_filter()
 ## 4. Why this is the right fix, not a narrower one
 
 An alternative would be to special-case `%{` (the only sequence that actually triggers expansion)
-and leave a bare `%` unescaped. Rejected: (a) it was empirically confirmed that even a **bare,
-unescaped** `%` fails today regardless of what follows it — the "Stray %" error fires on parsing
-the `%` itself, before drawtext ever looks ahead for a matching `{...}`, so there is no narrower
-per-character escape that fixes the crash while leaving expansion selectively available; (b)
+and leave every other `%` unescaped. Rejected: (a) it was empirically confirmed that a bare,
+unescaped `%` **not immediately followed by a well-formed `{...}` expansion token** fails
+unconditionally — e.g. `50% off` fails, because the "Stray %" error fires on parsing the `%` itself
+before drawtext finds a matching `{` to expand. A `%` that IS followed by a well-formed token
+(`%{pts}`, `%{eif:6*7:d}`) does NOT fail this way — it successfully expands instead, which is the
+separate, second problem this fix also closes (§7 below). So there is no narrower per-character
+escape that closes both problems at once: escaping only a lone `%` would still leave a *crafted*
+`%{...}` substring free to expand, and escaping `%{` specifically would still crash on any ordinary,
+non-adversarial `%` in real caption text. `expansion=none` is the only single change that closes
+both; (b)
 `expansion=none` is strictly safer than any escaping scheme for the original threat this function
 was defending against (an LLM-generated on-screen-text line containing a coincidental or
 adversarial `%{...}`-shaped substring being expanded into ffmpeg metadata) — the expansion engine
@@ -132,12 +142,16 @@ was found; this closes the roadmap item in full rather than partially.
   `compositor.py`, confirmed this test fails with the exact `RuntimeError`/"Stray %" error this
   design predicts, then restored the fix. This test alone cannot distinguish "the escape was
   removed" from "the escape was merely harmless" — see Correction 1.
-- `tests/test_compositor.py::test_composite_cut_percent_expansion_stays_literal_not_expanded` —
+- `tests/test_compositor.py::test_text_filter_percent_expansion_stays_literal_not_expanded` —
   real-ffmpeg frame-hash comparison proving the actual security property `expansion=none` exists
-  for: renders `%{pts}` at two different timestamps through the real `_build_text_filter()` output
-  and asserts the two frames are byte-identical (drawtext's `%{pts}` expands to the current
-  timestamp when expansion is active, so two different timestamps would render visibly different
-  text if expansion weren't actually disabled). Added in Correction 2 below.
+  for: renders `%{pts}` at two different timestamps, on a color source matching this app's real
+  `TARGET_W`x`TARGET_H` (see Correction 4 — an earlier version of this test rendered onto an
+  arbitrary small frame and passed vacuously), through the real `_build_text_filter()` output, and
+  asserts (a) the frame differs from a genuinely textless baseline frame — proving text was actually
+  drawn, not just that two black frames happened to match — and (b) the two text-bearing frames are
+  byte-identical to each other (drawtext's `%{pts}` expands to the current timestamp when expansion
+  is active, so two different timestamps would render visibly different text if expansion weren't
+  actually disabled). Added in Correction 2, fixed in Correction 4.
 
 Full suite: 737 tests (was 733; +4), 1 deselected (golden), `ruff check --select F,E9 .` clean.
 
@@ -170,7 +184,7 @@ integration test in the first draft) asserts only that the render succeeds — L
 that this cannot distinguish "expansion is genuinely off" from "this particular string happened not
 to trip a parse error," and that keeping the old, pointless `\%` escape would *also* pass it (since
 `\%` and `%` are byte-identical under `expansion=none` per Correction 1). Fixed by adding
-`test_composite_cut_percent_expansion_stays_literal_not_expanded`, a real-ffmpeg frame-hash
+`test_text_filter_percent_expansion_stays_literal_not_expanded`, a real-ffmpeg frame-hash
 comparison at two different timestamps through an on-screen-text string of `%{pts}` — this is the
 property §4's injection-closure argument actually depends on, and it was previously asserted in
 prose only.
@@ -187,6 +201,57 @@ now renders correctly. No test was added for this specific case — it is out of
 percent-sign bug this design exists to close and was not itself reported in the roadmap — but it is
 recorded here since an operator debugging a future "disappearing backslash" report predating this
 fix would otherwise have no trail to it.
+
+**Correction 4 — the frame-hash test added in Correction 2 was itself vacuous, and three prose
+claims in this document had wording defects.** A second review round — four personas (Security/
+Red-Team, Correctness/Edge-Case, Test-Quality Auditor, Documentation-Consistency), run in parallel
+against the merged PR — converged independently (three of the four reviews) on the same finding:
+`test_text_filter_percent_expansion_stays_literal_not_expanded` rendered its comparison frames onto
+an arbitrary `320x240` color source, but `_build_text_filter()`'s drawtext clause places text at a
+fixed `y=_TEXT_Y`, computed from this app's real `TARGET_H=1920` (≈1371px down) — so the text landed
+entirely below the visible area of the small test frame, both "frames" were plain, textless black
+regardless of the `expansion` setting, and the test **passed even with `:expansion=none` fully
+removed**. Correction 2's own claim that this test "proves the actual security property" was
+therefore false at the time it was written. Fixed by rendering the comparison frames at this app's
+real `TARGET_W`x`TARGET_H` (matching what `_TEXT_Y` actually assumes) and by adding a third
+assertion — the text-bearing frame must differ from a genuinely textless baseline frame (rendered
+with no `-vf` at all) — so a future off-screen-text regression fails loudly instead of the test
+quietly proving nothing. Re-verified by mutation: with the fix applied, deleting `:expansion=none`
+from `compositor.py` now makes this test fail with a real assertion mismatch between the two
+timestamped frames, confirmed via `git diff`/`git checkout --` before and after. The test's
+docstring and its position in the file (it built its own filter string via `_build_text_filter()`
+directly and ran a raw ffmpeg command, never calling `composite_cut()`) were also misleading — it
+was renamed from `test_composite_cut_percent_expansion_stays_literal_not_expanded` to
+`test_text_filter_percent_expansion_stays_literal_not_expanded` to match what it actually exercises.
+
+The same review round also caught three wording defects introduced by the corrections above, none
+of them affecting the fix's correctness, all now fixed in §2/§3/§4 above: (a) §2 said the roadmap's
+severity rating was "downgraded to Low" — it was already Low; nothing was downgraded, only reworded
+to remove that implication; (b) §3 item 2 still carried the original, disproven "would print a
+stray visible backslash" claim after Correction 1 rewrote §2 to say the opposite — Correction 1
+only updated §2 and the code docstring, missing this second occurrence, now fixed with an explicit
+pointer back to Correction 1; (c) §4's "(a)" argument claimed a bare `%` "fails today regardless of
+what follows it," which read as contradicting the very next section's own finding that `%{eif:...}`
+successfully expands rather than failing — reworded to state precisely that only a `%` **not**
+followed by a well-formed `{...}` expansion token fails unconditionally, while one that IS followed
+by such a token expands instead (the separate problem `expansion=none` also closes), so no single
+narrower escape could have fixed both at once.
+
+**Bonus finding (Security/Red-Team round, not itself a blocker) — this fix incidentally closes a
+live hang/DoS vector on `main` today.** `%{e:while(1,0)}` (drawtext's `e:` expression-evaluation
+expansion, reachable through the same `%{...}` syntax as `%{eif:...}`) makes ffmpeg hang
+indefinitely on the pre-fix code — confirmed with a 15s timeout against real ffmpeg. On the
+`rendering` queue (`worker_max_tasks_per_child`, `--concurrency=1`, see CLAUDE.md's Worker queues
+section), an LLM-generated `on_screen_text` string containing this substring would hang the single
+rendering worker until Celery's soft time limit (60 min, `render`'s `max_runtime_s`) escalates to
+SIGTERM/SIGKILL — a full hour of the rendering queue stalled behind one bad beat, not merely a
+failed render. Under `expansion=none` (the PR's fix), the identical string renders instantly as
+literal text. No exhaustive fuzz/injection search (400 randomized payloads, 24 hand-built
+adversarial ones, targeted lookalike-quote and control-byte cases) found any way to achieve
+filter-graph injection (breaking `text='...'` to inject a second filter/option) on either the
+pre-fix or fixed code — the `'`→curly-quote and `\`→`\\` escaping were already sufficient for that
+specific risk. This hang was previously unknown and unreported; it is recorded here rather than as
+its own roadmap item since this PR already closes it as a side effect of the primary fix.
 
 **Confirmed, not changed:** both lenses independently verified `expansion=none` has no other
 behavioral side effect relevant to this codebase (nothing in `compositor.py` uses `textfile=`,
