@@ -43,23 +43,25 @@ def _license_response(license_short="cc-by"):
     return resp
 
 
-def test_fetch_license_decodes_a_percent_encoded_filename_before_querying():
-    """The exact bug this fix closes: MediaWiki's titles= param needs the real
-    title (spaces/parens literal), not the still-percent-encoded URL segment
-    Wikipedia's own image URL carries."""
+def test_fetch_license_forwards_an_already_decoded_title_verbatim():
+    """_fetch_license() itself does no decoding -- decoding happens once, in
+    search(), before it calls this method (see
+    test_search_decodes_the_originalimage_filename_before_the_license_lookup
+    for the actual regression coverage of the decode step). This test only
+    confirms _fetch_license()'s own contract: whatever title string it's
+    given goes into the titles= param unmodified, with no double-decoding
+    or other mangling on the way in."""
     source = WikipediaImageSource.__new__(WikipediaImageSource)
     source._SEARCH = WikipediaImageSource._SEARCH
     source._HEADERS = WikipediaImageSource._HEADERS
 
-    encoded = "Lionel_Messi_-_2022146154227%20%28cropped%29.jpg"
     decoded = "Lionel_Messi_-_2022146154227 (cropped).jpg"
 
     with patch("engine.render.asset_sourcer.httpx.get", return_value=_license_response()) as mock_get:
-        source._fetch_license(decoded)  # search() decodes before calling _fetch_license
+        source._fetch_license(decoded)
 
     _, kwargs = mock_get.call_args
     assert kwargs["params"]["titles"] == f"File:{decoded}"
-    assert encoded not in kwargs["params"]["titles"]
 
 
 def test_search_decodes_the_originalimage_filename_before_the_license_lookup(tmp_path):
