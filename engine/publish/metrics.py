@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 import httpx
 
+from engine.observability import record_stage
 from engine.publish.youtube import get_valid_access_token
 
 
@@ -72,22 +73,49 @@ class InstagramMetricsFetcher(MetricsFetcher):
     _METRICS = "plays,likes,comments"
 
     def fetch(self, cut, credential, db) -> EngagementMetrics | None:
-        # Token in the Authorization header, not params — see discover_account()'s
-        # docstring in api/oauth.py for why (leaks into httpx.HTTPStatusError's
-        # __str__ on any GET request that fails, which _pull_one() logs).
-        resp = httpx.get(
-            f"https://graph.facebook.com/v19.0/{cut.platform_post_id}/insights",
-            params={"metric": self._METRICS},
-            headers={"Authorization": f"Bearer {credential.token_blob}"},
-            timeout=30.0,
-        )
-        resp.raise_for_status()
-        data = resp.json().get("data", [])
-        if not data:
-            return None
-        by_name = {d["name"]: d["values"][0]["value"] for d in data if d.get("values")}
-        return EngagementMetrics(
-            views=by_name.get("plays"),
-            likes=by_name.get("likes"),
-            comments=by_name.get("comments"),
-        )
+        # The whole HTTP call + parse is wrapped in record_stage so a whole-request
+        # failure (raise_for_status below, e.g. an entirely retired metric name
+        # 400ing the request) leaves a persisted, queryable StageEvent instead of
+        # only a log line — record_stage's own exception path already sets
+        # ev.ok=False / ev.detail["error"] and re-raises, so _pull_one()'s existing
+        # per-cut except Exception still catches it unchanged.
+        with record_stage(db, cut.reel_id, "instagram_metrics", cut_id=cut.id) as ev:
+            # Token in the Authorization header, not params — see discover_account()'s
+            # docstring in api/oauth.py for why (leaks into httpx.HTTPStatusError's
+            # __str__ on any GET request that fails, which _pull_one() logs).
+            resp = httpx.get(
+                f"https://graph.facebook.com/v19.0/{cut.platform_post_id}/insights",
+                params={"metric": self._METRICS},
+                headers={"Authorization": f"Bearer {credential.token_blob}"},
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            data = resp.json().get("data", [])
+            if not data:
+                # No insights yet (e.g. a just-published video) — the legitimate,
+                # unrelated-to-drift "platform has no data yet" case. Deliberately
+                # checked *before* the allowlist diff below: since `data` is empty,
+                # every requested metric name would otherwise show up as "missing"
+                # and spuriously flag every just-published video as drifted on its
+                # very first pull.
+                return None
+
+            # Diff against the RAW response's `name` keys, not by_name.keys() —
+            # by_name drops any entry whose `values` list is present-but-empty,
+            # so checking against it would misclassify "returned by name, empty
+            # value" as "missing," reproducing the exact silent-drop bug this
+            # check exists to catch. A name present in `data` (even with no
+            # values yet) is not a naming/renaming drift.
+            returned_names = {d["name"] for d in data}
+            requested_names = set(self._METRICS.split(","))
+            missing = requested_names - returned_names
+            if missing:
+                ev.ok = False
+                ev.detail["missing_metrics"] = sorted(missing)
+
+            by_name = {d["name"]: d["values"][0]["value"] for d in data if d.get("values")}
+            return EngagementMetrics(
+                views=by_name.get("plays"),
+                likes=by_name.get("likes"),
+                comments=by_name.get("comments"),
+            )

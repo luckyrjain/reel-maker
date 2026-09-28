@@ -22,6 +22,19 @@ _DEFAULT_PLATFORMS = [models.CutPlatform.youtube_shorts, models.CutPlatform.inst
 _CURATED_TTS_VOICE_NAMES = {v for v, _ in CURATED_EDGE_VOICES}
 _CURATED_TEXT_COLOR_NAMES = {c for c, _ in CURATED_TEXT_COLORS}
 
+# Stage names excluded from the two headline pipeline-panel sums (total_cost,
+# total_latency_ms) in _pipeline_summary() below — NOT from stage_summary,
+# which stays unfiltered so every stage still gets its own per-stage row.
+# "instagram_metrics" fires every 6h for as long as a cut stays published
+# (months/years), unlike every generation/render stage which fires a bounded
+# number of times per reel; folding it into "total LLM time" (the template's
+# label for total_latency_ms) would silently inflate that headline stat
+# forever and would be factually wrong regardless of volume (an HTTP
+# metrics-pull round-trip is not LLM time). Named as a set (not inlined) so a
+# future post-publish stage is an obvious one-line addition here, not a
+# second silent gap. See docs/specs/2026-09-instagram-metrics-drift-system-design.md §8.
+_EXCLUDED_FROM_TOTALS = {"instagram_metrics"}
+
 
 @router.post("/reels", response_class=HTMLResponse)
 def create_reel(
@@ -224,8 +237,12 @@ def _pipeline_summary(db: Session, reel_id: int) -> dict:
         .all()
     )
 
-    total_cost = sum(e.cost_usd or 0.0 for e in stage_events)
-    total_latency_ms = sum(e.latency_ms or 0 for e in stage_events)
+    total_cost = sum(
+        e.cost_usd or 0.0 for e in stage_events if e.stage not in _EXCLUDED_FROM_TOTALS
+    )
+    total_latency_ms = sum(
+        e.latency_ms or 0 for e in stage_events if e.stage not in _EXCLUDED_FROM_TOTALS
+    )
     quality_score = next(
         (
             j.meta.get("quality_score")

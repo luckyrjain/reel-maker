@@ -249,6 +249,43 @@ def test_pipeline_summary_aggregates_stages_and_failures(client):
     db.close()
 
 
+def test_pipeline_summary_excludes_instagram_metrics_from_headline_totals_but_not_the_stage_table(client):
+    """instagram_metrics fires every 6h for as long as a published Instagram cut
+    stays published (unlike every generation/render stage, which fires a
+    bounded number of times) — it must still show up in the per-stage
+    breakdown table with its own count/latency/cost/failures, but must NOT be
+    folded into the two headline total_cost/total_latency_ms sums, or "total
+    LLM time" would silently and permanently inflate on any reel with a
+    long-lived published Instagram cut. See
+    docs/specs/2026-09-instagram-metrics-drift-system-design.md §8."""
+    from api.routers.reels import _pipeline_summary
+
+    db = client._session_factory()
+    reel = models.Reel(context="Instagram metrics exclusion test", status=models.ReelStatus.guide_ready)
+    db.add(reel)
+    db.flush()
+    db.add(models.StageEvent(reel_id=reel.id, stage="generate", cost_usd=0.01, latency_ms=2000, ok=True))
+    db.add(models.StageEvent(
+        reel_id=reel.id, stage="instagram_metrics", cost_usd=0.5, latency_ms=99999, ok=False,
+        detail={"missing_metrics": ["comments"]},
+    ))
+    db.commit()
+
+    summary = _pipeline_summary(db, reel.id)
+
+    # Per-stage table stays unfiltered — instagram_metrics gets its own row.
+    assert summary["stage_summary"]["instagram_metrics"]["count"] == 1
+    assert summary["stage_summary"]["instagram_metrics"]["failures"] == 1
+    assert summary["stage_summary"]["instagram_metrics"]["cost_usd"] == 0.5
+    assert summary["stage_summary"]["instagram_metrics"]["latency_ms"] == 99999
+    assert summary["stage_summary"]["generate"]["count"] == 1
+
+    # Headline totals reflect only the "generate" row — instagram_metrics excluded.
+    assert round(summary["total_cost"], 3) == 0.01
+    assert summary["total_latency_ms"] == 2000
+    db.close()
+
+
 def test_estimate_endpoint_returns_fragment_for_unstructured_context(client):
     resp = client.post(
         "/api/reels/estimate",
