@@ -47,7 +47,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 721 tests across 30+ files, default run (4 test_compositor tests need ffmpeg
+.venv/bin/pytest                            # 722 tests across 30+ files, default run (4 test_compositor tests need ffmpeg
                                              # on PATH; 1 kokoro voice test skips without the kokoro package; 1 golden-reel
                                              # test is deselected by default — see below)
 .venv/bin/pytest -m golden                  # the golden-reel smoke test (real edge-tts + real ffmpeg, ~20s, needs network)
@@ -559,7 +559,7 @@ tests/
                               and the body is real multipart/related (no Content-Disposition), not multipart/form-data
   test_instagram_publisher.py  7 tests — container create/poll/publish flow, error paths, token-in-header regression
   test_attribution.py          8 tests — build_attribution_block dedup/formatting, build_published_caption
-  test_metrics_fetcher.py      11 tests — YouTube/Instagram metrics parsing, token-in-header regression;
+  test_metrics_fetcher.py      12 tests — YouTube/Instagram metrics parsing, token-in-header regression;
                               InstagramMetricsFetcher drift detection (Phase 7g) — a clean pull records
                               record_stage ok=True with no missing_metrics, a genuinely absent metric
                               records ok=False/missing_metrics without raising (partial result still

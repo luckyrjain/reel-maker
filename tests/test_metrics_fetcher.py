@@ -149,6 +149,31 @@ def _fake_record_stage(calls):
     return fn
 
 
+def test_instagram_fetch_records_the_no_data_yet_case_as_an_ordinary_ok_pull():
+    """The empty-`data` case ("no insights yet" for a just-published video) still
+    writes a StageEvent -- there is no way to enter record_stage's `with` block
+    around the HTTP call (needed so a whole-request failure is still instrumented)
+    and exit through an early `return` with zero write, since record_stage's own
+    `finally` fires on every normal exit. Resolution (see the design doc's
+    build-stage correction, found by a Lens B review of the first implementation):
+    this case writes an ordinary ok=True StageEvent with no missing_metrics key,
+    indistinguishable from a genuinely clean pull -- never flagged as drift, and
+    self-limiting (once real Insights data exists, this branch is never hit again
+    for that cut)."""
+    calls = []
+    resp = _resp({"data": []})
+    with (
+        patch("engine.publish.metrics.httpx.get", return_value=resp),
+        patch("engine.publish.metrics.record_stage", _fake_record_stage(calls)),
+    ):
+        result = InstagramMetricsFetcher().fetch(_fake_cut(), _fake_credential(), MagicMock())
+
+    assert result is None
+    assert len(calls) == 1
+    assert calls[0]["ok"] is True
+    assert "missing_metrics" not in calls[0]["detail"]
+
+
 def test_instagram_fetch_records_a_clean_pull_as_ok():
     calls = []
     resp = _resp({

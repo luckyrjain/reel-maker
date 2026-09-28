@@ -157,10 +157,36 @@ correctly by omitting it from the dict, which is the right behavior for that val
 `None`); the concern here is specifically about missing **names**, which `returned_names` correctly
 captures independent of whether each one's `values` was populated.
 
-**The fully-empty-`data` case is explicitly exempt from this new check.** `if not data: return
-None` (today's existing "platform has no data yet for a just-published video" path) is unchanged
-and untouched by this design — no `StageEvent` write is added there. The new allowlist check only
-runs when `data` is non-empty but incomplete relative to what was requested.
+**The fully-empty-`data` case is exempt from the *missing-metric flag*, not from the `StageEvent`
+write itself — a build-stage correction to this section.** `if not data: return None` (today's
+existing "platform has no data yet for a just-published video" path) is unchanged, and the new
+allowlist check never runs for it (an empty `data` would otherwise flag every requested metric as
+"missing" and spuriously mark every just-published video as drifted on its very first pull — that
+part of the original reasoning holds). But the original wording above — "no `StageEvent` write is
+added there" — turned out to be incompatible with `record_stage()`'s own contract, which a
+Lens B/Contracts-and-Operations review of the built code caught: `record_stage`'s `finally` block
+writes and commits the `StageEvent` on **every** normal exit from its `with` block, including an
+early `return` executed from inside it — there is no supported way to enter the block (needed
+around the HTTP call itself, so a whole-request failure per mode 2 still gets instrumented) and
+exit through this one specific branch with zero write, without either (a) moving the HTTP
+call itself outside `record_stage`'s instrumentation for this one code path, which would silently
+drop mode-2 failure tracking for exactly the class of pull most likely to hit it (a very recently
+published video, whose Insights endpoint is also more likely to be in a transient/incomplete
+state), or (b) hand-rolling a bespoke non-standard bypass of `record_stage` for one narrow branch,
+which this codebase's own conventions advise against (CLAUDE.md's `heartbeat()`/`job_task`
+copy-drift note: shared instrumentation helpers exist precisely so call sites don't each
+reimplement their own variant).
+
+**Resolution: the empty-`data` case still writes a `StageEvent`, with `ok=True` (the default) and
+no `missing_metrics` key** — indistinguishable, by design, from an ordinary clean pull. This is a
+deliberate relaxation of the original requirement, not an oversight: `ok=True` carries no
+false-failure signal (the entire point of this fix is to make *drift* loud, and "no data yet" is
+not drift), and the row's growth is self-limiting in a way `instagram_metrics` rows for a cut that
+*does* have data are not — once Instagram populates real Insights data (typically within hours of
+publish, not indefinitely), every later pull for that cut has non-empty `data` and this branch is
+never hit again for it. §6's unbounded-growth concern is about the steady-state, indefinite,
+`published`-status-duration volume from cuts that DO have data; this branch adds at most a handful
+of extra rows per cut during a short post-publish window, not a new unbounded category.
 
 ---
 
