@@ -386,3 +386,41 @@ def test_composite_cut_still_closes_readers_when_thumbnail_generation_fails(tmp_
             )
 
     tracker.assert_every_opened_reader_was_closed()
+
+
+def test_composite_cut_closes_earlier_beats_readers_when_a_later_beat_fails_to_build(tmp_path):
+    """A second design-review correction: the per-beat loop that opens video
+    readers used to run BEFORE composite_cut()'s try block even started, so a
+    later beat failing to build (e.g. a corrupt video file) left every EARLIER
+    beat's already-opened reader leaked -- the try/finally that owns
+    video_readers had never been entered. The loop is now inside the try."""
+    from engine.render.compositor import _build_beat_clip as real_build_beat_clip
+
+    video = tmp_path / "v.mp4"
+    _make_test_video(video, duration_s=2.0)
+    beats = [
+        {"duration_s": 2.0, "vo_script": "", "on_screen_text": []},
+        {"duration_s": 2.0, "vo_script": "", "on_screen_text": []},
+    ]
+    out = tmp_path / "out.mp4"
+    thumb = tmp_path / "thumb.jpg"
+
+    call_count = {"n": 0}
+
+    def flaky_build_beat_clip(media_paths, duration_s):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise RuntimeError("simulated corrupt media on beat 2")
+        return real_build_beat_clip(media_paths, duration_s)
+
+    with (
+        _ReaderTracker() as tracker,
+        patch("engine.render.compositor._build_beat_clip", side_effect=flaky_build_beat_clip),
+    ):
+        with pytest.raises(RuntimeError, match="simulated corrupt media"):
+            composite_cut(
+                beats=beats, beat_video_paths=[[video], [None]], beat_vo_paths=[None, None],
+                output_path=out, thumbnail_path=thumb,
+            )
+
+    tracker.assert_every_opened_reader_was_closed()

@@ -499,42 +499,45 @@ def composite_cut(
     video_readers: list[VideoFileClip] = []
     beat_durations: list[float] = []
     t = 0.0
-
-    for beat, media_paths, vo_path in zip(beats, beat_video_paths, beat_vo_paths):
-        duration = float(beat.get("duration_s", 5.0))
-        beat_durations.append(duration)
-
-        beat_clip, readers = _build_beat_clip(media_paths, duration)
-        beat_clips.append(beat_clip)
-        video_readers.extend(readers)
-
-        if vo_path and vo_path.exists():
-            try:
-                track = AudioFileClip(str(vo_path))
-                if track.duration > duration:
-                    track = track.subclipped(0, duration)
-                track = track.with_effects(
-                    [AudioFadeIn(0.12), AudioFadeOut(0.12)]
-                ).with_start(t)
-                vo_tracks.append(track)
-            except Exception:
-                _log.exception("Failed to load VO track %s for beat at t=%.2fs — beat will be silent", vo_path, t)
-
-        t += duration
-
-    final = concatenate_videoclips(beat_clips, method="compose")
-
-    if vo_tracks:
-        final = final.with_audio(CompositeAudioClip(vo_tracks))
-
-    # Write video+audio without text overlays
+    final = None
     notxt_path = output_path.with_suffix(".notxt.mp4")
     # Everything from here on must go through the finally block below so
     # video_readers/vo_tracks/final are closed on every exit path, not just the
-    # happy one — _write_thumbnail_candidates() moved inside this try for exactly
-    # that reason (a design review caught it sitting outside the original try,
-    # which meant a failure there skipped cleanup entirely).
+    # happy one. Two review-caught corrections folded in: the per-beat loop
+    # itself (which populates video_readers) is now INSIDE this try, not just
+    # the code after it — a beat raising partway through (e.g. a corrupt video
+    # file) used to leak every earlier beat's already-opened readers, since
+    # nothing tracking them had been reached by the try/finally yet. Likewise
+    # _write_thumbnail_candidates() moved inside this try — it used to sit
+    # before the try even started, so a failure there skipped cleanup entirely.
     try:
+        for beat, media_paths, vo_path in zip(beats, beat_video_paths, beat_vo_paths):
+            duration = float(beat.get("duration_s", 5.0))
+            beat_durations.append(duration)
+
+            beat_clip, readers = _build_beat_clip(media_paths, duration)
+            beat_clips.append(beat_clip)
+            video_readers.extend(readers)
+
+            if vo_path and vo_path.exists():
+                try:
+                    track = AudioFileClip(str(vo_path))
+                    if track.duration > duration:
+                        track = track.subclipped(0, duration)
+                    track = track.with_effects(
+                        [AudioFadeIn(0.12), AudioFadeOut(0.12)]
+                    ).with_start(t)
+                    vo_tracks.append(track)
+                except Exception:
+                    _log.exception("Failed to load VO track %s for beat at t=%.2fs — beat will be silent", vo_path, t)
+
+            t += duration
+
+        final = concatenate_videoclips(beat_clips, method="compose")
+
+        if vo_tracks:
+            final = final.with_audio(CompositeAudioClip(vo_tracks))
+
         # Candidate thumbnails at a few points across the reel (no text yet —
         # that's added below). thumbnail_candidates[0] is always thumbnail_path
         # itself, so a caller that ignores the rest of the list gets exactly the

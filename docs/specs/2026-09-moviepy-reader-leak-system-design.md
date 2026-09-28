@@ -4,6 +4,18 @@ Status: **Ready for implementation planning**
 Source item: `docs/roadmap.md` Open Issues table — `MoviePy video readers leak until worker recycle`
 (Low severity)
 
+> **Revision note (Lens A review of the built diff, after code existed):** an independent reviewer
+> found a real, narrow gap the design's own §2 fix left open: the per-beat loop that populates
+> `video_readers` originally ran **before** `composite_cut()`'s `try:` block, same as
+> `_write_thumbnail_candidates()` did before the round-1 correction below. If `_build_beat_clip()`
+> raised on beat N (e.g. a corrupt video file), every earlier beat's already-opened reader in that
+> same call was leaked — not a regression (nothing closed them before this fix either), but an
+> unaddressed instance of the exact same class of bug the round-1 correction fixed one call site
+> over. Fixed by moving the whole per-beat loop (and the `final = concatenate_videoclips(...)`
+> construction) inside the `try` block too — see the updated §2 below and the new
+> `test_composite_cut_closes_earlier_beats_readers_when_a_later_beat_fails_to_build` regression test
+> (mutation-tested: fails against the version with the loop still outside `try`).
+
 ## 1. Problem and non-goals
 
 **Problem, quoting the roadmap's own description verbatim:** *"`_build_media_sub_clip` opens
@@ -86,6 +98,16 @@ claim in the design. **Fix, folded into the plan below**: move `_write_thumbnail
 to run *inside* the `try` block (immediately after `final = ...` is built, before
 `final.write_videofile(...)`), so every code path past that point — including a
 thumbnail-extraction failure — reaches the same `finally` cleanup.
+
+**Correction 2 (Lens A review of the built diff — see the revision note at the top of this
+document):** the same class of gap existed one step earlier and wasn't caught by round 1. The
+per-beat loop that builds `beat_clips`/populates `video_readers`, plus
+`final = concatenate_videoclips(beat_clips, method="compose")`, also ran **before** the `try:`
+block. A `_build_beat_clip()` failure on beat N (corrupt media) left every earlier beat's readers
+in that call leaked, for the identical reason correction 1 already fixed one call further down.
+**Fix**: the whole per-beat loop and the `final = concatenate_videoclips(...)` construction move
+inside the `try` block too — `try:` now starts immediately after `vo_tracks`/`video_readers`/
+`beat_durations`/`notxt_path` are initialized, before the loop, not after it.
 
 Thread the real, reader-owning `VideoFileClip` instances back out of `_build_media_sub_clip()` and
 `_build_beat_clip()` as an explicit side list — the same shape `vo_tracks` already uses — so
@@ -192,6 +214,10 @@ path is entirely untested today. New coverage needed:
    reach the cleanup path and close every already-opened `VideoFileClip` — this is the one new
    failure-path branch the correction adds, and should have its own explicit test rather than only
    being implied by the happy-path move.
+7. Cover correction 2: a later beat's `_build_beat_clip()` raising must still close every earlier
+   beat's already-opened readers in that same call — patch `_build_beat_clip` to succeed on the
+   first call (delegating to the real implementation against a real video fixture) and raise on the
+   second, and assert the tracker's opened/closed sets are still equal despite the raise.
 
 ## 8. Rollout plan
 
