@@ -34,6 +34,28 @@ Source item: `docs/roadmap.md` Open Issues table — `MoviePy video readers leak
 > `test_build_beat_clip_closes_an_earlier_items_reader_when_a_later_item_in_the_same_beat_fails`
 > (calls `_build_beat_clip()` directly to isolate this layer; mutation-tested against a reverted
 > version of this specific fix).
+>
+> **A fourth, sibling gap**, found by a follow-up review pass focused specifically on whether the
+> `vo_tracks`/`AudioFileClip` side had the same problem the video-reader side did: it did.
+> `composite_cut()`'s VO-track loop opens `AudioFileClip(str(vo_path))` first, then chains
+> `.subclipped()`/`.with_effects()`/`.with_start()` — if any of those later steps raises, the
+> enclosing `except Exception: _log.exception(...)` only logs and moves to the next beat; the
+> already-opened `AudioFileClip` never reaches `vo_tracks.append(...)`, so the `finally` block's
+> `vo_tracks` close loop can never reach it either. Same bug class, same file, one call site over
+> from the three corrections above — narrow in practice (these are pure-Python metadata operations
+> that rarely raise on a valid audio file), but real. **Fix**: capture the pre-transform
+> `AudioFileClip` in its own variable (`audio_reader`) before any transform runs, and close *that*
+> specifically in the `except` block — not whatever `track` currently holds — mirroring the video
+> fix's own established pattern of always operating on the pre-transform object (chained
+> `.subclipped()`/`.with_effects()`/`.with_start()` calls return new wrapper objects via shallow
+> copy that share the same underlying `.reader`, so closing the original releases it regardless of
+> which transform succeeded before the raise; the first draft of this fix instead closed whatever
+> `track` currently was, which passed the *real* leak check but failed the regression test's
+> identity-based opened-vs-closed comparison, since `.subclipped()` doesn't reconstruct via
+> `AudioFileClip.__init__` — the reader was genuinely released either way, but the test caught the
+> inconsistency with the established pattern before it shipped). New regression test:
+> `test_composite_cut_closes_a_vo_track_opened_but_not_fully_built` (mutation-tested against a
+> reverted version of this specific fix).
 
 ## 1. Problem and non-goals
 

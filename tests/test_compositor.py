@@ -17,7 +17,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 import soundfile as sf
-from moviepy import VideoFileClip
+from moviepy import AudioFileClip, VideoFileClip
 
 from engine.render.compositor import (
     DEFAULT_TEXT_COLOR, _build_ffmpeg_args, _build_text_filter, _write_thumbnail_candidates,
@@ -280,16 +280,18 @@ def test_composite_cut_without_music_path_is_unaffected(tmp_path):
 # ── VideoFileClip reader leak (docs/specs/2026-09-moviepy-reader-leak-system-design.md) ──
 
 class _ReaderTracker:
-    """Wraps VideoFileClip.__init__/.close to record every instance opened and
+    """Wraps <clip_cls>.__init__/.close to record every instance opened and
     closed, so a test can assert the two sets are equal -- proving every reader
     actually opened during a render was actually closed, not just that close()
     was called on SOME object (a bare call-counter could pass vacuously if
-    construction itself went untracked)."""
-    def __init__(self):
-        self.opened: list[VideoFileClip] = []
-        self.closed: list[VideoFileClip] = []
-        self._orig_init = VideoFileClip.__init__
-        self._orig_close = VideoFileClip.close
+    construction itself went untracked). Defaults to VideoFileClip; pass
+    clip_cls=AudioFileClip to track VO tracks instead."""
+    def __init__(self, clip_cls=VideoFileClip):
+        self.clip_cls = clip_cls
+        self.opened: list = []
+        self.closed: list = []
+        self._orig_init = clip_cls.__init__
+        self._orig_close = clip_cls.close
 
     def __enter__(self):
         orig_init, orig_close = self._orig_init, self._orig_close
@@ -308,8 +310,8 @@ class _ReaderTracker:
             return orig_close(clip_self, *args, **kwargs)
 
         self._patches = [
-            patch.object(VideoFileClip, "__init__", tracking_init),
-            patch.object(VideoFileClip, "close", tracking_close),
+            patch.object(self.clip_cls, "__init__", tracking_init),
+            patch.object(self.clip_cls, "close", tracking_close),
         ]
         for p in self._patches:
             p.start()
@@ -464,5 +466,32 @@ def test_build_beat_clip_closes_an_earlier_items_reader_when_a_later_item_in_the
 
         with pytest.raises(RuntimeError, match="simulated corrupt media"):
             _build_beat_clip([video, video], 2.0)
+
+    tracker.assert_every_opened_reader_was_closed()
+
+
+def test_composite_cut_closes_a_vo_track_opened_but_not_fully_built(tmp_path):
+    """A fourth, sibling gap (found by yet another review pass): the VO-track
+    AudioFileClip opens BEFORE .subclipped()/.with_effects()/.with_start() run.
+    If any of those later steps raises, the enclosing try/except only logs and
+    moves to the next beat -- it never appends `track` to vo_tracks, so the
+    finally block's vo_tracks close loop can never reach it either. Same bug
+    class as the video-reader leaks above, one call site over."""
+    vo_path = _sine_wav(tmp_path / "vo.wav", freq=440.0, seconds=3.0)
+    beats = [{"duration_s": 2.0, "vo_script": "Test.", "on_screen_text": ["Test"]}]
+    out = tmp_path / "out.mp4"
+    thumb = tmp_path / "thumb.jpg"
+
+    with (
+        _ReaderTracker(clip_cls=AudioFileClip) as tracker,
+        patch.object(AudioFileClip, "with_effects", side_effect=RuntimeError("boom")),
+    ):
+        # The except-and-continue swallows this internally (beat renders silent,
+        # matching existing behavior for a broken VO track) -- composite_cut()
+        # itself must not raise.
+        composite_cut(
+            beats=beats, beat_video_paths=[[None]], beat_vo_paths=[vo_path],
+            output_path=out, thumbnail_path=thumb,
+        )
 
     tracker.assert_every_opened_reader_was_closed()

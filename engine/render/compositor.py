@@ -555,8 +555,10 @@ def composite_cut(
             video_readers.extend(readers)
 
             if vo_path and vo_path.exists():
+                audio_reader = None
                 try:
-                    track = AudioFileClip(str(vo_path))
+                    audio_reader = AudioFileClip(str(vo_path))
+                    track = audio_reader
                     if track.duration > duration:
                         track = track.subclipped(0, duration)
                     track = track.with_effects(
@@ -565,6 +567,18 @@ def composite_cut(
                     vo_tracks.append(track)
                 except Exception:
                     _log.exception("Failed to load VO track %s for beat at t=%.2fs — beat will be silent", vo_path, t)
+                    # track never made it into vo_tracks (append above is skipped on any
+                    # raise), so the finally block's vo_tracks close loop can never reach
+                    # it. Close the pre-transform audio_reader specifically, not whatever
+                    # `track` currently is -- .subclipped()/.with_effects()/.with_start()
+                    # return NEW wrapper objects via shallow copy that share the same
+                    # underlying .reader, so closing the original releases it regardless
+                    # of which (if any) transform succeeded before the raise.
+                    if audio_reader is not None:
+                        try:
+                            audio_reader.close()
+                        except Exception:
+                            pass
 
             t += duration
 
