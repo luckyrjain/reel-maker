@@ -125,6 +125,12 @@ class WikipediaImageSource:
 
         # Fetch license metadata for rights tracking (needed at publish time)
         image_filename = original.rsplit("/", 1)[-1].rsplit("?", 1)[0] if original else ""
+        # Decode: this is still URL-percent-encoded (from the raw image URL), but MediaWiki's
+        # titles= param expects the real title (spaces/accents/parens literal, not %XX) -- an
+        # accented or spaced filename otherwise matches no page and silently returns "unknown"/
+        # safe_to_publish=False. unquote(), not unquote_plus(): this came from a URL path segment,
+        # not a query string, so a literal "+" in a filename must not become a space.
+        image_filename = urllib.parse.unquote(image_filename)
         license_info = self._fetch_license(image_filename) if image_filename else {
             "license": "unknown", "license_url": None, "attribution": None, "safe_to_publish": False
         }
