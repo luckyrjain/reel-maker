@@ -12,14 +12,27 @@ that would have caught the regression before it shipped.
 """
 import json
 import subprocess
+from unittest.mock import patch
 
 import numpy as np
+import pytest
 import soundfile as sf
+from moviepy import VideoFileClip
 
 from engine.render.compositor import (
     DEFAULT_TEXT_COLOR, _build_ffmpeg_args, _build_text_filter, _write_thumbnail_candidates,
     composite_cut,
 )
+
+
+def _make_test_video(path, duration_s: float, color: str = "blue") -> None:
+    """A tiny real MP4 via ffmpeg's lavfi source -- no external fixture/network
+    needed, consistent with this file's own real-ffmpeg testing philosophy."""
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c={color}:s=320x240:d={duration_s}",
+         "-pix_fmt", "yuv420p", str(path)],
+        capture_output=True, check=True,
+    )
 
 
 def _has_audio_stream(path) -> bool:
@@ -262,3 +275,114 @@ def test_composite_cut_without_music_path_is_unaffected(tmp_path):
     assert out.exists()
     assert _has_audio_stream(out)
     _assert_valid_srt_with_cues(subtitle_path)
+
+
+# ── VideoFileClip reader leak (docs/specs/2026-09-moviepy-reader-leak-system-design.md) ──
+
+class _ReaderTracker:
+    """Wraps VideoFileClip.__init__/.close to record every instance opened and
+    closed, so a test can assert the two sets are equal -- proving every reader
+    actually opened during a render was actually closed, not just that close()
+    was called on SOME object (a bare call-counter could pass vacuously if
+    construction itself went untracked)."""
+    def __init__(self):
+        self.opened: list[VideoFileClip] = []
+        self.closed: list[VideoFileClip] = []
+        self._orig_init = VideoFileClip.__init__
+        self._orig_close = VideoFileClip.close
+
+    def __enter__(self):
+        orig_init, orig_close = self._orig_init, self._orig_close
+        opened, closed = self.opened, self.closed
+
+        # Plain functions, not bound methods: assigning a bound method as a class
+        # attribute breaks Python's normal descriptor auto-binding (instance.foo(...)
+        # would call the bound method directly, without injecting the instance as
+        # the first arg) -- these closures keep that binding intact.
+        def tracking_init(clip_self, *args, **kwargs):
+            orig_init(clip_self, *args, **kwargs)
+            opened.append(clip_self)
+
+        def tracking_close(clip_self, *args, **kwargs):
+            closed.append(clip_self)
+            return orig_close(clip_self, *args, **kwargs)
+
+        self._patches = [
+            patch.object(VideoFileClip, "__init__", tracking_init),
+            patch.object(VideoFileClip, "close", tracking_close),
+        ]
+        for p in self._patches:
+            p.start()
+        return self
+
+    def __exit__(self, *exc):
+        for p in self._patches:
+            p.stop()
+
+    def assert_every_opened_reader_was_closed(self):
+        opened_ids = {id(c) for c in self.opened}
+        closed_ids = {id(c) for c in self.closed}
+        assert opened_ids, "test setup bug: no VideoFileClip was opened at all"
+        assert opened_ids == closed_ids, (
+            f"opened {len(opened_ids)} readers, only closed {len(closed_ids)} -- "
+            f"leaked: {opened_ids - closed_ids}"
+        )
+
+
+def test_composite_cut_closes_every_video_reader_it_opens(tmp_path):
+    """The bug this fix closes: neither concatenate_videoclips()'s default
+    "chain" method nor CompositeVideoClip.close() reach the VideoFileClip
+    readers nested inside per-beat media clips -- see the design doc. Two
+    beats: one whose video is shorter than the beat duration (the loop-replica
+    branch -- the probe clip plus N loop copies, the most instances to leak at
+    once) and one whose video is already long enough (the single-reader
+    branch), so both code paths in _build_media_sub_clip() are covered."""
+    short_video = tmp_path / "short.mp4"
+    _make_test_video(short_video, duration_s=1.0)   # shorter than beat 0's 3s -> loops
+    long_video = tmp_path / "long.mp4"
+    _make_test_video(long_video, duration_s=3.0, color="red")   # longer than beat 1's 2s
+
+    beats = [
+        {"duration_s": 3.0, "vo_script": "", "on_screen_text": []},
+        {"duration_s": 2.0, "vo_script": "", "on_screen_text": []},
+    ]
+    out = tmp_path / "out.mp4"
+    thumb = tmp_path / "thumb.jpg"
+
+    with _ReaderTracker() as tracker:
+        composite_cut(
+            beats=beats,
+            beat_video_paths=[[short_video], [long_video]],
+            beat_vo_paths=[None, None],
+            output_path=out, thumbnail_path=thumb,
+        )
+
+    assert out.exists()
+    tracker.assert_every_opened_reader_was_closed()
+
+
+def test_composite_cut_still_closes_readers_when_thumbnail_generation_fails(tmp_path):
+    """A design-review correction: _write_thumbnail_candidates() moved inside
+    composite_cut()'s try block so a failure there still reaches the cleanup
+    path -- it used to run before the try even started, so raising there
+    skipped every close() (video readers, vo_tracks, final) entirely."""
+    video = tmp_path / "v.mp4"
+    _make_test_video(video, duration_s=2.0)
+    beats = [{"duration_s": 2.0, "vo_script": "", "on_screen_text": []}]
+    out = tmp_path / "out.mp4"
+    thumb = tmp_path / "thumb.jpg"
+
+    with (
+        _ReaderTracker() as tracker,
+        patch(
+            "engine.render.compositor._write_thumbnail_candidates",
+            side_effect=RuntimeError("boom"),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="boom"):
+            composite_cut(
+                beats=beats, beat_video_paths=[[video]], beat_vo_paths=[None],
+                output_path=out, thumbnail_path=thumb,
+            )
+
+    tracker.assert_every_opened_reader_was_closed()

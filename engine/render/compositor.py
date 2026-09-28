@@ -128,23 +128,33 @@ def _crop_to_9_16(clip: VideoFileClip) -> VideoFileClip:
 
 
 def _build_media_sub_clip(media_path: Path | None, duration_s: float):
-    """Build a single 9:16 clip from one image or video file."""
+    """Build a single 9:16 clip from one image or video file.
+
+    Returns (clip, readers): readers is the list of real VideoFileClip instances
+    this call opened (empty for an image or black-frame clip). Neither
+    concatenate_videoclips() (the default "chain" method only retains clip
+    references when a clip has a mask) nor CompositeVideoClip.close() (only
+    closes its synthetic bg/audio, never its .clips list) reach these nested
+    readers -- the caller must close them explicitly. See
+    docs/specs/2026-09-moviepy-reader-leak-system-design.md.
+    """
     if media_path and media_path.exists():
         if media_path.suffix.lower() in _IMAGE_EXTS:
             img = Image.open(media_path).convert("RGB")
             frame = np.array(_fit_image_9_16(img))
-            return _ken_burns(frame, duration_s)
+            return _ken_burns(frame, duration_s), []
         else:
             raw = VideoFileClip(str(media_path), audio=False)
             if raw.duration < duration_s:
                 loops = math.ceil(duration_s / raw.duration) + 1
                 raw.close()   # probe clip — the loop copies below replace it
-                raw = concatenate_videoclips(
-                    [VideoFileClip(str(media_path), audio=False) for _ in range(loops)]
-                )
-            return _crop_to_9_16(raw).subclipped(0, duration_s)
+                readers = [VideoFileClip(str(media_path), audio=False) for _ in range(loops)]
+                raw = concatenate_videoclips(readers)
+            else:
+                readers = [raw]
+            return _crop_to_9_16(raw).subclipped(0, duration_s), readers
     black = np.zeros((TARGET_H, TARGET_W, 3), dtype=np.uint8)
-    return ImageClip(black).with_duration(duration_s)
+    return ImageClip(black).with_duration(duration_s), []
 
 
 _FONT_CANDIDATES = [
@@ -320,16 +330,24 @@ def _build_text_filter(
 def _build_beat_clip(
     media_paths: list[Path | None],
     duration_s: float,
-) -> "VideoFileClip | CompositeVideoClip | ImageClip":
-    """Build the video clip for a beat — no text overlay (added by FFmpeg pass)."""
+):
+    """Build the video clip for a beat — no text overlay (added by FFmpeg pass).
+
+    Returns (clip, readers): readers is every real VideoFileClip opened across
+    this beat's media items, flattened, for the caller to close — see
+    _build_media_sub_clip()'s docstring.
+    """
     duration_s = max(duration_s, 0.5)
 
     if not media_paths:
         media_paths = [None]
 
     per = duration_s / len(media_paths)
-    sub_clips = [_build_media_sub_clip(p, per) for p in media_paths]
-    return concatenate_videoclips(sub_clips) if len(sub_clips) > 1 else sub_clips[0]
+    built = [_build_media_sub_clip(p, per) for p in media_paths]
+    sub_clips = [clip for clip, _ in built]
+    readers = [r for _, readers in built for r in readers]
+    beat_clip = concatenate_videoclips(sub_clips) if len(sub_clips) > 1 else sub_clips[0]
+    return beat_clip, readers
 
 
 _MUSIC_VOLUME = 0.18       # music level under narration, once ducked further by sidechaincompress
@@ -478,6 +496,7 @@ def composite_cut(
 
     beat_clips = []
     vo_tracks: list[AudioFileClip] = []
+    video_readers: list[VideoFileClip] = []
     beat_durations: list[float] = []
     t = 0.0
 
@@ -485,8 +504,9 @@ def composite_cut(
         duration = float(beat.get("duration_s", 5.0))
         beat_durations.append(duration)
 
-        beat_clip = _build_beat_clip(media_paths, duration)
+        beat_clip, readers = _build_beat_clip(media_paths, duration)
         beat_clips.append(beat_clip)
+        video_readers.extend(readers)
 
         if vo_path and vo_path.exists():
             try:
@@ -507,15 +527,20 @@ def composite_cut(
     if vo_tracks:
         final = final.with_audio(CompositeAudioClip(vo_tracks))
 
-    # Candidate thumbnails at a few points across the reel (no text yet — that's
-    # added below). thumbnail_candidates[0] is always thumbnail_path itself, so a
-    # caller that ignores the rest of the list gets exactly the old single-frame
-    # behavior at exactly the old timestamp.
-    thumbnail_candidates = _write_thumbnail_candidates(final, thumbnail_path)
-
     # Write video+audio without text overlays
     notxt_path = output_path.with_suffix(".notxt.mp4")
+    # Everything from here on must go through the finally block below so
+    # video_readers/vo_tracks/final are closed on every exit path, not just the
+    # happy one — _write_thumbnail_candidates() moved inside this try for exactly
+    # that reason (a design review caught it sitting outside the original try,
+    # which meant a failure there skipped cleanup entirely).
     try:
+        # Candidate thumbnails at a few points across the reel (no text yet —
+        # that's added below). thumbnail_candidates[0] is always thumbnail_path
+        # itself, so a caller that ignores the rest of the list gets exactly the
+        # old single-frame behavior at exactly the old timestamp.
+        thumbnail_candidates = _write_thumbnail_candidates(final, thumbnail_path)
+
         final.write_videofile(
             str(notxt_path),
             fps=FPS,
@@ -585,14 +610,21 @@ def composite_cut(
         subtitle_path = srt_writer.write_srt(srt_cues, output_path.with_suffix(".srt"))
     finally:
         notxt_path.unlink(missing_ok=True)
-        # Each AudioFileClip holds an open ffmpeg reader; without this a long
-        # reel leaks one process per beat until the worker recycles.
-        # ponytail: video readers opened inside _build_media_sub_clip are still
-        # only reclaimed by worker_max_tasks_per_child — thread the clips back
-        # out of the builder if fd pressure shows up in practice.
+        # Each AudioFileClip/VideoFileClip holds an open ffmpeg reader; without
+        # this a long reel leaks one process per beat until the worker recycles.
+        # final.close() alone does not reach these: concatenate_videoclips()'s
+        # default "chain" method only retains sub-clip references when a clip
+        # has a mask, and CompositeVideoClip.close() never iterates self.clips
+        # (only its own synthetic bg/audio) — see
+        # docs/specs/2026-09-moviepy-reader-leak-system-design.md.
         for track in vo_tracks:
             try:
                 track.close()
+            except Exception:
+                pass
+        for reader in video_readers:
+            try:
+                reader.close()
             except Exception:
                 pass
         try:
