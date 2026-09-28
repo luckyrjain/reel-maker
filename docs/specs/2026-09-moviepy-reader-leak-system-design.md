@@ -15,6 +15,25 @@ Source item: `docs/roadmap.md` Open Issues table — `MoviePy video readers leak
 > construction) inside the `try` block too — see the updated §2 below and the new
 > `test_composite_cut_closes_earlier_beats_readers_when_a_later_beat_fails_to_build` regression test
 > (mutation-tested: fails against the version with the loop still outside `try`).
+>
+> **A third gap, found by a round-2 re-review of the fixed code**, was one level deeper than either
+> correction above could reach: `composite_cut()`'s own try/finally can only close readers that
+> `_build_beat_clip()` actually *returns* to it. Within a single beat that has multiple
+> `media_paths` (the multi-image-per-beat feature), if the second item's `_build_media_sub_clip()`
+> call raised (corrupt media) after the first item had already opened a real reader, that reader
+> was never returned anywhere — it only ever existed in `_build_beat_clip()`'s own now-abandoned
+> local scope, unreachable to any outer `try`/`finally` no matter how far up the call stack it
+> extends. The identical structural problem exists one level deeper still, inside
+> `_build_media_sub_clip()`'s own loop-replica list comprehension (a short video looped to fill a
+> longer beat — if replica 2 fails to open, replica 1's already-open reader is lost the same way).
+> **Fix**: both `_build_media_sub_clip()` and `_build_beat_clip()` now wrap their own
+> resource-accumulating work in a `try`/`except Exception: close whatever's already in the local
+> readers list; raise` — each function is responsible for cleaning up its own partial state before
+> propagating a failure, rather than relying on a caller that structurally cannot see that state.
+> New regression test:
+> `test_build_beat_clip_closes_an_earlier_items_reader_when_a_later_item_in_the_same_beat_fails`
+> (calls `_build_beat_clip()` directly to isolate this layer; mutation-tested against a reverted
+> version of this specific fix).
 
 ## 1. Problem and non-goals
 

@@ -137,24 +137,40 @@ def _build_media_sub_clip(media_path: Path | None, duration_s: float):
     closes its synthetic bg/audio, never its .clips list) reach these nested
     readers -- the caller must close them explicitly. See
     docs/specs/2026-09-moviepy-reader-leak-system-design.md.
+
+    Closes whatever it already opened before re-raising on failure: a
+    VideoFileClip opened here (the probe, or a loop-replica) that never makes
+    it into the returned `readers` list (because a LATER open/transform in
+    this same call raises) would otherwise be unreachable to any caller --
+    nothing outside this function ever learns it existed.
     """
-    if media_path and media_path.exists():
-        if media_path.suffix.lower() in _IMAGE_EXTS:
-            img = Image.open(media_path).convert("RGB")
-            frame = np.array(_fit_image_9_16(img))
-            return _ken_burns(frame, duration_s), []
-        else:
-            raw = VideoFileClip(str(media_path), audio=False)
-            if raw.duration < duration_s:
-                loops = math.ceil(duration_s / raw.duration) + 1
-                raw.close()   # probe clip — the loop copies below replace it
-                readers = [VideoFileClip(str(media_path), audio=False) for _ in range(loops)]
-                raw = concatenate_videoclips(readers)
-            else:
-                readers = [raw]
-            return _crop_to_9_16(raw).subclipped(0, duration_s), readers
-    black = np.zeros((TARGET_H, TARGET_W, 3), dtype=np.uint8)
-    return ImageClip(black).with_duration(duration_s), []
+    if not (media_path and media_path.exists()):
+        black = np.zeros((TARGET_H, TARGET_W, 3), dtype=np.uint8)
+        return ImageClip(black).with_duration(duration_s), []
+    if media_path.suffix.lower() in _IMAGE_EXTS:
+        img = Image.open(media_path).convert("RGB")
+        frame = np.array(_fit_image_9_16(img))
+        return _ken_burns(frame, duration_s), []
+
+    readers: list[VideoFileClip] = []
+    try:
+        raw = VideoFileClip(str(media_path), audio=False)
+        readers.append(raw)
+        if raw.duration < duration_s:
+            loops = math.ceil(duration_s / raw.duration) + 1
+            raw.close()
+            readers.pop()   # probe clip closed above — the loop copies below replace it
+            for _ in range(loops):
+                readers.append(VideoFileClip(str(media_path), audio=False))
+            raw = concatenate_videoclips(readers)
+        return _crop_to_9_16(raw).subclipped(0, duration_s), readers
+    except Exception:
+        for r in readers:
+            try:
+                r.close()
+            except Exception:
+                pass
+        raise
 
 
 _FONT_CANDIDATES = [
@@ -336,6 +352,14 @@ def _build_beat_clip(
     Returns (clip, readers): readers is every real VideoFileClip opened across
     this beat's media items, flattened, for the caller to close — see
     _build_media_sub_clip()'s docstring.
+
+    Closes whatever readers earlier media items in this beat already opened if
+    a LATER item's _build_media_sub_clip() call raises: that later call's own
+    try/except already closes anything it opened internally before re-raising
+    (see its docstring), but readers from an earlier, already-SUCCEEDED item in
+    this same beat only exist in this function's own `readers` list — nothing
+    outside this function has seen them yet, so this function must close them
+    itself before propagating.
     """
     duration_s = max(duration_s, 0.5)
 
@@ -343,11 +367,22 @@ def _build_beat_clip(
         media_paths = [None]
 
     per = duration_s / len(media_paths)
-    built = [_build_media_sub_clip(p, per) for p in media_paths]
-    sub_clips = [clip for clip, _ in built]
-    readers = [r for _, readers in built for r in readers]
-    beat_clip = concatenate_videoclips(sub_clips) if len(sub_clips) > 1 else sub_clips[0]
-    return beat_clip, readers
+    sub_clips = []
+    readers: list[VideoFileClip] = []
+    try:
+        for p in media_paths:
+            clip, item_readers = _build_media_sub_clip(p, per)
+            sub_clips.append(clip)
+            readers.extend(item_readers)
+        beat_clip = concatenate_videoclips(sub_clips) if len(sub_clips) > 1 else sub_clips[0]
+        return beat_clip, readers
+    except Exception:
+        for r in readers:
+            try:
+                r.close()
+            except Exception:
+                pass
+        raise
 
 
 _MUSIC_VOLUME = 0.18       # music level under narration, once ducked further by sidechaincompress

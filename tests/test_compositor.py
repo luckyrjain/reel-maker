@@ -424,3 +424,45 @@ def test_composite_cut_closes_earlier_beats_readers_when_a_later_beat_fails_to_b
             )
 
     tracker.assert_every_opened_reader_was_closed()
+
+
+def test_build_beat_clip_closes_an_earlier_items_reader_when_a_later_item_in_the_same_beat_fails(
+    tmp_path,
+):
+    """A third, deeper gap (found by yet another review pass after the two above
+    already shipped): a SINGLE beat can have multiple media_paths (the
+    multi-image-per-beat feature). composite_cut()'s own try/finally can only
+    close readers _build_beat_clip() actually RETURNS to it -- if the second
+    media item in one beat fails inside _build_media_sub_clip() (corrupt
+    media), the first item's already-opened reader was never returned to
+    anything outside _build_beat_clip()'s own now-abandoned local scope, so no
+    outer try/finally can ever reach it. _build_beat_clip() must close its own
+    partial state before re-raising -- calling this function directly (not
+    through the full composite_cut()/ffmpeg pipeline) to isolate exactly this
+    layer."""
+    from engine.render.compositor import _build_media_sub_clip as real_build_media_sub_clip
+
+    video = tmp_path / "v.mp4"
+    _make_test_video(video, duration_s=2.0)
+
+    call_count = {"n": 0}
+
+    def flaky_build_media_sub_clip(media_path, duration_s):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise RuntimeError("simulated corrupt media on the second item")
+        return real_build_media_sub_clip(media_path, duration_s)
+
+    with (
+        _ReaderTracker() as tracker,
+        patch(
+            "engine.render.compositor._build_media_sub_clip",
+            side_effect=flaky_build_media_sub_clip,
+        ),
+    ):
+        from engine.render.compositor import _build_beat_clip
+
+        with pytest.raises(RuntimeError, match="simulated corrupt media"):
+            _build_beat_clip([video, video], 2.0)
+
+    tracker.assert_every_opened_reader_was_closed()
