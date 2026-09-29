@@ -1,5 +1,5 @@
 """Tests for the reel list/detail HTML routes in api/routers/reels.py."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -11,6 +11,7 @@ from sqlalchemy.pool import StaticPool
 from api import models
 from api.db import get_db
 from api.main import app
+from api.routers.reels import latest_failed_job_for_reel
 
 
 @pytest.fixture()
@@ -60,6 +61,60 @@ def _make_reel(session_factory, **overrides):
         return reel.id
     finally:
         db.close()
+
+
+@pytest.fixture()
+def db_session():
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    models.Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    yield db
+    db.close()
+
+
+def test_latest_failed_job_for_reel_is_none_for_a_status_that_is_not_failed(db_session):
+    reel = models.Reel(context="x", status=models.ReelStatus.generating)
+    db_session.add(reel)
+    db_session.commit()
+    assert latest_failed_job_for_reel(db_session, reel) is None
+
+
+def test_latest_failed_job_for_reel_falls_back_to_none_without_a_matching_row(db_session):
+    reel = models.Reel(context="x", status=models.ReelStatus.failed)
+    db_session.add(reel)
+    db_session.commit()
+    assert latest_failed_job_for_reel(db_session, reel) is None
+
+
+def test_latest_failed_job_for_reel_is_type_agnostic_and_picks_the_most_recent(db_session):
+    """Mirrors latest_failed_job_for_cut()'s own type-agnostic contract: a reel can
+    fail either enrichment or generation, and the row that explains the CURRENT
+    "failed" state is whichever failed most recently, not a fixed type."""
+    reel = models.Reel(context="x", status=models.ReelStatus.failed)
+    db_session.add(reel)
+    db_session.flush()
+    now = datetime.now(timezone.utc)
+    older_enrich_failure = models.Job(
+        type=models.JobType.enrich, reel_id=reel.id,
+        status=models.JobStatus.failed, error="enrichment LLM timed out",
+        created_at=now,
+    )
+    newer_generate_failure = models.Job(
+        type=models.JobType.generate, reel_id=reel.id,
+        status=models.JobStatus.failed, error="guide failed schema validation",
+        created_at=now + timedelta(seconds=5),
+    )
+    db_session.add_all([older_enrich_failure, newer_generate_failure])
+    db_session.commit()
+
+    found = latest_failed_job_for_reel(db_session, reel)
+    assert found is not None
+    assert found.id == newer_generate_failure.id
+    assert found.error == "guide failed schema validation"
 
 
 def test_list_reels_empty_state(client):
@@ -240,6 +295,123 @@ def test_reel_detail_only_the_rendering_cut_gets_a_live_status_fragment(client):
     assert "Rendering in progress — refresh to update." in without_job_card
     assert f"job_id={job_id}" not in without_job_card
     assert f"job_id={job_id}" in with_job_card
+
+
+def test_reel_detail_surfaces_the_real_failure_reason_for_a_failed_cut(client):
+    """Closes the "Failure reason is not shown after a page refresh" Open Issues item:
+    job.error used to be rendered only inside render_status.html/publish_status.html,
+    the polling fragment of the tab that happened to be open when the job failed. A
+    fresh GET /api/reels/{id} for a failed cut must now show the actual error text,
+    not just the generic hard-coded "Failed. Retry render..." message."""
+    reel_id = _make_reel(client._session_factory, cut_status=models.CutStatus.failed)
+    db = client._session_factory()
+    try:
+        cut = db.query(models.Cut).filter(models.Cut.reel_id == reel_id).first()
+        job = models.Job(
+            type=models.JobType.render, reel_id=reel_id, cut_id=cut.id,
+            status=models.JobStatus.failed,
+            error="FFmpeg text/audio pass failed (exit 234): Stray % near ' today'",
+        )
+        db.add(job)
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.get(f"/api/reels/{reel_id}")
+    assert resp.status_code == 200
+    # Jinja HTML-autoescapes the apostrophe as &#39; -- assert on the un-escapable core.
+    assert "Stray % near" in resp.text
+    assert "exit 234" in resp.text
+
+
+def test_reel_detail_failed_cut_without_a_job_row_shows_only_the_generic_message(client):
+    """Defensive fallback: a failed cut with no matching Job row (not expected in
+    normal operation) must not error or show a blank/broken error paragraph -- only
+    the pre-existing generic message."""
+    reel_id = _make_reel(client._session_factory, cut_status=models.CutStatus.failed)
+    resp = client.get(f"/api/reels/{reel_id}")
+    assert resp.status_code == 200
+    assert "Failed. Retry render" in resp.text
+
+
+def test_reel_detail_only_the_matching_failed_cut_shows_its_own_error(client):
+    """Multi-cut isolation for failed_jobs, mirroring the active_jobs isolation test
+    above -- two failed cuts, each with its own distinct error, must never show each
+    other's error text."""
+    db = client._session_factory()
+    try:
+        reel = models.Reel(context="Multi-failure isolation reel", status=models.ReelStatus.guide_ready)
+        db.add(reel)
+        db.flush()
+        cut_a = models.Cut(
+            reel_id=reel.id, platform=models.CutPlatform.youtube_shorts,
+            status=models.CutStatus.failed,
+        )
+        cut_b = models.Cut(
+            reel_id=reel.id, platform=models.CutPlatform.instagram_reels,
+            status=models.CutStatus.failed,
+        )
+        db.add_all([cut_a, cut_b])
+        db.flush()
+        job_a = models.Job(
+            type=models.JobType.render, reel_id=reel.id, cut_id=cut_a.id,
+            status=models.JobStatus.failed, error="cut A distinctive render error",
+        )
+        job_b = models.Job(
+            type=models.JobType.publish, reel_id=reel.id, cut_id=cut_b.id,
+            status=models.JobStatus.failed, error="cut B distinctive publish error",
+        )
+        db.add_all([job_a, job_b])
+        db.commit()
+        reel_id, cut_a_id, cut_b_id = reel.id, cut_a.id, cut_b.id
+    finally:
+        db.close()
+
+    resp = client.get(f"/api/reels/{reel_id}")
+    assert resp.status_code == 200
+    card_a = resp.text.split(f'id="cut-card-{cut_a_id}"')[1].split(f'id="cut-card-{cut_b_id}"')[0]
+    card_b = resp.text.split(f'id="cut-card-{cut_b_id}"')[1]
+    assert "cut A distinctive render error" in card_a
+    assert "cut B distinctive publish error" not in card_a
+    assert "cut B distinctive publish error" in card_b
+    assert "cut A distinctive render error" not in card_b
+
+
+def test_reel_detail_surfaces_the_real_failure_reason_for_a_failed_reel(client):
+    """The reel-level sibling of the cut-level fix above: a failed generate/enrich job
+    rolls the REEL (not a cut) back to "failed" via JOB_IN_FLIGHT -- found as a
+    symmetric, previously-missed gap during review of the cut-level fix. Before this,
+    reel.html showed only the bare "failed" badge with no reason, since
+    pipeline_status.html (the fragment that DOES show job.error) is only ever returned
+    by POST /api/reels and GET /active-job-fragment directly, never included in
+    reel.html itself."""
+    reel_id = _make_reel(client._session_factory, status=models.ReelStatus.failed)
+    db = client._session_factory()
+    try:
+        job = models.Job(
+            type=models.JobType.generate, reel_id=reel_id,
+            status=models.JobStatus.failed,
+            error="Guide generation failed schema validation after 3 attempts",
+        )
+        db.add(job)
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.get(f"/api/reels/{reel_id}")
+    assert resp.status_code == 200
+    assert "Guide generation failed schema validation after 3 attempts" in resp.text
+
+
+def test_reel_detail_failed_reel_without_a_job_row_shows_no_error_paragraph(client):
+    """Defensive fallback, reel level: a failed reel with no matching Job row must not
+    error or show a broken/empty error paragraph."""
+    reel_id = _make_reel(client._session_factory, status=models.ReelStatus.failed)
+    resp = client.get(f"/api/reels/{reel_id}")
+    assert resp.status_code == 200
+    # No stray error paragraph from the reel-level block specifically (the cut card's
+    # own unrelated "Failed. Retry render..." text is a separate, expected paragraph).
+    assert resp.text.count('<p class="error" style="margin-top:6px;">') == 0
 
 
 def test_failed_cut_card_has_no_duplicate_ids_and_valid_hx_targets(client):
