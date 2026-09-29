@@ -301,6 +301,45 @@ def test_rendered_guide_fingerprint_is_computed_and_assigned_on_success():
     assert cut.rendered_guide_fingerprint == "feedface" * 8
 
 
+def test_rendered_guide_fingerprint_is_not_touched_when_the_render_fails(monkeypatch):
+    """Caught in review as an untested regression risk: the fingerprint write must stay
+    at the END of render_cut, AFTER composite_cut() succeeds -- the same point
+    rendered_pins_fingerprint is already written. If it were ever moved earlier (e.g. to
+    the top of the function, snapshotting the CURRENT guide before the render actually
+    runs), a render that then failed would leave cut.rendered_guide_fingerprint pointing
+    at a guide whose video was never actually produced -- silently defeating the whole
+    staleness gate for a cut whose render simply crashed, not the "guide edited, re-render
+    failed" case this feature exists to catch. Forces composite_cut() to raise and
+    confirms the fingerprint (pinned to a sentinel before the call) is untouched."""
+    from worker.tasks.render import render_cut
+
+    job = _job()
+    cut = _cut()
+    cut.rendered_guide_fingerprint = "pre-existing-sentinel-untouched-by-a-failed-render"
+    reel = _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else (
+        cut if model is models.Cut else reel
+    )
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.render.get_asset_sourcer"),
+        patch("worker.tasks.render.get_wiki_sourcer"),
+        patch("worker.tasks.render.get_hf_sourcer"),
+        patch("worker.tasks.render.get_hf_video_sourcer"),
+        patch("worker.tasks.render.get_tts_provider"),
+        patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
+        patch("worker.tasks.render.record_stage"),
+        patch("worker.tasks.render.composite_cut", side_effect=RuntimeError("ffmpeg crashed")),
+    ):
+        with pytest.raises(RuntimeError, match="ffmpeg crashed"):
+            render_cut(1)
+
+    assert job.status == models.JobStatus.failed
+    assert cut.rendered_guide_fingerprint == "pre-existing-sentinel-untouched-by-a-failed-render"
+
+
 def test_matching_music_cue_is_passed_to_composite_cut():
     """The hook beat's music_cue should resolve to a track and reach composite_cut."""
     from worker.tasks.render import render_cut

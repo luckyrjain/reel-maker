@@ -32,11 +32,12 @@ Concrete sequence:
 This is the guide-content sibling of the already-fixed `rendered_pins_fingerprint` gap (Phase 7e,
 `docs/specs/2026-09-video-pins-staleness-gate-system-design.md`) — same shape of bug (a later
 mutation committed, then the render that would have caught video_path up failed before finishing),
-different content (asset pins there, guide text/timing here). That fix's design doc explicitly
-scoped this one out (see its own closing note: *"Does not address the separate, still-open,
-Low-severity 'Retry publish on a failed cut can ship a stale pre-edit video' row below — that's
-the broader 'any guide edit, not just an asset re-pin' staleness gap, explicitly out of scope for
-this fix."*) — this design closes that gap using the identical mechanism.
+different content (asset pins there, guide text/timing here). `docs/roadmap.md`'s own Open Issues
+row for that fix explicitly scoped this one out at the time (see its closing note: *"Does not
+address the separate, still-open, Low-severity 'Retry publish on a failed cut can ship a stale
+pre-edit video' row below — that's the broader 'any guide edit, not just an asset re-pin'
+staleness gap, explicitly out of scope for this fix."*) — this design closes that gap using the
+identical mechanism.
 
 ## 2. Fix
 
@@ -127,9 +128,9 @@ can name which dimension is actually stale, rather than a generic "something cha
   mirroring the exact mutation the pins gate's own rollout-safety test is guarded against) and
   confirmed the rollout-safety test fails for the predicted reason, then restored.
 
-Full suite: 771 tests (was 755; +16), 1 deselected (golden), `ruff check --select F,E9 .` clean.
+Full suite: 777 tests (was 758; +19), 1 deselected (golden), `ruff check --select F,E9 .` clean.
 
-## 4. Corrections (from adversarial dual-lens review of the built code)
+## 4. Corrections — Round 1 (dual-lens review, before this PR was opened)
 
 Two independent review passes (Lens A — Safety/State; Lens B — Contracts/Operations) ran against
 the implemented diff before this shipped, both explicitly asked to verify empirically rather than
@@ -214,3 +215,69 @@ marginal earlier feedback). This matches the already-established precedent of th
 pins-fingerprint gate, which is equally publish-time-only, not approve-time. An operator only
 discovers the block on the eventual publish attempt — acceptable for a Low-severity fix whose
 entire purpose is closing a correctness hole, not redesigning the review-and-approve UX flow.
+
+## 5. Corrections — Round 2 (deep 4-persona review on the opened PR)
+
+Per this pipeline's own standing convention (established after PR #20's drawtext fix, now applied
+by default to every PR rather than only on explicit request): four parallel personas —
+Security/Red-Team, Correctness/Edge-Case, Test-Quality Auditor, Documentation-Consistency — ran
+against the already-dual-lens-reviewed PR before merge.
+
+**Correction 4 (Security/Red-Team AND Documentation-Consistency, independently) — Round 1's fix
+for the false-positive in Correction 1 was itself incomplete.** Both personas, working
+independently, reproduced the identical residual bug: Correction 1's fix compared the
+**submitted** form value (always passed through `.strip()`/CRLF-normalization) against the
+**stored** value **as-is, unnormalized**. Any beat field whose stored value already carried
+incidental whitespace or line-ending quirks — realistic and unremarkable, since e.g.
+`worker/tasks/generate.py` stores an LLM's `visual_direction` raw, never itself `.strip()`'d — still
+registered as "changed" on every untouched save. The Security/Red-Team persona confirmed this
+**fails closed**: it can only over-block a publish that should be allowed, never bypass the gate,
+so it was never a security defect — but it remained a real, user-facing false positive within the
+exact bug class Correction 1 already exists to close, and the Documentation-Consistency persona
+independently caught it by testing the design doc's own "leaves `guide` byte-for-byte unchanged"
+claim (this section, Round 1) against the actual code rather than trusting the prose. Fixed by
+normalizing **both sides** identically — stored and submitted — before every beat-field comparison
+(`visual_direction`, `vo_script`, `on_screen_text`), and by also handling a lone `\r` (not just
+`\r\n`) as a line-ending variant. A new regression test pins a stored value with pre-existing
+trailing whitespace and confirms an untouched resave leaves it exactly as-is; mutation-tested
+against a version that normalizes only the submitted side (confirmed the test fails for the exact
+predicted reason), then restored.
+
+**Correction 5 (Test-Quality Auditor) — the beat/hashtag list-order test in
+`tests/test_guide_schema.py` didn't actually test beat order.** The single test covering both
+claims used two hashtag lists of equal length for both the "forward" and "reordered" case (and,
+implicitly, never varied `beats` at all) — a hypothetical future regression that sorted every list
+before hashing (not just normalizing dict-key order, which is correct) would still make the two
+hashtag fingerprints differ for an unrelated reason (this was verified directly: mutating
+`compute_guide_fingerprint()` to deep-sort every list still failed the hashtag-order assertion, but
+for the wrong reason — sorted-and-then-compared-by-repr order happened to differ regardless of
+whether order was genuinely preserved). Split into two tests: hashtag-order (unchanged) and a new
+beat-order test using two *structurally distinct* beats swapped, which a deep-sort mutation now
+provably fails for the right reason (both new tests fail identically under that mutation, confirmed
+directly, then reverted).
+
+**Correction 6 (Test-Quality Auditor) — no test proved `Cut.rendered_guide_fingerprint` is written
+only on render success, at the correct point in `render_cut`.** The design's entire safety property
+depends on this write happening *after* `composite_cut()` succeeds, at the same point
+`rendered_pins_fingerprint` is written (§2) — a hypothetical future refactor that moved it earlier
+(e.g. to the top of the function, snapshotting whatever `cut.guide` says *before* the render
+actually runs) would silently defeat the whole gate for any cut whose render simply crashes: the
+fingerprint would already reflect the *current* guide by the time of the crash, so a subsequent
+"Retry publish" of the (stale, pre-crash) video would pass the gate instead of being caught by it —
+the exact failure mode this whole feature exists to close, reintroduced through a different door.
+Added `test_rendered_guide_fingerprint_is_not_touched_when_the_render_fails`
+(`tests/test_render_task.py`): pins a sentinel value on `cut.rendered_guide_fingerprint`, forces
+`composite_cut()` to raise, and confirms the sentinel survives untouched. Mutation-tested by
+actually moving the fingerprint-write line to the top of `render_cut()` (the exact regression this
+test exists to catch) and confirming the test fails for the predicted reason, then restored.
+
+**Confirmed, not changed (Round 2):** the Security/Red-Team persona found no hash collision, no
+unhandled exception reachable from any value `cut.guide` can legitimately hold (circular
+references, deep nesting, mixed-type keys, and `bytes` all throw, but none of these are reachable
+through the JSONB column or the PATCH endpoint's fixed-shape writes), no information leak in the
+`ValueError` message (a fixed string, no guide content/fingerprint/path), and no new injection
+surface (Jinja's autoescaping is unaffected by the normalize-then-compare logic; an HTML-payload
+round-trip test confirmed escaped output and byte-identical re-storage). The Test-Quality Auditor
+separately confirmed the DB-round-trip test from Correction 2 is not vacuous, by instrumenting
+SQLAlchemy's own query events to prove `db.expire_all()` genuinely forces a fresh `SELECT` rather
+than reusing the cached in-memory object.

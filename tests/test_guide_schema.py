@@ -54,12 +54,28 @@ def test_compute_guide_fingerprint_changes_when_vo_script_changes():
     assert before != after
 
 
-def test_compute_guide_fingerprint_changes_when_beat_order_or_list_order_changes():
-    """Unlike dict-key order, LIST order is meaningful (beat sequence, hashtag list) and
-    must NOT be normalized away -- a genuine reorder is a genuine content change."""
+def test_compute_guide_fingerprint_changes_when_hashtag_list_order_changes():
+    """Unlike dict-key order, LIST order is meaningful and must NOT be normalized away --
+    a genuine reorder is a genuine content change."""
     a = compute_guide_fingerprint(_guide(hashtags=["a", "b", "c", "d", "e"]))
     b = compute_guide_fingerprint(_guide(hashtags=["e", "d", "c", "b", "a"]))
     assert a != b
+
+
+def test_compute_guide_fingerprint_changes_when_beat_order_changes():
+    """Same property, for the `beats` list specifically -- caught in review as an
+    untested gap: the sibling hashtag-order test above doesn't actually exercise beat
+    order at all (both a and b lists there have the same length, so a naive
+    "sort every list before hashing" regression would still make them differ for an
+    unrelated reason -- length parity alone can't distinguish that from a real
+    order-sensitivity check). Two DISTINCT beats, swapped, isolates the property."""
+    beat_a = {"index": 0, "type": "hook", "duration_s": 2.0, "visual_direction": "x",
+              "on_screen_text": ["Hi"], "vo_script": "First beat.", "transition": "cut"}
+    beat_b = {"index": 1, "type": "body", "duration_s": 3.0, "visual_direction": "y",
+              "on_screen_text": ["Bye"], "vo_script": "Second beat.", "transition": "cut"}
+    forward = {**_guide(), "beats": [beat_a, beat_b]}
+    swapped = {**_guide(), "beats": [beat_b, beat_a]}
+    assert compute_guide_fingerprint(forward) != compute_guide_fingerprint(swapped)
 
 
 def test_compute_guide_fingerprint_returns_a_hex_string():

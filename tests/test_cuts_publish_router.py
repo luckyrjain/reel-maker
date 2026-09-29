@@ -502,6 +502,47 @@ def test_update_cut_still_writes_through_a_genuine_vo_script_edit(client):
         db.close()
 
 
+def test_update_cut_a_stored_value_with_pre_existing_whitespace_is_not_changed_by_an_untouched_save(client):
+    """Second review round found the first fix (normalizing only the SUBMITTED value
+    before comparing) was incomplete: `worker/tasks/generate.py` stores an LLM's
+    `visual_direction` raw, with no `.strip()` -- so a beat whose stored value already
+    carried incidental trailing whitespace (a realistic, unremarkable LLM output
+    quirk, not an edited value) still "changed" on every untouched save, since the
+    submitted form value always comes back through `.strip()` while the stored
+    comparison target didn't. Fails closed (only over-blocks publish, never bypasses
+    the gate) but is still a real, fixable false positive -- normalizing BOTH sides
+    before comparing closes it fully."""
+    from engine.generation.guide_schema import compute_guide_fingerprint
+
+    guide_with_untrimmed_visual_direction = {
+        **_MULTILINE_GUIDE,
+        "beats": [{**_MULTILINE_GUIDE["beats"][0], "visual_direction": "crowd "}],
+    }
+    cut_id = _make_cut_with_guide(client._session_factory, guide_with_untrimmed_visual_direction)
+    fingerprint_before = compute_guide_fingerprint(guide_with_untrimmed_visual_direction)
+
+    # The rendered edit form always shows the .strip()-free stored value, so a browser
+    # resubmitting it untouched sends exactly "crowd " back -- but browsers themselves
+    # don't add trailing whitespace, so what actually comes back is the value AS
+    # DISPLAYED, unchanged by the round-trip. Simulate that faithfully here.
+    resp = client.patch(f"/api/cuts/{cut_id}", data={
+        "caption": "An updated caption",
+        "beat_0_duration_s": "3.0",
+        "beat_0_visual_direction": "crowd ",
+        "beat_0_vo_script": "He stopped three.\r\nThen another one. Nobody expected it.",
+        "beat_0_on_screen_text": "He stopped three.\r\nThen another one.",
+    })
+    assert resp.status_code == 200
+
+    db = client._session_factory()
+    try:
+        cut = db.get(models.Cut, cut_id)
+        assert cut.guide == guide_with_untrimmed_visual_direction  # byte-for-byte unchanged
+        assert compute_guide_fingerprint(cut.guide) == fingerprint_before
+    finally:
+        db.close()
+
+
 def test_a_failed_request_is_reported_to_the_operator_not_swallowed_by_htmx(client):
     """htmx does not swap 4xx/5xx responses, so without a handler the 503 for an unqueueable job
     looks like nothing happened."""

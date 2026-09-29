@@ -203,32 +203,53 @@ async def update_cut(cut_id: int, request: Request, db: Session = Depends(get_db
                         guide_changed = True
             if form.get(f"beat_{i}_visual_direction", "").strip():
                 new_vd = form[f"beat_{i}_visual_direction"].strip()
-                if new_vd != beats[i].get("visual_direction"):
+                # Normalize the STORED side the same way before comparing, not just the
+                # submitted side — caught in review: a stored value that already carried
+                # incidental whitespace (e.g. from LLM generation, never itself run
+                # through .strip()) would otherwise "change" on every untouched save,
+                # since the submitted form value always comes back through .strip().
+                if new_vd != (beats[i].get("visual_direction") or "").strip():
                     beats[i]["visual_direction"] = new_vd
                     guide_changed = True
             if f"beat_{i}_vo_script" in form:
-                # Normalize the textarea's CRLF line endings back to the LF this guide's
+                # Normalize the textarea's line endings back to the LF this guide's
                 # vo_script was actually stored with (script_parser.py joins section
                 # bodies with "\n") — an HTML form always re-encodes a <textarea>'s
-                # newlines as \r\n on submit, touched or not, so comparing raw form
-                # output against the stored value would treat every single save of a
-                # multi-line vo_script as a content change even when nothing was edited.
-                # Caught in review: this exact false positive would spuriously trip
-                # Cut.rendered_guide_fingerprint's staleness gate (see engine/publish/
-                # gate.py::assert_video_matches_guide()) on an untouched beat.
-                new_vo = form[f"beat_{i}_vo_script"].replace("\r\n", "\n").strip()
-                if new_vo != beats[i].get("vo_script"):
+                # newlines on submit (CRLF, or a lone CR from some clients/OSes), touched
+                # or not, so comparing raw form output against the stored value would
+                # treat every single save of a multi-line vo_script as a content change
+                # even when nothing was edited. Caught in review: this exact false
+                # positive would spuriously trip Cut.rendered_guide_fingerprint's
+                # staleness gate (see engine/publish/gate.py::assert_video_matches_guide())
+                # on an untouched beat. The STORED side is normalized identically before
+                # comparing (a second review round caught that a stored value with its
+                # own incidental whitespace/line-ending quirks — pre-dating this feature,
+                # never itself normalized — would otherwise "change" on every untouched
+                # save too).
+                new_vo = form[f"beat_{i}_vo_script"].replace("\r\n", "\n").replace("\r", "\n").strip()
+                stored_vo = (beats[i].get("vo_script") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+                if new_vo != stored_vo:
                     beats[i]["vo_script"] = new_vo
                     beats[i]["on_screen_text"] = _derive_on_screen(new_vo, max_lines=5)
                     guide_changed = True
             if f"beat_{i}_on_screen_text" in form:
                 lines = [
                     l.strip()
-                    for l in form[f"beat_{i}_on_screen_text"].replace("\r\n", "\n").splitlines()
+                    for l in form[f"beat_{i}_on_screen_text"].replace("\r\n", "\n").replace("\r", "\n").splitlines()
                     if l.strip()
                 ]
                 new_lines = lines[:5]
-                if new_lines != beats[i].get("on_screen_text"):
+                # Same stored-side normalization as vo_script/visual_direction above —
+                # an already-stored list with a blank/whitespace-only entry (or one
+                # itself containing a raw newline the LLM produced) must not look
+                # "changed" just because the new value re-derives it more strictly.
+                stored_lines = [
+                    l.strip()
+                    for l in (beats[i].get("on_screen_text") or [])
+                    for l in str(l).replace("\r\n", "\n").replace("\r", "\n").splitlines()
+                    if l.strip()
+                ][:5]
+                if new_lines != stored_lines:
                     beats[i]["on_screen_text"] = new_lines
                     guide_changed = True
         if guide_changed:
