@@ -3,7 +3,7 @@ from pathlib import Path
 from api import models
 from api.config import settings
 from api.state import CUT_TRANSITIONS, transition
-from engine.generation.guide_schema import PlatformGuide
+from engine.generation.guide_schema import PlatformGuide, compute_guide_fingerprint
 from engine.observability import record_stage
 from engine.render.asset_sourcer import compute_pins_fingerprint_for_render, get_asset_sourcer, get_hf_sourcer, get_hf_video_sourcer, get_music_sourcer, get_wiki_sourcer, resolve_or_reuse
 from engine.render.compositor import DEFAULT_TEXT_COLOR, composite_cut
@@ -168,4 +168,14 @@ def render_cut(self, db, job, ctx):
     # rendered" and permanently exempt from the staleness check. See that function's
     # docstring and CLAUDE.md's Key conventions entry on this gate.
     cut.rendered_pins_fingerprint = compute_pins_fingerprint_for_render(db, cut.id)
+    # Snapshot of the guide content that built THIS video, for
+    # engine/publish/gate.py::assert_video_matches_guide() to detect a guide edit (PATCH
+    # /cuts/{id}, or a hook-variant swap — both only reachable while "in_review") followed
+    # by a re-render that fails before video_path catches up — see docs/specs/2026-09-
+    # stale-video-on-failed-rerender-system-design.md. `cut.guide` read here is guaranteed
+    # to be the exact guide THIS render ran against: trigger_render() moves cut.status to
+    # "rendering" before enqueueing, and the guide-editing endpoints (update_cut,
+    # choose_hook_variant) both 409 outside "in_review" — no PATCH can land while a render
+    # is in flight, so there is nothing to race here.
+    cut.rendered_guide_fingerprint = compute_guide_fingerprint(cut.guide)
     transition(cut, "in_review", CUT_TRANSITIONS)
