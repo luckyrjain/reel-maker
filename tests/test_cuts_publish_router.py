@@ -11,7 +11,7 @@ from sqlalchemy.pool import StaticPool
 from api import models
 from api.db import get_db
 from api.main import app
-from api.routers.cuts import active_job_for_cut
+from api.routers.cuts import active_job_for_cut, latest_failed_job_for_cut
 
 
 @pytest.fixture()
@@ -513,3 +513,77 @@ def test_active_job_for_cut_matches_job_type_to_cut_status(db_session):
     found = active_job_for_cut(db_session, cut)
     assert found is not None
     assert found.id == publish_job.id
+
+
+# ── latest_failed_job_for_cut() — surfaces job.error on a "failed" cut card ──
+
+def test_latest_failed_job_for_cut_is_none_for_a_status_that_is_not_failed(db_session):
+    cut = _cut(db_session, models.CutStatus.rendering)
+    db_session.commit()
+    assert latest_failed_job_for_cut(db_session, cut) is None
+
+
+def test_latest_failed_job_for_cut_falls_back_to_none_without_a_matching_row(db_session):
+    """Defensive branch, not expected in normal operation -- same caveat as
+    active_job_for_cut()'s own fallback."""
+    cut = _cut(db_session, models.CutStatus.failed)
+    db_session.commit()
+    assert latest_failed_job_for_cut(db_session, cut) is None
+
+
+def test_latest_failed_job_for_cut_finds_the_failed_render_job(db_session):
+    cut = _cut(db_session, models.CutStatus.failed)
+    job = models.Job(
+        type=models.JobType.render, reel_id=cut.reel_id, cut_id=cut.id,
+        status=models.JobStatus.failed, error="ffmpeg exited with code 234",
+    )
+    db_session.add(job)
+    db_session.commit()
+
+    found = latest_failed_job_for_cut(db_session, cut)
+    assert found is not None
+    assert found.id == job.id
+    assert found.error == "ffmpeg exited with code 234"
+
+
+def test_latest_failed_job_for_cut_is_type_agnostic_and_picks_the_most_recent(db_session):
+    """Unlike active_job_for_cut(), this does NOT filter by Job.type -- a "failed" cut
+    can be reached from either a failed render OR a failed publish (CUT_TRANSITIONS
+    allows both retry paths), so the right row is whichever failed MOST RECENTLY,
+    regardless of type. A cut that failed rendering, was retried, then failed
+    publishing must surface the publish failure, not the earlier render one."""
+    cut = _cut(db_session, models.CutStatus.failed)
+    now = datetime.now(timezone.utc)
+    older_render_failure = models.Job(
+        type=models.JobType.render, reel_id=cut.reel_id, cut_id=cut.id,
+        status=models.JobStatus.failed, error="ffmpeg exited with code 234",
+        created_at=now,
+    )
+    newer_publish_failure = models.Job(
+        type=models.JobType.publish, reel_id=cut.reel_id, cut_id=cut.id,
+        status=models.JobStatus.failed, error="YouTube upload timed out",
+        created_at=now + timedelta(seconds=5),
+    )
+    db_session.add_all([older_render_failure, newer_publish_failure])
+    db_session.commit()
+
+    found = latest_failed_job_for_cut(db_session, cut)
+    assert found is not None
+    assert found.id == newer_publish_failure.id
+    assert found.error == "YouTube upload timed out"
+
+
+def test_latest_failed_job_for_cut_ignores_a_non_terminal_job(db_session):
+    """A pending/running Job for a "failed" cut would be unusual (the cut only enters
+    "failed" via a Job's own failure path), but the query must still only ever match
+    status==failed rows -- not accidentally surface an unrelated in-flight job's
+    (empty) error as if it were the failure reason."""
+    cut = _cut(db_session, models.CutStatus.failed)
+    live_job = models.Job(
+        type=models.JobType.render, reel_id=cut.reel_id, cut_id=cut.id,
+        status=models.JobStatus.running, progress=10,
+    )
+    db_session.add(live_job)
+    db_session.commit()
+
+    assert latest_failed_job_for_cut(db_session, cut) is None

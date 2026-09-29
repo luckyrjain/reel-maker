@@ -5,6 +5,7 @@
 {% set st = cut.status.value %}
 {% set editable = st == "in_review" %}
 {% set active_job = active_job|default(none) %}
+{% set failed_job = failed_job|default(none) %}
 
 <div id="cut-card-{{ cut.id }}" class="cut-card">
 
@@ -270,6 +271,9 @@
     {% endif %}
 
     {% elif st == "failed" %}
+    {% if failed_job and failed_job.error %}
+    <p class="error" style="margin-top:10px;margin-bottom:4px;">{{ failed_job.error }}</p>
+    {% endif %}
     <p class="error" style="margin-top:10px;margin-bottom:8px;">
       {% if cut.platform_post_id %}
       Failed after the video was posted ({{ cut.platform_post_id }}). Retry publish

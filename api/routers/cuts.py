@@ -47,10 +47,54 @@ def active_job_for_cut(db: Session, cut: models.Cut) -> models.Job | None:
     )
 
 
+def latest_failed_job_for_cut(db: Session, cut: models.Cut) -> models.Job | None:
+    """The most recent terminal-`failed` render/publish Job for a `"failed"` cut, if
+    any — lets the cut card show the ACTUAL failure reason (`job.error`) instead of
+    the generic hard-coded "Failed. Retry render..." message. Closes the "Failure
+    reason is not shown after a page refresh" Open Issues item: `job.error` used to be
+    rendered only inside render_status.html/publish_status.html, the polling fragment
+    of the tab that happened to be open when the job failed — any other view of the
+    cut (a fresh page load, a different tab) showed nothing more specific.
+
+    `CUT_TRANSITIONS["failed"]` is reachable from either a failed render OR a failed
+    publish (see CLAUDE.md's Key conventions on why "failed" is deliberately
+    ambiguous), so — unlike active_job_for_cut()'s status->type mapping — this does
+    not filter by Job.type: it takes the most recently failed row of EITHER type,
+    which is exactly the one that caused THIS cut to be sitting in "failed" right now
+    (job_task's own failure path sets cut.status in the same transaction it fails the
+    Job — see worker/tasks/common.py's per-job-type owner rollback).
+
+    Returns `None` for any other status, or defensively if no matching row is found —
+    not expected in normal operation, same caveat as active_job_for_cut().
+
+    `order_by()` breaks a `created_at` tie on `Job.id` (also monotonic, assigned by the
+    DB rather than this process's wall clock) — belt-and-suspenders found in review:
+    unlike `active_job_for_cut()`, where the 409 status guard on `cut.status` structurally
+    limits the match to at most one live row, a `"failed"` cut can accumulate several
+    `failed` rows over repeated manual retries, so ordering has to be right, not just
+    usually right."""
+    if cut.status.value != "failed":
+        return None
+    return (
+        db.query(models.Job)
+        .filter(
+            models.Job.cut_id == cut.id,
+            models.Job.type.in_([models.JobType.render, models.JobType.publish]),
+            models.Job.status == models.JobStatus.failed,
+        )
+        .order_by(models.Job.created_at.desc(), models.Job.id.desc())
+        .first()
+    )
+
+
 def _cut_card(request: Request, cut: models.Cut, db: Session) -> HTMLResponse:
     return templates.TemplateResponse(
         request, "fragments/cut_card.html",
-        {"cut": cut, "active_job": active_job_for_cut(db, cut)},
+        {
+            "cut": cut,
+            "active_job": active_job_for_cut(db, cut),
+            "failed_job": latest_failed_job_for_cut(db, cut),
+        },
     )
 
 

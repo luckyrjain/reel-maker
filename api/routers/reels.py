@@ -6,7 +6,7 @@ from typing import Annotated, Optional
 
 from api.db import get_db
 from api import models
-from api.routers.cuts import active_job_for_cut
+from api.routers.cuts import active_job_for_cut, latest_failed_job_for_cut
 from api.state import transition, REEL_TRANSITIONS
 from engine.generation.estimate import estimate_generation
 from engine.observability import latest_quality_scores
@@ -274,6 +274,37 @@ def _pipeline_summary(db: Session, reel_id: int) -> dict:
     }
 
 
+def latest_failed_job_for_reel(db: Session, reel: models.Reel) -> models.Job | None:
+    """`latest_failed_job_for_cut()`'s reel-level sibling (api/routers/cuts.py) — a
+    `"failed"` reel (an enrich/generate job failure rolls the reel back via
+    `api/state.py::JOB_IN_FLIGHT`, the same `rollback_owner()` mechanism that rolls a
+    cut back on a render/publish failure) had the identical "only in
+    pipeline_status.html, the polling fragment of the tab that started it" gap:
+    `reel.html`'s own status badge shows a bare `"failed"` with no reason, and
+    `reel.html` never includes `pipeline_status.html` — that fragment is only ever
+    returned by `POST /api/reels` and `GET /.../active-job-fragment` directly. Found
+    during review of the cut-level fix as a real, symmetric gap the roadmap's original
+    "cut card and reel page" wording already implied but the first version of this fix
+    missed.
+
+    Not type-filtered, for the same reason `latest_failed_job_for_cut()` isn't: a reel
+    can fail either enrichment or generation, and the most-recently-failed row of
+    either type is the one that caused the CURRENT `"failed"` state. Returns `None`
+    for any other status, or defensively if no matching row is found."""
+    if reel.status.value != "failed":
+        return None
+    return (
+        db.query(models.Job)
+        .filter(
+            models.Job.reel_id == reel.id,
+            models.Job.type.in_([models.JobType.enrich, models.JobType.generate]),
+            models.Job.status == models.JobStatus.failed,
+        )
+        .order_by(models.Job.created_at.desc(), models.Job.id.desc())
+        .first()
+    )
+
+
 @router.get("/reels/{reel_id}", response_class=HTMLResponse)
 def reel_detail(reel_id: int, request: Request, db: Session = Depends(get_db)):
     reel = db.get(models.Reel, reel_id)
@@ -285,7 +316,15 @@ def reel_detail(reel_id: int, request: Request, db: Session = Depends(get_db)):
     # load embed the self-polling render/publish status fragment instead of a static
     # "refresh to update" message for a cut mid-render/publish.
     active_jobs = {cut.id: active_job_for_cut(db, cut) for cut in cuts}
+    # See latest_failed_job_for_cut()'s docstring — surfaces the actual job.error on
+    # a fresh page load for a "failed" cut, instead of only the generic message.
+    failed_jobs = {cut.id: latest_failed_job_for_cut(db, cut) for cut in cuts}
+    # See latest_failed_job_for_reel()'s docstring — same fix, reel level.
+    failed_reel_job = latest_failed_job_for_reel(db, reel)
     return templates.TemplateResponse(
         request, "reel.html",
-        {"reel": reel, "cuts": cuts, "active_jobs": active_jobs, **pipeline},
+        {
+            "reel": reel, "cuts": cuts, "active_jobs": active_jobs,
+            "failed_jobs": failed_jobs, "failed_reel_job": failed_reel_job, **pipeline,
+        },
     )

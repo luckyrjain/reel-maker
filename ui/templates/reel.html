@@ -23,6 +23,9 @@
         <span>·</span>
         <span>{{ reel.voiceover_mode }}</span>
     </div>
+    {% if reel.status.value == "failed" and failed_reel_job and failed_reel_job.error %}
+    <p class="error" style="margin-top:6px;">{{ failed_reel_job.error }}</p>
+    {% endif %}
 
     {% if stage_events %}
     <section class="pipeline-panel">
@@ -63,6 +66,7 @@
     <div class="cuts">
         {% for cut in cuts %}
         {% set active_job = active_jobs.get(cut.id) %}
+        {% set failed_job = failed_jobs.get(cut.id) %}
         {% include "fragments/cut_card.html" %}
         {% endfor %}
     </div>
