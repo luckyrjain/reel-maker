@@ -6,6 +6,7 @@ from typing import Annotated, Optional
 
 from api.db import get_db
 from api import models
+from api.routers.cuts import active_job_for_cut
 from api.state import transition, REEL_TRANSITIONS
 from engine.generation.estimate import estimate_generation
 from engine.observability import latest_quality_scores
@@ -280,7 +281,11 @@ def reel_detail(reel_id: int, request: Request, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Reel not found")
     cuts = db.query(models.Cut).filter(models.Cut.reel_id == reel_id).all()
     pipeline = _pipeline_summary(db, reel_id)
+    # See active_job_for_cut()'s docstring (api/routers/cuts.py) — lets a fresh page
+    # load embed the self-polling render/publish status fragment instead of a static
+    # "refresh to update" message for a cut mid-render/publish.
+    active_jobs = {cut.id: active_job_for_cut(db, cut) for cut in cuts}
     return templates.TemplateResponse(
         request, "reel.html",
-        {"reel": reel, "cuts": cuts, **pipeline},
+        {"reel": reel, "cuts": cuts, "active_jobs": active_jobs, **pipeline},
     )

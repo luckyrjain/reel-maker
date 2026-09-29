@@ -1,4 +1,5 @@
 """Tests for POST /api/cuts/{id}/publish and GET /api/cuts/{id}/publish-status."""
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -10,6 +11,7 @@ from sqlalchemy.pool import StaticPool
 from api import models
 from api.db import get_db
 from api.main import app
+from api.routers.cuts import active_job_for_cut
 
 
 @pytest.fixture()
@@ -418,3 +420,96 @@ def test_a_failed_request_is_reported_to_the_operator_not_swallowed_by_htmx(clie
     cut_id = _make_cut(client._session_factory, models.CutStatus.failed)
     reel_id = client._session_factory().get(models.Cut, cut_id).reel_id
     assert "/static/htmx-errors.js" in client.get(f"/api/reels/{reel_id}").text
+
+
+# ── active_job_for_cut() — the lookup behind the render/publish live-status fix ──
+
+@pytest.fixture()
+def db_session():
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    models.Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    yield db
+    db.close()
+
+
+def _cut(db, status):
+    reel = models.Reel(context="x", status=models.ReelStatus.guide_ready)
+    db.add(reel)
+    db.flush()
+    cut = models.Cut(reel_id=reel.id, platform=models.CutPlatform.youtube_shorts, status=status)
+    db.add(cut)
+    db.flush()
+    return cut
+
+
+def test_active_job_for_cut_is_none_for_a_status_that_has_no_in_flight_job(db_session):
+    cut = _cut(db_session, models.CutStatus.in_review)
+    db_session.commit()
+    assert active_job_for_cut(db_session, cut) is None
+
+
+def test_active_job_for_cut_finds_the_pending_render_job(db_session):
+    cut = _cut(db_session, models.CutStatus.rendering)
+    job = models.Job(
+        type=models.JobType.render, reel_id=cut.reel_id, cut_id=cut.id,
+        status=models.JobStatus.pending, progress=0,
+    )
+    db_session.add(job)
+    db_session.commit()
+
+    found = active_job_for_cut(db_session, cut)
+    assert found is not None
+    assert found.id == job.id
+
+
+def test_active_job_for_cut_ignores_a_done_job_and_falls_back_to_none(db_session):
+    """A completed/stale Job row for this cut must not be mistaken for a live one --
+    only pending/running rows count, matching the docstring's "not expected in normal
+    operation" fallback."""
+    cut = _cut(db_session, models.CutStatus.rendering)
+    old_job = models.Job(
+        type=models.JobType.render, reel_id=cut.reel_id, cut_id=cut.id,
+        status=models.JobStatus.done, progress=100,
+    )
+    db_session.add(old_job)
+    db_session.commit()
+
+    assert active_job_for_cut(db_session, cut) is None
+
+
+def test_active_job_for_cut_matches_job_type_to_cut_status(db_session):
+    """A publishing cut must be matched against a publish Job, not a render Job, even
+    when a NON-terminal render Job row also exists for the same cut. Deliberately gives
+    the render Job a live (pending) status, not done/failed -- a done render Job would
+    already be excluded by the status filter alone, making the assertion pass without
+    the Job.type filter actually doing anything (caught in review: the first draft of
+    this test used a done render Job, which the status filter alone excludes).
+
+    The render Job's created_at is also pinned STRICTLY LATER than the publish Job's,
+    so order_by(created_at.desc()).first() alone -- with the type filter removed --
+    would pick the render Job, not coincidentally pick the right one by insertion-order
+    timestamp ties (caught in review round 2: an earlier version of this fix let both
+    rows get the same default created_at instant, which happened to still return the
+    right row even with the type filter mutated out, silently passing for the wrong
+    reason)."""
+    cut = _cut(db_session, models.CutStatus.publishing)
+    now = datetime.now(timezone.utc)
+    publish_job = models.Job(
+        type=models.JobType.publish, reel_id=cut.reel_id, cut_id=cut.id,
+        status=models.JobStatus.running, progress=40, created_at=now,
+    )
+    live_render_job = models.Job(
+        type=models.JobType.render, reel_id=cut.reel_id, cut_id=cut.id,
+        status=models.JobStatus.pending, progress=0, created_at=now + timedelta(seconds=5),
+    )
+    db_session.add_all([publish_job, live_render_job])
+    db_session.commit()
+
+    found = active_job_for_cut(db_session, cut)
+    assert found is not None
+    assert found.id == publish_job.id
