@@ -267,6 +267,40 @@ def test_rendered_pins_fingerprint_is_computed_and_assigned_on_success():
     assert cut.rendered_pins_fingerprint == "deadbeef" * 8
 
 
+def test_rendered_guide_fingerprint_is_computed_and_assigned_on_success():
+    """Same call-and-assign wiring test as the pins-fingerprint one above, for the
+    sibling guide-content fingerprint (docs/specs/2026-09-stale-video-on-failed-rerender-
+    system-design.md). compute_guide_fingerprint() is called with the render's cut.guide
+    (the real _GUIDE dict, not a mock) and its return value lands on
+    cut.rendered_guide_fingerprint."""
+    from worker.tasks.render import render_cut
+
+    job = _job()
+    cut = _cut()
+    reel = _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else (
+        cut if model is models.Cut else reel
+    )
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.render.get_asset_sourcer"),
+        patch("worker.tasks.render.get_wiki_sourcer"),
+        patch("worker.tasks.render.get_hf_sourcer"),
+        patch("worker.tasks.render.get_hf_video_sourcer"),
+        patch("worker.tasks.render.get_tts_provider"),
+        patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
+        patch("worker.tasks.render.record_stage"),
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"], _FAKE_SRT_PATH)),
+        patch("worker.tasks.render.compute_guide_fingerprint", return_value="feedface" * 8) as mock_fp,
+    ):
+        render_cut(1)
+
+    mock_fp.assert_called_once_with(cut.guide)
+    assert cut.rendered_guide_fingerprint == "feedface" * 8
+
+
 def test_matching_music_cue_is_passed_to_composite_cut():
     """The hook beat's music_cue should resolve to a track and reach composite_cut."""
     from worker.tasks.render import render_cut

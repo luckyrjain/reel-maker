@@ -2,7 +2,13 @@
 import pytest
 
 from api import models
-from engine.publish.gate import assert_safe_to_publish, assert_video_matches_pins, unsafe_assets
+from engine.generation.guide_schema import compute_guide_fingerprint
+from engine.publish.gate import (
+    assert_safe_to_publish,
+    assert_video_matches_guide,
+    assert_video_matches_pins,
+    unsafe_assets,
+)
 from engine.render.asset_sourcer import (
     EMPTY_PINS_FINGERPRINT,
     SourcedAsset,
@@ -269,3 +275,140 @@ def test_staleness_bug_sequence_a_repin_that_fails_before_video_path_updates_is_
     # --- The gate must now catch the mismatch: current pins != what built video_path. ---
     with pytest.raises(ValueError, match="Re-render before publishing"):
         assert_video_matches_pins(db, cut)
+
+
+# ---------------------------------------------------------------------------
+# assert_video_matches_guide — the guide-content sibling of assert_video_matches_pins
+# (docs/specs/2026-09-stale-video-on-failed-rerender-system-design.md)
+# ---------------------------------------------------------------------------
+
+_GUIDE = {
+    "platform": "youtube_shorts", "target_length_s": 45.0,
+    "beats": [{"index": 0, "type": "hook", "duration_s": 2.0, "visual_direction": "x",
+               "on_screen_text": ["Hi"], "vo_script": "Original line.", "transition": "cut"}],
+    "caption": "A caption", "hashtags": ["a", "b", "c", "d", "e"],
+}
+_EDITED_GUIDE = {**_GUIDE, "beats": [{**_GUIDE["beats"][0], "vo_script": "Edited line."}]}
+
+
+def _make_cut_with_guide(db, guide=None):
+    reel = models.Reel(context="x", status=models.ReelStatus.guide_ready)
+    db.add(reel)
+    db.flush()
+    cut = models.Cut(
+        reel_id=reel.id, platform=models.CutPlatform.youtube_shorts,
+        status=models.CutStatus.approved, guide=guide or _GUIDE,
+    )
+    db.add(cut)
+    db.commit()
+    return cut
+
+
+def test_guide_matching_fingerprint_does_not_raise(db_session):
+    db = db_session
+    cut = _make_cut_with_guide(db)
+    cut.rendered_guide_fingerprint = compute_guide_fingerprint(cut.guide)
+    db.commit()
+
+    assert_video_matches_guide(db, cut)  # must not raise
+
+
+def test_guide_mismatched_fingerprint_raises_with_an_actionable_message(db_session):
+    """The actual bug: operator edits the guide (PATCH /cuts/{id}) after a successful
+    render, then a re-render fails before video_path catches up. video_path still points
+    at the pre-edit video; cut.guide already reflects the edit."""
+    db = db_session
+    cut = _make_cut_with_guide(db)
+    cut.rendered_guide_fingerprint = compute_guide_fingerprint(cut.guide)
+    db.commit()
+
+    cut.guide = _EDITED_GUIDE  # the PATCH edit
+    db.commit()
+
+    with pytest.raises(ValueError, match="Re-render before publishing"):
+        assert_video_matches_guide(db, cut)
+
+
+def test_guide_none_fingerprint_does_not_block_even_with_a_real_current_guide(db_session):
+    """Same rollout-safety property as assert_video_matches_pins' own None-means-skip
+    test: a legacy cut rendered before this column existed must not be blocked, even
+    though its current guide computes to a real, non-None fingerprint."""
+    db = db_session
+    cut = _make_cut_with_guide(db)
+    cut.rendered_guide_fingerprint = None
+    db.commit()
+
+    assert compute_guide_fingerprint(cut.guide) is not None  # sanity: not vacuous
+
+    assert_video_matches_guide(db, cut)  # must not raise
+
+
+def test_staleness_bug_sequence_a_guide_edit_after_render_then_a_failed_rerender_is_caught(db_session):
+    """End-to-end reproduction of the exact failure sequence from the Open Issues entry:
+
+    1. Render N succeeds: the guide is rendered, cut.video_path is set, and
+       cut.rendered_guide_fingerprint is snapshotted from that guide -- exactly what
+       worker/tasks/render.py::render_cut does at the end of a successful render.
+    2. The operator edits the guide (PATCH /cuts/{id} -- only reachable while
+       "in_review", which render_cut's own final transition() call leaves the cut in).
+    3. A re-render starts and FAILS before reaching the end of the function, so
+       video_path/rendered_guide_fingerprint are never updated -- cut.guide already
+       reflects the edit, but video_path still points at the pre-edit file.
+    4. assert_video_matches_guide(db, cut) must now raise -- "Retry publish" on the
+       resulting "failed" card must not be allowed to ship the stale pre-edit video.
+    """
+    db = db_session
+    cut = _make_cut_with_guide(db)
+
+    # --- Render N: guide renders successfully. ---
+    cut.video_path = "/video_store/1/youtube_shorts.mp4"
+    cut.rendered_guide_fingerprint = compute_guide_fingerprint(cut.guide)
+    db.commit()
+    assert_video_matches_guide(db, cut)  # sanity: passes right after it finishes
+
+    # --- Operator edits the guide (PATCH), then a re-render starts and fails before
+    # touching video_path/rendered_guide_fingerprint. ---
+    cut.guide = _EDITED_GUIDE
+    db.commit()
+
+    # --- The gate must catch this on the eventual "Retry publish" attempt. ---
+    with pytest.raises(ValueError, match="Re-render before publishing"):
+        assert_video_matches_guide(db, cut)
+
+
+def test_guide_fingerprint_survives_a_real_db_round_trip(db_session):
+    """Caught by review as a real, previously-untested gap: nothing proved the fingerprint
+    render_cut writes from an in-memory guide dict actually matches the one
+    assert_video_matches_guide recomputes at publish time from a FRESH read of the same
+    row through the DB's own JSON column encode/decode cycle -- an unrelated-to-content
+    round-trip difference (key ordering, float precision, None-vs-missing-key handling)
+    silently blocking every publish would be a far worse regression than the staleness
+    bug this whole feature exists to catch. Uses values most likely to expose exactly
+    that class of drift: a non-terminating float, unicode text, smart quotes, an emoji,
+    and an explicit None field."""
+    db = db_session
+    guide = {
+        "platform": "youtube_shorts", "target_length_s": 33.333333333333336,
+        "beats": [{"index": 0, "type": "hook", "duration_s": 2.5, "visual_direction": "café ⚽",
+                   "on_screen_text": ["“Quoted” text"], "vo_script": "Iñárritu's move.",
+                   "music_cue": None, "transition": "fade"}],
+        "caption": "A caption", "hashtags": ["a", "b", "c", "d", "e"],
+    }
+    reel = models.Reel(context="x", status=models.ReelStatus.guide_ready)
+    db.add(reel)
+    db.flush()
+    cut = models.Cut(
+        reel_id=reel.id, platform=models.CutPlatform.youtube_shorts,
+        status=models.CutStatus.approved, guide=guide,
+    )
+    db.add(cut)
+    db.commit()
+    cut_id = cut.id
+
+    fingerprint_at_render_time = compute_guide_fingerprint(guide)
+
+    db.expire_all()  # force the next access to issue a fresh SELECT, not reuse the cached object
+    reloaded = db.get(models.Cut, cut_id)
+    fingerprint_at_publish_time = compute_guide_fingerprint(reloaded.guide)
+
+    assert fingerprint_at_publish_time == fingerprint_at_render_time

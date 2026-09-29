@@ -118,6 +118,19 @@ class Cut(Base):
     # checks the current pins, not the video that will ship" entry and
     # docs/specs/2026-09-video-pins-staleness-gate-system-design.md.
     rendered_pins_fingerprint = Column(String(64))
+    # Fingerprint (sha256, see engine/generation/guide_schema.py::compute_guide_fingerprint)
+    # of the `guide` dict that built the CURRENTLY-STORED video_path, snapshotted at the
+    # moment a render succeeds — the sibling of rendered_pins_fingerprint above, but for the
+    # guide's own content (vo_script/on_screen_text/etc.) rather than which assets are bound.
+    # None means "not yet rendered" or "rendered before this column existed" (same rollout-
+    # safety semantics). Closes the "'Retry publish' on a failed cut can ship a stale
+    # pre-edit video" Open Issues item: an operator can edit `guide` (PATCH /cuts/{id}, or a
+    # hook-variant swap) only while a cut sits in "in_review", then trigger a re-render that
+    # FAILS — video_path still points at the PRE-EDIT file, while `guide` already reflects
+    # the edit. engine/publish/gate.py::assert_video_matches_guide() compares this against a
+    # fresh fingerprint of the current `guide` at publish time. See
+    # docs/specs/2026-09-stale-video-on-failed-rerender-system-design.md.
+    rendered_guide_fingerprint = Column(String(64))
     # Path to the SRT caption file written alongside the MP4 by composite_cut(), or None
     # when there was nothing to caption (e.g. silent voiceover_mode) or the cut predates
     # this feature. Written by render_cut; a re-render replaces it wholesale, same policy

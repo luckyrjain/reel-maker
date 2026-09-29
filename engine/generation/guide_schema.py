@@ -1,3 +1,5 @@
+import hashlib
+import json
 from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
@@ -77,3 +79,30 @@ class MasterGuide(BaseModel):
     cuts: list[PlatformGuide] = Field(
         description="One PlatformGuide per requested platform"
     )
+
+
+def compute_guide_fingerprint(guide: dict | None) -> str | None:
+    """Deterministic fingerprint of a serialized `PlatformGuide` dict (`cuts.guide`, see
+    api/models.py::Cut). Used by render_cut (worker/tasks/render.py) to snapshot what guide
+    content actually built a render, and by
+    engine/publish/gate.py::assert_video_matches_guide() to detect a later guide edit
+    (PATCH /cuts/{id}, or a hook-variant swap) followed by a re-render that fails before
+    `video_path` catches up — see docs/specs/2026-09-stale-video-on-failed-rerender-system-
+    design.md. The sibling of engine/render/asset_sourcer.py::compute_pins_fingerprint(),
+    same shape, different content: pins track which ASSETS are bound, this tracks the
+    guide's own text/timing content.
+
+    `json.dumps(guide, sort_keys=True)` — `sort_keys` makes dict-key ordering irrelevant at
+    every level, but deliberately does NOT touch list ordering: `beats` stays in its
+    meaningful sequence (beat order is semantic), and any genuine content change — including
+    a reordered `hashtags` list — changes the fingerprint. This mirrors
+    compute_pins_fingerprint()'s own "a genuine change to any one pin changes the
+    fingerprint" philosophy applied to guide content instead of asset pins.
+
+    Returns None for a falsy `guide` (not expected in practice — every call site here has
+    already confirmed `cut.guide` is set before a render can even be triggered — but matches
+    compute_pins_fingerprint()'s own None-in/None-out defensiveness rather than raising)."""
+    if not guide:
+        return None
+    canonical = json.dumps(guide, sort_keys=True)
+    return hashlib.sha256(canonical.encode()).hexdigest()[:64]

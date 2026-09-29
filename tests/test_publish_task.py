@@ -34,6 +34,8 @@ def _cut():
     # below that exercises the uploading branch would otherwise trip the NEW staleness check
     # instead of whatever it actually means to exercise.
     cut.rendered_pins_fingerprint = None
+    # Same rule, same reason, for assert_video_matches_guide()'s sibling staleness check.
+    cut.rendered_guide_fingerprint = None
     return cut
 
 
@@ -132,6 +134,35 @@ def test_stale_video_pins_mismatch_blocks_publish():
         patch(
             "engine.publish.gate.compute_pins_fingerprint_for_render",
             return_value="a-different-fingerprint-from-a-later-repin",
+        ),
+        patch.object(publish_cut, "retry", side_effect=Retry()) as mock_retry,
+    ):
+        with pytest.raises(ValueError, match="Re-render before publishing"):
+            publish_cut(1)
+
+    mock_retry.assert_not_called()
+    mock_get_publisher.assert_not_called()
+    mock_get_publisher.return_value.publish.assert_not_called()
+    assert job.status == models.JobStatus.failed
+
+
+def test_stale_video_guide_mismatch_blocks_publish():
+    """assert_video_matches_guide wiring: the sibling of test_stale_video_pins_mismatch_
+    blocks_publish above, for the guide-content fingerprint instead of the asset-pins one —
+    docs/specs/2026-09-stale-video-on-failed-rerender-system-design.md."""
+    from worker.tasks.publish import publish_cut
+
+    job = _job()
+    cut = _cut()
+    cut.rendered_guide_fingerprint = "fingerprint-from-the-render-that-built-video-path"
+    db = _db_with(job, cut)
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.publish.get_publisher") as mock_get_publisher,
+        patch(
+            "engine.publish.gate.compute_guide_fingerprint",
+            return_value="a-different-fingerprint-from-an-edited-guide",
         ),
         patch.object(publish_cut, "retry", side_effect=Retry()) as mock_retry,
     ):
@@ -306,6 +337,33 @@ def test_an_already_posted_cut_with_mismatched_pins_is_still_finalized_without_b
         patch(
             "engine.publish.gate.compute_pins_fingerprint_for_render",
             return_value="a-different-fingerprint-from-a-later-repin",
+        ),
+        patch("worker.tasks.publish.transition") as mock_transition,
+    ):
+        publish_cut(1)
+
+    mock_get_publisher.return_value.publish.assert_not_called()
+    mock_transition.assert_called_once_with(cut, "published", CUT_TRANSITIONS)
+    assert job.status == models.JobStatus.done
+
+
+def test_an_already_posted_cut_with_mismatched_guide_is_still_finalized_without_blocking():
+    """Sibling of test_an_already_posted_cut_with_mismatched_pins_is_still_finalized_
+    without_blocking above, for assert_video_matches_guide."""
+    from worker.tasks.publish import publish_cut
+
+    job = _job()
+    cut = _cut()
+    cut.platform_post_id = "yt-earlier"
+    cut.rendered_guide_fingerprint = "fingerprint-from-the-render-that-built-video-path"
+    db = _db_with(job, cut)
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.publish.get_publisher") as mock_get_publisher,
+        patch(
+            "engine.publish.gate.compute_guide_fingerprint",
+            return_value="a-different-fingerprint-from-an-edited-guide",
         ),
         patch("worker.tasks.publish.transition") as mock_transition,
     ):

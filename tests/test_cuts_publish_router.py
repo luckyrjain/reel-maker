@@ -411,6 +411,97 @@ def test_update_cut_reads_the_body_before_taking_the_row_lock(client):
     assert order == ["form", "lock"]
 
 
+def _make_cut_with_guide(session_factory, guide):
+    db = session_factory()
+    try:
+        reel = models.Reel(context="x", status=models.ReelStatus.guide_ready)
+        db.add(reel)
+        db.flush()
+        cut = models.Cut(
+            reel_id=reel.id, platform=models.CutPlatform.youtube_shorts,
+            status=models.CutStatus.in_review, video_path="/data/videos/1/youtube_shorts.mp4",
+            guide=guide,
+        )
+        db.add(cut)
+        db.commit()
+        return cut.id
+    finally:
+        db.close()
+
+
+_MULTILINE_GUIDE = {
+    "platform": "youtube_shorts", "target_length_s": 30.0,
+    "beats": [
+        {"index": 0, "type": "hook", "duration_s": 3.0, "visual_direction": "crowd",
+         "on_screen_text": ["He stopped three.", "Then another one."],
+         "vo_script": "He stopped three.\nThen another one. Nobody expected it."},
+    ],
+    "caption": "A caption", "hashtags": ["a", "b", "c", "d", "e"],
+}
+
+
+def test_update_cut_untouched_beat_fields_do_not_change_the_guide_or_its_fingerprint(client):
+    """Regression test for a real false-positive found by review: cut_card.html's edit
+    form resubmits EVERY beat field on every "Save changes" click, whether or not the
+    operator actually touched it, and a browser always re-encodes a <textarea>'s newlines
+    as CRLF on submit. Before this fix, a caption-only edit (or any edit that leaves a
+    multi-line vo_script textarea untouched) still rewrote cut.guide's vo_script with LF
+    replaced by CRLF, changing compute_guide_fingerprint()'s output for a render that
+    never actually went stale -- see docs/specs/2026-09-stale-video-on-failed-rerender-
+    system-design.md."""
+    from engine.generation.guide_schema import compute_guide_fingerprint
+
+    cut_id = _make_cut_with_guide(client._session_factory, _MULTILINE_GUIDE)
+    fingerprint_before = compute_guide_fingerprint(_MULTILINE_GUIDE)
+
+    resp = client.patch(f"/api/cuts/{cut_id}", data={
+        "caption": "An updated caption",
+        # The full beat-editing form, resubmitted verbatim (untouched) -- note the CRLF,
+        # matching what a real browser sends for a <textarea> regardless of whether its
+        # content was edited.
+        "beat_0_duration_s": "3.0",
+        "beat_0_visual_direction": "crowd",
+        "beat_0_vo_script": "He stopped three.\r\nThen another one. Nobody expected it.",
+        "beat_0_on_screen_text": "He stopped three.\r\nThen another one.",
+    })
+    assert resp.status_code == 200
+
+    db = client._session_factory()
+    try:
+        cut = db.get(models.Cut, cut_id)
+        assert cut.caption == "An updated caption"  # the actual edit did apply
+        assert cut.guide == _MULTILINE_GUIDE  # but the untouched guide is byte-for-byte unchanged
+        assert compute_guide_fingerprint(cut.guide) == fingerprint_before
+    finally:
+        db.close()
+
+
+def test_update_cut_still_writes_through_a_genuine_vo_script_edit(client):
+    """The other half of the regression guard above: a REAL content change must still be
+    written and must still change the fingerprint -- the fix must not make update_cut
+    silently drop real edits while chasing the false-positive above."""
+    from engine.generation.guide_schema import compute_guide_fingerprint
+
+    cut_id = _make_cut_with_guide(client._session_factory, _MULTILINE_GUIDE)
+    fingerprint_before = compute_guide_fingerprint(_MULTILINE_GUIDE)
+
+    resp = client.patch(f"/api/cuts/{cut_id}", data={
+        "beat_0_duration_s": "3.0",
+        "beat_0_visual_direction": "crowd",
+        "beat_0_vo_script": "He stopped three.\r\nThen a FOURTH. Nobody expected it.",
+        "beat_0_on_screen_text": "He stopped three.\r\nThen a FOURTH.",
+    })
+    assert resp.status_code == 200
+
+    db = client._session_factory()
+    try:
+        cut = db.get(models.Cut, cut_id)
+        assert "FOURTH" in cut.guide["beats"][0]["vo_script"]
+        assert compute_guide_fingerprint(cut.guide) != fingerprint_before
+    finally:
+        db.close()
+
+
 def test_a_failed_request_is_reported_to_the_operator_not_swallowed_by_htmx(client):
     """htmx does not swap 4xx/5xx responses, so without a handler the 503 for an unqueueable job
     looks like nothing happened."""

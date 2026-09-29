@@ -190,27 +190,57 @@ async def update_cut(cut_id: int, request: Request, db: Session = Depends(get_db
     if cut.guide:
         guide = dict(cut.guide)
         beats = [dict(b) for b in guide.get("beats", [])]
+        guide_changed = False
         for i in range(len(beats)):
             if form.get(f"beat_{i}_duration_s", "").strip():
                 try:
-                    beats[i]["duration_s"] = float(form[f"beat_{i}_duration_s"])
+                    new_duration = float(form[f"beat_{i}_duration_s"])
                 except ValueError:
                     pass
+                else:
+                    if new_duration != beats[i].get("duration_s"):
+                        beats[i]["duration_s"] = new_duration
+                        guide_changed = True
             if form.get(f"beat_{i}_visual_direction", "").strip():
-                beats[i]["visual_direction"] = form[f"beat_{i}_visual_direction"].strip()
+                new_vd = form[f"beat_{i}_visual_direction"].strip()
+                if new_vd != beats[i].get("visual_direction"):
+                    beats[i]["visual_direction"] = new_vd
+                    guide_changed = True
             if f"beat_{i}_vo_script" in form:
-                new_vo = form[f"beat_{i}_vo_script"].strip()
-                beats[i]["vo_script"] = new_vo
-                beats[i]["on_screen_text"] = _derive_on_screen(new_vo, max_lines=5)
+                # Normalize the textarea's CRLF line endings back to the LF this guide's
+                # vo_script was actually stored with (script_parser.py joins section
+                # bodies with "\n") — an HTML form always re-encodes a <textarea>'s
+                # newlines as \r\n on submit, touched or not, so comparing raw form
+                # output against the stored value would treat every single save of a
+                # multi-line vo_script as a content change even when nothing was edited.
+                # Caught in review: this exact false positive would spuriously trip
+                # Cut.rendered_guide_fingerprint's staleness gate (see engine/publish/
+                # gate.py::assert_video_matches_guide()) on an untouched beat.
+                new_vo = form[f"beat_{i}_vo_script"].replace("\r\n", "\n").strip()
+                if new_vo != beats[i].get("vo_script"):
+                    beats[i]["vo_script"] = new_vo
+                    beats[i]["on_screen_text"] = _derive_on_screen(new_vo, max_lines=5)
+                    guide_changed = True
             if f"beat_{i}_on_screen_text" in form:
                 lines = [
                     l.strip()
-                    for l in form[f"beat_{i}_on_screen_text"].splitlines()
+                    for l in form[f"beat_{i}_on_screen_text"].replace("\r\n", "\n").splitlines()
                     if l.strip()
                 ]
-                beats[i]["on_screen_text"] = lines[:5]
-        guide["beats"] = beats
-        cut.guide = guide
+                new_lines = lines[:5]
+                if new_lines != beats[i].get("on_screen_text"):
+                    beats[i]["on_screen_text"] = new_lines
+                    guide_changed = True
+        if guide_changed:
+            # Only reassign cut.guide when a beat field's NORMALIZED value actually
+            # differs from what's stored — a pure "Save changes" click that touched only
+            # the caption/hashtags (both separate Cut columns, not part of `guide` at
+            # all) must leave `guide` byte-for-byte untouched, or it would spuriously
+            # change Cut.rendered_guide_fingerprint's comparison target for a render that
+            # never actually went stale. See the vo_script comment above and
+            # docs/specs/2026-09-stale-video-on-failed-rerender-system-design.md.
+            guide["beats"] = beats
+            cut.guide = guide
 
     db.commit()
     return _cut_card(request, cut, db)

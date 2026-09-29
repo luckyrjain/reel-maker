@@ -7,6 +7,7 @@ safe_to_publish=True. Computing the field is not the same as enforcing it:
 this module is the one place that actually blocks a publish on it.
 """
 from api import models
+from engine.generation.guide_schema import compute_guide_fingerprint
 from engine.render.asset_sourcer import compute_pins_fingerprint_for_render
 
 
@@ -84,4 +85,41 @@ def assert_video_matches_pins(db, cut: "models.Cut") -> None:
             "Cannot publish — the rendered video no longer matches the currently pinned "
             "assets (a render after this video was built changed at least one beat's "
             "asset and then failed before completing). Re-render before publishing."
+        )
+
+
+def assert_video_matches_guide(db, cut: "models.Cut") -> None:
+    """Raise ValueError (deterministic, not retried — same class as
+    assert_safe_to_publish/assert_video_matches_pins) if the CURRENT `cut.guide` no longer
+    matches the guide content that built `cut.video_path`.
+
+    Closes the "'Retry publish' on a failed cut can ship a stale pre-edit video" Open
+    Issues item: an operator can edit `guide` (PATCH /cuts/{id}, or a hook-variant swap —
+    both gated to "in_review") and then trigger a re-render that FAILS before completing.
+    `video_path` still points at the PRE-EDIT video, `cut.guide` already reflects the edit,
+    and `CUT_TRANSITIONS["failed"]` intentionally allows retrying publish straight from the
+    "failed" card (so a failed *publish* doesn't force an unrelated full re-render) — which
+    would ship the stale video with no check that it still matches what the operator most
+    recently approved editing. See docs/specs/2026-09-stale-video-on-failed-rerender-
+    system-design.md for the full failure sequence.
+
+    Same rollout-safety null-handling as assert_video_matches_pins():
+    `cut.rendered_guide_fingerprint is None` means "no completed render has ever written
+    this column" (never rendered, or rendered before this column existed) — treated as
+    "unknown, don't block" rather than a mismatch, so this ships without retroactively
+    blocking every already-rendered cut in the database. Self-heals on that cut's next
+    successful re-render.
+
+    Takes the Cut object directly, same asymmetry as assert_video_matches_pins and for the
+    identical reason: publish_cut is the sole caller of all three gate functions and already
+    has the Cut loaded."""
+    if cut.rendered_guide_fingerprint is None:
+        return
+    current = compute_guide_fingerprint(cut.guide)
+    if current != cut.rendered_guide_fingerprint:
+        raise ValueError(
+            "Cannot publish — the rendered video no longer matches the current guide "
+            "(the guide was edited after this video was built, and the re-render that "
+            "should have caught up either failed or hasn't run yet). Re-render before "
+            "publishing."
         )
