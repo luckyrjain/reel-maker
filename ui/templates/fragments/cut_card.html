@@ -4,6 +4,7 @@
 
 {% set st = cut.status.value %}
 {% set editable = st == "in_review" %}
+{% set active_job = active_job|default(none) %}
 
 <div id="cut-card-{{ cut.id }}" class="cut-card">
 
@@ -232,9 +233,14 @@
     <p style="color:#5b21b6;font-size:0.85rem;margin-top:10px;">Scheduled for publishing.</p>
 
     {% elif st == "publishing" %}
+    {% if active_job %}
+    {% set job = active_job %}
+    {% include "fragments/publish_status.html" %}
+    {% else %}
     <p style="color:#92400e;font-size:0.85rem;margin-top:10px;">
       Publishing in progress — refresh to update.
     </p>
+    {% endif %}
 
     {% elif st == "published" %}
     <p class="success" style="margin-top:10px;">
@@ -254,9 +260,14 @@
     {% endif %}
 
     {% elif st == "rendering" %}
+    {% if active_job %}
+    {% set job = active_job %}
+    {% include "fragments/render_status.html" %}
+    {% else %}
     <p style="color:#92400e;font-size:0.85rem;margin-top:10px;">
       Rendering in progress — refresh to update.
     </p>
+    {% endif %}
 
     {% elif st == "failed" %}
     <p class="error" style="margin-top:10px;margin-bottom:8px;">

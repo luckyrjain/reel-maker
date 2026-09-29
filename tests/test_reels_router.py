@@ -129,6 +129,119 @@ def test_reel_detail_links_back_to_list(client):
     assert resp.status_code == 200
 
 
+def test_reel_detail_embeds_live_render_status_for_a_rendering_cut(client):
+    """Closes the "Cut page does not poll while rendering" Open Issues item: a fresh
+    GET /api/reels/{id} for a cut mid-render must embed the same self-polling
+    render_status.html fragment the triggering POST /render itself returns, not the
+    old static "refresh to update" message."""
+    reel_id = _make_reel(client._session_factory, cut_status=models.CutStatus.rendering)
+    db = client._session_factory()
+    try:
+        cut = db.query(models.Cut).filter(models.Cut.reel_id == reel_id).first()
+        job = models.Job(
+            type=models.JobType.render, reel_id=reel_id, cut_id=cut.id,
+            status=models.JobStatus.running, progress=45,
+        )
+        db.add(job)
+        db.commit()
+        job_id, cut_id = job.id, cut.id
+    finally:
+        db.close()
+
+    resp = client.get(f"/api/reels/{reel_id}")
+    assert resp.status_code == 200
+    assert f"/api/cuts/{cut_id}/render-status?job_id={job_id}" in resp.text
+    assert "Rendering in progress — refresh to update." not in resp.text
+
+
+def test_reel_detail_embeds_live_publish_status_for_a_publishing_cut(client):
+    """Same fix, publish side."""
+    reel_id = _make_reel(
+        client._session_factory, cut_status=models.CutStatus.publishing,
+        video_path="/data/videos/1/youtube_shorts.mp4",
+    )
+    db = client._session_factory()
+    try:
+        cut = db.query(models.Cut).filter(models.Cut.reel_id == reel_id).first()
+        job = models.Job(
+            type=models.JobType.publish, reel_id=reel_id, cut_id=cut.id,
+            status=models.JobStatus.running, progress=60,
+        )
+        db.add(job)
+        db.commit()
+        job_id, cut_id = job.id, cut.id
+    finally:
+        db.close()
+
+    resp = client.get(f"/api/reels/{reel_id}")
+    assert resp.status_code == 200
+    assert f"/api/cuts/{cut_id}/publish-status?job_id={job_id}" in resp.text
+    assert "Publishing in progress — refresh to update." not in resp.text
+
+
+def test_reel_detail_falls_back_to_static_message_without_an_active_job_row(client):
+    """Defensive branch: a rendering cut with no matching Job row (not expected in
+    normal operation — see active_job_for_cut()'s docstring) still renders a sensible
+    message instead of crashing or leaving the section blank."""
+    reel_id = _make_reel(client._session_factory, cut_status=models.CutStatus.rendering)
+    resp = client.get(f"/api/reels/{reel_id}")
+    assert resp.status_code == 200
+    assert "Rendering in progress — refresh to update." in resp.text
+
+
+def test_reel_detail_only_the_rendering_cut_gets_a_live_status_fragment(client):
+    """Multi-cut isolation: active_jobs is threaded per-cut via {% set active_job =
+    active_jobs.get(cut.id) %} in reel.html -- a reel with TWO rendering cuts, only one
+    of which has a matching Job row, must not leak cut_a's job onto cut_b's card (or
+    vice versa). Caught as an untested gap by an independent review round; verified by
+    rendering the real page through the real app rather than reasoning about Jinja
+    scoping in the abstract. Deliberately uses two cuts BOTH in "rendering" (not one
+    rendering + one draft) -- a mutation that threads a single shared active_job value
+    to every cut in the loop would otherwise go undetected here, since a non-rendering
+    cut never even reaches the branch that reads active_job at all."""
+    db = client._session_factory()
+    try:
+        reel = models.Reel(context="Multi-cut isolation reel", status=models.ReelStatus.guide_ready)
+        db.add(reel)
+        db.flush()
+        cut_with_job = models.Cut(
+            reel_id=reel.id, platform=models.CutPlatform.youtube_shorts,
+            status=models.CutStatus.rendering,
+        )
+        cut_without_job = models.Cut(
+            reel_id=reel.id, platform=models.CutPlatform.instagram_reels,
+            status=models.CutStatus.rendering,
+        )
+        db.add_all([cut_with_job, cut_without_job])
+        db.flush()
+        job = models.Job(
+            type=models.JobType.render, reel_id=reel.id, cut_id=cut_with_job.id,
+            status=models.JobStatus.running, progress=55,
+        )
+        db.add(job)
+        db.commit()
+        reel_id, with_job_id, without_job_id, job_id = (
+            reel.id, cut_with_job.id, cut_without_job.id, job.id,
+        )
+    finally:
+        db.close()
+
+    resp = client.get(f"/api/reels/{reel_id}")
+    assert resp.status_code == 200
+    # Exactly one live-status fragment on the whole page, naming cut_with_job's own job.
+    assert resp.text.count("hx-get=\"/api/cuts/") == 1
+    assert f"/api/cuts/{with_job_id}/render-status?job_id={job_id}" in resp.text
+    # cut_without_job's own card must show its status branch's static fallback, not
+    # cut_with_job's live fragment or job id bleeding across the loop iteration.
+    without_job_card = resp.text.split(f'id="cut-card-{without_job_id}"')[1]
+    with_job_card = resp.text.split(f'id="cut-card-{with_job_id}"')[1].split(
+        f'id="cut-card-{without_job_id}"'
+    )[0]
+    assert "Rendering in progress — refresh to update." in without_job_card
+    assert f"job_id={job_id}" not in without_job_card
+    assert f"job_id={job_id}" in with_job_card
+
+
 def test_failed_cut_card_has_no_duplicate_ids_and_valid_hx_targets(client):
     """Regression test: a "Retry publish" button once targeted #cut-card-{id}
     with outerHTML while the endpoint actually returns the small publish_status

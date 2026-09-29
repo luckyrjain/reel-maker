@@ -18,10 +18,39 @@ router = APIRouter()
 templates = Jinja2Templates(directory="ui/templates")
 
 
-def _cut_card(request: Request, cut: models.Cut) -> HTMLResponse:
+def active_job_for_cut(db: Session, cut: models.Cut) -> models.Job | None:
+    """The in-flight render/publish Job backing a `"rendering"`/`"publishing"` cut, if
+    any — lets a fresh page load (no live htmx poll chain yet) embed the same
+    self-polling render_status.html/publish_status.html fragment the triggering POST
+    itself returns, instead of a static "refresh to update" message. Closes the "Cut
+    page does not poll while rendering" Open Issues item.
+
+    Returns `None` for any other status, or defensively if no matching row is found —
+    not expected in normal operation: `trigger_render()`/`trigger_publish()` create the
+    Job in the same transaction that sets `cut.status`, and the 409 guard on
+    `cut.status` ensures only one such job is ever in flight per cut at a time.
+    cut_card.html falls back to the static message when this comes back `None`."""
+    job_type = {"rendering": models.JobType.render, "publishing": models.JobType.publish}.get(
+        cut.status.value
+    )
+    if job_type is None:
+        return None
+    return (
+        db.query(models.Job)
+        .filter(
+            models.Job.cut_id == cut.id,
+            models.Job.type == job_type,
+            models.Job.status.in_([models.JobStatus.pending, models.JobStatus.running]),
+        )
+        .order_by(models.Job.created_at.desc())
+        .first()
+    )
+
+
+def _cut_card(request: Request, cut: models.Cut, db: Session) -> HTMLResponse:
     return templates.TemplateResponse(
         request, "fragments/cut_card.html",
-        {"cut": cut},
+        {"cut": cut, "active_job": active_job_for_cut(db, cut)},
     )
 
 
@@ -140,7 +169,7 @@ async def update_cut(cut_id: int, request: Request, db: Session = Depends(get_db
         cut.guide = guide
 
     db.commit()
-    return _cut_card(request, cut)
+    return _cut_card(request, cut, db)
 
 
 @router.post("/cuts/{cut_id}/approve", response_class=HTMLResponse)
@@ -154,7 +183,7 @@ def approve_cut(cut_id: int, request: Request, db: Session = Depends(get_db)):
         )
     transition(cut, "approved", CUT_TRANSITIONS)
     db.commit()
-    return _cut_card(request, cut)
+    return _cut_card(request, cut, db)
 
 
 @router.post("/cuts/{cut_id}/publish", response_class=HTMLResponse)
@@ -279,7 +308,7 @@ async def choose_thumbnail(cut_id: int, request: Request, db: Session = Depends(
         raise HTTPException(status_code=422, detail="No such thumbnail candidate")
     cut.thumbnail_path = cut.thumbnail_candidates[index]
     db.commit()
-    return _cut_card(request, cut)
+    return _cut_card(request, cut, db)
 
 
 @router.post("/cuts/{cut_id}/hook-variant", response_class=HTMLResponse)
@@ -307,4 +336,4 @@ async def choose_hook_variant(cut_id: int, request: Request, db: Session = Depen
     guide["beats"] = beats
     cut.guide = guide
     db.commit()
-    return _cut_card(request, cut)
+    return _cut_card(request, cut, db)
