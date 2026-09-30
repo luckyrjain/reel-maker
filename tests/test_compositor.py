@@ -19,9 +19,11 @@ import numpy as np
 import pytest
 import soundfile as sf
 from moviepy import AudioFileClip, VideoFileClip
+from PIL import Image
 
 from engine.render.compositor import (
-    DEFAULT_TEXT_COLOR, TARGET_H, TARGET_W, _build_ffmpeg_args, _build_text_filter,
+    DEFAULT_TEXT_COLOR, TARGET_H, TARGET_W, _build_beat_clip, _build_collage_clip,
+    _build_ffmpeg_args, _build_text_filter,
     _write_thumbnail_candidates,
     composite_cut,
 )
@@ -596,3 +598,180 @@ def test_text_filter_percent_expansion_stays_literal_not_expanded(tmp_path):
 
     assert frame_early != frame_no_text   # text is actually visible in the frame
     assert frame_early == frame_late
+
+
+# ── 2-up collage layout (docs/specs/2026-09-multi-image-collage-system-design.md) ──
+
+def _sample_pixel(video_path, t: float, x_frac: float, y_frac: float, out_path) -> tuple:
+    """Extract the frame at time `t` from a real rendered MP4 and return the RGB
+    pixel at the given fractional (x_frac, y_frac) position -- used to prove two
+    collage halves are visible SIMULTANEOUSLY at the same timestamp, which a
+    doesn't-crash-only test can't distinguish from the old sequential cycling."""
+    subprocess.run(
+        ["ffmpeg", "-y", "-ss", str(t), "-i", str(video_path), "-frames:v", "1", str(out_path)],
+        capture_output=True, check=True,
+    )
+    img = Image.open(out_path).convert("RGB")
+    x, y = int(img.width * x_frac), int(img.height * y_frac)
+    return img.getpixel((x, y))
+
+
+def _assert_close_to(rgb, expected, tol=40):
+    assert all(abs(a - b) <= tol for a, b in zip(rgb, expected)), f"{rgb} not close to {expected}"
+
+
+def test_composite_cut_collage_shows_both_items_simultaneously(tmp_path):
+    """The actual bug this design fixes: a 2-item beat used to cycle
+    sequentially, each item visible for only half the beat. Two distinctly
+    colored real videos, sampled on the LEFT and RIGHT quarters of the frame at
+    the SAME timestamp (the beat's midpoint): only a collage shows red on the
+    left AND blue on the right at once -- the old sequential path would show
+    only one color at any given instant. Explicit RGB tolerance (not exact
+    equality) to absorb H.264 compression drift."""
+    red_video = tmp_path / "red.mp4"
+    _make_test_video(red_video, duration_s=2.0, color="red")
+    blue_video = tmp_path / "blue.mp4"
+    _make_test_video(blue_video, duration_s=2.0, color="blue")
+
+    beats = [{"duration_s": 2.0, "vo_script": "", "on_screen_text": []}]
+    out = tmp_path / "out.mp4"
+    thumb = tmp_path / "thumb.jpg"
+
+    composite_cut(
+        beats=beats,
+        beat_video_paths=[[red_video, blue_video]],
+        beat_vo_paths=[None],
+        output_path=out, thumbnail_path=thumb,
+    )
+
+    left_rgb = _sample_pixel(out, 1.0, 0.25, 0.5, tmp_path / "left.png")
+    right_rgb = _sample_pixel(out, 1.0, 0.75, 0.5, tmp_path / "right.png")
+
+    _assert_close_to(left_rgb, (255, 0, 0))
+    _assert_close_to(right_rgb, (0, 0, 255))
+
+
+def test_composite_cut_closes_readers_for_a_collage_beat(tmp_path):
+    """The collage path's own reader-leak regression, mirroring
+    test_composite_cut_closes_every_video_reader_it_opens() above for the
+    sequential path -- two real videos in ONE beat, both opened via
+    _build_media_sub_clip() inside _build_collage_clip(), must both be closed
+    by composite_cut()'s existing finally block."""
+    red_video = tmp_path / "red2.mp4"
+    _make_test_video(red_video, duration_s=2.0, color="red")
+    blue_video = tmp_path / "blue2.mp4"
+    _make_test_video(blue_video, duration_s=2.0, color="blue")
+
+    beats = [{"duration_s": 2.0, "vo_script": "", "on_screen_text": []}]
+    out = tmp_path / "out.mp4"
+    thumb = tmp_path / "thumb.jpg"
+
+    with _ReaderTracker() as tracker:
+        composite_cut(
+            beats=beats,
+            beat_video_paths=[[red_video, blue_video]],
+            beat_vo_paths=[None],
+            output_path=out, thumbnail_path=thumb,
+        )
+
+    assert out.exists()
+    tracker.assert_every_opened_reader_was_closed()
+
+
+def test_build_beat_clip_does_not_use_collage_for_one_or_three_items():
+    """Collage is scoped to EXACTLY 2 items -- 1-item and 3+-item beats keep
+    today's sequential-cycling behavior unchanged. Mocking _build_collage_clip
+    to raise if it's ever called proves the boundary directly rather than
+    inferring it from output pixels."""
+    with patch(
+        "engine.render.compositor._build_collage_clip",
+        side_effect=AssertionError("collage must not be used for a non-2-item beat"),
+    ):
+        clip1, readers1 = _build_beat_clip([None], 2.0)
+        clip3, readers3 = _build_beat_clip([None, None, None], 3.0)
+
+    assert clip1.duration == 2.0
+    assert clip3.duration == 3.0
+    assert readers1 == []
+    assert readers3 == []
+
+
+def test_build_beat_clip_collage_respects_the_duration_floor(tmp_path):
+    """Regression for a design-review-caught bug: the `len(media_paths) == 2`
+    branch in _build_beat_clip() must sit AFTER the existing
+    `duration_s = max(duration_s, 0.5)` floor, not before it -- placed before,
+    a short real beat would reach _build_collage_clip() with an unfloored
+    (near-zero) duration, diverging from every other path's guarantee.
+    Mutation-tested by moving the branch above the floor line and confirming
+    this then fails with clip.duration == 0.1 instead of 0.5."""
+    video = tmp_path / "v.mp4"
+    _make_test_video(video, duration_s=1.0)
+
+    clip, readers = _build_beat_clip([video, video], 0.1)
+    try:
+        assert clip.duration == 0.5
+    finally:
+        for r in readers:
+            r.close()
+
+
+def test_build_collage_clip_closes_both_readers_when_the_crop_or_composite_step_fails(tmp_path):
+    """A second review round (Security/Red-Team, on the opened PR) caught a gap
+    the first draft's try/except didn't cover: it only closed readers when the
+    SECOND _build_media_sub_clip() call raised. Once BOTH sub-clips already
+    succeeded, _center_crop_half()/the CompositeVideoClip(...) construction ran
+    with no exception handling at all -- either raising there would leak two
+    real VideoFileClip readers with no caller ever able to reach them, the
+    identical leak class this codebase mutation-tested and fixed four times
+    already for the sequential path (Phase 7i). Forces the failure in
+    _center_crop_half() -- after both real videos have already opened readers
+    -- and asserts both are closed, not just the first item's."""
+    left_video = tmp_path / "left.mp4"
+    _make_test_video(left_video, duration_s=2.0, color="red")
+    right_video = tmp_path / "right.mp4"
+    _make_test_video(right_video, duration_s=2.0, color="blue")
+
+    with (
+        _ReaderTracker() as tracker,
+        patch(
+            "engine.render.compositor._center_crop_half",
+            side_effect=RuntimeError("simulated crop failure after both sub-clips succeeded"),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="simulated crop failure"):
+            _build_collage_clip([left_video, right_video], 2.0)
+
+    tracker.assert_every_opened_reader_was_closed()
+
+
+def test_build_collage_clip_with_one_missing_path_renders_a_black_half(tmp_path):
+    """Defensive-only case (real code never produces a mixed real/missing pair
+    today -- see the design doc's Failure-strategy section) -- but
+    _build_collage_clip() must not crash if it ever does: the missing side
+    degrades to a black half via _build_media_sub_clip()'s own existing
+    None/missing-file handling, same as a single-item beat already does.
+
+    A Test-Quality Auditor review caught the first version of this test
+    proving only "doesn't crash + right shape" -- any non-crashing fill of the
+    right dimensions would have passed, black or not. Samples the RIGHT
+    half's actual pixel content (media_paths[1] is the missing path) via
+    clip.get_frame() -- a pure in-memory MoviePy read, no ffmpeg render
+    needed -- and asserts it's genuinely near-black, not just present."""
+    red_video = tmp_path / "red_v.mp4"
+    _make_test_video(red_video, duration_s=2.0, color="red")
+    missing = tmp_path / "does_not_exist.mp4"
+
+    clip, readers = _build_collage_clip([red_video, missing], 2.0)
+    try:
+        assert clip.duration == 2.0
+        assert clip.size == (TARGET_W, TARGET_H)
+        assert len(readers) >= 1   # the real `red_video` side opened at least one reader
+
+        frame = clip.get_frame(1.0)
+        right_pixel = frame[TARGET_H // 2, int(TARGET_W * 0.75)]
+        assert all(c <= 20 for c in right_pixel[:3]), (
+            f"missing-path half should render near-black, got {right_pixel}"
+        )
+    finally:
+        for r in readers:
+            r.close()

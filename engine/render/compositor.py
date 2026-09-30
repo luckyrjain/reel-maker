@@ -358,6 +358,67 @@ def _build_text_filter(
     return ",".join(parts) if parts else "null"
 
 
+def _center_crop_half(clip):
+    """Crop an already-9:16 (TARGET_W x TARGET_H) clip to its centered half-width
+    strip, for the 2-up collage layout. A pure lazy MoviePy transform — like
+    .resized()/.subclipped() elsewhere in this file, it shares the underlying
+    reader via shallow copy and opens no new VideoFileClip. Both _ken_burns()'s
+    zoom keyframes and this crop are centered on the same full frame, so nesting
+    them stays centered at every timestamp — no independent drift."""
+    return clip.cropped(
+        x_center=clip.w / 2, y_center=clip.h / 2,
+        width=TARGET_W // 2, height=TARGET_H,
+    )
+
+
+def _build_collage_clip(media_paths: list[Path | None], duration_s: float):
+    """2-up side-by-side layout for a beat with exactly two resolved media items,
+    e.g. a beat naming two people, each with their own Wikipedia photo (the
+    realistic multi-item case — see engine/render/asset_sourcer.py::
+    resolve_beat_assets()'s Wikipedia branch). Both items play for the FULL beat
+    duration side by side, instead of _build_beat_clip()'s default sequential
+    cycling (duration split N ways). Only used for exactly 2 items — see
+    docs/specs/2026-09-multi-image-collage-system-design.md for why 3+ falls
+    back to sequential rather than a grid.
+
+    Returns (clip, readers) — same shape as _build_media_sub_clip()/
+    _build_beat_clip(): the returned clip is a CompositeVideoClip, and
+    CompositeVideoClip.close() does not cascade to nested clips, but nothing
+    relies on that — the real VideoFileClip readers opened by the two
+    _build_media_sub_clip() calls below are exactly what the caller's existing
+    readers-list threading already closes, unchanged. bg_color=(0, 0, 0) on the
+    composite avoids MoviePy's transparent/alpha-mask compositing path (real
+    per-frame work) — the two halves already tile the full frame edge to edge,
+    so no background pixel is ever visible anyway.
+
+    Everything after the first _build_media_sub_clip() call is wrapped in one
+    try/except that closes every reader accumulated so far before re-raising —
+    not just readers opened by the SECOND _build_media_sub_clip() call. A
+    security review caught the first draft only guarded that second call:
+    _center_crop_half() or the CompositeVideoClip(...) construction raising
+    after BOTH sub-clips already succeeded would otherwise leak both real
+    VideoFileClip readers with no caller ever able to reach them — the exact
+    leak class this codebase mutation-tested and fixed four times already for
+    the sequential path (Phase 7i, CLAUDE.md's Key conventions).
+    """
+    left_clip, left_readers = _build_media_sub_clip(media_paths[0], duration_s)
+    readers = list(left_readers)
+    try:
+        right_clip, right_readers = _build_media_sub_clip(media_paths[1], duration_s)
+        readers.extend(right_readers)
+        left = _center_crop_half(left_clip).with_position((0, 0))
+        right = _center_crop_half(right_clip).with_position((TARGET_W // 2, 0))
+        collage = CompositeVideoClip([left, right], size=(TARGET_W, TARGET_H), bg_color=(0, 0, 0))
+        return collage, readers
+    except Exception:
+        for r in readers:
+            try:
+                r.close()
+            except Exception:
+                pass
+        raise
+
+
 def _build_beat_clip(
     media_paths: list[Path | None],
     duration_s: float,
@@ -380,6 +441,15 @@ def _build_beat_clip(
 
     if not media_paths:
         media_paths = [None]
+
+    # Exactly 2 items -> side-by-side collage, both playing the full beat
+    # duration. This branch must stay AFTER the duration floor and the
+    # empty-list guard above — placed earlier, a short real beat would reach
+    # _build_collage_clip() with an unfloored (possibly near-zero) duration,
+    # diverging from every other path's guarantee. See
+    # docs/specs/2026-09-multi-image-collage-system-design.md Correction 2.
+    if len(media_paths) == 2:
+        return _build_collage_clip(media_paths, duration_s)
 
     per = duration_s / len(media_paths)
     sub_clips = []
