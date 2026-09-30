@@ -1049,3 +1049,162 @@ def test_visual_variety_still_penalizes_a_mostly_other_reel_that_incidentally_ma
     )
     _, issues = score_guide(_CTX_FINANCE, guide, 45)
     assert _axis_deduction(issues, "variety") == 2, issues
+
+
+# ── CAR-2 decomposition review: mutation-testing found these sub-axis behaviors
+# had no dedicated assertion (surviving a reverted fix silently) — a deep 4-persona
+# review on the PR that decomposed score_guide() into per-axis functions
+# (docs/specs/2026-09-score-guide-decomposition-module-design.md) caught this via
+# real mutation testing, not inspection. Each test below is itself mutation-tested
+# against the specific regression it guards.
+
+def test_duration_deduction_accumulates_across_multiple_cuts_not_just_the_last():
+    """_score_duration() loops over guide.cuts, accumulating into one local total
+    via `deduction += dur_deduction` -- a regression that collapsed this to a plain
+    `deduction = dur_deduction` (only the last mismatched cut survives) passed every
+    pre-existing test silently, since no fixture gave two cuts different duration
+    ratios. Two cuts, each independently mismatched in a different direction (one
+    far too short, one far too long), each capped at the per-cut max of 5 -- the
+    combined deduction must be their SUM (10), not just one cut's contribution."""
+    beats = [
+        _beat(0, "hook", 3, "Could Argentina win the World Cup?", "Argentina training"),
+        _beat(1, "body", 4, "Messi creates chances every match.", "Messi highlights"),
+        _beat(2, "cta", 3, "Drop your prediction below.", "logo"),
+    ]   # beats sum to 10s
+
+    def _cut(platform, target_length_s):
+        return PlatformGuide(
+            platform=platform, target_length_s=target_length_s,
+            caption="Argentina's tournament run, broken down beat by beat for you.",
+            hashtags=["football"] * 12, beats=list(beats),
+        )
+
+    # cut A: 10s vs target 100s -> ratio 0.10, far below 0.70 -> dur_deduction=5
+    # cut B: 10s vs target 6s   -> ratio 1.667, far above 1.30 -> dur_deduction=5
+    guide = MasterGuide(
+        title="Test", niche="football",
+        cuts=[_cut("youtube_shorts", 100), _cut("instagram_reels", 6)],
+    )
+    _, issues = score_guide(_CTX, guide, 45)
+    assert _axis_deduction(issues, "duration") == 10, issues
+
+
+def test_caption_hashtag_deduction_accumulates_within_and_across_cuts():
+    """_score_caption_hashtag() accumulates two independent per-cut checks (caption
+    too short, too few hashtags) via `deduction += 2` each, across every cut in
+    guide.cuts -- a regression that collapsed either accumulation to a plain
+    `deduction = 2` passed every pre-existing test silently, since no fixture
+    combined both violations in one cut or repeated a violation across cuts. Two
+    identical cuts, EACH violating both caption length and hashtag count, must
+    deduct 2+2 per cut, summed across both cuts: 8 total."""
+    beats = [
+        _beat(0, "hook", 5, "Could Argentina win?", "Argentina training"),
+        _beat(1, "body", 30, "Messi creates 12 key passes.", "Messi highlights"),
+        _beat(2, "cta", 10, "Subscribe for more.", "logo"),
+    ]
+
+    def _bad_cut(platform):
+        return PlatformGuide(
+            platform=platform, target_length_s=45,
+            caption="Hi.",
+            hashtags=["football", "messi", "argentina", "worldcup", "soccer"],
+            beats=list(beats),
+        )
+
+    guide = MasterGuide(
+        title="Test", niche="football",
+        cuts=[_bad_cut("youtube_shorts"), _bad_cut("instagram_reels")],
+    )
+    _, issues = score_guide(_CTX, guide, 45)
+    assert _axis_deduction(issues, "caption_hashtag") == 8, issues
+
+
+def test_emotion_distribution_deducts_separately_from_and_on_top_of_density():
+    """_score_emotion() has two independently-evaluated deduction sources into the
+    SAME key: the density if/elif/elif chain, and a separate `if total_hits >= 4:`
+    distribution check that ADDS 3 more when emotion words cluster in too few
+    beats. A regression that dropped the distribution block entirely (not just
+    weakened it) passed every pre-existing test silently -- no test exercised the
+    distribution sub-axis in isolation. 4 distinct positive emotion words (single
+    polarity -> density elif deducts 2) all placed in ONE beat out of 4 (clustered,
+    below the 40% spread threshold) must deduct 2+3=5; the same 4 words spread
+    across beats so >=2 beats carry emotion must deduct only the density 2."""
+    clustered = _guide(
+        _beat(0, "hook", 5, "Could this decide the whole tournament for Argentina?", "Argentina training"),
+        _beat(1, "body", 10,
+              "This squad has glory, legacy, triumph, and an iconic chance ahead of it.",
+              "Argentina celebration"),
+        _beat(2, "body", 10, "Romero presses hard in every match.", "Romero tackle"),
+        _beat(3, "cta", 5, "Drop your prediction below.", "logo"),
+    )
+    spread = _guide(
+        _beat(0, "hook", 5, "Could this be Argentina's glory moment?", "Argentina training"),
+        _beat(1, "body", 10, "This squad carries real legacy into the tournament.", "Argentina celebration"),
+        _beat(2, "body", 10, "Romero's triumph last season was iconic for the whole team.", "Romero tackle"),
+        _beat(3, "cta", 5, "Drop your prediction below.", "logo"),
+    )
+    _, issues_clustered = score_guide(_CTX, clustered, 45)
+    _, issues_spread = score_guide(_CTX, spread, 45)
+    assert _axis_deduction(issues_clustered, "emotion") == 5, issues_clustered
+    assert _axis_deduction(issues_spread, "emotion") == 2, issues_spread
+    assert any("clustered" in i.lower() for i in issues_clustered)
+
+
+def test_retention_momentum_sub_axis_deducts_when_every_beat_has_flat_energy():
+    """_score_retention()'s momentum sub-axis (0-5 pts) deducts when every beat
+    shares the same energy signature and no beat is notably short or long -- a
+    regression that zeroed this sub-axis out silently passed every pre-existing
+    test, since no fixture isolated momentum from the hook/open-loop sub-axes
+    sharing the same 'retention' key. This guide is built so hook quality (10/10)
+    and open loops (2 trigger phrases, 5/5) are BOTH maxed out -- any nonzero
+    'retention' deduction here can only come from momentum. Every beat contains
+    '?' (uniform 'question' energy) and every beat's word count sits in the
+    11-24 range (avoiding the has_short/has_long momentum bonuses), producing a
+    single flat energy signature and the full 5-pt momentum deduction."""
+    guide = _guide(
+        _beat(0, "hook", 5,
+              "Could this secret decide Argentina's World Cup dream, you ask? It really might.",
+              "Argentina training"),
+        _beat(1, "body", 10,
+              "However the left-back position is genuinely exposed, isn't it a concern?",
+              "Tagliafico defending"),
+        _beat(2, "body", 10,
+              "But here's the real question, could Romero really cover that gap?",
+              "Romero tackle"),
+        _beat(3, "cta", 5,
+              "So could that one decision decide everything, will the fans ever truly forgive it?",
+              "Argentina squad"),
+    )
+    _, issues = score_guide(_CTX, guide, 45)
+    assert _axis_deduction(issues, "retention") == 5, issues
+    assert any("flat energy" in i.lower() for i in issues)
+
+
+def test_audio_hook_pacing_problems_are_weighted_double_body_pacing_problems():
+    """_score_audio() weighs a rushed HOOK beat's pacing problem at 4 pts and a
+    rushed BODY beat's at 2 pts (`len(hook_pacing_problems) * 4 + len(pacing_problems)
+    * 2`) -- a rushed hook is the worst first impression. A regression that
+    equalized these weights (e.g. both at 2) passed every pre-existing test
+    silently, since no test compared the two deduction magnitudes directly. One
+    rushed hook beat (wps > MAX_WPS_HOOK=3.0) must deduct exactly 4; one
+    equally-rushed body beat (wps > MAX_WPS=4.0) must deduct exactly 2."""
+    # Every guide needs >=3 beats (schema minimum) and every non-rushed filler
+    # beat is deliberately kept clear of every OTHER pacing trigger this same axis
+    # checks (MIN_WPS silent-gap, the >16-word opener check, the "all beats same
+    # length" monotone-rhythm check) so the only nonzero "audio" contribution is
+    # the one rushed beat under test -- word counts are picked from real fillers
+    # so each `_word_count` claim below is exact, not approximate.
+    rushed_hook = _guide(
+        _beat(0, "hook", 2.0, "word " * 7 + "word", "Argentina training"),    # 8w/2.0s = 4.0 wps > 3.0 (hook cap)
+        _beat(1, "body", 8.0, "word " * 19 + "word", "Romero tackle"),        # 20w/8.0s = 2.5 wps, safe
+        _beat(2, "cta", 6.0, "word " * 7 + "word", "logo"),                   # 8w/6.0s = 1.33 wps, safe
+    )
+    rushed_body = _guide(
+        _beat(0, "hook", 5.0, "word " * 7 + "word", "Argentina training"),    # 8w/5.0s = 1.6 wps, safe
+        _beat(1, "body", 4.0, "word " * 19 + "word", "Romero tackle"),        # 20w/4.0s = 5.0 wps > 4.0 (MAX_WPS)
+        _beat(2, "cta", 6.0, "word " * 7 + "word", "logo"),                   # 8w/6.0s = 1.33 wps, safe
+    )
+    _, issues_hook = score_guide(_CTX, rushed_hook, 45)
+    _, issues_body = score_guide(_CTX, rushed_body, 45)
+    assert _axis_deduction(issues_hook, "audio") == 4, issues_hook
+    assert _axis_deduction(issues_body, "audio") == 2, issues_body

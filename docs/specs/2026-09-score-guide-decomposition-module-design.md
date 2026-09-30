@@ -65,3 +65,36 @@ Zero external in-process callers beyond `worker/tasks/generate.py`'s 2 existing 
 (structured + standard path), both unaffected — the public `score_guide(context, guide, target_length_s,
 axis_multipliers=None) -> (score, issues)` contract is unchanged. All 41 tests exercise that public contract
 only; none call any per-axis internal directly, confirmed via grep before implementing.
+
+## 7. Corrections — deep 4-persona review on the opened PR
+
+Security/Red-Team, Correctness/Edge-Case, and Documentation-Consistency found no defects on this PR — a
+direct line-by-line diff against the original inline code (not just "41 tests pass") confirmed every one of
+the 17 extracted functions is a verbatim transcription, the `axis_multipliers` correction block is
+byte-identical, and every doc claim in this file and CLAUDE.md checks out against the code.
+
+**Test-Quality Auditor, independently corroborated by Correctness/Edge-Case, found real test-coverage
+gaps** — not regressions in this PR's code (both reviewers confirmed the extracted logic is correct), but
+real gaps in what the 41 pre-existing tests actually exercise, now newly visible as a decomposition
+boundary a future maintainer could edit in isolation without any test catching a regression. Both reviewers
+independently mutation-tested (not just inspected) the same handful of sub-axis behaviors and found each
+survived silently:
+
+- `_score_duration()`/`_score_caption_hashtag()`'s multi-cut accumulation (`deduction += ...` inside a
+  `for cut in guide.cuts:` loop) — no fixture in the file ever gave two cuts genuinely different
+  duration-mismatch ratios or combined a caption-too-short violation with a too-few-hashtags violation in
+  one cut, so collapsing the accumulator to a plain `deduction = ...` (losing everything but the last
+  write) passed all 41 tests.
+- `_score_emotion()`'s distribution sub-block (the separate `if total_hits >= 4:` clustering check, additive
+  on top of the density elif chain) — no test exercised it in isolation; deleting the block outright passed
+  all 41 tests.
+- `_score_retention()`'s momentum sub-axis and `_score_audio()`'s hook-vs-body pacing weight (×4 vs ×2) —
+  both are one of three additive contributions into a shared `retention`/`audio` key with no test isolating
+  that specific sub-axis's value; zeroing momentum out, or equalizing the audio weights, both passed all 41
+  tests.
+
+Closed with 5 new regression tests in `tests/test_evaluator.py`, each constructed to isolate exactly one
+sub-axis (e.g. the momentum test deliberately maxes out the hook and open-loop sub-axes first, so any
+nonzero `retention` deduction it observes can only come from momentum) and each mutation-tested against the
+exact regression it guards — the mutation applied, the test confirmed to fail for the predicted reason, then
+reverted. Full suite: 797 passed / 3 skipped / 1 deselected, `ruff check --select F,E9 .` clean.
