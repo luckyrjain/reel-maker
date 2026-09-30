@@ -715,21 +715,63 @@ def test_build_beat_clip_collage_respects_the_duration_floor(tmp_path):
             r.close()
 
 
+def test_build_collage_clip_closes_both_readers_when_the_crop_or_composite_step_fails(tmp_path):
+    """A second review round (Security/Red-Team, on the opened PR) caught a gap
+    the first draft's try/except didn't cover: it only closed readers when the
+    SECOND _build_media_sub_clip() call raised. Once BOTH sub-clips already
+    succeeded, _center_crop_half()/the CompositeVideoClip(...) construction ran
+    with no exception handling at all -- either raising there would leak two
+    real VideoFileClip readers with no caller ever able to reach them, the
+    identical leak class this codebase mutation-tested and fixed four times
+    already for the sequential path (Phase 7i). Forces the failure in
+    _center_crop_half() -- after both real videos have already opened readers
+    -- and asserts both are closed, not just the first item's."""
+    left_video = tmp_path / "left.mp4"
+    _make_test_video(left_video, duration_s=2.0, color="red")
+    right_video = tmp_path / "right.mp4"
+    _make_test_video(right_video, duration_s=2.0, color="blue")
+
+    with (
+        _ReaderTracker() as tracker,
+        patch(
+            "engine.render.compositor._center_crop_half",
+            side_effect=RuntimeError("simulated crop failure after both sub-clips succeeded"),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="simulated crop failure"):
+            _build_collage_clip([left_video, right_video], 2.0)
+
+    tracker.assert_every_opened_reader_was_closed()
+
+
 def test_build_collage_clip_with_one_missing_path_renders_a_black_half(tmp_path):
     """Defensive-only case (real code never produces a mixed real/missing pair
     today -- see the design doc's Failure-strategy section) -- but
     _build_collage_clip() must not crash if it ever does: the missing side
     degrades to a black half via _build_media_sub_clip()'s own existing
-    None/missing-file handling, same as a single-item beat already does."""
-    video = tmp_path / "v.mp4"
-    _make_test_video(video, duration_s=2.0)
+    None/missing-file handling, same as a single-item beat already does.
+
+    A Test-Quality Auditor review caught the first version of this test
+    proving only "doesn't crash + right shape" -- any non-crashing fill of the
+    right dimensions would have passed, black or not. Samples the RIGHT
+    half's actual pixel content (media_paths[1] is the missing path) via
+    clip.get_frame() -- a pure in-memory MoviePy read, no ffmpeg render
+    needed -- and asserts it's genuinely near-black, not just present."""
+    red_video = tmp_path / "red_v.mp4"
+    _make_test_video(red_video, duration_s=2.0, color="red")
     missing = tmp_path / "does_not_exist.mp4"
 
-    clip, readers = _build_collage_clip([video, missing], 2.0)
+    clip, readers = _build_collage_clip([red_video, missing], 2.0)
     try:
         assert clip.duration == 2.0
         assert clip.size == (TARGET_W, TARGET_H)
-        assert len(readers) >= 1   # the real `video` side opened at least one reader
+        assert len(readers) >= 1   # the real `red_video` side opened at least one reader
+
+        frame = clip.get_frame(1.0)
+        right_pixel = frame[TARGET_H // 2, int(TARGET_W * 0.75)]
+        assert all(c <= 20 for c in right_pixel[:3]), (
+            f"missing-path half should render near-black, got {right_pixel}"
+        )
     finally:
         for r in readers:
             r.close()

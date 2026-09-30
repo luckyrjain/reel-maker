@@ -302,3 +302,42 @@ leak/text-filter independence claims, and confirmed the MoviePy API usage (`.cro
    the first three; the type-agnostic claim is accepted as covered by the existing per-type
    `_build_media_sub_clip()` test coverage rather than needing a fourth new collage-specific test,
    since `_build_collage_clip()` calls that function unmodified.
+
+## 11. Corrections — Round 2 (deep 4-persona review on the opened PR)
+
+A second review round — Security/Red-Team, Correctness/Edge-Case, Test-Quality Auditor,
+Documentation-Consistency, this pipeline's default review depth per session convention — ran against
+PR #24 after §10's fixes were already implemented and tested. Correctness/Edge-Case found nothing
+(explicitly traced `_center_crop_half()`'s bounds against all three `_build_media_sub_clip()` return
+paths, the sole `_build_collage_clip()` call site, the pixel-boundary math, and the untouched 1-/3+-
+item path — all confirmed correct). The other three found:
+
+1. **A second reader-leak gap, real (Security/Red-Team)** — `_build_collage_clip()`'s try/except only
+   covered the *second* `_build_media_sub_clip()` call; once both sub-clips succeeded,
+   `_center_crop_half()` and the `CompositeVideoClip(...)` construction ran with no exception
+   handling at all. Either raising after both real readers were already open would leak both — the
+   identical leak class this codebase mutation-tested and fixed four separate times already for the
+   sequential path (Phase 7i). Not attacker-reachable (no untrusted input selects which step raises),
+   so a robustness gap rather than an exploitable vulnerability, but a real one matching this
+   codebase's own established bar. Fixed by widening the try block to cover everything after the
+   first `_build_media_sub_clip()` call, accumulating readers into one list closed on any failure in
+   that block — not just the second sub-clip build.
+2. **A vacuous test, real (Test-Quality Auditor)** —
+   `test_build_collage_clip_with_one_missing_path_renders_a_black_half` asserted only `clip.duration`,
+   `clip.size`, and `len(readers) >= 1` — it never sampled a pixel, so any non-crashing fill of the
+   right dimensions (not necessarily black) would have passed. `_build_media_sub_clip()`'s own
+   black-frame behavior is real, but this specific test couldn't have caught a regression that broke
+   it. Fixed by sampling the missing side's actual pixel via `clip.get_frame()` (a pure in-memory
+   MoviePy read, no re-render needed) and asserting it's genuinely near-black.
+3. **A doc arithmetic slip, real but not originating in this PR (Documentation-Consistency)** —
+   CLAUDE.md's total pytest count comment already read "777" on `main` before this PR touched it,
+   while `main`'s actual collected count is 778 (774 passed + 3 skipped + 1 deselected) — a
+   pre-existing off-by-one this PR didn't introduce. This PR's own edit (777→782, +5 for the new
+   collage tests) carried the error forward instead of correcting it. Fixed by setting the line to
+   783 (779 passed + 3 skipped + 1 deselected on this branch) — the true post-merge count, which
+   incidentally also corrects the pre-existing discrepancy going forward. Every other doc claim
+   checked (the Key-conventions bullet's `bg_color`/branch-ordering claims, the module-layout entry,
+   the roadmap row, the architecture.md edits, and the design doc's own §4 code sketch against the
+   merged code) matched the actual code exactly.
+
+All three fixes applied and the full suite re-verified green before merge.

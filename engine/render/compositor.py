@@ -384,27 +384,39 @@ def _build_collage_clip(media_paths: list[Path | None], duration_s: float):
     Returns (clip, readers) — same shape as _build_media_sub_clip()/
     _build_beat_clip(): the returned clip is a CompositeVideoClip, and
     CompositeVideoClip.close() does not cascade to nested clips, but nothing
-    relies on that — the two real VideoFileClip readers opened by the two
+    relies on that — the real VideoFileClip readers opened by the two
     _build_media_sub_clip() calls below are exactly what the caller's existing
     readers-list threading already closes, unchanged. bg_color=(0, 0, 0) on the
     composite avoids MoviePy's transparent/alpha-mask compositing path (real
     per-frame work) — the two halves already tile the full frame edge to edge,
     so no background pixel is ever visible anyway.
+
+    Everything after the first _build_media_sub_clip() call is wrapped in one
+    try/except that closes every reader accumulated so far before re-raising —
+    not just readers opened by the SECOND _build_media_sub_clip() call. A
+    security review caught the first draft only guarded that second call:
+    _center_crop_half() or the CompositeVideoClip(...) construction raising
+    after BOTH sub-clips already succeeded would otherwise leak both real
+    VideoFileClip readers with no caller ever able to reach them — the exact
+    leak class this codebase mutation-tested and fixed four times already for
+    the sequential path (Phase 7i, CLAUDE.md's Key conventions).
     """
     left_clip, left_readers = _build_media_sub_clip(media_paths[0], duration_s)
+    readers = list(left_readers)
     try:
         right_clip, right_readers = _build_media_sub_clip(media_paths[1], duration_s)
+        readers.extend(right_readers)
+        left = _center_crop_half(left_clip).with_position((0, 0))
+        right = _center_crop_half(right_clip).with_position((TARGET_W // 2, 0))
+        collage = CompositeVideoClip([left, right], size=(TARGET_W, TARGET_H), bg_color=(0, 0, 0))
+        return collage, readers
     except Exception:
-        for r in left_readers:
+        for r in readers:
             try:
                 r.close()
             except Exception:
                 pass
         raise
-    left = _center_crop_half(left_clip).with_position((0, 0))
-    right = _center_crop_half(right_clip).with_position((TARGET_W // 2, 0))
-    collage = CompositeVideoClip([left, right], size=(TARGET_W, TARGET_H), bg_color=(0, 0, 0))
-    return collage, left_readers + right_readers
 
 
 def _build_beat_clip(
