@@ -1,4 +1,5 @@
 import re
+from dataclasses import dataclass
 
 from engine.generation.guide_schema import MasterGuide
 
@@ -287,55 +288,40 @@ def _visual_category(visual: str) -> str:
     return "other"
 
 
-# ── main scorer ───────────────────────────────────────────────────────────────
+# ── scoring context ─────────────────────────────────────────────────────────
 
-def score_guide(
-    context: str,
-    guide: MasterGuide,
-    target_length_s: float,
-    axis_multipliers: dict[str, float] | None = None,
-) -> tuple[int, list[str]]:
+@dataclass
+class _ScoringContext:
+    """Values every axis below needs, computed once by _build_scoring_context()
+    rather than threaded individually into 17 function signatures — the same
+    bundling-over-individual-threading choice generate.py's _GenerationContext
+    made (CAR-1), for the identical reason: different axes need different,
+    overlapping subsets of these ~15 values, and threading them individually
+    would reproduce the unbundled-parameter-list risk this decomposition exists
+    to fix. See docs/specs/2026-09-score-guide-decomposition-module-design.md.
     """
-    Score a generated MasterGuide against the standard for a top-tier automated reel.
-    Returns (score 0–100, list of human-readable issues).
+    guide: MasterGuide
+    context: str
+    all_beats: list
+    all_vo: str
+    all_vo_words: set[str]
+    total_beats: int
+    hook_beats: list
+    body_beats: list
+    cta_beats: list
+    first_vo: str
+    first_sents: list[str]
+    tactical_re: re.Pattern
+    actions_re: re.Pattern
+    context_re: re.Pattern
 
-    axis_multipliers: optional per-axis deduction scaling (Settings.evaluator_axis_weight_multipliers).
-    None/empty is a no-op — every axis behaves exactly as documented below. See the
-    correction block at the end of this function for the exact formula and worked examples.
 
-    Axes (max deductions exceed 100; final score clamped to 0–100)
-    ────
-    1  Retention Architecture  (20 pts)  hook quality(10) + open loops(5) + momentum shifts(5)
-    2  Narrative Quality       (15 pts)  HOOK→CONTEXT→ANALYSIS→CONFLICT→CONCLUSION arc
-    3  Context Coverage        (10 pts)  ≥50% of source context sentences echoed in VO
-    4  Insight Density         (15 pts)  stats + causal + tactics + comparisons (per-beat distribution)
-    5  Script → Visual Align   (20 pts)  entity(8) + action(8) + context(4) match
-    6  Clip Availability       (10 pts)  visual_direction describes sourceable footage
-    7  Visual Editability      (10 pts)  visual_direction is specific enough for automation
-    8  Emotional Impact        (13 pts)  density(10) + distribution across beats(3)
-    9  Audio Delivery           (5 pts)  WPS range + avg sentence length + punchy opener + rhythm
-    10 Visual Variety           (5 pts)  mix of highlight/tactical/celebration/crowd/training
-    11 Duration Fit             (5 pts)  beat durations sum within ±30% of cut target
-    12 Caption & Hashtag        (5 pts)  caption ≥30 chars; ≥10 hashtags
-    13 CTA Action               (3 pts)  quality-weighted: prediction/opinion > passive follow
-    14 Conversational Tone     (10 pts)  penalise encyclopaedic phrasing; reward direct address
-    15 Hook-CTA Throughline     (5 pts)  CTA references the hook's central tension or player
-    16 Per-Beat Specificity     (5 pts)  each body beat makes at least one falsifiable claim
-    17 Repetition               (5 pts)  body beats use distinct vocabulary across the script
-
-    Tactical/action/context vocabulary selected by guide.niche:
-      football/soccer/futbol → full football-specific patterns
-      all other niches       → universal sport patterns
-    """
-    issues: list[str] = []
-    score = 100
-    deductions: dict[str, int] = {}
-
+def _build_scoring_context(context: str, guide: MasterGuide) -> _ScoringContext:
     # Both platform guides usually carry identical beats (the structured path
     # builds them from one stub list). Counting each beat twice inflates the
     # capped per-beat axes and pairs every beat against its own clone in the
-    # repetition axis, so dedupe by content. Per-cut axes below still iterate
-    # guide.cuts directly.
+    # repetition axis, so dedupe by content. Per-cut axes (duration, caption)
+    # still iterate guide.cuts directly, inside their own scorer.
     _seen: set[tuple[int, str, str]] = set()
     all_beats = []
     for _cut in guide.cuts:
@@ -352,18 +338,39 @@ def score_guide(
     body_beats = [b for b in all_beats if b.type == "body"]
     cta_beats = [b for b in all_beats if b.type == "cta"]
     first_vo = hook_beats[0].vo_script if hook_beats else (all_beats[0].vo_script if all_beats else "")
+    first_sents = _vo_sentences(first_vo)
 
     # Select vocabulary based on niche
     _football = guide.niche.lower() in {"football", "soccer", "futbol"}
-    _tactical_re = _INSIGHT_TACTICAL         if _football else _INSIGHT_TACTICAL_UNIVERSAL
-    _actions_re  = _VO_ACTIONS               if _football else _VO_ACTIONS_UNIVERSAL
-    _context_re  = _SPECIFIC_CONTEXT         if _football else _SPECIFIC_CONTEXT_UNIVERSAL
+    tactical_re = _INSIGHT_TACTICAL           if _football else _INSIGHT_TACTICAL_UNIVERSAL
+    actions_re  = _VO_ACTIONS                 if _football else _VO_ACTIONS_UNIVERSAL
+    context_re  = _SPECIFIC_CONTEXT           if _football else _SPECIFIC_CONTEXT_UNIVERSAL
 
-    # ── 1. Retention Architecture (20 pts) ───────────────────────────────────
-    # Sub-axis A: Hook quality (0–10)
-    # Checks actual VO signals — beat type is always "hook" so it's not a quality signal.
+    return _ScoringContext(
+        guide=guide, context=context, all_beats=all_beats, all_vo=all_vo,
+        all_vo_words=all_vo_words, total_beats=total_beats,
+        hook_beats=hook_beats, body_beats=body_beats, cta_beats=cta_beats,
+        first_vo=first_vo, first_sents=first_sents,
+        tactical_re=tactical_re, actions_re=actions_re, context_re=context_re,
+    )
+
+
+# ── per-axis scorers ─────────────────────────────────────────────────────────
+# Each returns (deduction, issues) for its own axis only. None of these are
+# called anywhere outside score_guide()'s own orchestration loop below — see
+# the module design doc for why a shared _ScoringContext was chosen over
+# individually-threaded parameters.
+
+def _score_retention(ctx: _ScoringContext) -> tuple[int, list[str]]:
+    """1. Retention Architecture (20 pts): hook quality(10) + open loops(5) + momentum shifts(5)."""
+    issues: list[str] = []
+    first_vo = ctx.first_vo
+    all_beats = ctx.all_beats
+
+    # Sub-axis A: Hook quality (0–10). Checks actual VO signals — beat type is
+    # always "hook" so it's not a quality signal.
     hook_pts = 0
-    first_sents = _vo_sentences(first_vo)
+    first_sents = ctx.first_sents
     opener_wc = len(first_sents[0].split()) if first_sents else 99
     if opener_wc <= 12:
         hook_pts += 3   # punchy opener (short first sentence = high impact)
@@ -402,8 +409,6 @@ def score_guide(
 
     retention_deduction = hook_sub_deduction + open_loop_deduction + momentum_deduction
     if retention_deduction > 0:
-        score -= retention_deduction
-        deductions["retention"] = retention_deduction
         if hook_sub_deduction > 0:
             issues.append(
                 f'Weak hook: "{first_vo[:80]}…" — needs a short punchy opener (≤8 words), '
@@ -418,13 +423,21 @@ def score_guide(
             issues.append(
                 "Flat energy — every beat feels the same; mix short punchy lines with longer analysis"
             )
+    return retention_deduction, issues
 
-    # ── 2. Narrative Quality (15 pts) ────────────────────────────────────────
-    # 5 required story stages: HOOK · CONTEXT · ANALYSIS · CONFLICT · CONCLUSION
+
+def _score_narrative(ctx: _ScoringContext) -> tuple[int, list[str]]:
+    """2. Narrative Quality (15 pts): HOOK→CONTEXT→ANALYSIS→CONFLICT→CONCLUSION arc."""
+    issues: list[str] = []
+    hook_beats, body_beats, cta_beats, all_beats = (
+        ctx.hook_beats, ctx.body_beats, ctx.cta_beats, ctx.all_beats
+    )
+    context_re = ctx.context_re
+
     has_hook_stage = bool(hook_beats)
     # Context: a body beat that names someone specific or references a real event/tournament
     has_context_stage = any(
-        bool(_person_names(b.vo_script)) or bool(_context_re.search(b.vo_script))
+        bool(_person_names(b.vo_script)) or bool(context_re.search(b.vo_script))
         for b in body_beats
     )
     has_analysis_stage = any(_ANALYSIS_MARKERS.search(b.vo_script) for b in body_beats)
@@ -438,19 +451,22 @@ def score_guide(
     missing_stages = stages.count(False)
     narrative_deduction = min(15, missing_stages * 3)
     if narrative_deduction > 0:
-        score -= narrative_deduction
-        deductions["narrative"] = narrative_deduction
         labels = ["HOOK", "CONTEXT", "ANALYSIS", "CONFLICT", "CONCLUSION"]
         absent = [labels[i] for i, present in enumerate(stages) if not present]
         issues.append(
             f"Incomplete story arc — missing stage(s): {', '.join(absent)} "
             "(needs HOOK→CONTEXT→ANALYSIS→CONFLICT→CONCLUSION)"
         )
+    return narrative_deduction, issues
 
-    # ── 3. Context Coverage (10 pts) ─────────────────────────────────────────
-    ctx_sentences = _sentences(context)[:30]
+
+def _score_context_coverage(ctx: _ScoringContext) -> tuple[int, list[str]]:
+    """3. Context Coverage (10 pts): ≥50% of source context sentences echoed in VO."""
+    issues: list[str] = []
+    ctx_sentences = _sentences(ctx.context)[:30]
+    deduction = 0
     if ctx_sentences:
-        all_vo_kw = _keyword_set(all_vo)
+        all_vo_kw = _keyword_set(ctx.all_vo)
         ctx_matched = 0
         for ctx_sent in ctx_sentences:
             ctx_kw = _keyword_set(ctx_sent)
@@ -461,29 +477,34 @@ def score_guide(
                 ctx_matched += 1
         ctx_ratio = ctx_matched / len(ctx_sentences)
         if ctx_ratio < 0.50:
-            ctx_deduction = min(10, int((0.50 - ctx_ratio) * 40))
-            score -= ctx_deduction
-            deductions["context"] = ctx_deduction
+            deduction = min(10, int((0.50 - ctx_ratio) * 40))
             issues.append(
                 f"Low context coverage ({ctx_matched}/{len(ctx_sentences)} source sentences "
                 f"echoed in VO, {ctx_ratio:.0%}) — script ignores too much of the source material"
             )
+    return deduction, issues
 
-    # ── 4. Insight Density (15 pts) — per-beat distribution ─────────────────
-    # Count beats that carry each signal rather than total occurrences, so a single
-    # information-dense beat cannot inflate the score.
+
+def _score_insight(ctx: _ScoringContext) -> tuple[int, list[str]]:
+    """4. Insight Density (15 pts): stats + causal + tactics + comparisons (per-beat distribution).
+
+    Counts beats that carry each signal rather than total occurrences, so a
+    single information-dense beat cannot inflate the score.
+    """
+    issues: list[str] = []
+    all_beats, body_beats, all_vo = ctx.all_beats, ctx.body_beats, ctx.all_vo
+    tactical_re = ctx.tactical_re
+
     insight_pts = 0
     insight_pts += min(5, sum(1 for b in all_beats   if _INSIGHT_STAT.search(b.vo_script)) * 2)
     insight_pts += min(4, sum(1 for b in body_beats  if _INSIGHT_CAUSAL.search(b.vo_script)))
-    tactical_hits = len(set(m.lower() for m in _tactical_re.findall(all_vo)))
+    tactical_hits = len(set(m.lower() for m in tactical_re.findall(all_vo)))
     # Narrative reels (no tactical vocab) get 2/4 baseline — they aren't shallow, just a different style
     insight_pts += min(4, tactical_hits) if tactical_hits > 0 else 2
     insight_pts += min(2, sum(1 for b in all_beats   if _INSIGHT_COMPARATIVE.search(b.vo_script)))
 
     insight_deduction = max(0, 15 - insight_pts)
     if insight_deduction > 0:
-        score -= insight_deduction
-        deductions["insight"] = insight_deduction
         if insight_deduction > 5:
             issues.append(
                 "Low insight density — script states facts rather than explaining them "
@@ -494,8 +515,30 @@ def score_guide(
             issues.append(
                 f"Thin insight ({insight_pts}/15 pts) — add one more stat, causal claim, or tactical observation"
             )
+    return insight_deduction, issues
 
-    # ── 5. Script → Visual Alignment (20 pts) ────────────────────────────────
+
+def _score_alignment(ctx: _ScoringContext) -> tuple[int, list[str]]:
+    """5. Script → Visual Alignment (20 pts): entity(8) + action(8) + context(4) match.
+
+    Each sub-signal only contributes to the 20-point max when it actually applies to
+    this content (entity_total/action_total/context_total > 0). A niche whose VO never
+    names a person or uses action/event vocabulary (personal finance, tech reviews,
+    cooking — anything without named individuals or competition-style verbs) would
+    otherwise have every sub-signal's *_total stay 0, collapsing this whole axis to a
+    flat 20-point deduction regardless of how well the visuals actually match the
+    script — confirmed empirically: a realistic, well-aligned personal-finance guide
+    scored align_deduction=20 (the maximum) purely because _person_names()/actions_re/
+    context_re found nothing to check, not because anything was actually misaligned.
+    Redistributing the 20 points across only the applicable sub-signals — and treating
+    zero applicable sub-signals as full credit rather than zero — mirrors the same
+    "not applicable ≠ maximally bad" principle Insight Density already applies to
+    non-tactical reels (the 2/4 tactical baseline above).
+    """
+    issues: list[str] = []
+    all_beats = ctx.all_beats
+    actions_re, context_re = ctx.actions_re, ctx.context_re
+
     entity_matches: float = 0
     entity_total = 0
     action_matches = action_total = 0
@@ -514,29 +557,16 @@ def score_guide(
             )
             entity_matches += n_matched / len(names)
 
-        if _actions_re.search(beat.vo_script):
+        if actions_re.search(beat.vo_script):
             action_total += 1
-            if _actions_re.search(vis):
+            if actions_re.search(vis):
                 action_matches += 1
 
-        if _context_re.search(beat.vo_script):
+        if context_re.search(beat.vo_script):
             context_total += 1
-            if _context_re.search(vis):
+            if context_re.search(vis):
                 context_matches += 1
 
-    # Each sub-signal only contributes to the 20-point max when it actually applies to
-    # this content (entity_total/action_total/context_total > 0). A niche whose VO never
-    # names a person or uses action/event vocabulary (personal finance, tech reviews,
-    # cooking — anything without named individuals or competition-style verbs) would
-    # otherwise have every sub-signal's *_total stay 0, collapsing this whole axis to a
-    # flat 20-point deduction regardless of how well the visuals actually match the
-    # script — confirmed empirically: a realistic, well-aligned personal-finance guide
-    # scored align_deduction=20 (the maximum) purely because _person_names()/_actions_re/
-    # _context_re found nothing to check, not because anything was actually misaligned.
-    # Redistributing the 20 points across only the applicable sub-signals — and treating
-    # zero applicable sub-signals as full credit rather than zero — mirrors the same
-    # "not applicable ≠ maximally bad" principle Insight Density already applies to
-    # non-tactical reels (the 2/4 tactical baseline above).
     applicable_max = 0.0
     align_score = 0.0
     if entity_total:
@@ -554,8 +584,6 @@ def score_guide(
     else:
         align_deduction = max(0, round(20 - (align_score / applicable_max) * 20))
     if align_deduction > 0:
-        score -= align_deduction
-        deductions["alignment"] = align_deduction
         parts: list[str] = []
         if entity_total and entity_matches / entity_total < 0.7:
             pct = int(entity_matches / entity_total * 100)
@@ -566,14 +594,21 @@ def score_guide(
             parts.append(f"context mismatch ({context_matches}/{context_total} event references aligned)")
         if parts:
             issues.append("Script → visual misalignment: " + "; ".join(parts))
+    return align_deduction, issues
 
-    # ── 6. Clip Availability (10 pts) ────────────────────────────────────────
+
+def _score_clip_availability(ctx: _ScoringContext) -> tuple[int, list[str]]:
+    """6. Clip Availability (10 pts): visual_direction describes sourceable footage."""
+    issues: list[str] = []
+    all_beats, total_beats = ctx.all_beats, ctx.total_beats
+    actions_re, tactical_re, context_re = ctx.actions_re, ctx.tactical_re, ctx.context_re
+
     clip_pts = 0
     for beat in all_beats:
         vis = beat.visual_direction.strip()
         has_name = bool(_person_names(vis))
-        has_action = bool(_actions_re.search(vis)) or bool(_tactical_re.search(vis))
-        has_ctx = bool(_context_re.search(vis))
+        has_action = bool(actions_re.search(vis)) or bool(tactical_re.search(vis))
+        has_ctx = bool(context_re.search(vis))
         is_abstract = bool(_ABSTRACT_VISUAL.search(vis))
 
         if is_abstract:
@@ -587,18 +622,23 @@ def score_guide(
 
     max_clip = total_beats * 3
     clip_ratio = clip_pts / max(max_clip, 1)
+    deduction = 0
     if clip_ratio < 0.55:
-        clip_deduction = min(10, round((0.55 - clip_ratio) * 22))
-        score -= clip_deduction
-        deductions["clip"] = clip_deduction
+        deduction = min(10, round((0.55 - clip_ratio) * 22))
         hard_count = sum(1 for b in all_beats if _ABSTRACT_VISUAL.search(b.visual_direction))
         issues.append(
             f"Low clip availability ({clip_pts}/{max_clip} pts) — "
             f"{hard_count} beat(s) use abstract descriptions that can't be sourced as footage; "
             "use: player name + specific action + match context"
         )
+    return deduction, issues
 
-    # ── 7. Visual Editability (10 pts) ───────────────────────────────────────
+
+def _score_editability(ctx: _ScoringContext) -> tuple[int, list[str]]:
+    """7. Visual Editability (10 pts): visual_direction is specific enough for automation."""
+    issues: list[str] = []
+    all_beats, total_beats = ctx.all_beats, ctx.total_beats
+
     editable_pts = 0
     vague_beats: list[str] = []
     for beat in all_beats:
@@ -615,42 +655,44 @@ def score_guide(
 
     max_editable = total_beats * 2
     edit_ratio = editable_pts / max(max_editable, 1)
+    deduction = 0
     if edit_ratio < 0.5 or len(vague_beats) / max(total_beats, 1) > 0.3:
-        edit_deduction = min(10, max(
+        deduction = min(10, max(
             round((0.5 - edit_ratio) * 20),
             round(len(vague_beats) / max(total_beats, 1) * 12)
         ))
-        score -= edit_deduction
-        deductions["editability"] = edit_deduction
         issues.append(
             f"{len(vague_beats)} beat(s) have vague visual_direction — "
             "an automated editor can't reliably fetch these; "
             "be specific: 'Messi beats Gvardiol then assists Alvarez, 2022 WC semifinal'"
         )
+    return deduction, issues
 
-    # ── 8. Emotional Impact (13 pts) — density + distribution ────────────────
+
+def _score_emotion(ctx: _ScoringContext) -> tuple[int, list[str]]:
+    """8. Emotional Impact (13 pts): density(10) + distribution across beats(3)."""
+    issues: list[str] = []
+    all_vo_words, all_beats, total_beats = ctx.all_vo_words, ctx.all_beats, ctx.total_beats
+
     pos_hits = len(all_vo_words & _EMOTION_POSITIVE)
     neg_hits = len(all_vo_words & _EMOTION_NEGATIVE)
     total_hits = pos_hits + neg_hits
 
+    deduction = 0
     if total_hits < 2:
-        emo_deduction = min(10, (3 - total_hits) * 4)
-        score -= emo_deduction
-        deductions["emotion"] = emo_deduction
+        deduction = min(10, (3 - total_hits) * 4)
         issues.append(
             f"Emotionally flat ({total_hits} emotion words) — "
             "top reels are emotion engines; add glory, redemption, collapse, pressure, destiny"
         )
     elif total_hits < 4:
-        score -= 4
-        deductions["emotion"] = 4
+        deduction = 4
         issues.append(
             f"Low emotional density ({total_hits} emotion words, pos={pos_hits}/neg={neg_hits}) — "
             "script needs more emotional contrast"
         )
     elif pos_hits == 0 or neg_hits == 0:
-        score -= 2
-        deductions["emotion"] = 2
+        deduction = 2
         issues.append(
             "Single emotional polarity — mix positive (glory, legacy) with negative (weakness, pressure) "
             "for more compelling contrast"
@@ -660,15 +702,22 @@ def score_guide(
     if total_hits >= 4:
         beats_with_emotion = sum(1 for b in all_beats if _word_set(b.vo_script) & _EMOTION_WORDS)
         if total_beats >= 3 and beats_with_emotion < max(2, int(total_beats * 0.4)):
-            score -= 3
-            deductions["emotion"] = deductions.get("emotion", 0) + 3
+            deduction += 3
             issues.append(
                 f"Emotion clustered — only {beats_with_emotion}/{total_beats} beats have emotional language; "
                 "spread glory/pressure/destiny across the reel, not just hook and CTA"
             )
+    return deduction, issues
 
-    # ── 9. Audio Delivery Quality (5 pts) ────────────────────────────────────
-    # Hook beats use a tighter WPS cap — a rushed hook is the worst first impression.
+
+def _score_audio(ctx: _ScoringContext) -> tuple[int, list[str]]:
+    """9. Audio Delivery Quality (5 pts): WPS range + avg sentence length + punchy opener + rhythm.
+
+    Hook beats use a tighter WPS cap — a rushed hook is the worst first impression.
+    """
+    issues: list[str] = []
+    guide, all_beats, first_sents = ctx.guide, ctx.all_beats, ctx.first_sents
+
     MAX_WPS_HOOK = 3.0
 
     pacing_problems: list[str] = []
@@ -727,96 +776,118 @@ def score_guide(
 
     # Hook pacing problems are worth double — a rushed hook is the worst outcome.
     all_pacing = hook_pacing_problems + pacing_problems
+    deduction = 0
     if all_pacing:
-        audio_deduction = min(10, len(hook_pacing_problems) * 4 + len(pacing_problems) * 2)
-        score -= audio_deduction
-        deductions["audio"] = audio_deduction
+        deduction = min(10, len(hook_pacing_problems) * 4 + len(pacing_problems) * 2)
         issues.append(
             f"Audio delivery problems ({len(all_pacing)}): "
             + "; ".join(all_pacing[:3])
         )
+    return deduction, issues
 
-    # ── 10. Visual Variety (5 pts) ────────────────────────────────────────────
-    # _VISUAL_CATEGORY_RE (unlike the niche-gated regexes above) is not conditioned on
-    # `_football` at all — its six categories are entirely football/sports vocabulary
-    # (goal, tactic, celebrat, crowd, train, sprint...). _visual_category() falls back to
-    # "other" when nothing matches, which every beat's visual_direction does for a niche
-    # like personal finance or cooking — collapsing unique_cats to 1 and triggering this
-    # deduction on every single non-football reel, regardless of how visually varied the
-    # footage actually is. Only penalize when the shared category is a REAL one the
-    # scheme recognized (a genuine repetition finding); "all beats are 'other'" means the
-    # categorization scheme doesn't apply to this content at all, not that it's repetitive.
+
+def _score_variety(ctx: _ScoringContext) -> tuple[int, list[str]]:
+    """10. Visual Variety (5 pts): mix of highlight/tactical/celebration/crowd/training.
+
+    _VISUAL_CATEGORY_RE (unlike the niche-gated regexes elsewhere) is not conditioned on
+    the football/non-football niche split at all — its six categories are entirely
+    football/sports vocabulary (goal, tactic, celebrat, crowd, train, sprint...).
+    _visual_category() falls back to "other" when nothing matches, which every beat's
+    visual_direction does for a niche like personal finance or cooking — collapsing
+    unique_cats to 1 and triggering this deduction on every single non-football reel,
+    regardless of how visually varied the footage actually is. Only penalize when the
+    shared category is a REAL one the scheme recognized (a genuine repetition finding);
+    "all beats are 'other'" means the categorization scheme doesn't apply to this
+    content at all, not that it's repetitive.
+    """
+    issues: list[str] = []
+    all_beats = ctx.all_beats
     categories = [_visual_category(b.visual_direction) for b in all_beats]
     unique_cats = len(set(categories))
+    deduction = 0
     if unique_cats == 1 and categories[0] == "other":
         pass   # scheme found nothing football-specific anywhere — inapplicable, not a finding
     elif unique_cats < 2:
-        score -= 5
-        deductions["variety"] = 5
+        deduction = 5
         issues.append(
             f"No visual variety — all beats map to '{categories[0]}'; "
             "mix in highlight, tactical, celebration, training, and crowd shots"
         )
     elif unique_cats < 3:
-        score -= 2
-        deductions["variety"] = 2
+        deduction = 2
         issues.append(
             f"Limited visual variety ({unique_cats} types) — "
             "aim for 4+ visual categories across the reel"
         )
+    return deduction, issues
 
-    # ── 11. Duration Fit (up to 5 pts per cut) ───────────────────────────────
-    for cut in guide.cuts:
+
+def _score_duration(ctx: _ScoringContext) -> tuple[int, list[str]]:
+    """11. Duration Fit (up to 5 pts per cut): beat durations sum within ±30% of cut target."""
+    issues: list[str] = []
+    deduction = 0
+    for cut in ctx.guide.cuts:
         actual_s = sum(b.duration_s for b in cut.beats)
         ratio = actual_s / max(cut.target_length_s, 1)
         if ratio < 0.70 or ratio > 1.30:
             dur_deduction = min(5, round(abs(1.0 - ratio) * 10))
-            score -= dur_deduction
-            deductions["duration"] = deductions.get("duration", 0) + dur_deduction
+            deduction += dur_deduction
             issues.append(
                 f"{cut.platform}: beats sum to {actual_s:.0f}s vs target {cut.target_length_s:.0f}s "
                 f"({ratio:.0%}) — beat durations must sum within ±30% of target"
             )
+    return deduction, issues
 
-    # ── 12. Caption & Hashtag Quality (up to 5 pts) ──────────────────────────
-    for cut in guide.cuts:
+
+def _score_caption_hashtag(ctx: _ScoringContext) -> tuple[int, list[str]]:
+    """12. Caption & Hashtag Quality (up to 5 pts): caption ≥30 chars; ≥10 hashtags."""
+    issues: list[str] = []
+    deduction = 0
+    for cut in ctx.guide.cuts:
         if len(cut.caption.strip()) < 30:
-            score -= 2
-            deductions["caption_hashtag"] = deductions.get("caption_hashtag", 0) + 2
+            deduction += 2
             issues.append(
                 f"{cut.platform}: caption too short ({len(cut.caption.strip())} chars) — "
                 "write 1–2 punchy sentences"
             )
         if len(cut.hashtags) < 10:
-            score -= 2
-            deductions["caption_hashtag"] = deductions.get("caption_hashtag", 0) + 2
+            deduction += 2
             issues.append(
                 f"{cut.platform}: only {len(cut.hashtags)} hashtag(s) — "
                 "aim for 15 (5 broad, 5 niche, 5 trending)"
             )
+    return deduction, issues
 
-    # ── 13. CTA Action Quality (3 pts, quality-weighted) ─────────────────────
+
+def _score_cta(ctx: _ScoringContext) -> tuple[int, list[str]]:
+    """13. CTA Action Quality (3 pts, quality-weighted): prediction/opinion > passive follow."""
+    issues: list[str] = []
+    deduction = 0
+    cta_beats = ctx.cta_beats
     if cta_beats:
         cta_vo_combined = " ".join(b.vo_script for b in cta_beats)
         if _CTA_ACTIONS_HIGH.search(cta_vo_combined):
             pass   # high-quality engagement action — full marks
         elif _CTA_ACTIONS_LOW.search(cta_vo_combined):
-            score -= 1
-            deductions["cta"] = 1
+            deduction = 1
             issues.append(
                 "Weak CTA — 'subscribe/follow' is passive; ask for a prediction or opinion: "
                 "'Who wins this? Drop it below.'"
             )
         else:
-            score -= 3
-            deductions["cta"] = 3
+            deduction = 3
             issues.append(
                 "CTA has no action phrase — add 'comment your prediction', "
                 "'who wins this? drop it below', 'what do you think?', etc."
             )
+    return deduction, issues
 
-    # ── 14. Conversational Tone (10 pts) ─────────────────────────────────────
-    # Penalise encyclopaedic phrasing; reward direct address and present-tense drama.
+
+def _score_tone(ctx: _ScoringContext) -> tuple[int, list[str]]:
+    """14. Conversational Tone (10 pts): penalise encyclopaedic phrasing; reward direct address."""
+    issues: list[str] = []
+    all_vo, first_vo = ctx.all_vo, ctx.first_vo
+
     article_matches = _ARTICLE_TONE.findall(all_vo)
     has_second_person = bool(_SECOND_PERSON.search(all_vo))
     has_direct_hook_opener = bool(_DIRECT_HOOK.search(first_vo))
@@ -842,12 +913,14 @@ def score_guide(
         )
 
     tone_deduction = min(10, tone_deduction)
-    if tone_deduction > 0:
-        score -= tone_deduction
-        deductions["tone"] = tone_deduction
+    return tone_deduction, issues
 
-    # ── 15. Hook-CTA Throughline (5 pts) ─────────────────────────────────────
-    # The CTA should call back to the central tension or player introduced in the hook.
+
+def _score_throughline(ctx: _ScoringContext) -> tuple[int, list[str]]:
+    """15. Hook-CTA Throughline (5 pts): CTA references the hook's central tension or player."""
+    issues: list[str] = []
+    deduction = 0
+    cta_beats, hook_beats, first_vo = ctx.cta_beats, ctx.hook_beats, ctx.first_vo
     if cta_beats and hook_beats:
         cta_vo_all = " ".join(b.vo_script for b in cta_beats)
         hook_names = _person_names(first_vo)
@@ -859,21 +932,26 @@ def score_guide(
         kw_callback = len(hook_kw & cta_kw) >= 2
 
         if not name_callback and not kw_callback:
-            score -= 5
-            deductions["throughline"] = 5
+            deduction = 5
             issues.append(
                 "Throughline missing — CTA doesn't reference the hook's central tension; "
                 "e.g. hook: 'Is Romero the best?' → CTA: 'So IS Romero the best? Drop your take below'"
             )
+    return deduction, issues
 
-    # ── 16. Per-Beat Specificity (5 pts) ─────────────────────────────────────
-    # Each body beat should make at least one falsifiable claim.
+
+def _score_specificity(ctx: _ScoringContext) -> tuple[int, list[str]]:
+    """16. Per-Beat Specificity (5 pts): each body beat makes at least one falsifiable claim."""
+    issues: list[str] = []
+    deduction = 0
+    body_beats = ctx.body_beats
+    actions_re = ctx.actions_re
     vague_body: list[str] = []
     for beat in body_beats:
         vo = beat.vo_script
         has_stat       = bool(re.search(r'\b\d+\b', vo))
         has_causal     = bool(_INSIGHT_CAUSAL.search(vo))
-        has_action     = bool(_actions_re.search(vo))
+        has_action     = bool(actions_re.search(vo))
         has_comparison = bool(_INSIGHT_COMPARATIVE.search(vo))
         has_conflict   = bool(_CONFLICT_MARKERS.search(vo))   # conflict beats are inherently specific
         if not any([has_stat, has_causal, has_action, has_comparison, has_conflict]):
@@ -882,17 +960,23 @@ def score_guide(
     if vague_body:
         vague_ratio = len(vague_body) / max(len(body_beats), 1)
         if vague_ratio >= 0.4:
-            spec_deduction = min(5, round(vague_ratio * 8))
-            score -= spec_deduction
-            deductions["specificity"] = spec_deduction
+            deduction = min(5, round(vague_ratio * 8))
             issues.append(
                 f"{len(vague_body)} body beat(s) make only vague assertions — "
                 "each beat needs a stat, causal claim, action verb, or comparison "
                 f"({', '.join(vague_body[:3])})"
             )
+    return deduction, issues
 
-    # ── 17. Repetition (5 pts) ────────────────────────────────────────────────
-    # Body beats should introduce distinct ideas — >50% keyword overlap signals filler.
+
+def _score_repetition(ctx: _ScoringContext) -> tuple[int, list[str]]:
+    """17. Repetition (5 pts): body beats use distinct vocabulary across the script.
+
+    Body beats should introduce distinct ideas — >50% keyword overlap signals filler.
+    """
+    issues: list[str] = []
+    deduction = 0
+    body_beats = ctx.body_beats
     if len(body_beats) >= 3:
         beat_kw_sets = [_keyword_set(b.vo_script) - _STOPWORDS for b in body_beats]
         total_pairs = 0
@@ -907,13 +991,92 @@ def score_guide(
                     high_overlap_pairs += 1
 
         if total_pairs > 0 and high_overlap_pairs / total_pairs > 0.4:
-            rep_deduction = min(5, round(high_overlap_pairs / total_pairs * 10))
-            score -= rep_deduction
-            deductions["repetition"] = rep_deduction
+            deduction = min(5, round(high_overlap_pairs / total_pairs * 10))
             issues.append(
                 f"Repetitive vocabulary — {high_overlap_pairs}/{total_pairs} body beat pairs "
                 "share >50% keywords; each beat should introduce distinct language and ideas"
             )
+    return deduction, issues
+
+
+# Order matters only for the "Score breakdown — ..." issue line's key ordering
+# (dict insertion order) — every axis's deduction/score math is independent of
+# where in this list it sits.
+_AXIS_SCORERS = [
+    ("retention", _score_retention),
+    ("narrative", _score_narrative),
+    ("context", _score_context_coverage),
+    ("insight", _score_insight),
+    ("alignment", _score_alignment),
+    ("clip", _score_clip_availability),
+    ("editability", _score_editability),
+    ("emotion", _score_emotion),
+    ("audio", _score_audio),
+    ("variety", _score_variety),
+    ("duration", _score_duration),
+    ("caption_hashtag", _score_caption_hashtag),
+    ("cta", _score_cta),
+    ("tone", _score_tone),
+    ("throughline", _score_throughline),
+    ("specificity", _score_specificity),
+    ("repetition", _score_repetition),
+]
+
+
+# ── main scorer ───────────────────────────────────────────────────────────────
+
+def score_guide(
+    context: str,
+    guide: MasterGuide,
+    target_length_s: float,
+    axis_multipliers: dict[str, float] | None = None,
+) -> tuple[int, list[str]]:
+    """
+    Score a generated MasterGuide against the standard for a top-tier automated reel.
+    Returns (score 0–100, list of human-readable issues).
+
+    axis_multipliers: optional per-axis deduction scaling (Settings.evaluator_axis_weight_multipliers).
+    None/empty is a no-op — every axis behaves exactly as documented below. See the
+    correction block at the end of this function for the exact formula and worked examples.
+
+    Axes (max deductions exceed 100; final score clamped to 0–100) — each is implemented
+    by its own `_score_<axis>()` function above, sharing one `_ScoringContext` built once
+    per call (see that dataclass's own docstring for why):
+    ────
+    1  Retention Architecture  (20 pts)  hook quality(10) + open loops(5) + momentum shifts(5)
+    2  Narrative Quality       (15 pts)  HOOK→CONTEXT→ANALYSIS→CONFLICT→CONCLUSION arc
+    3  Context Coverage        (10 pts)  ≥50% of source context sentences echoed in VO
+    4  Insight Density         (15 pts)  stats + causal + tactics + comparisons (per-beat distribution)
+    5  Script → Visual Align   (20 pts)  entity(8) + action(8) + context(4) match
+    6  Clip Availability       (10 pts)  visual_direction describes sourceable footage
+    7  Visual Editability      (10 pts)  visual_direction is specific enough for automation
+    8  Emotional Impact        (13 pts)  density(10) + distribution across beats(3)
+    9  Audio Delivery           (5 pts)  WPS range + avg sentence length + punchy opener + rhythm
+    10 Visual Variety           (5 pts)  mix of highlight/tactical/celebration/crowd/training
+    11 Duration Fit             (5 pts)  beat durations sum within ±30% of cut target
+    12 Caption & Hashtag        (5 pts)  caption ≥30 chars; ≥10 hashtags
+    13 CTA Action               (3 pts)  quality-weighted: prediction/opinion > passive follow
+    14 Conversational Tone     (10 pts)  penalise encyclopaedic phrasing; reward direct address
+    15 Hook-CTA Throughline     (5 pts)  CTA references the hook's central tension or player
+    16 Per-Beat Specificity     (5 pts)  each body beat makes at least one falsifiable claim
+    17 Repetition               (5 pts)  body beats use distinct vocabulary across the script
+
+    Tactical/action/context vocabulary selected by guide.niche:
+      football/soccer/futbol → full football-specific patterns
+      all other niches       → universal sport patterns
+    """
+    issues: list[str] = []
+    score = 100
+    deductions: dict[str, int] = {}
+
+    ctx = _build_scoring_context(context, guide)
+
+    for key, scorer in _AXIS_SCORERS:
+        axis_deduction, axis_issues = scorer(ctx)
+        if axis_deduction > 0:
+            score -= axis_deduction
+            deductions[key] = axis_deduction
+            issues.extend(axis_issues)
 
     # Per-axis breakdown appended as a diagnostic for the retry loop.
     if deductions:
