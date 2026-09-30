@@ -146,7 +146,7 @@ The browser never fetches JSON. All API responses to the browser are HTML fragme
 | `test_r4_gaps.py` | 30 tests — round-4 mutation-testing regressions: heartbeat commit visibility, failure-path rollback of flushed rows, `after_commit` cleanup without a hook |
 | `test_tasks_real_db.py` | 4 tests — real tasks through `job_task`: post id durable, caption sent, enrich enqueues the real job id |
 | `test_common.py` | 18 tests — transient-error classification (incl. DB connection errors), retry budget boundary |
-| `test_generate_task.py` | 9 tests — missing reel, reel not generating, paid-call budget, structured-path fallback (incl. a soft-limit kill), `music_cue` default, caption/hashtags does not swallow a runtime-limit timeout |
+| `test_generate_task.py` | 17 tests — missing reel, reel not generating, paid-call budget, structured-path fallback (incl. a soft-limit kill), `music_cue` default, caption/hashtags does not swallow a runtime-limit timeout, standard-path content-aware caption/hashtags regeneration (success across every platform, failure leaves the original untouched, skipped when every vo_script is empty) |
 | `test_publish_task.py` | 10 tests — safety gate, no auto-retry, early post id, finalize without re-upload, attribution |
 | `test_render_task.py` | 6 tests — missing cut, already-posted cut refused, success clears stale error, music wiring |
 | `test_maintenance.py` | 29 tests — reaper on SQLite: per-job-type rollback and pending thresholds, compare-and-set back-off, status pin |

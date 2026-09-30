@@ -226,6 +226,226 @@ def test_generate_caption_hashtags_still_falls_back_on_an_ordinary_error():
     assert _generate_caption_hashtags([], "football", llm) == ("", [])
 
 
+# ── Phase 7o — standard-path caption/hashtags content-awareness ─────────────
+# docs/roadmap.md's Open Issues item: the single-shot MasterGuide JSON call
+# writes caption/hashtags from niche/context alone, with no explicit
+# instruction to derive them from the beats it just wrote. generate_guide()
+# now makes one extra best-effort call to the ALREADY-generalized
+# _generate_caption_hashtags() (see its own docstring) with the accepted
+# guide's real vo_script content, overwriting the model's own caption/
+# hashtags on success and leaving them untouched on any failure.
+
+def test_standard_path_regenerates_caption_hashtags_from_real_vo_content():
+    """The success path: _generate_caption_hashtags() returns real content, and
+    every platform guide's caption/hashtags is overwritten with it -- not the
+    generic caption/hashtags _valid_guide_raw()'s single-shot JSON produced."""
+    from worker.tasks.generate import generate_guide
+
+    job = _job()
+    reel = _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
+    db.query.side_effect = _query_dispatch(notes=[], cuts=[_cut()])
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.generate.paid_call_count", return_value=0),
+        patch("worker.tasks.generate.script_parser.parse", return_value=None),  # force standard path
+        patch("worker.tasks.generate.get_llm_provider") as mock_get_llm,
+        patch("worker.tasks.generate.build_messages", return_value=[{"role": "system", "content": "x"}]),
+        patch("worker.tasks.generate.score_guide", return_value=(0, [])),
+        patch("worker.tasks.generate._combined_score", return_value=(90, [])),
+        patch("worker.tasks.generate._enrich_standard_path_guide"),
+        patch("worker.tasks.generate.generate_hook_variants", return_value=[]),
+        patch(
+            "worker.tasks.generate._generate_caption_hashtags",
+            return_value=("Content-aware caption from real VO.", ["a", "b", "c", "d", "e"]),
+        ) as mock_caption,
+    ):
+        mock_get_llm.return_value.complete.return_value = _valid_guide_raw()
+        generate_guide(1)
+
+    assert job.status == models.JobStatus.done
+    mock_caption.assert_called_once()
+    # The real accepted guide's own beat VO content, not empty/placeholder text.
+    vo_scripts_arg = mock_caption.call_args.args[0]
+    assert any("biggest upset" in v for v in vo_scripts_arg)
+
+    cut = db.query.side_effect(models.Cut).filter.return_value.all.return_value[0]
+    assert cut.guide["caption"] == "Content-aware caption from real VO."
+    assert cut.caption == "Content-aware caption from real VO."
+    assert cut.hashtags == ["a", "b", "c", "d", "e"]
+
+
+def test_standard_path_regenerates_caption_hashtags_for_every_platform_not_just_the_first():
+    """A Test-Quality Auditor review caught a real gap: every prior test used a
+    single-cut/single-platform fixture, so a bug that only overwrote
+    guide.cuts[0] (e.g. `guide.cuts[0].caption = new_caption` instead of
+    looping every platform_guide) would have passed undetected. Uses TWO
+    platforms so the overwrite loop actually has more than one item to miss."""
+    from worker.tasks.generate import generate_guide
+
+    job = _job()
+    reel = _reel()
+    db = MagicMock()
+    yt_cut = _cut()
+    ig_cut = _cut()
+    ig_cut.platform.value = "instagram_reels"
+    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
+    db.query.side_effect = _query_dispatch(notes=[], cuts=[yt_cut, ig_cut])
+
+    two_platform_raw = json.dumps({
+        "title": "Test guide",
+        "niche": "football",
+        "cuts": [
+            {
+                "platform": "youtube_shorts",
+                "target_length_s": 45.0,
+                "beats": [
+                    {"index": 0, "type": "hook", "duration_s": 5, "visual_direction": "stadium wide shot",
+                     "on_screen_text": ["Hook"], "vo_script": "Could this be the biggest upset yet?"},
+                    {"index": 1, "type": "body", "duration_s": 10, "visual_direction": "training ground clip",
+                     "on_screen_text": ["Body"], "vo_script": "The squad has been preparing all week for this."},
+                    {"index": 2, "type": "cta", "duration_s": 5, "visual_direction": "crowd celebration",
+                     "on_screen_text": ["CTA"], "vo_script": "Drop your prediction below."},
+                ],
+                "caption": "Big match preview.",
+                "hashtags": ["football", "soccer", "sports", "matchday", "preview"],
+            },
+            {
+                "platform": "instagram_reels",
+                "target_length_s": 30.0,
+                "beats": [
+                    {"index": 0, "type": "hook", "duration_s": 3, "visual_direction": "stadium wide shot",
+                     "on_screen_text": ["Hook"], "vo_script": "Could this be the biggest upset yet?"},
+                    {"index": 1, "type": "body", "duration_s": 4, "visual_direction": "training ground clip",
+                     "on_screen_text": ["Body"], "vo_script": "The squad has been preparing all week for this."},
+                    {"index": 2, "type": "cta", "duration_s": 3, "visual_direction": "crowd celebration",
+                     "on_screen_text": ["CTA"], "vo_script": "Drop your prediction below."},
+                ],
+                "caption": "Big match preview (IG).",
+                "hashtags": ["football", "soccer", "sports", "matchday", "preview"],
+            },
+        ],
+    })
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.generate.paid_call_count", return_value=0),
+        patch("worker.tasks.generate.script_parser.parse", return_value=None),  # force standard path
+        patch("worker.tasks.generate.get_llm_provider") as mock_get_llm,
+        patch("worker.tasks.generate.build_messages", return_value=[{"role": "system", "content": "x"}]),
+        patch("worker.tasks.generate.score_guide", return_value=(0, [])),
+        patch("worker.tasks.generate._combined_score", return_value=(90, [])),
+        patch("worker.tasks.generate._enrich_standard_path_guide"),
+        patch("worker.tasks.generate.generate_hook_variants", return_value=[]),
+        patch(
+            "worker.tasks.generate._generate_caption_hashtags",
+            return_value=("Content-aware caption from real VO.", ["a", "b", "c", "d", "e"]),
+        ),
+    ):
+        mock_get_llm.return_value.complete.return_value = two_platform_raw
+        generate_guide(1)
+
+    assert job.status == models.JobStatus.done
+    for cut in (yt_cut, ig_cut):
+        assert cut.guide["caption"] == "Content-aware caption from real VO.", cut.platform.value
+        assert cut.caption == "Content-aware caption from real VO.", cut.platform.value
+        assert cut.hashtags == ["a", "b", "c", "d", "e"], cut.platform.value
+
+
+def test_standard_path_skips_caption_regeneration_when_every_vo_script_is_empty():
+    """A Correctness/Edge-Case review caught a real edge case: music_only/silent
+    voiceover_mode instructs the LLM to leave every vo_script empty
+    (build_messages()'s vo_note) -- the caption-regeneration call would
+    otherwise fire with nothing to ground a caption in, wasting a paid call
+    that could never succeed. Must be skipped outright, not attempted and
+    left to fail."""
+    from worker.tasks.generate import generate_guide
+
+    job = _job()
+    reel = _reel()
+    reel.voiceover_mode = "silent"
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
+    db.query.side_effect = _query_dispatch(notes=[], cuts=[_cut()])
+
+    silent_raw = json.dumps({
+        "title": "Test guide",
+        "niche": "football",
+        "cuts": [{
+            "platform": "youtube_shorts",
+            "target_length_s": 45.0,
+            "beats": [
+                {"index": 0, "type": "hook", "duration_s": 5, "visual_direction": "stadium wide shot",
+                 "on_screen_text": ["Hook"], "vo_script": ""},
+                {"index": 1, "type": "body", "duration_s": 10, "visual_direction": "training ground clip",
+                 "on_screen_text": ["Body"], "vo_script": ""},
+                {"index": 2, "type": "cta", "duration_s": 5, "visual_direction": "crowd celebration",
+                 "on_screen_text": ["CTA"], "vo_script": ""},
+            ],
+            "caption": "Big match preview.",
+            "hashtags": ["football", "soccer", "sports", "matchday", "preview"],
+        }],
+    })
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.generate.paid_call_count", return_value=0),
+        patch("worker.tasks.generate.script_parser.parse", return_value=None),  # force standard path
+        patch("worker.tasks.generate.get_llm_provider") as mock_get_llm,
+        patch("worker.tasks.generate.build_messages", return_value=[{"role": "system", "content": "x"}]),
+        patch("worker.tasks.generate.score_guide", return_value=(0, [])),
+        patch("worker.tasks.generate._combined_score", return_value=(90, [])),
+        patch("worker.tasks.generate._enrich_standard_path_guide"),
+        patch("worker.tasks.generate.generate_hook_variants", return_value=[]),
+        patch("worker.tasks.generate._generate_caption_hashtags") as mock_caption,
+    ):
+        mock_get_llm.return_value.complete.return_value = silent_raw
+        generate_guide(1)
+
+    assert job.status == models.JobStatus.done
+    mock_caption.assert_not_called()
+    cut = db.query.side_effect(models.Cut).filter.return_value.all.return_value[0]
+    assert cut.guide["caption"] == "Big match preview."
+
+
+def test_standard_path_keeps_original_caption_when_regeneration_fails():
+    """The degrade path: _generate_caption_hashtags() returning its own
+    documented failure contract ("", []) must leave the single-shot guide's
+    ORIGINAL model-generated caption/hashtags untouched -- never blanked out,
+    never worse than before this fix existed."""
+    from worker.tasks.generate import generate_guide
+
+    job = _job()
+    reel = _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
+    db.query.side_effect = _query_dispatch(notes=[], cuts=[_cut()])
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.generate.paid_call_count", return_value=0),
+        patch("worker.tasks.generate.script_parser.parse", return_value=None),  # force standard path
+        patch("worker.tasks.generate.get_llm_provider") as mock_get_llm,
+        patch("worker.tasks.generate.build_messages", return_value=[{"role": "system", "content": "x"}]),
+        patch("worker.tasks.generate.score_guide", return_value=(0, [])),
+        patch("worker.tasks.generate._combined_score", return_value=(90, [])),
+        patch("worker.tasks.generate._enrich_standard_path_guide"),
+        patch("worker.tasks.generate.generate_hook_variants", return_value=[]),
+        patch("worker.tasks.generate._generate_caption_hashtags", return_value=("", [])),
+    ):
+        mock_get_llm.return_value.complete.return_value = _valid_guide_raw()
+        generate_guide(1)
+
+    assert job.status == models.JobStatus.done
+    cut = db.query.side_effect(models.Cut).filter.return_value.all.return_value[0]
+    # Exactly the caption/hashtags _valid_guide_raw()'s single-shot JSON carried.
+    assert cut.guide["caption"] == "Big match preview."
+    assert cut.caption == "Big match preview."
+    assert cut.hashtags == ["football", "soccer", "sports", "matchday", "preview"]
+
+
 # ── §3.5 performance-note wiring regressions ─────────────────────────────────
 # Both tests below were written first against the naive/buggy implementation
 # (a plain `feedback = [...]` replace for #1; notes queried inside the
@@ -309,6 +529,7 @@ def test_seeded_performance_notes_survive_past_attempt_1_on_retry():
         patch("worker.tasks.generate._combined_score", side_effect=_combined_score_side_effect),
         patch("worker.tasks.generate._enrich_standard_path_guide"),
         patch("worker.tasks.generate.generate_hook_variants", return_value=[]),
+        patch("worker.tasks.generate._generate_caption_hashtags", return_value=("", [])),
     ):
         mock_get_llm.return_value.complete.return_value = _valid_guide_raw()
         generate_guide(1)
@@ -511,6 +732,7 @@ def test_genuine_structured_fallback_still_recorded_after_the_strip():
         patch("worker.tasks.generate.build_messages", return_value=[{"role": "system", "content": "x"}]),
         patch("worker.tasks.generate._enrich_standard_path_guide"),
         patch("worker.tasks.generate.generate_hook_variants", return_value=[]),
+        patch("worker.tasks.generate._generate_caption_hashtags", return_value=("", [])),
     ):
         mock_get_llm.return_value.complete.return_value = _valid_guide_raw()
         generate_guide(1)
