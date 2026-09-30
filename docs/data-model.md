@@ -1,6 +1,6 @@
 # Data Model
 
-All tables are defined in `api/models.py`. Migrations: `0001_initial.py` (base schema) + `0002_improvements.py` (pinning, licensing, observability, heartbeat) + `0003_context_enrichment.py` (enriched_context column, enriching/enrich enum values) + `0004_publishing.py` (tiktok platform, Credential refresh/account-id columns) + `0005_metrics.py` (Cut engagement columns) + `0006_variants.py` (Cut thumbnail/hook-variant columns) + `0007_performance_notes.py` (`performance_notes` table) + `0008_tts_voice.py` (Reel.tts_voice column) + `0009_text_color.py` (Reel.text_color column) + `0010_black_frame_visibility.py` (Cut.black_frame_beat_indices column) + `0011_subtitle_caption_export.py` (Cut.subtitle_path column) + `0012_rendered_pins_fingerprint.py` (Cut.rendered_pins_fingerprint column) + `0013_reaper_resume_and_claim_token.py` (Job.reaper_resumes/Job.claim_token columns) + `0014_rendered_guide_fingerprint.py` (Cut.rendered_guide_fingerprint column). Video and audio files live on disk under `ASSET_STORE_DIR` / `VIDEO_STORE_DIR`; the DB stores paths, never blobs.
+All tables are defined in `api/models.py`. Migrations: `0001_initial.py` (base schema) + `0002_improvements.py` (pinning, licensing, observability, heartbeat) + `0003_context_enrichment.py` (enriched_context column, enriching/enrich enum values) + `0004_publishing.py` (tiktok platform, Credential refresh/account-id columns) + `0005_metrics.py` (Cut engagement columns) + `0006_variants.py` (Cut thumbnail/hook-variant columns) + `0007_performance_notes.py` (`performance_notes` table) + `0008_tts_voice.py` (Reel.tts_voice column) + `0009_text_color.py` (Reel.text_color column) + `0010_black_frame_visibility.py` (Cut.black_frame_beat_indices column) + `0011_subtitle_caption_export.py` (Cut.subtitle_path column) + `0012_rendered_pins_fingerprint.py` (Cut.rendered_pins_fingerprint column) + `0013_reaper_resume_and_claim_token.py` (Job.reaper_resumes/Job.claim_token columns) + `0014_rendered_guide_fingerprint.py` (Cut.rendered_guide_fingerprint column) + `0015_cut_metric_snapshots.py` (`cut_metric_snapshots` table). Video and audio files live on disk under `ASSET_STORE_DIR` / `VIDEO_STORE_DIR`; the DB stores paths, never blobs.
 
 ---
 
@@ -56,6 +56,31 @@ One row per platform per reel. All generated content for a platform lives here.
 | `metrics_updated_at` | timestamptz | Timestamp of the last successful metrics pull; `null` until first pull |
 
 **CutStatus:** `draft` → `rendering` → `in_review` → `approved` → `publishing` → `published` (also `scheduled`, `failed`)
+
+---
+
+### `cut_metric_snapshots`
+
+Append-only metrics history, alongside (never replacing) `cuts.views`/`likes`/`comments`/
+`metrics_updated_at` above, which remain the single "latest known" source every existing reader
+uses (reel list, insights page, correlation, the cut card). One row is written per
+`pull_publish_metrics()` reading that actually reached a fetch (no row when there's no credential,
+no fetcher for the platform, or the fetch itself raised). Closes the "`pull_publish_metrics()`
+overwrites rather than accumulates a time series" Open Issues item — no chart/trend UI reads this
+table yet; it exists to start accumulating history now for a future analytics feature to consume.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | integer PK | |
+| `cut_id` | FK → cuts | |
+| `views` | integer, nullable | The RAW value this specific pull returned — `null` when this pull didn't return this metric (e.g. Instagram metric-name drift), never forward-filled from the cut's prior known value. |
+| `likes` | integer, nullable | Same raw-value semantics as `views`. |
+| `comments` | integer, nullable | Same raw-value semantics as `views`. |
+| `recorded_at` | timestamptz | Set to the exact same timestamp as this pull's `cuts.metrics_updated_at` write (captured once, reused for both) — not merely close in time. |
+
+No ORM relationship is declared on `Cut` for this table (modeled on `stage_events` below, which is
+also queried directly rather than through a collection). See
+`docs/specs/2026-09-metrics-history-system-design.md`.
 
 ---
 

@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     Boolean, Column, Float, ForeignKey, Integer, JSON, String, Text,
-    DateTime, Enum as SAEnum, UniqueConstraint,
+    DateTime, Enum as SAEnum, UniqueConstraint, func,
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
 
@@ -152,6 +152,35 @@ class Cut(Base):
 
     reel = relationship("Reel", back_populates="cuts")
     cut_assets = relationship("CutAsset", back_populates="cut", cascade="all, delete-orphan")
+
+
+class CutMetricSnapshot(Base):
+    """One row per pull_publish_metrics() reading for a cut -- an append-only history
+    alongside Cut.views/likes/comments above (unchanged, still the single "latest
+    known" source every existing reader uses -- reel list, insights, correlation,
+    the cut card). Modeled on StageEvent's own shape: a plain FK-bearing log table,
+    no relationship/back_populates declared (queried directly, not via a
+    Cut.metric_snapshots collection), since nothing in this codebase needs one.
+
+    Stores the FETCH's raw, possibly-partial values (each field individually None
+    when that specific pull didn't return it) -- never the post-merge, forward-
+    filled Cut columns. A pull that's missing one metric (e.g. the Instagram
+    metric-name-drift case engine/publish/metrics.py::InstagramMetricsFetcher
+    already detects) must not fabricate a history data point for the missing
+    field by carrying forward the last known value under a new timestamp -- that
+    would corrupt a future trend line with a false flat segment. Closes the
+    "pull_publish_metrics() overwrites rather than accumulates a time series"
+    Open Issues item; no consumer for this table exists yet -- see
+    docs/specs/2026-09-metrics-history-system-design.md.
+    """
+    __tablename__ = "cut_metric_snapshots"
+
+    id = Column(Integer, primary_key=True)
+    cut_id = Column(Integer, ForeignKey("cuts.id"), nullable=False)
+    views = Column(Integer)
+    likes = Column(Integer)
+    comments = Column(Integer)
+    recorded_at = Column(DateTime(timezone=True), default=_now, server_default=func.now(), nullable=False)
 
 
 class Asset(Base):
