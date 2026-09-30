@@ -178,31 +178,33 @@ def test_structured_path_non_hook_beats_have_no_music_cue():
 
 
 def test_the_soft_time_limit_in_the_structured_path_does_not_fall_back_to_the_standard_path():
-    """The structured path catches Exception and falls back to a second, paid LLM path; that would
-    swallow the runtime limit and keep running to the hard kill."""
-    from celery.exceptions import SoftTimeLimitExceeded
-    from worker.tasks.generate import generate_guide
+    """The structured path catches Exception and falls back to the standard path; that would
+    swallow the runtime limit and keep running to the hard kill.
 
-    job = _job()
+    Narrowed to a direct test of _try_structured_path() after the generate_guide()
+    decomposition (module design CAR-1, docs/specs/2026-09-generate-guide-decomposition-
+    module-design.md) -- no longer needs to drive the whole task or mock any standard-path
+    dependency (build_messages, path-resolution, SessionLocal, job_task's own lifecycle):
+    "does the standard path get reached" is no longer even representable here, since this
+    function never calls it -- the property is proven by never reaching the return."""
+    from celery.exceptions import SoftTimeLimitExceeded
+    from worker.tasks.generate import _GenerationContext, _try_structured_path
+
     reel = _reel()
     db = MagicMock()
-    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
-    db.query.return_value.filter.return_value.all.return_value = [_cut()]
+    ctx = _GenerationContext(
+        db=db, job=_job(), reel=reel, cuts=[_cut()], platforms=["youtube_shorts"],
+        target_lengths={"youtube_shorts": 45.0}, max_target=45.0, voiceover_mode="voiceover",
+        effective_context=reel.context, active_notes=[], axis_multipliers=None,
+        quality_threshold=65, llm=MagicMock(),
+    )
 
-    with (
-        patch("worker.tasks.common.SessionLocal", return_value=db),
-        patch("worker.tasks.generate.paid_call_count", return_value=0),
-        patch("worker.tasks.generate.get_llm_provider"),
-        patch("worker.tasks.generate.script_parser.parse", return_value=[MagicMock()]),
-        patch("worker.tasks.generate.resolve_generation_path", return_value="structured"),
-        patch("worker.tasks.generate._generate_from_structured_script", side_effect=SoftTimeLimitExceeded()),
-        patch("worker.tasks.generate.build_messages") as standard_path,
+    with patch(
+        "worker.tasks.generate._generate_from_structured_script",
+        side_effect=SoftTimeLimitExceeded(),
     ):
         with pytest.raises(SoftTimeLimitExceeded):
-            generate_guide(1)
-
-    standard_path.assert_not_called()
-    assert job.status == models.JobStatus.failed
+            _try_structured_path(ctx, stubs=[MagicMock()])
 
 
 def test_generate_caption_hashtags_does_not_swallow_the_soft_time_limit():
@@ -235,46 +237,56 @@ def test_generate_caption_hashtags_still_falls_back_on_an_ordinary_error():
 # guide's real vo_script content, overwriting the model's own caption/
 # hashtags on success and leaving them untouched on any failure.
 
+def _generation_context(reel, db, **overrides):
+    """Minimal _GenerationContext for the narrow best-effort-call/path-runner unit
+    tests below (module design CAR-1) -- fields not read by the function under test
+    are filled with cheap placeholders, since the dataclass requires all 13."""
+    from worker.tasks.generate import _GenerationContext
+
+    fields = dict(
+        db=db, job=_job(), reel=reel, cuts=[], platforms=["youtube_shorts"],
+        target_lengths={"youtube_shorts": 45.0}, max_target=45.0,
+        voiceover_mode=reel.voiceover_mode, effective_context=reel.context,
+        active_notes=[], axis_multipliers=None, quality_threshold=65, llm=MagicMock(),
+    )
+    fields.update(overrides)
+    return _GenerationContext(**fields)
+
+
 def test_standard_path_regenerates_caption_hashtags_from_real_vo_content():
     """The success path: _generate_caption_hashtags() returns real content, and
     every platform guide's caption/hashtags is overwritten with it -- not the
-    generic caption/hashtags _valid_guide_raw()'s single-shot JSON produced."""
-    from worker.tasks.generate import generate_guide
+    generic caption/hashtags _valid_guide_raw()'s single-shot JSON produced.
 
-    job = _job()
+    Narrowed to a direct test of _maybe_regenerate_caption_hashtags() after the
+    generate_guide() decomposition (module design CAR-1) -- no longer needs the LLM
+    provider, build_messages, score_guide, _combined_score,
+    _enrich_standard_path_guide, generate_hook_variants, or SessionLocal/job_task's
+    own lifecycle; the guide is constructed directly instead of round-tripped through
+    a mocked LLM completion."""
+    from worker.tasks.generate import _maybe_regenerate_caption_hashtags
+
     reel = _reel()
     db = MagicMock()
-    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
-    db.query.side_effect = _query_dispatch(notes=[], cuts=[_cut()])
+    guide = MasterGuide.model_validate_json(_valid_guide_raw())
+    ctx = _generation_context(reel, db)
 
     with (
-        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.generate.paid_call_count", return_value=0),
-        patch("worker.tasks.generate.script_parser.parse", return_value=None),  # force standard path
-        patch("worker.tasks.generate.get_llm_provider") as mock_get_llm,
-        patch("worker.tasks.generate.build_messages", return_value=[{"role": "system", "content": "x"}]),
-        patch("worker.tasks.generate.score_guide", return_value=(0, [])),
-        patch("worker.tasks.generate._combined_score", return_value=(90, [])),
-        patch("worker.tasks.generate._enrich_standard_path_guide"),
-        patch("worker.tasks.generate.generate_hook_variants", return_value=[]),
         patch(
             "worker.tasks.generate._generate_caption_hashtags",
             return_value=("Content-aware caption from real VO.", ["a", "b", "c", "d", "e"]),
         ) as mock_caption,
     ):
-        mock_get_llm.return_value.complete.return_value = _valid_guide_raw()
-        generate_guide(1)
+        _maybe_regenerate_caption_hashtags(ctx, guide)
 
-    assert job.status == models.JobStatus.done
     mock_caption.assert_called_once()
     # The real accepted guide's own beat VO content, not empty/placeholder text.
     vo_scripts_arg = mock_caption.call_args.args[0]
     assert any("biggest upset" in v for v in vo_scripts_arg)
 
-    cut = db.query.side_effect(models.Cut).filter.return_value.all.return_value[0]
-    assert cut.guide["caption"] == "Content-aware caption from real VO."
-    assert cut.caption == "Content-aware caption from real VO."
-    assert cut.hashtags == ["a", "b", "c", "d", "e"]
+    assert guide.cuts[0].caption == "Content-aware caption from real VO."
+    assert guide.cuts[0].hashtags == ["a", "b", "c", "d", "e"]
 
 
 def test_standard_path_regenerates_caption_hashtags_for_every_platform_not_just_the_first():
@@ -282,18 +294,15 @@ def test_standard_path_regenerates_caption_hashtags_for_every_platform_not_just_
     single-cut/single-platform fixture, so a bug that only overwrote
     guide.cuts[0] (e.g. `guide.cuts[0].caption = new_caption` instead of
     looping every platform_guide) would have passed undetected. Uses TWO
-    platforms so the overwrite loop actually has more than one item to miss."""
-    from worker.tasks.generate import generate_guide
+    platforms so the overwrite loop actually has more than one item to miss.
 
-    job = _job()
+    Narrowed to a direct test of _maybe_regenerate_caption_hashtags() -- no longer
+    needs Cut fixtures/_query_dispatch at all, since persisting onto Cut rows is now
+    a separate function (_persist_guide) this test doesn't exercise."""
+    from worker.tasks.generate import _maybe_regenerate_caption_hashtags
+
     reel = _reel()
     db = MagicMock()
-    yt_cut = _cut()
-    ig_cut = _cut()
-    ig_cut.platform.value = "instagram_reels"
-    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
-    db.query.side_effect = _query_dispatch(notes=[], cuts=[yt_cut, ig_cut])
-
     two_platform_raw = json.dumps({
         "title": "Test guide",
         "niche": "football",
@@ -328,30 +337,21 @@ def test_standard_path_regenerates_caption_hashtags_for_every_platform_not_just_
             },
         ],
     })
+    guide = MasterGuide.model_validate_json(two_platform_raw)
+    ctx = _generation_context(reel, db)
 
     with (
-        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.generate.paid_call_count", return_value=0),
-        patch("worker.tasks.generate.script_parser.parse", return_value=None),  # force standard path
-        patch("worker.tasks.generate.get_llm_provider") as mock_get_llm,
-        patch("worker.tasks.generate.build_messages", return_value=[{"role": "system", "content": "x"}]),
-        patch("worker.tasks.generate.score_guide", return_value=(0, [])),
-        patch("worker.tasks.generate._combined_score", return_value=(90, [])),
-        patch("worker.tasks.generate._enrich_standard_path_guide"),
-        patch("worker.tasks.generate.generate_hook_variants", return_value=[]),
         patch(
             "worker.tasks.generate._generate_caption_hashtags",
             return_value=("Content-aware caption from real VO.", ["a", "b", "c", "d", "e"]),
         ),
     ):
-        mock_get_llm.return_value.complete.return_value = two_platform_raw
-        generate_guide(1)
+        _maybe_regenerate_caption_hashtags(ctx, guide)
 
-    assert job.status == models.JobStatus.done
-    for cut in (yt_cut, ig_cut):
-        assert cut.guide["caption"] == "Content-aware caption from real VO.", cut.platform.value
-        assert cut.caption == "Content-aware caption from real VO.", cut.platform.value
-        assert cut.hashtags == ["a", "b", "c", "d", "e"], cut.platform.value
+    for pg in guide.cuts:
+        assert pg.caption == "Content-aware caption from real VO.", pg.platform
+        assert pg.hashtags == ["a", "b", "c", "d", "e"], pg.platform
 
 
 def test_standard_path_skips_caption_regeneration_when_every_vo_script_is_empty():
@@ -360,16 +360,14 @@ def test_standard_path_skips_caption_regeneration_when_every_vo_script_is_empty(
     (build_messages()'s vo_note) -- the caption-regeneration call would
     otherwise fire with nothing to ground a caption in, wasting a paid call
     that could never succeed. Must be skipped outright, not attempted and
-    left to fail."""
-    from worker.tasks.generate import generate_guide
+    left to fail.
 
-    job = _job()
+    Narrowed to a direct test of _maybe_regenerate_caption_hashtags()."""
+    from worker.tasks.generate import _maybe_regenerate_caption_hashtags
+
     reel = _reel()
     reel.voiceover_mode = "silent"
     db = MagicMock()
-    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
-    db.query.side_effect = _query_dispatch(notes=[], cuts=[_cut()])
-
     silent_raw = json.dumps({
         "title": "Test guide",
         "niche": "football",
@@ -388,62 +386,42 @@ def test_standard_path_skips_caption_regeneration_when_every_vo_script_is_empty(
             "hashtags": ["football", "soccer", "sports", "matchday", "preview"],
         }],
     })
+    guide = MasterGuide.model_validate_json(silent_raw)
+    ctx = _generation_context(reel, db)
 
     with (
-        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.generate.paid_call_count", return_value=0),
-        patch("worker.tasks.generate.script_parser.parse", return_value=None),  # force standard path
-        patch("worker.tasks.generate.get_llm_provider") as mock_get_llm,
-        patch("worker.tasks.generate.build_messages", return_value=[{"role": "system", "content": "x"}]),
-        patch("worker.tasks.generate.score_guide", return_value=(0, [])),
-        patch("worker.tasks.generate._combined_score", return_value=(90, [])),
-        patch("worker.tasks.generate._enrich_standard_path_guide"),
-        patch("worker.tasks.generate.generate_hook_variants", return_value=[]),
         patch("worker.tasks.generate._generate_caption_hashtags") as mock_caption,
     ):
-        mock_get_llm.return_value.complete.return_value = silent_raw
-        generate_guide(1)
+        _maybe_regenerate_caption_hashtags(ctx, guide)
 
-    assert job.status == models.JobStatus.done
     mock_caption.assert_not_called()
-    cut = db.query.side_effect(models.Cut).filter.return_value.all.return_value[0]
-    assert cut.guide["caption"] == "Big match preview."
+    assert guide.cuts[0].caption == "Big match preview."
 
 
 def test_standard_path_keeps_original_caption_when_regeneration_fails():
     """The degrade path: _generate_caption_hashtags() returning its own
     documented failure contract ("", []) must leave the single-shot guide's
     ORIGINAL model-generated caption/hashtags untouched -- never blanked out,
-    never worse than before this fix existed."""
-    from worker.tasks.generate import generate_guide
+    never worse than before this fix existed.
 
-    job = _job()
+    Narrowed to a direct test of _maybe_regenerate_caption_hashtags()."""
+    from worker.tasks.generate import _maybe_regenerate_caption_hashtags
+
     reel = _reel()
     db = MagicMock()
-    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
-    db.query.side_effect = _query_dispatch(notes=[], cuts=[_cut()])
+    guide = MasterGuide.model_validate_json(_valid_guide_raw())
+    ctx = _generation_context(reel, db)
 
     with (
-        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.generate.paid_call_count", return_value=0),
-        patch("worker.tasks.generate.script_parser.parse", return_value=None),  # force standard path
-        patch("worker.tasks.generate.get_llm_provider") as mock_get_llm,
-        patch("worker.tasks.generate.build_messages", return_value=[{"role": "system", "content": "x"}]),
-        patch("worker.tasks.generate.score_guide", return_value=(0, [])),
-        patch("worker.tasks.generate._combined_score", return_value=(90, [])),
-        patch("worker.tasks.generate._enrich_standard_path_guide"),
-        patch("worker.tasks.generate.generate_hook_variants", return_value=[]),
         patch("worker.tasks.generate._generate_caption_hashtags", return_value=("", [])),
     ):
-        mock_get_llm.return_value.complete.return_value = _valid_guide_raw()
-        generate_guide(1)
+        _maybe_regenerate_caption_hashtags(ctx, guide)
 
-    assert job.status == models.JobStatus.done
-    cut = db.query.side_effect(models.Cut).filter.return_value.all.return_value[0]
     # Exactly the caption/hashtags _valid_guide_raw()'s single-shot JSON carried.
-    assert cut.guide["caption"] == "Big match preview."
-    assert cut.caption == "Big match preview."
-    assert cut.hashtags == ["football", "soccer", "sports", "matchday", "preview"]
+    assert guide.cuts[0].caption == "Big match preview."
+    assert guide.cuts[0].hashtags == ["football", "soccer", "sports", "matchday", "preview"]
 
 
 # ── §3.5 performance-note wiring regressions ─────────────────────────────────
@@ -501,18 +479,25 @@ def test_seeded_performance_notes_survive_past_attempt_1_on_retry():
     would silently drop performance notes seeded before attempt 1. Force attempt 1
     to score below threshold and attempt 2 to succeed; the seeded notes' text must
     still be present in the build_messages() call for attempt 2, not just attempt 1.
-    """
-    from worker.tasks.generate import generate_guide
 
-    job = _job()
+    Narrowed to a direct test of _run_standard_path_attempts() after the
+    generate_guide() decomposition (module design CAR-1) -- no longer needs
+    path-selection (script_parser.parse/resolve_generation_path), the best-effort
+    caption/hook-variant calls, or SessionLocal/job_task's own lifecycle; active
+    notes are passed in directly instead of round-tripped through a mocked
+    PerformanceNote query.
+    """
+    from worker.tasks.generate import _run_standard_path_attempts
+
     reel = _reel()
     db = MagicMock()
-    notes = [
-        SimpleNamespace(id=1, text="Direct-question hooks outperform statement hooks."),
-        SimpleNamespace(id=2, text="Keep the CTA under 8 seconds."),
+    llm = MagicMock()
+    llm.complete.return_value = _valid_guide_raw()
+    notes_text = [
+        "Direct-question hooks outperform statement hooks.",
+        "Keep the CTA under 8 seconds.",
     ]
-    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
-    db.query.side_effect = _query_dispatch(notes=notes)
+    ctx = _generation_context(reel, db, active_notes=notes_text, llm=llm)
 
     def _combined_score_side_effect(rule_s, rule_i, guide, context, db=None, reel_id=None, attempt=None):
         if attempt == 1:
@@ -520,28 +505,25 @@ def test_seeded_performance_notes_survive_past_attempt_1_on_retry():
         return 90, []
 
     with (
-        patch("worker.tasks.common.SessionLocal", return_value=db),
         patch("worker.tasks.generate.paid_call_count", return_value=0),
-        patch("worker.tasks.generate.script_parser.parse", return_value=None),  # force standard path
-        patch("worker.tasks.generate.get_llm_provider") as mock_get_llm,
-        patch("worker.tasks.generate.build_messages", return_value=[{"role": "system", "content": "x"}]) as mock_build_messages,
         patch("worker.tasks.generate.score_guide", return_value=(0, [])),
         patch("worker.tasks.generate._combined_score", side_effect=_combined_score_side_effect),
         patch("worker.tasks.generate._enrich_standard_path_guide"),
-        patch("worker.tasks.generate.generate_hook_variants", return_value=[]),
-        patch("worker.tasks.generate._generate_caption_hashtags", return_value=("", [])),
+        patch(
+            "worker.tasks.generate.build_messages",
+            return_value=[{"role": "system", "content": "x"}],
+        ) as mock_build_messages,
     ):
-        mock_get_llm.return_value.complete.return_value = _valid_guide_raw()
-        generate_guide(1)
+        result = _run_standard_path_attempts(ctx, stubs=None)
 
-    assert job.status == models.JobStatus.done
+    assert result.guide is not None
     assert mock_build_messages.call_count >= 2
 
     second_call_kwargs = mock_build_messages.call_args_list[1].kwargs
     prior_feedback = second_call_kwargs.get("prior_feedback") or []
-    for note in notes:
-        assert note.text in prior_feedback, (
-            f"seeded note {note.text!r} missing from attempt-2 prior_feedback — "
+    for text in notes_text:
+        assert text in prior_feedback, (
+            f"seeded note {text!r} missing from attempt-2 prior_feedback — "
             "the retry-replace bug dropped it"
         )
 

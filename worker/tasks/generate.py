@@ -1,5 +1,7 @@
 import json
 import logging
+from dataclasses import dataclass
+from typing import Any, Callable, NamedTuple, TypeVar
 
 from celery.exceptions import SoftTimeLimitExceeded
 from pydantic import ValidationError
@@ -364,260 +366,302 @@ def _prepare_generate(db, job):
     return reel
 
 
-# Worst case from the code: up to 3 standard-path attempts, each a generate call plus batched
-# enrichment and a judge call, at the 360 s per-call LLM timeout, is about 3.2 h.
-_MAX_RUNTIME_S = 4 * 60 * 60
-
-
-@celery_app.task(bind=True, max_retries=2, **time_limits(_MAX_RUNTIME_S))
-@job_task("generate", prepare=_prepare_generate, start_progress=10, max_runtime_s=_MAX_RUNTIME_S)
-def generate_guide(self, db, job, reel):
-    effective_context = reel.enriched_context or reel.context
-
-    # A killed or ordinarily-retried attempt of this SAME Job row may have already committed
-    # "structured_fallback"/"structured_score"/"path" from a prior run (e.g. one that took the
-    # structured path, failed its quality gate, and fell through to standard, then got SIGKILLed
-    # before finishing). job.meta is always merged additively below, never reset, so those stale
-    # keys would otherwise survive into this run's final job.meta even when THIS run's structured
-    # path succeeds cleanly with no fallback at all — corrupting
-    # engine/generation/estimate.py::estimate_generation()'s structured_fallback-exclusion bucketing
-    # for every future reel on this path. Reaper-resume turns this from a rare, barely-reachable
-    # edge case into an operationally common one, which is why the fix lands here rather than being
-    # filed separately — see CLAUDE.md's Key conventions entry on the fencing-token/resume
-    # mechanism. Only these three keys are stripped: never context_score, performance_note_ids, or
-    # any other legitimately-persisted key.
+def _strip_stale_fallback_meta(db, job) -> None:
+    """A killed or ordinarily-retried attempt of this SAME Job row may have already committed
+    "structured_fallback"/"structured_score"/"path" from a prior run (e.g. one that took the
+    structured path, failed its quality gate, and fell through to standard, then got SIGKILLed
+    before finishing). job.meta is always merged additively (see generate_guide's own writes),
+    never reset, so those stale keys would otherwise survive into this run's final job.meta even
+    when THIS run's structured path succeeds cleanly with no fallback at all — corrupting
+    engine/generation/estimate.py::estimate_generation()'s structured_fallback-exclusion bucketing
+    for every future reel on this path. Reaper-resume turns this from a rare, barely-reachable
+    edge case into an operationally common one, which is why the fix lands here rather than being
+    filed separately — see CLAUDE.md's Key conventions entry on the fencing-token/resume
+    mechanism. Only these three keys are stripped: never context_score, performance_note_ids, or
+    any other legitimately-persisted key.
+    """
     stale_meta_keys = {"structured_fallback", "structured_score", "path"}
     if job.meta and stale_meta_keys & job.meta.keys():
         job.meta = {k: v for k, v in job.meta.items() if k not in stale_meta_keys}
         db.commit()
 
-    # Queried once, unconditionally, before the structured-vs-standard branch below —
-    # the shared job.meta write at the end of this function (reached by BOTH paths)
-    # records performance_note_ids, and the standard path's prior_feedback seed also
-    # reads active_notes. Querying this inside the `if guide is None:` (standard-path)
-    # block instead would NameError on every structured-path success — see
-    # docs/specs/2026-09-phase5-quality-engagement-feedback.md §3.5.
-    active_notes_rows = (
+
+def _load_active_performance_notes(db) -> list["models.PerformanceNote"]:
+    """Queried once, unconditionally, before the structured-vs-standard branch — the shared
+    job.meta write at the end of generate_guide (reached by BOTH paths) records
+    performance_note_ids, and the standard path's prior_feedback seed also reads these notes'
+    text. Querying this only inside the standard path would NameError on every structured-path
+    success — see docs/specs/2026-09-phase5-quality-engagement-feedback.md §3.5.
+    """
+    return (
         db.query(models.PerformanceNote)
         .filter(models.PerformanceNote.active.is_(True)).all()
     )
-    active_notes = [n.text for n in active_notes_rows]
-    axis_multipliers = settings.evaluator_axis_weight_multipliers or None
 
-    cuts = db.query(models.Cut).filter(models.Cut.reel_id == reel.id).all()
-    platforms = [c.platform.value for c in cuts]
-    target_lengths = {c.platform.value: c.target_length_s or 45.0 for c in cuts}
-    max_target = max(target_lengths.values())
-    voiceover_mode = reel.voiceover_mode or "voiceover"
 
-    llm = get_llm_provider()
-    quality_threshold = QUALITY_THRESHOLD if is_nvidia_generation() else QUALITY_THRESHOLD_LOCAL
-    guide = None
+# Worst case from the code: up to 3 standard-path attempts, each a generate call plus batched
+# enrichment and a judge call, at the 360 s per-call LLM timeout, is about 3.2 h.
+_MAX_RUNTIME_S = 4 * 60 * 60
+
+
+@dataclass
+class _GenerationContext:
+    """Read-only bundle of per-run state every generate_guide() section needs, computed once
+    near the top of the task and never reassigned afterward — mutation happens only through
+    ctx.job.meta / ctx.db (ordinary ORM/session mutation, unchanged in kind from before this
+    decomposition). Threading these 13 values individually through _try_structured_path(),
+    _run_standard_path_attempts(), _maybe_regenerate_caption_hashtags(), and
+    _maybe_generate_hook_variants() was rejected (see
+    docs/specs/2026-09-generate-guide-decomposition-module-design.md) — it reproduces the exact
+    unbundled-parameter-list risk the decomposition exists to avoid.
+    """
+    db: Any
+    job: Any
+    reel: Any
+    cuts: list
+    platforms: list[str]
+    target_lengths: dict[str, float]
+    max_target: float
+    voiceover_mode: str
+    effective_context: str
+    active_notes: list[str]
+    axis_multipliers: dict[str, float] | None
+    quality_threshold: int
+    llm: Any
+
+
+class GuideResult(NamedTuple):
+    guide: MasterGuide | None
+    score: int
+    issues: list[str]
+    exc: Exception | None
+
+
+T = TypeVar("T")
+
+
+def _best_effort_llm_call(
+    db, reel_id: int, stage: str, call: Callable[[Any], T],
+    detail: Callable[[T], dict] | None = None,
+) -> T | None:
+    """Run call(llm) under this reel's paid-call budget, best-effort — returns None (never
+    raises for a budget or ordinary-failure reason) when the budget is already exhausted.
+    `call` itself owns its own failure-degradation contract (e.g. _generate_caption_hashtags
+    degrades to ("", []); generate_hook_variants degrades to []) — this wrapper only owns
+    budget gating, provider selection, and record_stage instrumentation, identical across both
+    current call sites (caption/hashtags regeneration and hook-variant generation) before this
+    decomposition. `detail`, if given, is applied to ev.detail from inside the same
+    record_stage transaction, preserving each call site's own diagnostic keys
+    ("replaced"/"variant_count") exactly as before.
+    """
+    if paid_call_count(db, reel_id) >= settings.max_paid_llm_calls_per_reel:
+        return None
+    provider = "nvidia" if settings.nvidia_api_key else "ollama"
+    llm = get_enrichment_provider()
+    with record_stage(db, reel_id, stage, provider=provider) as ev:
+        result = call(llm)
+        usage = getattr(llm, "last_usage", {})
+        ev.tokens_in = usage.get("prompt_tokens")
+        ev.tokens_out = usage.get("completion_tokens")
+        ev.cost_usd = llm_cost_usd(provider, ev.tokens_in, ev.tokens_out)
+        if detail is not None:
+            ev.detail.update(detail(result))
+    return result
+
+
+def _try_structured_path(ctx: _GenerationContext, stubs: list[BeatStub]) -> GuideResult:
+    """Run the structured-script fast path: generate + score. On success records
+    job.meta["path"]="structured" (only after success, matching the original inline
+    ordering); if the guide misses the quality gate, also records
+    job.meta["structured_score"]/["structured_fallback"]=True and returns guide=None so the
+    caller falls through to the standard path. Owns exactly these job.meta keys — never
+    "quality_score"/"performance_note_ids" (generate_guide's own, written once at the very end
+    regardless of which path produced the guide).
+
+    Re-raises SoftTimeLimitExceeded uncaught: the runtime limit ends the whole task, and
+    falling back to the standard path would silently ignore it.
+    """
+    heartbeat(ctx.db, ctx.job, 20)
+    try:
+        guide = _generate_from_structured_script(
+            ctx.reel, ctx.cuts, ctx.llm, ctx.db, ctx.target_lengths, stubs,
+            context=ctx.effective_context,
+        )
+        clean_guide(guide, ctx.voiceover_mode)
+        rule_s, rule_i = score_guide(ctx.effective_context, guide, ctx.max_target, ctx.axis_multipliers)
+        score, issues = _combined_score(
+            rule_s, rule_i, guide, ctx.effective_context,
+            db=ctx.db, reel_id=ctx.reel.id, attempt=1,
+        )
+        # Record path only after structured path succeeds
+        ctx.job.meta = {**(ctx.job.meta or {}), "path": "structured", "stub_count": len(stubs) if stubs else 0}
+        ctx.db.commit()
+        # Fall through to standard path if quality is too low
+        if score < ctx.quality_threshold:
+            ctx.job.meta = {**(ctx.job.meta or {}), "structured_score": score, "structured_fallback": True}
+            return GuideResult(None, score, issues, None)
+        return GuideResult(guide, score, issues, None)
+    except SoftTimeLimitExceeded:
+        raise
+    except Exception as exc:
+        return GuideResult(None, 0, [], exc)
+
+
+def _run_standard_path_attempts(ctx: _GenerationContext, stubs: list[BeatStub] | None) -> GuideResult:
+    """Run the standard LLM path's up-to-3-attempt retry loop with closed-loop feedback and
+    best-of-N acceptance. Records job.meta["path"]="standard" unconditionally at entry — the
+    last path to actually run wins, matching the original inline behavior exactly (a structured-
+    path fallback overwrites "path" from "structured" to "standard").
+
+    feedback MUST stay additive (active_notes + issues), never a plain replace — active_notes is
+    seeded into `feedback` before attempt 1, and a wholesale overwrite on a later attempt would
+    silently drop those performance notes. See
+    docs/specs/2026-09-phase5-quality-engagement-feedback.md §3.5 and
+    tests/test_generate_task.py::test_seeded_performance_notes_survive_past_attempt_1_on_retry.
+    """
+    ctx.job.meta = {**(ctx.job.meta or {}), "path": "standard", "stub_count": len(stubs) if stubs else 0}
+    ctx.db.commit()
+    generate_provider = "nvidia" if is_nvidia_generation() else "ollama"
+    # Seeded from attempt 1, not just retries — every active PerformanceNote is automatic
+    # prompt-injection plumbing once an operator has curated it (see
+    # docs/specs/2026-09-phase5-quality-engagement-feedback.md §3.2).
+    feedback: list[str] = list(ctx.active_notes)
+    best_guide: MasterGuide | None = None
+    best_score = 0
     last_exc: Exception | None = None
     last_score = 0
     last_issues: list[str] = []
+    guide: MasterGuide | None = None
 
-    # ── Structured-script fast path ──────────────────────────────────────
-    forced_path = (job.meta or {}).get("generation_path", "auto")
-    stubs = script_parser.parse(effective_context)
-    # resolve_generation_path() (shared with the pre-generation cost
-    # estimate, which has no stubs to check) decides via is_structured()
-    # alone. is_structured() is a cheaper header-count check that parse()
-    # itself starts with — but parse() can still return None even when
-    # is_structured() is True, if every detected section's body is empty
-    # after stripping labels/player prefixes. Require stubs is not None
-    # here so that disagreement falls straight through to the standard
-    # path instead of calling _generate_from_structured_script(stubs=None)
-    # and wasting an attempt on a guaranteed TypeError.
-    use_structured = (
-        resolve_generation_path(effective_context, forced_path) == "structured"
-        and stubs is not None
-    )
+    for attempt in range(3):
+        _enforce_paid_call_budget(ctx.db, ctx.reel.id)
+        heartbeat(ctx.db, ctx.job, 20 + attempt * 20)
 
-    if use_structured:
-        heartbeat(db, job, 20)
-        try:
-            guide = _generate_from_structured_script(
-                reel, cuts, llm, db, target_lengths, stubs, context=effective_context
-            )
-            clean_guide(guide, voiceover_mode)
-            rule_s, rule_i = score_guide(effective_context, guide, max_target, axis_multipliers)
-            last_score, last_issues = _combined_score(
-                rule_s, rule_i, guide, effective_context,
-                db=db, reel_id=reel.id, attempt=1,
-            )
-            # Record path only after structured path succeeds
-            job.meta = {**(job.meta or {}), "path": "structured", "stub_count": len(stubs) if stubs else 0}
-            db.commit()
-            # Fall through to standard path if quality is too low
-            if last_score < quality_threshold:
-                job.meta = {**(job.meta or {}), "structured_score": last_score, "structured_fallback": True}
-                guide = None
-        except SoftTimeLimitExceeded:
-            raise   # the runtime limit ends the whole task; falling back to the standard path would ignore it
-        except Exception as exc:
-            last_exc = exc
-            guide = None
-
-    # ── Standard LLM path (unstructured context or fallback) ─────────────
-    if guide is None:
-        last_exc = None  # structured-path exception must not pollute standard-path errors
-        job.meta = {**(job.meta or {}), "path": "standard", "stub_count": len(stubs) if stubs else 0}
-        db.commit()
-        generate_provider = "nvidia" if is_nvidia_generation() else "ollama"
-        # Seeded from attempt 1, not just retries — every active PerformanceNote is
-        # automatic prompt-injection plumbing once an operator has curated it (see
-        # docs/specs/2026-09-phase5-quality-engagement-feedback.md §3.2).
-        feedback: list[str] = list(active_notes)
-        best_guide: MasterGuide | None = None
-        best_score = 0
-
-        for attempt in range(3):
-            _enforce_paid_call_budget(db, reel.id)
-            heartbeat(db, job, 20 + attempt * 20)
-
-            messages = build_messages(
-                context=effective_context,
-                niche=reel.niche or "",
-                platforms=platforms,
-                voiceover_mode=voiceover_mode,
-                target_lengths=target_lengths,
-                prior_feedback=feedback or None,
-            )
-
-            with record_stage(db, reel.id, "generate",
-                              provider=generate_provider, attempt=attempt + 1) as ev:
-                raw = llm.complete(messages, json_mode=True)
-                ev.detail["raw_len"] = len(raw)
-                usage = getattr(llm, "last_usage", {})
-                ev.tokens_in = usage.get("prompt_tokens")
-                ev.tokens_out = usage.get("completion_tokens")
-                ev.cost_usd = llm_cost_usd(generate_provider, ev.tokens_in, ev.tokens_out)
-
-            try:
-                candidate = MasterGuide.model_validate_json(raw)
-            except ValidationError as exc:
-                last_exc = exc
-                continue
-
-            clean_guide(candidate, voiceover_mode)
-            enrich_provider = "nvidia" if settings.nvidia_api_key else "ollama"
-            enrichment_llm = get_enrichment_provider()
-            with record_stage(db, reel.id, "enrich",
-                              provider=enrich_provider,
-                              attempt=attempt + 1) as ev:
-                usage_before = dict(getattr(enrichment_llm, "total_usage", {}))
-                shallow_before = sum(
-                    1 for pg in candidate.cuts for b in pg.beats
-                    if b.type == "body" and b.vo_script
-                    and len(b.vo_script.split()) < 25
-                )
-                _enrich_standard_path_guide(candidate, effective_context, enrichment_llm)
-                ev.detail["shallow_beats"] = shallow_before
-                usage_after = getattr(enrichment_llm, "total_usage", {})
-                ev.tokens_in = usage_after.get("prompt_tokens", 0) - usage_before.get("prompt_tokens", 0)
-                ev.tokens_out = usage_after.get("completion_tokens", 0) - usage_before.get("completion_tokens", 0)
-                ev.cost_usd = llm_cost_usd(enrich_provider, ev.tokens_in, ev.tokens_out)
-
-            rule_s, rule_i = score_guide(effective_context, candidate, max_target, axis_multipliers)
-            last_score, last_issues = _combined_score(
-                rule_s, rule_i, candidate, effective_context,
-                db=db, reel_id=reel.id, attempt=attempt + 1,
-            )
-
-            if last_score >= quality_threshold:
-                guide = candidate
-                break
-
-            # Track best-of-N so we can accept it if all retries fail
-            if last_score > best_score:
-                best_score = last_score
-                best_guide = candidate
-
-            # MUST be additive, not a plain replace — active_notes is seeded into
-            # `feedback` before attempt 1 (above), and a wholesale overwrite here would
-            # silently drop those performance notes on attempt 2 and 3. See
-            # docs/specs/2026-09-phase5-quality-engagement-feedback.md §3.5.
-            feedback = active_notes + [i for i in last_issues if not i.startswith("Score breakdown")]
-            last_exc = None
-
-        # Accept best-of-N rather than failing when nothing clears the threshold
-        if guide is None and best_guide is not None:
-            guide = best_guide
-            last_score = best_score
-
-        # The single-shot MasterGuide JSON call above writes caption/hashtags from
-        # niche/context alone, with no explicit instruction to derive them from the
-        # beats it just wrote — the "Standard LLM path caption/hashtags not
-        # content-aware" Open Issues item. Regenerate them from the ACTUAL accepted
-        # guide's real VO content, mirroring the structured path's
-        # _generate_caption_hashtags() call (Phase 7o). Best-effort, one extra paid
-        # call gated by the same lifetime-per-reel budget hook_variants already
-        # uses below — on any failure (budget exhausted, or _generate_caption_
-        # hashtags() itself degrading to ("", [])), the model's own caption/hashtags
-        # already on `guide` are left untouched, never worse than before this fix.
-        if guide is not None and guide.cuts \
-                and paid_call_count(db, reel.id) < settings.max_paid_llm_calls_per_reel:
-            vo_scripts = [b.vo_script for b in guide.cuts[0].beats]
-            # A Correctness/Edge-Case review caught a real edge case: music_only/silent
-            # voiceover_mode instructs the LLM to leave every vo_script empty (see
-            # build_messages()'s vo_note), so this call would otherwise fire with nothing
-            # to ground a caption in -- wasted latency/budget on a call that could never
-            # succeed (_generate_caption_hashtags()'s own validation would reject an
-            # empty-VO caption anyway, but skipping the call outright avoids paying for
-            # a guaranteed-useless attempt).
-            if any(v.strip() for v in vo_scripts):
-                caption_provider = "nvidia" if settings.nvidia_api_key else "ollama"
-                caption_llm = get_enrichment_provider()
-                with record_stage(db, reel.id, "caption_hashtags", provider=caption_provider) as ev:
-                    new_caption, new_hashtags = _generate_caption_hashtags(
-                        vo_scripts, reel.niche or "general", caption_llm,
-                    )
-                    usage = getattr(caption_llm, "last_usage", {})
-                    ev.tokens_in = usage.get("prompt_tokens")
-                    ev.tokens_out = usage.get("completion_tokens")
-                    ev.cost_usd = llm_cost_usd(caption_provider, ev.tokens_in, ev.tokens_out)
-                    ev.detail["replaced"] = bool(new_caption and new_hashtags)
-                if new_caption and new_hashtags:
-                    for platform_guide in guide.cuts:
-                        platform_guide.caption = new_caption
-                        platform_guide.hashtags = new_hashtags
-
-    if guide is None:
-        if last_exc:
-            raise ValueError(
-                f"LLM returned invalid guide after 3 attempts: {last_exc}"
-            ) from last_exc
-        raise ValueError(
-            f"Guide quality score {last_score}/100 after 3 attempts — "
-            f"below {quality_threshold}. Issues: {'; '.join(last_issues)}"
+        messages = build_messages(
+            context=ctx.effective_context,
+            niche=ctx.reel.niche or "",
+            platforms=ctx.platforms,
+            voiceover_mode=ctx.voiceover_mode,
+            target_lengths=ctx.target_lengths,
+            prior_feedback=feedback or None,
         )
 
-    heartbeat(db, job, 80)
-
-    # One cheap extra call for alternate hook lines — all platform guides normally share
-    # identical beats (see CLAUDE.md), so this runs once per reel, not once per cut, and
-    # the same variant list is applied to every cut below. Best-effort: a failure or an
-    # exhausted paid-call budget just means no variants, never a failed generate job.
-    hook_variants: list[str] = []
-    hook_beat = guide.cuts[0].beats[0] if guide.cuts and guide.cuts[0].beats else None
-    if hook_beat is not None and hook_beat.type == "hook" and hook_beat.vo_script.strip() \
-            and paid_call_count(db, reel.id) < settings.max_paid_llm_calls_per_reel:
-        hook_provider = "nvidia" if settings.nvidia_api_key else "ollama"
-        hook_llm = get_enrichment_provider()
-        with record_stage(db, reel.id, "hook_variants", provider=hook_provider) as ev:
-            # A single one-shot call inside generate_hook_variants() — last_usage (not
-            # total_usage) is the right field, same as the main "generate" stage above;
-            # no before/after diffing needed since there's only one call to diff against.
-            hook_variants = generate_hook_variants(
-                hook_beat.vo_script, effective_context, reel.niche or "", hook_llm,
-            )
-            usage = getattr(hook_llm, "last_usage", {})
+        with record_stage(ctx.db, ctx.reel.id, "generate",
+                          provider=generate_provider, attempt=attempt + 1) as ev:
+            raw = ctx.llm.complete(messages, json_mode=True)
+            ev.detail["raw_len"] = len(raw)
+            usage = getattr(ctx.llm, "last_usage", {})
             ev.tokens_in = usage.get("prompt_tokens")
             ev.tokens_out = usage.get("completion_tokens")
-            ev.cost_usd = llm_cost_usd(hook_provider, ev.tokens_in, ev.tokens_out)
-            ev.detail["variant_count"] = len(hook_variants)
+            ev.cost_usd = llm_cost_usd(generate_provider, ev.tokens_in, ev.tokens_out)
 
+        try:
+            candidate = MasterGuide.model_validate_json(raw)
+        except ValidationError as exc:
+            last_exc = exc
+            continue
+
+        clean_guide(candidate, ctx.voiceover_mode)
+        enrich_provider = "nvidia" if settings.nvidia_api_key else "ollama"
+        enrichment_llm = get_enrichment_provider()
+        with record_stage(ctx.db, ctx.reel.id, "enrich",
+                          provider=enrich_provider,
+                          attempt=attempt + 1) as ev:
+            usage_before = dict(getattr(enrichment_llm, "total_usage", {}))
+            shallow_before = sum(
+                1 for pg in candidate.cuts for b in pg.beats
+                if b.type == "body" and b.vo_script
+                and len(b.vo_script.split()) < 25
+            )
+            _enrich_standard_path_guide(candidate, ctx.effective_context, enrichment_llm)
+            ev.detail["shallow_beats"] = shallow_before
+            usage_after = getattr(enrichment_llm, "total_usage", {})
+            ev.tokens_in = usage_after.get("prompt_tokens", 0) - usage_before.get("prompt_tokens", 0)
+            ev.tokens_out = usage_after.get("completion_tokens", 0) - usage_before.get("completion_tokens", 0)
+            ev.cost_usd = llm_cost_usd(enrich_provider, ev.tokens_in, ev.tokens_out)
+
+        rule_s, rule_i = score_guide(ctx.effective_context, candidate, ctx.max_target, ctx.axis_multipliers)
+        last_score, last_issues = _combined_score(
+            rule_s, rule_i, candidate, ctx.effective_context,
+            db=ctx.db, reel_id=ctx.reel.id, attempt=attempt + 1,
+        )
+
+        if last_score >= ctx.quality_threshold:
+            guide = candidate
+            break
+
+        # Track best-of-N so we can accept it if all retries fail
+        if last_score > best_score:
+            best_score = last_score
+            best_guide = candidate
+
+        feedback = ctx.active_notes + [i for i in last_issues if not i.startswith("Score breakdown")]
+        last_exc = None
+
+    # Accept best-of-N rather than failing when nothing clears the threshold
+    if guide is None and best_guide is not None:
+        guide = best_guide
+        last_score = best_score
+
+    return GuideResult(guide, last_score, last_issues, last_exc)
+
+
+def _maybe_regenerate_caption_hashtags(ctx: _GenerationContext, guide: MasterGuide) -> None:
+    """Best-effort: regenerate caption/hashtags from the ACCEPTED guide's real VO content,
+    mirroring the structured path's own _generate_caption_hashtags() call (Phase 7o) — the
+    single-shot MasterGuide JSON call writes SOME caption/hashtags from niche/context alone,
+    with no explicit instruction to ground them in the beats it just wrote. Mutates
+    guide.cuts[*].caption/hashtags in place on success; leaves them untouched on any failure
+    (budget exhausted, empty VO, or _generate_caption_hashtags() itself degrading to ("", [])) —
+    never worse than before this feature existed.
+
+    Skips the call entirely (not just discards its result) when every vo_script is empty —
+    music_only/silent voiceover_mode leaves them that way by design (build_messages()'s
+    vo_note), and the call could never succeed anyway.
+    """
+    if not guide.cuts:
+        return
+    vo_scripts = [b.vo_script for b in guide.cuts[0].beats]
+    if not any(v.strip() for v in vo_scripts):
+        return
+    niche = ctx.reel.niche or "general"
+    result = _best_effort_llm_call(
+        ctx.db, ctx.reel.id, "caption_hashtags",
+        lambda llm: _generate_caption_hashtags(vo_scripts, niche, llm),
+        detail=lambda r: {"replaced": bool(r[0] and r[1])},
+    )
+    if result is None:
+        return
+    new_caption, new_hashtags = result
+    if new_caption and new_hashtags:
+        for platform_guide in guide.cuts:
+            platform_guide.caption = new_caption
+            platform_guide.hashtags = new_hashtags
+
+
+def _maybe_generate_hook_variants(ctx: _GenerationContext, guide: MasterGuide) -> list[str]:
+    """Best-effort: one cheap extra call for alternate hook lines. All platform guides
+    normally share identical beats, so this runs once per reel, not once per cut, and the same
+    variant list is applied to every cut by _persist_guide(). A failure or an exhausted
+    paid-call budget just means no variants, never a failed generate job.
+    """
+    hook_beat = guide.cuts[0].beats[0] if guide.cuts and guide.cuts[0].beats else None
+    if hook_beat is None or hook_beat.type != "hook" or not hook_beat.vo_script.strip():
+        return []
+    context = ctx.effective_context
+    niche = ctx.reel.niche or ""
+    result = _best_effort_llm_call(
+        ctx.db, ctx.reel.id, "hook_variants",
+        lambda llm: generate_hook_variants(hook_beat.vo_script, context, niche, llm),
+        detail=lambda r: {"variant_count": len(r)},
+    )
+    return result or []
+
+
+def _persist_guide(cuts, guide: MasterGuide, hook_variants: list[str]) -> None:
+    """Write the accepted guide onto every matching Cut row. A platform_guide with no matching
+    Cut (shouldn't happen — defensive) is silently skipped, unchanged from the original inline
+    loop."""
     for platform_guide in guide.cuts:
         cut = next(
             (c for c in cuts if c.platform.value == platform_guide.platform), None
@@ -629,8 +673,74 @@ def generate_guide(self, db, job, reel):
         cut.hashtags = platform_guide.hashtags
         cut.hook_variants = hook_variants or None
 
+
+@celery_app.task(bind=True, max_retries=2, **time_limits(_MAX_RUNTIME_S))
+@job_task("generate", prepare=_prepare_generate, start_progress=10, max_runtime_s=_MAX_RUNTIME_S)
+def generate_guide(self, db, job, reel):
+    effective_context = reel.enriched_context or reel.context
+    _strip_stale_fallback_meta(db, job)
+    active_notes_rows = _load_active_performance_notes(db)
+    active_notes = [n.text for n in active_notes_rows]
+
+    cuts = db.query(models.Cut).filter(models.Cut.reel_id == reel.id).all()
+    platforms = [c.platform.value for c in cuts]
+    target_lengths = {c.platform.value: c.target_length_s or 45.0 for c in cuts}
+    max_target = max(target_lengths.values())
+    voiceover_mode = reel.voiceover_mode or "voiceover"
+
+    llm = get_llm_provider()
+    quality_threshold = QUALITY_THRESHOLD if is_nvidia_generation() else QUALITY_THRESHOLD_LOCAL
+
+    ctx = _GenerationContext(
+        db=db, job=job, reel=reel, cuts=cuts, platforms=platforms,
+        target_lengths=target_lengths, max_target=max_target, voiceover_mode=voiceover_mode,
+        effective_context=effective_context, active_notes=active_notes,
+        axis_multipliers=settings.evaluator_axis_weight_multipliers or None,
+        quality_threshold=quality_threshold, llm=llm,
+    )
+
+    # ── Structured-script fast path ──────────────────────────────────────
+    forced_path = (job.meta or {}).get("generation_path", "auto")
+    stubs = script_parser.parse(effective_context)
+    # resolve_generation_path() (shared with the pre-generation cost
+    # estimate, which has no stubs to check) decides via is_structured()
+    # alone. is_structured() is a cheaper header-count check that parse()
+    # itself starts with — but parse() can still return None even when
+    # is_structured() is True, if every detected section's body is empty
+    # after stripping labels/player prefixes. Require stubs is not None
+    # here so that disagreement falls straight through to the standard
+    # path instead of calling _try_structured_path with stubs=None and
+    # wasting an attempt on a guaranteed TypeError.
+    use_structured = (
+        resolve_generation_path(effective_context, forced_path) == "structured"
+        and stubs is not None
+    )
+
+    result = _try_structured_path(ctx, stubs) if use_structured else GuideResult(None, 0, [], None)
+
+    # ── Standard LLM path (unstructured context or fallback) ─────────────
+    if result.guide is None:
+        result = _run_standard_path_attempts(ctx, stubs)
+
+    if result.guide is None:
+        if result.exc:
+            raise ValueError(
+                f"LLM returned invalid guide after 3 attempts: {result.exc}"
+            ) from result.exc
+        raise ValueError(
+            f"Guide quality score {result.score}/100 after 3 attempts — "
+            f"below {quality_threshold}. Issues: {'; '.join(result.issues)}"
+        )
+
+    guide = result.guide
+    heartbeat(db, job, 80)
+
+    _maybe_regenerate_caption_hashtags(ctx, guide)
+    hook_variants = _maybe_generate_hook_variants(ctx, guide)
+    _persist_guide(cuts, guide, hook_variants)
+
     transition(reel, "guide_ready", REEL_TRANSITIONS)
     # Shared by both paths — active_notes_rows is always defined by now regardless of
     # which path produced `guide` (queried unconditionally at the top of this function).
-    job.meta = {**(job.meta or {}), "quality_score": last_score,
+    job.meta = {**(job.meta or {}), "quality_score": result.score,
                 "performance_note_ids": [n.id for n in active_notes_rows]}
