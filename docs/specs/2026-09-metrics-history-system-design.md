@@ -243,3 +243,20 @@ call site in the codebase — none touches Cut or Reel). It found two real gaps,
 
 No other factual claims in the design were found to be wrong; the single-`now()`-reuse design,
 cascading-delete reasoning, and migration-syntax claims all held up against direct code inspection.
+
+## 11. Corrections — review on the opened PR
+
+A deep 4-persona review (Security/Red-Team, Correctness/Edge-Case, Test-Quality Auditor,
+Documentation-Consistency, this pipeline's default review depth) ran against the opened PR.
+Security/Red-Team, Correctness/Edge-Case, and Test-Quality Auditor found nothing — each
+independently re-verified, by direct execution (not just reading), the single-`now()`-capture
+property, the raw-vs-forward-filled snapshot content, commit atomicity, and every new test's
+mutation-kill claims, including empirically confirming SQLite/SQLAlchemy round-trips full
+microsecond precision on `DateTime(timezone=True)` in this test suite's in-memory fixture (so the
+exact-equality timestamp assertion is genuinely discriminating, not a coincidence of low
+resolution). Documentation-Consistency found one real, pre-existing gap this PR should have caught
+but didn't: `docs/architecture.md`'s "What is not yet built" section still had a stale "Metrics time
+series" line claiming `cuts.views`/`likes`/`comments` "hold only the latest pull, not a history"
+with no mention of the new table — this diff hadn't touched that file at all. Fixed by updating the
+line to describe the actual current state (history now accumulates via `cut_metric_snapshots`; the
+separate, still-open gap is the trend-chart UI, not the data).
