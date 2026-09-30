@@ -18,9 +18,12 @@ _STRUCTURED_TIME_S = (60, 120)
 _STANDARD_TIME_S = (120, 300)
 
 # Rough paid-LLM-call ranges per path (enrich/conflict/visuals/caption/judge for
-# structured; up to 3 retry attempts of generate+enrich+judge for standard).
+# structured; up to 3 retry attempts of generate+enrich+judge for standard, plus
+# one best-effort content-aware caption/hashtags regeneration call once a guide
+# is accepted — Phase 7o, docs/roadmap.md's "Standard LLM path caption/hashtags
+# not content-aware" Open Issues item).
 _STRUCTURED_CALLS = (4, 7)
-_STANDARD_CALLS = (3, 9)
+_STANDARD_CALLS = (3, 10)
 
 
 @dataclass

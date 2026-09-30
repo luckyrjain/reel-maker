@@ -226,6 +226,93 @@ def test_generate_caption_hashtags_still_falls_back_on_an_ordinary_error():
     assert _generate_caption_hashtags([], "football", llm) == ("", [])
 
 
+# ── Phase 7o — standard-path caption/hashtags content-awareness ─────────────
+# docs/roadmap.md's Open Issues item: the single-shot MasterGuide JSON call
+# writes caption/hashtags from niche/context alone, with no explicit
+# instruction to derive them from the beats it just wrote. generate_guide()
+# now makes one extra best-effort call to the ALREADY-generalized
+# _generate_caption_hashtags() (see its own docstring) with the accepted
+# guide's real vo_script content, overwriting the model's own caption/
+# hashtags on success and leaving them untouched on any failure.
+
+def test_standard_path_regenerates_caption_hashtags_from_real_vo_content():
+    """The success path: _generate_caption_hashtags() returns real content, and
+    every platform guide's caption/hashtags is overwritten with it -- not the
+    generic caption/hashtags _valid_guide_raw()'s single-shot JSON produced."""
+    from worker.tasks.generate import generate_guide
+
+    job = _job()
+    reel = _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
+    db.query.side_effect = _query_dispatch(notes=[], cuts=[_cut()])
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.generate.paid_call_count", return_value=0),
+        patch("worker.tasks.generate.script_parser.parse", return_value=None),  # force standard path
+        patch("worker.tasks.generate.get_llm_provider") as mock_get_llm,
+        patch("worker.tasks.generate.build_messages", return_value=[{"role": "system", "content": "x"}]),
+        patch("worker.tasks.generate.score_guide", return_value=(0, [])),
+        patch("worker.tasks.generate._combined_score", return_value=(90, [])),
+        patch("worker.tasks.generate._enrich_standard_path_guide"),
+        patch("worker.tasks.generate.generate_hook_variants", return_value=[]),
+        patch(
+            "worker.tasks.generate._generate_caption_hashtags",
+            return_value=("Content-aware caption from real VO.", ["a", "b", "c", "d", "e"]),
+        ) as mock_caption,
+    ):
+        mock_get_llm.return_value.complete.return_value = _valid_guide_raw()
+        generate_guide(1)
+
+    assert job.status == models.JobStatus.done
+    mock_caption.assert_called_once()
+    # The real accepted guide's own beat VO content, not empty/placeholder text.
+    vo_scripts_arg = mock_caption.call_args.args[0]
+    assert any("biggest upset" in v for v in vo_scripts_arg)
+
+    cut = db.query.side_effect(models.Cut).filter.return_value.all.return_value[0]
+    assert cut.guide["caption"] == "Content-aware caption from real VO."
+    assert cut.caption == "Content-aware caption from real VO."
+    assert cut.hashtags == ["a", "b", "c", "d", "e"]
+
+
+def test_standard_path_keeps_original_caption_when_regeneration_fails():
+    """The degrade path: _generate_caption_hashtags() returning its own
+    documented failure contract ("", []) must leave the single-shot guide's
+    ORIGINAL model-generated caption/hashtags untouched -- never blanked out,
+    never worse than before this fix existed."""
+    from worker.tasks.generate import generate_guide
+
+    job = _job()
+    reel = _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
+    db.query.side_effect = _query_dispatch(notes=[], cuts=[_cut()])
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.generate.paid_call_count", return_value=0),
+        patch("worker.tasks.generate.script_parser.parse", return_value=None),  # force standard path
+        patch("worker.tasks.generate.get_llm_provider") as mock_get_llm,
+        patch("worker.tasks.generate.build_messages", return_value=[{"role": "system", "content": "x"}]),
+        patch("worker.tasks.generate.score_guide", return_value=(0, [])),
+        patch("worker.tasks.generate._combined_score", return_value=(90, [])),
+        patch("worker.tasks.generate._enrich_standard_path_guide"),
+        patch("worker.tasks.generate.generate_hook_variants", return_value=[]),
+        patch("worker.tasks.generate._generate_caption_hashtags", return_value=("", [])),
+    ):
+        mock_get_llm.return_value.complete.return_value = _valid_guide_raw()
+        generate_guide(1)
+
+    assert job.status == models.JobStatus.done
+    cut = db.query.side_effect(models.Cut).filter.return_value.all.return_value[0]
+    # Exactly the caption/hashtags _valid_guide_raw()'s single-shot JSON carried.
+    assert cut.guide["caption"] == "Big match preview."
+    assert cut.caption == "Big match preview."
+    assert cut.hashtags == ["football", "soccer", "sports", "matchday", "preview"]
+
+
 # ── §3.5 performance-note wiring regressions ─────────────────────────────────
 # Both tests below were written first against the naive/buggy implementation
 # (a plain `feedback = [...]` replace for #1; notes queried inside the
@@ -309,6 +396,7 @@ def test_seeded_performance_notes_survive_past_attempt_1_on_retry():
         patch("worker.tasks.generate._combined_score", side_effect=_combined_score_side_effect),
         patch("worker.tasks.generate._enrich_standard_path_guide"),
         patch("worker.tasks.generate.generate_hook_variants", return_value=[]),
+        patch("worker.tasks.generate._generate_caption_hashtags", return_value=("", [])),
     ):
         mock_get_llm.return_value.complete.return_value = _valid_guide_raw()
         generate_guide(1)
@@ -511,6 +599,7 @@ def test_genuine_structured_fallback_still_recorded_after_the_strip():
         patch("worker.tasks.generate.build_messages", return_value=[{"role": "system", "content": "x"}]),
         patch("worker.tasks.generate._enrich_standard_path_guide"),
         patch("worker.tasks.generate.generate_hook_variants", return_value=[]),
+        patch("worker.tasks.generate._generate_caption_hashtags", return_value=("", [])),
     ):
         mock_get_llm.return_value.complete.return_value = _valid_guide_raw()
         generate_guide(1)

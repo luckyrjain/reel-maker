@@ -158,10 +158,16 @@ def _stubs_to_platform_guide(
 
 
 def _generate_caption_hashtags(
-    stubs: list[BeatStub], niche: str, llm
+    vo_scripts: list[str], niche: str, llm
 ) -> tuple[str, list[str]]:
-    """Ask the LLM to write a caption and hashtags from the actual VO content."""
-    combined_vo = " ".join(s.vo_script for s in stubs if s.vo_script)[:600]
+    """Ask the LLM to write a caption and hashtags from the actual VO content.
+
+    Takes plain VO strings (not BeatStub) so both generation paths can call it —
+    the structured path passes `[s.vo_script for s in stubs]`, the standard path
+    passes `[b.vo_script for b in guide.cuts[0].beats]` (see generate_guide()'s
+    standard-path caption/hashtags regeneration, Phase 7o — see CLAUDE.md's Key
+    conventions and docs/roadmap.md's Open Issues table)."""
+    combined_vo = " ".join(v for v in vo_scripts if v)[:600]
     messages = [
         {"role": "system", "content":
             "You write social media copy for sports short-form videos. "
@@ -276,7 +282,9 @@ def _generate_from_structured_script(
     niche = reel.niche or "general"
     niche_tag = niche.replace(" ", "").lower()
     with record_stage(db, reel.id, "caption_hashtags", provider=enrich_provider) as ev:
-        caption, hashtags = _generate_caption_hashtags(stubs, niche, enrichment_llm)
+        caption, hashtags = _generate_caption_hashtags(
+            [s.vo_script for s in stubs], niche, enrichment_llm
+        )
         usage = getattr(enrichment_llm, "last_usage", {})
         ev.tokens_in = usage.get("prompt_tokens")
         ev.tokens_out = usage.get("completion_tokens")
@@ -537,6 +545,35 @@ def generate_guide(self, db, job, reel):
         if guide is None and best_guide is not None:
             guide = best_guide
             last_score = best_score
+
+        # The single-shot MasterGuide JSON call above writes caption/hashtags from
+        # niche/context alone, with no explicit instruction to derive them from the
+        # beats it just wrote — the "Standard LLM path caption/hashtags not
+        # content-aware" Open Issues item. Regenerate them from the ACTUAL accepted
+        # guide's real VO content, mirroring the structured path's
+        # _generate_caption_hashtags() call (Phase 7o). Best-effort, one extra paid
+        # call gated by the same lifetime-per-reel budget hook_variants already
+        # uses below — on any failure (budget exhausted, or _generate_caption_
+        # hashtags() itself degrading to ("", [])), the model's own caption/hashtags
+        # already on `guide` are left untouched, never worse than before this fix.
+        if guide is not None and guide.cuts \
+                and paid_call_count(db, reel.id) < settings.max_paid_llm_calls_per_reel:
+            caption_provider = "nvidia" if settings.nvidia_api_key else "ollama"
+            caption_llm = get_enrichment_provider()
+            vo_scripts = [b.vo_script for b in guide.cuts[0].beats]
+            with record_stage(db, reel.id, "caption_hashtags", provider=caption_provider) as ev:
+                new_caption, new_hashtags = _generate_caption_hashtags(
+                    vo_scripts, reel.niche or "general", caption_llm,
+                )
+                usage = getattr(caption_llm, "last_usage", {})
+                ev.tokens_in = usage.get("prompt_tokens")
+                ev.tokens_out = usage.get("completion_tokens")
+                ev.cost_usd = llm_cost_usd(caption_provider, ev.tokens_in, ev.tokens_out)
+                ev.detail["replaced"] = bool(new_caption and new_hashtags)
+            if new_caption and new_hashtags:
+                for platform_guide in guide.cuts:
+                    platform_guide.caption = new_caption
+                    platform_guide.hashtags = new_hashtags
 
     if guide is None:
         if last_exc:
