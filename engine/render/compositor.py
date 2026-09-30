@@ -11,7 +11,7 @@ import logging
 import math
 import os
 import subprocess
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -128,14 +128,44 @@ def _crop_to_9_16(clip: VideoFileClip) -> VideoFileClip:
     )
 
 
+@contextmanager
+def _closing(reader):
+    """Wrap a MoviePy reader (VideoFileClip/AudioFileClip) so registering it on an
+    ExitStack via `stack.enter_context(_closing(reader))` closes it on unwind
+    WITHOUT letting a close()-time failure mask whatever exception triggered that
+    unwind in the first place.
+
+    A raw `stack.enter_context(reader)` does not have this property: ExitStack's
+    own unwind does not suppress an exception raised by a registered context's
+    __exit__ — it replaces whatever exception was propagating with that one. A
+    real VideoFileClip reader's close() calls into FFMPEG_VideoReader.close(),
+    which can itself raise (e.g. terminating/waiting on an already-dead ffmpeg
+    subprocess) — plausible exactly when the render is failing because of
+    corrupt/malformed input media, i.e. the same condition that's already raising
+    the real error this stack is unwinding for. Without this wrapper, a reader's
+    close() failure during cleanup would silently replace an operator-relevant
+    corrupt-media error with an unrelated "close failed" message in job.error —
+    this codebase's own invariant elsewhere (see worker/tasks/common.py's
+    "errors while recording a failure ... never mask the original exception")
+    otherwise holds everywhere except here without this wrapper.
+    """
+    try:
+        yield reader
+    finally:
+        try:
+            reader.close()
+        except Exception:
+            _log.exception("Failed to close a MoviePy reader during cleanup")
+
+
 def _build_media_sub_clip(media_path: Path | None, duration_s: float, stack: ExitStack):
     """Build a single 9:16 clip from one image or video file.
 
-    Every real VideoFileClip this call opens is registered on `stack` at the
-    moment it's opened (`stack.enter_context(...)`), so the caller's own
-    `with ExitStack()` block guarantees it gets closed on every exit path —
-    including a later open/transform in this same call raising — without this
-    function needing to track or return anything itself. Neither
+    Every real VideoFileClip this call opens is registered on `stack` (via
+    `_closing()`, see its own docstring) at the moment it's opened, so the
+    caller's own `with ExitStack()` block guarantees it gets closed on every
+    exit path — including a later open/transform in this same call raising —
+    without this function needing to track or return anything itself. Neither
     concatenate_videoclips() (the default "chain" method only retains clip
     references when a clip has a mask) nor CompositeVideoClip.close() (only
     closes its synthetic bg/audio, never its .clips list) reach these nested
@@ -151,17 +181,23 @@ def _build_media_sub_clip(media_path: Path | None, duration_s: float, stack: Exi
         frame = np.array(_fit_image_9_16(img))
         return _ken_burns(frame, duration_s)
 
-    raw = stack.enter_context(VideoFileClip(str(media_path), audio=False))
+    raw = stack.enter_context(_closing(VideoFileClip(str(media_path), audio=False)))
     if raw.duration < duration_s:
         loops = math.ceil(duration_s / raw.duration) + 1
         # The probe clip is discarded in favor of N loop copies below. Closing
         # it here (rather than waiting for stack-exit) frees it right away
         # instead of holding an unused ffmpeg reader open for the whole
         # render; Clip.close() is idempotent (`if self.reader: ...`), so the
-        # stack closing it again at exit is a verified no-op.
-        raw.close()
+        # stack closing it again at exit is a verified no-op. Swallowed like
+        # every other reader close in this module (see _closing()) — a
+        # close()-time failure here must not abort an otherwise-successful
+        # render over a discarded probe clip.
+        try:
+            raw.close()
+        except Exception:
+            _log.exception("Failed to close the discarded probe clip for %s", media_path)
         raw = concatenate_videoclips([
-            stack.enter_context(VideoFileClip(str(media_path), audio=False))
+            stack.enter_context(_closing(VideoFileClip(str(media_path), audio=False)))
             for _ in range(loops)
         ])
     return _crop_to_9_16(raw).subclipped(0, duration_s)
@@ -615,7 +651,7 @@ def composite_cut(
 
                 if vo_path and vo_path.exists():
                     try:
-                        track = stack.enter_context(AudioFileClip(str(vo_path)))
+                        track = stack.enter_context(_closing(AudioFileClip(str(vo_path))))
                         if track.duration > duration:
                             track = track.subclipped(0, duration)
                         track = track.with_effects(

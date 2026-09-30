@@ -455,6 +455,49 @@ def test_composite_cut_closes_earlier_beats_readers_when_a_later_beat_fails_to_b
     tracker.assert_every_opened_reader_was_closed()
 
 
+def test_composite_cut_propagates_the_original_exception_even_if_a_readers_close_fails(tmp_path):
+    """Security/Red-Team review finding on the ExitStack refactor: ExitStack's own
+    unwind does NOT protect against a registered reader's close() itself raising --
+    that close()-time exception would otherwise REPLACE whatever exception
+    triggered the unwind, silently masking (e.g.) a real corrupt-media error behind
+    an unrelated "close failed" message in job.error. This codebase's own invariant
+    elsewhere (worker/tasks/common.py: "errors while recording a failure ... never
+    mask the original exception") requires this not happen here either. Forces
+    both a real build failure on beat 2 AND VideoFileClip.close() raising for the
+    reader beat 1 already opened -- the ORIGINAL RuntimeError must still be what
+    propagates, not the close-time one. Fixed via compositor.py's `_closing()`
+    wrapper, which swallows (and logs) a close()-time failure instead of letting
+    it reach ExitStack's own unwind."""
+    from engine.render.compositor import _build_beat_clip as real_build_beat_clip
+
+    video = tmp_path / "v.mp4"
+    _make_test_video(video, duration_s=2.0)
+    beats = [
+        {"duration_s": 2.0, "vo_script": "", "on_screen_text": []},
+        {"duration_s": 2.0, "vo_script": "", "on_screen_text": []},
+    ]
+    out = tmp_path / "out.mp4"
+    thumb = tmp_path / "thumb.jpg"
+
+    call_count = {"n": 0}
+
+    def flaky_build_beat_clip(media_paths, duration_s, stack):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise RuntimeError("simulated corrupt media on beat 2")
+        return real_build_beat_clip(media_paths, duration_s, stack)
+
+    with (
+        patch("engine.render.compositor._build_beat_clip", side_effect=flaky_build_beat_clip),
+        patch.object(VideoFileClip, "close", side_effect=RuntimeError("close failed")),
+    ):
+        with pytest.raises(RuntimeError, match="simulated corrupt media on beat 2"):
+            composite_cut(
+                beats=beats, beat_video_paths=[[video], [None]], beat_vo_paths=[None, None],
+                output_path=out, thumbnail_path=thumb,
+            )
+
+
 def test_build_beat_clip_closes_an_earlier_items_reader_when_a_later_item_in_the_same_beat_fails(
     tmp_path,
 ):
@@ -683,8 +726,18 @@ def test_build_beat_clip_does_not_use_collage_for_one_or_three_items():
     """Collage is scoped to EXACTLY 2 items -- 1-item and 3+-item beats keep
     today's sequential-cycling behavior unchanged. Mocking _build_collage_clip
     to raise if it's ever called proves the boundary directly rather than
-    inferring it from output pixels."""
+    inferring it from output pixels.
+
+    Also restores (via _ReaderTracker) a property the pre-ExitStack version of
+    this test proved via `readers1 == readers3 == []`: a None/missing
+    media_path must never open a real VideoFileClip reader. Losing that
+    assertion when the tuple return was dropped was a real Test-Quality gap
+    caught on review -- mutation-tested against a version of
+    _build_media_sub_clip() that opens an unnecessary real reader for the
+    None/missing-path branch, which every other test in this file passed
+    against undetected."""
     with (
+        _ReaderTracker() as tracker,
         patch(
             "engine.render.compositor._build_collage_clip",
             side_effect=AssertionError("collage must not be used for a non-2-item beat"),
@@ -696,6 +749,7 @@ def test_build_beat_clip_does_not_use_collage_for_one_or_three_items():
 
     assert clip1.duration == 2.0
     assert clip3.duration == 3.0
+    assert tracker.opened == [], "a None/missing media_path must never open a real VideoFileClip reader"
 
 
 def test_build_beat_clip_collage_respects_the_duration_floor(tmp_path):
