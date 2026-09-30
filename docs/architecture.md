@@ -501,7 +501,7 @@ MasterGuide:
 - **TikTok publishing**: `CutPlatform.tiktok` exists (render/review works); `TikTokPublisher.publish()` raises `NotImplementedError` on purpose — the Content Posting API needs a separate audited app review, unlike YouTube/Instagram's self-serve OAuth
 - **Scheduling**: `scheduled` cut status and `publish_cut` both handle a cut already sitting in `scheduled`; no UI/scheduler worker transitions a cut *into* it yet
 - **Word-level caption export**: Whisper timing drives on-screen text, but no SRT/VTT file is generated for the platform uploader
-- **Metrics time series**: `cuts.views`/`likes`/`comments`/`metrics_updated_at` hold only the latest pull, not a history — see `docs/roadmap.md` Phase 5b
+- **Metrics trend UI**: `cuts.views`/`likes`/`comments`/`metrics_updated_at` still hold only the latest pull; `cut_metric_snapshots` (migration `0015`) now accumulates the history alongside it, but no chart or endpoint reads it yet — see `docs/roadmap.md`'s "not yet wired in" section
 
 YouTube + Instagram publishing (OAuth, `safe_to_publish` gate, upload flows) shipped
 in Phase 4b — see `engine/publish/`, `api/oauth.py`, `worker/tasks/publish.py`.

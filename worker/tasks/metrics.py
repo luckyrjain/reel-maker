@@ -59,11 +59,22 @@ def _pull_one(db, cut: "models.Cut") -> None:
     if result is None:
         return
 
+    now = datetime.now(timezone.utc)
     if result.views is not None:
         cut.views = result.views
     if result.likes is not None:
         cut.likes = result.likes
     if result.comments is not None:
         cut.comments = result.comments
-    cut.metrics_updated_at = datetime.now(timezone.utc)
+    cut.metrics_updated_at = now
+    # Append-only history, alongside (never replacing) the "latest known" columns
+    # above -- records the RAW fetch result, not the forward-filled cut.views/
+    # likes/comments, so a metric missing from this specific pull (e.g. Instagram
+    # metric-name drift) doesn't fabricate a history point by carrying forward a
+    # stale value under a new timestamp. See
+    # docs/specs/2026-09-metrics-history-system-design.md.
+    db.add(models.CutMetricSnapshot(
+        cut_id=cut.id, views=result.views, likes=result.likes, comments=result.comments,
+        recorded_at=now,
+    ))
     db.commit()
