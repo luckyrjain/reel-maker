@@ -429,7 +429,7 @@ Font: 60px white, black shadow, centered at 73% of frame height. Up to 5 segment
 - Rate-limit handling: 0.5 s between players, 2 s retry on 429
 - License fields stored: `license`, `license_url`, `attribution`, `safe_to_publish`
 - `safe_to_publish` is `True` only for CC0/CC-BY/public domain — most player headshots are CC-BY-SA (attribution required at publish)
-- Multiple players in one beat → multiple assets, cycled as Ken Burns sub-clips
+- Multiple players in one beat → multiple assets; exactly 2 → 2-up side-by-side collage (each half its own Ken Burns crop of the full frame — see `_build_collage_clip()`), 1 or 3+ → sequential Ken Burns sub-clips
 
 ### TTS audio
 
@@ -500,7 +500,6 @@ MasterGuide:
 
 - **TikTok publishing**: `CutPlatform.tiktok` exists (render/review works); `TikTokPublisher.publish()` raises `NotImplementedError` on purpose — the Content Posting API needs a separate audited app review, unlike YouTube/Instagram's self-serve OAuth
 - **Scheduling**: `scheduled` cut status and `publish_cut` both handle a cut already sitting in `scheduled`; no UI/scheduler worker transitions a cut *into* it yet
-- **Multi-image collage**: cycles sequentially; no side-by-side layout within a beat
 - **Word-level caption export**: Whisper timing drives on-screen text, but no SRT/VTT file is generated for the platform uploader
 - **Metrics time series**: `cuts.views`/`likes`/`comments`/`metrics_updated_at` hold only the latest pull, not a history — see `docs/roadmap.md` Phase 5b
 
