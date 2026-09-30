@@ -13,6 +13,7 @@ that would have caught the regression before it shipped.
 import hashlib
 import json
 import subprocess
+from contextlib import ExitStack
 from unittest.mock import patch
 
 import numpy as np
@@ -435,11 +436,11 @@ def test_composite_cut_closes_earlier_beats_readers_when_a_later_beat_fails_to_b
 
     call_count = {"n": 0}
 
-    def flaky_build_beat_clip(media_paths, duration_s):
+    def flaky_build_beat_clip(media_paths, duration_s, stack):
         call_count["n"] += 1
         if call_count["n"] == 2:
             raise RuntimeError("simulated corrupt media on beat 2")
-        return real_build_beat_clip(media_paths, duration_s)
+        return real_build_beat_clip(media_paths, duration_s, stack)
 
     with (
         _ReaderTracker() as tracker,
@@ -452,6 +453,49 @@ def test_composite_cut_closes_earlier_beats_readers_when_a_later_beat_fails_to_b
             )
 
     tracker.assert_every_opened_reader_was_closed()
+
+
+def test_composite_cut_propagates_the_original_exception_even_if_a_readers_close_fails(tmp_path):
+    """Security/Red-Team review finding on the ExitStack refactor: ExitStack's own
+    unwind does NOT protect against a registered reader's close() itself raising --
+    that close()-time exception would otherwise REPLACE whatever exception
+    triggered the unwind, silently masking (e.g.) a real corrupt-media error behind
+    an unrelated "close failed" message in job.error. This codebase's own invariant
+    elsewhere (worker/tasks/common.py: "errors while recording a failure ... never
+    mask the original exception") requires this not happen here either. Forces
+    both a real build failure on beat 2 AND VideoFileClip.close() raising for the
+    reader beat 1 already opened -- the ORIGINAL RuntimeError must still be what
+    propagates, not the close-time one. Fixed via compositor.py's `_closing()`
+    wrapper, which swallows (and logs) a close()-time failure instead of letting
+    it reach ExitStack's own unwind."""
+    from engine.render.compositor import _build_beat_clip as real_build_beat_clip
+
+    video = tmp_path / "v.mp4"
+    _make_test_video(video, duration_s=2.0)
+    beats = [
+        {"duration_s": 2.0, "vo_script": "", "on_screen_text": []},
+        {"duration_s": 2.0, "vo_script": "", "on_screen_text": []},
+    ]
+    out = tmp_path / "out.mp4"
+    thumb = tmp_path / "thumb.jpg"
+
+    call_count = {"n": 0}
+
+    def flaky_build_beat_clip(media_paths, duration_s, stack):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise RuntimeError("simulated corrupt media on beat 2")
+        return real_build_beat_clip(media_paths, duration_s, stack)
+
+    with (
+        patch("engine.render.compositor._build_beat_clip", side_effect=flaky_build_beat_clip),
+        patch.object(VideoFileClip, "close", side_effect=RuntimeError("close failed")),
+    ):
+        with pytest.raises(RuntimeError, match="simulated corrupt media on beat 2"):
+            composite_cut(
+                beats=beats, beat_video_paths=[[video], [None]], beat_vo_paths=[None, None],
+                output_path=out, thumbnail_path=thumb,
+            )
 
 
 def test_build_beat_clip_closes_an_earlier_items_reader_when_a_later_item_in_the_same_beat_fails(
@@ -475,11 +519,11 @@ def test_build_beat_clip_closes_an_earlier_items_reader_when_a_later_item_in_the
 
     call_count = {"n": 0}
 
-    def flaky_build_media_sub_clip(media_path, duration_s):
+    def flaky_build_media_sub_clip(media_path, duration_s, stack):
         call_count["n"] += 1
         if call_count["n"] == 2:
             raise RuntimeError("simulated corrupt media on the second item")
-        return real_build_media_sub_clip(media_path, duration_s)
+        return real_build_media_sub_clip(media_path, duration_s, stack)
 
     with (
         _ReaderTracker() as tracker,
@@ -490,8 +534,8 @@ def test_build_beat_clip_closes_an_earlier_items_reader_when_a_later_item_in_the
     ):
         from engine.render.compositor import _build_beat_clip
 
-        with pytest.raises(RuntimeError, match="simulated corrupt media"):
-            _build_beat_clip([video, video], 2.0)
+        with ExitStack() as stack, pytest.raises(RuntimeError, match="simulated corrupt media"):
+            _build_beat_clip([video, video], 2.0, stack)
 
     tracker.assert_every_opened_reader_was_closed()
 
@@ -682,18 +726,30 @@ def test_build_beat_clip_does_not_use_collage_for_one_or_three_items():
     """Collage is scoped to EXACTLY 2 items -- 1-item and 3+-item beats keep
     today's sequential-cycling behavior unchanged. Mocking _build_collage_clip
     to raise if it's ever called proves the boundary directly rather than
-    inferring it from output pixels."""
-    with patch(
-        "engine.render.compositor._build_collage_clip",
-        side_effect=AssertionError("collage must not be used for a non-2-item beat"),
+    inferring it from output pixels.
+
+    Also restores (via _ReaderTracker) a property the pre-ExitStack version of
+    this test proved via `readers1 == readers3 == []`: a None/missing
+    media_path must never open a real VideoFileClip reader. Losing that
+    assertion when the tuple return was dropped was a real Test-Quality gap
+    caught on review -- mutation-tested against a version of
+    _build_media_sub_clip() that opens an unnecessary real reader for the
+    None/missing-path branch, which every other test in this file passed
+    against undetected."""
+    with (
+        _ReaderTracker() as tracker,
+        patch(
+            "engine.render.compositor._build_collage_clip",
+            side_effect=AssertionError("collage must not be used for a non-2-item beat"),
+        ),
+        ExitStack() as stack,
     ):
-        clip1, readers1 = _build_beat_clip([None], 2.0)
-        clip3, readers3 = _build_beat_clip([None, None, None], 3.0)
+        clip1 = _build_beat_clip([None], 2.0, stack)
+        clip3 = _build_beat_clip([None, None, None], 3.0, stack)
 
     assert clip1.duration == 2.0
     assert clip3.duration == 3.0
-    assert readers1 == []
-    assert readers3 == []
+    assert tracker.opened == [], "a None/missing media_path must never open a real VideoFileClip reader"
 
 
 def test_build_beat_clip_collage_respects_the_duration_floor(tmp_path):
@@ -707,12 +763,9 @@ def test_build_beat_clip_collage_respects_the_duration_floor(tmp_path):
     video = tmp_path / "v.mp4"
     _make_test_video(video, duration_s=1.0)
 
-    clip, readers = _build_beat_clip([video, video], 0.1)
-    try:
+    with ExitStack() as stack:
+        clip = _build_beat_clip([video, video], 0.1, stack)
         assert clip.duration == 0.5
-    finally:
-        for r in readers:
-            r.close()
 
 
 def test_build_collage_clip_closes_both_readers_when_the_crop_or_composite_step_fails(tmp_path):
@@ -738,8 +791,8 @@ def test_build_collage_clip_closes_both_readers_when_the_crop_or_composite_step_
             side_effect=RuntimeError("simulated crop failure after both sub-clips succeeded"),
         ),
     ):
-        with pytest.raises(RuntimeError, match="simulated crop failure"):
-            _build_collage_clip([left_video, right_video], 2.0)
+        with ExitStack() as stack, pytest.raises(RuntimeError, match="simulated crop failure"):
+            _build_collage_clip([left_video, right_video], 2.0, stack)
 
     tracker.assert_every_opened_reader_was_closed()
 
@@ -761,17 +814,15 @@ def test_build_collage_clip_with_one_missing_path_renders_a_black_half(tmp_path)
     _make_test_video(red_video, duration_s=2.0, color="red")
     missing = tmp_path / "does_not_exist.mp4"
 
-    clip, readers = _build_collage_clip([red_video, missing], 2.0)
-    try:
+    with _ReaderTracker() as tracker, ExitStack() as stack:
+        clip = _build_collage_clip([red_video, missing], 2.0, stack)
         assert clip.duration == 2.0
         assert clip.size == (TARGET_W, TARGET_H)
-        assert len(readers) >= 1   # the real `red_video` side opened at least one reader
+        assert tracker.opened, "the real red_video side should have opened at least one reader"
 
         frame = clip.get_frame(1.0)
         right_pixel = frame[TARGET_H // 2, int(TARGET_W * 0.75)]
         assert all(c <= 20 for c in right_pixel[:3]), (
             f"missing-path half should render near-black, got {right_pixel}"
         )
-    finally:
-        for r in readers:
-            r.close()
+    tracker.assert_every_opened_reader_was_closed()
