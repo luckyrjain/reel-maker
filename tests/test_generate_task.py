@@ -253,6 +253,81 @@ def _generation_context(reel, db, **overrides):
     return _GenerationContext(**fields)
 
 
+def test_persist_guide_writes_every_matching_cut_and_skips_unmatched_platforms():
+    """A Test-Quality Auditor review of the generate_guide() decomposition (module design
+    CAR-1) caught a real coverage gap: no test called _persist_guide() directly or asserted
+    on the Cut ORM rows it writes -- the 4 caption-regeneration tests below assert only on
+    the pydantic `guide` object, never on `cut.guide`/`cut.caption`/`cut.hashtags`/
+    `cut.hook_variants`. A bug here (wrong platform-matching in the `next(...)` lookup, a
+    swapped field, a dropped hook_variants assignment) would have passed every test in this
+    file undetected.
+
+    Uses TWO platforms with `cuts` passed in the OPPOSITE order from `guide.cuts`, so a
+    mutation like "always use the first cut regardless of platform" (mutation-tested below)
+    actually has something to get wrong -- a single-platform-guide version of this test
+    passed even against that exact mutation, since `cuts[0]` coincidentally WAS the right
+    match when there was only one platform_guide to place."""
+    from worker.tasks.generate import _persist_guide
+
+    yt_cut = _cut()
+    ig_cut = _cut()
+    ig_cut.platform.value = "instagram_reels"
+    unmatched_cut = _cut()
+    unmatched_cut.platform.value = "tiktok"  # no matching platform_guide below -- must be skipped
+    original_unmatched_guide = unmatched_cut.guide  # the auto-mock attribute, captured before persisting
+
+    two_platform_raw = json.dumps({
+        "title": "Test guide",
+        "niche": "football",
+        "cuts": [
+            {
+                "platform": "youtube_shorts",
+                "target_length_s": 45.0,
+                "beats": [
+                    {"index": 0, "type": "hook", "duration_s": 5, "visual_direction": "v",
+                     "on_screen_text": ["Hook"], "vo_script": "YouTube hook."},
+                    {"index": 1, "type": "body", "duration_s": 10, "visual_direction": "v",
+                     "on_screen_text": ["Body"], "vo_script": "YouTube body."},
+                    {"index": 2, "type": "cta", "duration_s": 5, "visual_direction": "v",
+                     "on_screen_text": ["CTA"], "vo_script": "YouTube CTA."},
+                ],
+                "caption": "YouTube caption.",
+                "hashtags": ["a", "b", "c", "d", "e"],
+            },
+            {
+                "platform": "instagram_reels",
+                "target_length_s": 30.0,
+                "beats": [
+                    {"index": 0, "type": "hook", "duration_s": 3, "visual_direction": "v",
+                     "on_screen_text": ["Hook"], "vo_script": "Instagram hook."},
+                    {"index": 1, "type": "body", "duration_s": 4, "visual_direction": "v",
+                     "on_screen_text": ["Body"], "vo_script": "Instagram body."},
+                    {"index": 2, "type": "cta", "duration_s": 3, "visual_direction": "v",
+                     "on_screen_text": ["CTA"], "vo_script": "Instagram CTA."},
+                ],
+                "caption": "Instagram caption.",
+                "hashtags": ["f", "g", "h", "i", "j"],
+            },
+        ],
+    })
+    guide = MasterGuide.model_validate_json(two_platform_raw)
+    hook_variants = ["Alt hook one.", "Alt hook two."]
+
+    # cuts in the OPPOSITE order from guide.cuts (ig, yt, unmatched vs. guide.cuts' yt, ig).
+    _persist_guide([ig_cut, yt_cut, unmatched_cut], guide, hook_variants)
+
+    assert yt_cut.caption == "YouTube caption."
+    assert yt_cut.hashtags == ["a", "b", "c", "d", "e"]
+    assert yt_cut.hook_variants == hook_variants
+    assert ig_cut.caption == "Instagram caption."
+    assert ig_cut.hashtags == ["f", "g", "h", "i", "j"]
+    assert ig_cut.hook_variants == hook_variants
+    # unmatched_cut's platform has no corresponding platform_guide -- identity-unchanged
+    # proves _persist_guide() never touched it (a MagicMock attribute read alone would
+    # auto-vivify a NEW mock, not preserve this one, if the code had actually assigned it).
+    assert unmatched_cut.guide is original_unmatched_guide
+
+
 def test_standard_path_regenerates_caption_hashtags_from_real_vo_content():
     """The success path: _generate_caption_hashtags() returns real content, and
     every platform guide's caption/hashtags is overwritten with it -- not the
@@ -528,6 +603,47 @@ def test_seeded_performance_notes_survive_past_attempt_1_on_retry():
         )
 
 
+def test_active_performance_notes_text_is_correctly_extracted_and_seeded():
+    """A Test-Quality Auditor review of the generate_guide() decomposition (module design
+    CAR-1) caught a real coverage gap: test_seeded_performance_notes_survive_past_attempt_1_
+    on_retry above now injects active_notes as plain strings directly into
+    _GenerationContext, bypassing generate_guide()'s own `active_notes = [n.text for n in
+    active_notes_rows]` extraction entirely -- a regression swapping `.text` for `.id` (or
+    any other field) there would ship silently, with no crash and no failing assertion
+    anywhere. This test drives the real end-to-end generate_guide() path with a real
+    PerformanceNote-shaped row to prove that extraction actually works."""
+    from worker.tasks.generate import generate_guide
+
+    job = _job()
+    reel = _reel()
+    db = MagicMock()
+    notes = [SimpleNamespace(id=42, text="A real performance note's text.")]
+    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
+    db.query.side_effect = _query_dispatch(notes=notes, cuts=[_cut()])
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.generate.paid_call_count", return_value=0),
+        patch("worker.tasks.generate.script_parser.parse", return_value=None),  # force standard path
+        patch("worker.tasks.generate.get_llm_provider") as mock_get_llm,
+        patch(
+            "worker.tasks.generate.build_messages",
+            return_value=[{"role": "system", "content": "x"}],
+        ) as mock_build_messages,
+        patch("worker.tasks.generate.score_guide", return_value=(0, [])),
+        patch("worker.tasks.generate._combined_score", return_value=(90, [])),
+        patch("worker.tasks.generate._enrich_standard_path_guide"),
+        patch("worker.tasks.generate.generate_hook_variants", return_value=[]),
+        patch("worker.tasks.generate._generate_caption_hashtags", return_value=("", [])),
+    ):
+        mock_get_llm.return_value.complete.return_value = _valid_guide_raw()
+        generate_guide(1)
+
+    assert job.status == models.JobStatus.done
+    first_call_kwargs = mock_build_messages.call_args_list[0].kwargs
+    assert first_call_kwargs.get("prior_feedback") == ["A real performance note's text."]
+
+
 def test_structured_path_success_does_not_nameerror_on_performance_notes():
     """The NameError bug: active_notes_rows must be queried unconditionally at the
     top of generate_guide, not inside the `if guide is None:` (standard-path-only)
@@ -582,6 +698,65 @@ def test_structured_path_success_does_not_nameerror_on_performance_notes():
     assert job.status == models.JobStatus.done
     assert job.meta.get("performance_note_ids") == [7]
     assert job.meta.get("quality_score") == 90
+
+
+def test_structured_path_success_does_not_regenerate_caption_hashtags_a_second_time():
+    """A Correctness/Edge-Case review of the generate_guide() decomposition (module design
+    CAR-1) caught a real regression, confirmed by running both versions: the original inline
+    code nested the caption/hashtags-regeneration call INSIDE `if guide is None:` (the
+    standard-path-only block) -- a direct structured-path success never reached it, since the
+    structured path already produces content-aware caption/hashtags via its own
+    _generate_caption_hashtags() call inside _generate_from_structured_script(). The first
+    decomposed version called _maybe_regenerate_caption_hashtags() unconditionally from the
+    orchestrator, silently double-regenerating (and risking overwriting with a second,
+    nondeterministic LLM result) every structured-path success. Fixed by moving the call back
+    inside _run_standard_path_attempts(), reached only on the standard path."""
+    from worker.tasks.generate import generate_guide
+
+    job = _job()
+    reel = _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else reel
+    db.query.side_effect = _query_dispatch(notes=[], cuts=[_cut()])
+
+    structured_guide = MasterGuide(
+        title="Structured guide",
+        niche="football",
+        cuts=[PlatformGuide(
+            platform="youtube_shorts",
+            target_length_s=45.0,
+            caption="Structured path's own caption.",
+            hashtags=["football"] * 6,
+            beats=[
+                Beat(index=0, type="hook", duration_s=5, visual_direction="v",
+                     on_screen_text=["h"], vo_script="Could this be the biggest upset yet?"),
+                Beat(index=1, type="body", duration_s=10, visual_direction="v",
+                     on_screen_text=["b"], vo_script="Body content here."),
+                Beat(index=2, type="cta", duration_s=5, visual_direction="v",
+                     on_screen_text=["c"], vo_script="Drop your prediction below."),
+            ],
+        )],
+    )
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.generate.paid_call_count", return_value=0),
+        patch("worker.tasks.generate.get_llm_provider"),
+        patch("worker.tasks.generate.script_parser.parse", return_value=[MagicMock()]),
+        patch("worker.tasks.generate.resolve_generation_path", return_value="structured"),
+        patch("worker.tasks.generate._generate_from_structured_script", return_value=structured_guide),
+        patch("worker.tasks.generate.score_guide", return_value=(90, [])),
+        patch("worker.tasks.generate._combined_score", return_value=(90, [])),
+        patch("worker.tasks.generate.generate_hook_variants", return_value=[]),
+        patch("worker.tasks.generate.build_messages") as mock_build_messages,
+        patch("worker.tasks.generate._generate_caption_hashtags") as mock_caption,
+    ):
+        generate_guide(1)
+
+    mock_build_messages.assert_not_called()  # never falls through to the standard path
+    mock_caption.assert_not_called()
+    cut = db.query.side_effect(models.Cut).filter.return_value.all.return_value[0]
+    assert cut.caption == "Structured path's own caption."
 
 
 # ── reaper-resume design §7 — job.meta staleness-across-retry regression ────

@@ -603,6 +603,17 @@ def _run_standard_path_attempts(ctx: _GenerationContext, stubs: list[BeatStub] |
         guide = best_guide
         last_score = best_score
 
+    # Owned by the STANDARD path only, matching the original inline nesting exactly (it
+    # sat inside `if guide is None:`, never reached on a direct structured-path success) --
+    # a security/correctness review of the first version of this decomposition caught a
+    # real regression where this call had moved to the orchestrator and run unconditionally,
+    # double-regenerating (and potentially overwriting with a second, nondeterministic LLM
+    # result) a structured-path guide that already has its own content-aware caption/
+    # hashtags from _generate_from_structured_script()'s own _generate_caption_hashtags()
+    # call. See docs/specs/2026-09-generate-guide-decomposition-module-design.md §5.
+    if guide is not None:
+        _maybe_regenerate_caption_hashtags(ctx, guide)
+
     return GuideResult(guide, last_score, last_issues, last_exc)
 
 
@@ -735,7 +746,11 @@ def generate_guide(self, db, job, reel):
     guide = result.guide
     heartbeat(db, job, 80)
 
-    _maybe_regenerate_caption_hashtags(ctx, guide)
+    # Caption/hashtags regeneration is called from inside _run_standard_path_attempts()
+    # itself, not here -- it is standard-path-only (see that function's own comment and
+    # docs/specs/2026-09-generate-guide-decomposition-module-design.md §5). Hook-variant
+    # generation, unlike caption regen, was already guide-agnostic in the original inline
+    # code (it ran unconditionally after either path produced a guide) and stays that way.
     hook_variants = _maybe_generate_hook_variants(ctx, guide)
     _persist_guide(cuts, guide, hook_variants)
 

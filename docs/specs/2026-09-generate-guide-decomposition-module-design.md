@@ -1,9 +1,12 @@
 # Module design: `worker/tasks/generate.py::generate_guide()` decomposition (CAR-1)
 
-**Status:** Implemented. **Origin:** CAR-1, a "Worth exploring" candidate from a full-repository
-codebase architecture review (report-only, not persisted to this repo). **Scope:** pure internal
-refactor of `generate_guide()` — no behavior change; verified by running the full pre-existing test
-suite against the decomposed code before touching a single test.
+**Status:** Implemented, revised once after a deep 4-persona review on the opened PR found one real
+regression (see §5). **Origin:** CAR-1, a "Worth exploring" candidate from a full-repository
+codebase architecture review (report-only, not persisted to this repo). **Scope:** intended as a
+pure internal refactor of `generate_guide()` — no behavior change — and verified as such by running
+the full pre-existing test suite against the decomposed code before touching a single test, but the
+opened-PR review found the first version was NOT in fact behavior-preserving; see §5 for the full
+account.
 
 ## 1. Problem
 
@@ -12,8 +15,10 @@ suite against the decomposed code before touching a single test.
 standard), structured-path execution + quality-gate fallback decision, the standard-path 3-attempt
 retry loop with per-attempt paid-call budget enforcement, best-effort caption/hashtags regeneration
 (Phase 7o), best-effort hook-variant generation, per-cut persistence, and final `job.meta`
-finalization. 15 of `tests/test_generate_task.py`'s 17 tests drove the whole function end-to-end,
-each needing 6–10 `patch(...)` calls across unrelated dependencies to isolate one behavior. Two
+finalization. 13 of `tests/test_generate_task.py`'s 17 tests drove the whole function end-to-end
+(the other 4 were already isolated unit tests of pre-existing helper functions, unaffected by this
+decomposition), each needing 6–10 `patch(...)` calls across unrelated dependencies to isolate one
+behavior. Two
 ~20-line blocks (caption/hashtags regeneration, hook-variant generation) independently implemented
 an identical 5-step shape: precondition → paid-call budget gate → provider selection →
 `get_enrichment_provider()` → `record_stage(...)` + usage/token/cost bookkeeping.
@@ -94,17 +99,89 @@ write the final `job.meta`.
      round-tripped through a mocked LLM completion.
    - `test_seeded_performance_notes_survive_past_attempt_1_on_retry` → direct test of
      `_run_standard_path_attempts`, dropping path-selection and best-effort-call mocking.
-   The remaining 11 tests stay end-to-end tests of `generate_guide` itself — they exercise genuinely
-   cross-cutting orchestration (`_prepare_generate`'s guards, path resolution, `job.meta`
+   Of the remaining 11 tests, 7 stay end-to-end tests of `generate_guide` itself — they exercise
+   genuinely cross-cutting orchestration (`_prepare_generate`'s guards, path resolution, `job.meta`
    ownership/ordering across a structured→standard fallback) that no single extracted function
-   owns, matching the module design's own honest assessment that not every test could narrow.
+   owns, matching the module design's own honest assessment that not every test could narrow — and
+   the other 4 are the pre-existing already-isolated helper tests from §1, unaffected either way.
 3. **Mutation-tested two of the narrowed regression tests** against the same bug classes their
    originals were written to catch: (a) the multi-platform overwrite test, mutated to only touch
    `guide.cuts[0]`, fails with the exact expected assertion; (b) the seeded-performance-notes test,
    mutated to a plain-replace `feedback = [...]` (the original retry-replace bug), fails with the
    exact expected assertion. Both restored.
-4. Full suite (788 tests, unchanged count — a 1:1 test rewrite, not an addition) green;
-   `ruff check --select F,E9 .` clean.
+4. Full suite (792 tests at this point — 17 tests in this file, unchanged count from `main`'s own
+   17 — before the 3 further tests §5 adds; a draft of this section originally miscounted this as
+   788, caught and corrected by the opened-PR review) green; `ruff check --select F,E9 .` clean.
+
+## 5. Corrections — deep 4-persona review on the opened PR
+
+A deep 4-persona review (Security/Red-Team, Correctness/Edge-Case, Test-Quality Auditor,
+Documentation-Consistency, this pipeline's default review depth per session convention) ran against
+the opened PR. Security/Red-Team found nothing. The other three found:
+
+**One real, empirically-confirmed regression (Correctness/Edge-Case) — the "pure refactor, no
+behavior change" claim in §4 above was false for the first version of this decomposition.**
+The reviewer ran the SAME scenario (structured path succeeds with score 90, threshold 65) against
+both `main` (old code) and this branch (new code), with `_generate_caption_hashtags` spied via
+`patch`, and observed a real divergence: `caption_hashtags called: False` on `main`,
+`caption_hashtags called: True` on the new code. Root cause: the original inline caption/hashtags-
+regeneration block sat at 8-space indent, nested *inside* `if guide is None:` (the standard-path-
+only block) — a direct structured-path success never reached it, since
+`_generate_from_structured_script()` already produces content-aware caption/hashtags via its own
+`_generate_caption_hashtags()` call. The first decomposed version called
+`_maybe_regenerate_caption_hashtags(ctx, guide)` unconditionally from the orchestrator, after either
+path-runner produced a guide, with no branch distinguishing which path won. Impact for every reel
+taking the (fast, recommended) structured path and succeeding on the first try: one extra,
+previously-nonexistent paid `caption_hashtags` LLM call + `StageEvent`, consuming one more slot of
+`max_paid_llm_calls_per_reel`, that could silently overwrite the structured path's own
+already-content-aware caption/hashtags with a second, independently-sampled (nondeterministic) LLM
+result — and, concretely, caused two pre-existing tests
+(`test_structured_path_success_does_not_nameerror_on_performance_notes`,
+`test_stale_structured_fallback_does_not_leak_into_a_clean_success`) to silently attempt a real,
+unmocked LLM-provider construction inside what should have been a fully-mocked unit test (masked
+only by `_generate_caption_hashtags`'s own `except Exception: pass` swallowing the resulting
+connection failure). §4's own "all 17 tests pass unmodified" verification step did not catch this,
+because no original test used a spy/mock on `_generate_caption_hashtags` while exercising the
+structured-success path — only `NameError`-absence and `job.meta` content were asserted, neither of
+which distinguishes zero calls from one extra call. Fixed by moving the
+`_maybe_regenerate_caption_hashtags(ctx, guide)` call from the orchestrator into
+`_run_standard_path_attempts()` itself, right before it returns — restoring the original
+standard-path-only ownership exactly, not merely patching the symptom. Hook-variant generation was
+NOT affected: it was already guide-agnostic in the original inline code (running unconditionally
+after either path produced a guide, outside the `if guide is None:` block), so it correctly stayed
+in the orchestrator. A new regression test
+(`test_structured_path_success_does_not_regenerate_caption_hashtags_a_second_time`) asserts
+`_generate_caption_hashtags` is never called on a structured-path success — mutation-tested by
+reverting the fix and confirming the test fails for the exact right reason.
+
+**Two real test-coverage gaps (Test-Quality Auditor).** (1) `_persist_guide()` had zero direct test
+coverage — the 4 narrowed caption-regeneration tests assert only on the pydantic `guide` object,
+never on the `Cut` ORM rows `_persist_guide()` actually writes; a wrong platform-matching bug, a
+swapped field, or a dropped `hook_variants` assignment would have passed every test in this file
+undetected. Closed with `test_persist_guide_writes_every_matching_cut_and_skips_unmatched_
+platforms` — a **two-platform, reversed-cut-order** fixture was required, not a single-platform one:
+a single-platform version of this test was tried first and found to pass even against the exact
+"always use the first cut regardless of platform" mutation, since `cuts[0]` coincidentally matched
+the only platform_guide present by luck. (2) The narrowed
+`test_seeded_performance_notes_survive_past_attempt_1_on_retry` now injects `active_notes` as plain
+strings directly into `_GenerationContext`, bypassing `generate_guide()`'s own `active_notes = [n.text
+for n in active_notes_rows]` extraction entirely — a regression swapping `.text` for `.id` (or any
+other field) there would ship silently, with no crash and no failing assertion anywhere in the
+suite. Closed with `test_active_performance_notes_text_is_correctly_extracted_and_seeded`, a real
+end-to-end run with a real `PerformanceNote`-shaped row, mutation-tested by swapping `.text` for
+`.id` in the extraction and confirming the test fails.
+
+**Documentation-Consistency found three real count discrepancies**, all in this document's and
+CLAUDE.md's own prose (not in the code): "15 of 17 tests drove the whole thing end-to-end" was wrong
+(actual pre-refactor count was 13 — 4 tests were always isolated helper-function tests, never
+end-to-end); "the other 11 stay end-to-end tests of `generate_guide` itself" was wrong (only 7 of
+those 11 actually call `generate_guide` — the other 4 are the same pre-existing isolated tests from
+the first miscount); and "788 tests, unchanged count" was wrong (the real pre-this-PR baseline,
+verified against `main` in a throwaway worktree, was 792 total / 791 default-run + 1 deselected).
+All three corrected throughout this document and CLAUDE.md.
+
+All fixes applied and mutation-tested before merge; full suite (795 tests — 792 + the 3 tests added
+in this round) green, `ruff check --select F,E9 .` clean.
 
 The full `MODULE_DESIGN_SPEC.md` this implementation followed (evidence ledger, depth assessment,
 contract tables, dependency-direction table) was produced by the `module-design` skill and sent
