@@ -558,22 +558,30 @@ def generate_guide(self, db, job, reel):
         # already on `guide` are left untouched, never worse than before this fix.
         if guide is not None and guide.cuts \
                 and paid_call_count(db, reel.id) < settings.max_paid_llm_calls_per_reel:
-            caption_provider = "nvidia" if settings.nvidia_api_key else "ollama"
-            caption_llm = get_enrichment_provider()
             vo_scripts = [b.vo_script for b in guide.cuts[0].beats]
-            with record_stage(db, reel.id, "caption_hashtags", provider=caption_provider) as ev:
-                new_caption, new_hashtags = _generate_caption_hashtags(
-                    vo_scripts, reel.niche or "general", caption_llm,
-                )
-                usage = getattr(caption_llm, "last_usage", {})
-                ev.tokens_in = usage.get("prompt_tokens")
-                ev.tokens_out = usage.get("completion_tokens")
-                ev.cost_usd = llm_cost_usd(caption_provider, ev.tokens_in, ev.tokens_out)
-                ev.detail["replaced"] = bool(new_caption and new_hashtags)
-            if new_caption and new_hashtags:
-                for platform_guide in guide.cuts:
-                    platform_guide.caption = new_caption
-                    platform_guide.hashtags = new_hashtags
+            # A Correctness/Edge-Case review caught a real edge case: music_only/silent
+            # voiceover_mode instructs the LLM to leave every vo_script empty (see
+            # build_messages()'s vo_note), so this call would otherwise fire with nothing
+            # to ground a caption in -- wasted latency/budget on a call that could never
+            # succeed (_generate_caption_hashtags()'s own validation would reject an
+            # empty-VO caption anyway, but skipping the call outright avoids paying for
+            # a guaranteed-useless attempt).
+            if any(v.strip() for v in vo_scripts):
+                caption_provider = "nvidia" if settings.nvidia_api_key else "ollama"
+                caption_llm = get_enrichment_provider()
+                with record_stage(db, reel.id, "caption_hashtags", provider=caption_provider) as ev:
+                    new_caption, new_hashtags = _generate_caption_hashtags(
+                        vo_scripts, reel.niche or "general", caption_llm,
+                    )
+                    usage = getattr(caption_llm, "last_usage", {})
+                    ev.tokens_in = usage.get("prompt_tokens")
+                    ev.tokens_out = usage.get("completion_tokens")
+                    ev.cost_usd = llm_cost_usd(caption_provider, ev.tokens_in, ev.tokens_out)
+                    ev.detail["replaced"] = bool(new_caption and new_hashtags)
+                if new_caption and new_hashtags:
+                    for platform_guide in guide.cuts:
+                        platform_guide.caption = new_caption
+                        platform_guide.hashtags = new_hashtags
 
     if guide is None:
         if last_exc:

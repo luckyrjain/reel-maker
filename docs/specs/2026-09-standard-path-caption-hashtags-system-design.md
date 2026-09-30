@@ -177,3 +177,35 @@ done (see §7).
   caption_when_regeneration_fails` failed as expected (`cut.guide["caption"] == ""` instead of the
   original value) — this is the test that actually proves the failure-path guard does its job.
 - Both mutations restored; full suite (786 tests) and `ruff check --select F,E9 .` green afterward.
+
+## 8. Corrections — review on the opened PR
+
+A deep 4-persona review (Security/Red-Team, Correctness/Edge-Case, Test-Quality Auditor,
+Documentation-Consistency, this pipeline's default review depth) ran against the opened PR.
+Security/Red-Team and Documentation-Consistency found nothing (the latter flagged one pre-existing,
+unrelated stale test count in `docs/architecture.md`, fixed opportunistically). Correctness/Edge-Case
+and Test-Quality Auditor each found one real, non-blocking gap:
+
+1. **Wasted call in `music_only`/`silent` voiceover_mode (Correctness/Edge-Case)** —
+   `build_messages()`'s own prompt instructs the LLM to leave every beat's `vo_script` empty in
+   these modes. The new caption-regeneration call would still fire with nothing to ground a caption
+   in — `_generate_caption_hashtags()`'s own validation would reject the result and the guide's
+   original caption/hashtags would survive untouched either way, so this was never a correctness bug,
+   only a wasted paid call and a small latency cost on a mode this fix's whole premise doesn't apply
+   to. Fixed by gating the call on `any(v.strip() for v in vo_scripts)` — a new, dedicated test
+   (`test_standard_path_skips_caption_regeneration_when_every_vo_script_is_empty`) proves the call is
+   skipped outright, mutation-tested by removing the guard and confirming the test then fails (the
+   mocked `_generate_caption_hashtags` gets called with no `return_value` configured, itself
+   surfacing as an unpack error — proof the call fired when it shouldn't have).
+2. **Multi-platform overwrite never exercised (Test-Quality Auditor)** — every existing test used a
+   single-cut/single-platform fixture (`_cut()`, `_valid_guide_raw()`), so a bug that only overwrote
+   `guide.cuts[0]`'s caption/hashtags instead of looping every `platform_guide` would have passed
+   every existing test undetected. Fixed with a new two-platform test
+   (`test_standard_path_regenerates_caption_hashtags_for_every_platform_not_just_the_first`,
+   `youtube_shorts` + `instagram_reels`, each with its own distinct original caption), asserting both
+   platforms' `cut.caption`/`cut.hashtags` are overwritten — mutation-tested by changing the
+   production overwrite loop to touch only `guide.cuts[0]` and confirming the test fails specifically
+   on the second platform's cut.
+
+Both fixes applied and mutation-tested before merge; full suite (788 tests) and
+`ruff check --select F,E9 .` green afterward.

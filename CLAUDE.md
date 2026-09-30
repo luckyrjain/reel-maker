@@ -47,7 +47,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 786 tests across 30+ files, default run (11 test_compositor tests need ffmpeg
+.venv/bin/pytest                            # 788 tests across 30+ files, default run (11 test_compositor tests need ffmpeg
                                              # on PATH; 1 kokoro voice test skips without the kokoro package; 1 golden-reel
                                              # test is deselected by default — see below)
 .venv/bin/pytest -m golden                  # the golden-reel smoke test (real edge-tts + real ffmpeg, ~20s, needs network)
@@ -572,7 +572,7 @@ tests/
                               ok=False, detail.error=...) row (mutation-tested against both wrong-composition bugs:
                               no inner try/except propagating the failure, and catching without setting ev.ok); success
                               path records ok=True; no subtitle_path means no captions_upload attempt or StageEvent at all
-  test_generate_task.py       15 tests — missing reel, reel not generating, paid-call budget, structured-path fallback (incl. a soft-limit kill), music_cue default, caption/hashtags does not swallow a runtime-limit timeout;
+  test_generate_task.py       17 tests — missing reel, reel not generating, paid-call budget, structured-path fallback (incl. a soft-limit kill), music_cue default, caption/hashtags does not swallow a runtime-limit timeout;
                               2 regression tests (mutation-tested against the naive/buggy version first):
                               seeded PerformanceNotes survive past attempt 1 on retry (the retry-replace bug),
                               structured-path success doesn't NameError on performance_note_ids (the wrong-branch-query bug);
@@ -589,7 +589,13 @@ tests/
                               empty/placeholder), and leaves the single-shot guide's original caption/hashtags
                               completely untouched when that call degrades to its own documented `("", [])`
                               failure contract — both mutation-tested (the first against removing the whole
-                              new block, the second against unconditionally overwriting regardless of success)
+                              new block, the second against unconditionally overwriting regardless of success);
+                              2 more (a review round on the opened PR) — every platform guide's caption/
+                              hashtags gets overwritten on success, not just the first (a two-platform
+                              fixture, mutation-tested against a version that only touched guide.cuts[0]), and
+                              the regeneration call is skipped outright (never attempted) when every beat's
+                              vo_script is empty — the music_only/silent voiceover_mode case, where the call
+                              could never succeed anyway — mutation-tested against removing that guard
   test_render_task.py          16 tests — missing cut, already-posted cut refused, success clears stale error, music wiring, reel.tts_voice/text_color threaded into get_tts_provider()/composite_cut(), black_frame_beat_indices flagged when a beat resolves no real media and stays None when every beat does;
                               subtitle_path (Phase 5d) — populated from composite_cut()'s 3rd return value on a successful
                               render, reset to None (not left stale) on a re-render that produces zero cues;
