@@ -86,6 +86,25 @@ def test_set_beat_field_vo_script_crlf_resubmit_is_not_a_change():
     assert beats[1]["on_screen_text"] == original_on_screen
 
 
+def test_set_beat_field_vo_script_strips_a_leaked_label_prefix():
+    """Review-round finding: script_parser.derive_on_screen() (now the single canonical
+    on-screen-text implementation, see Key conventions) strips a leaked structural label
+    prefix ("Guardiola: ...", "DEFENSE: ...") via _clean_vo() before deriving
+    on_screen_text -- a behavior postprocess.py's OLD, now-deleted _derive_on_screen()
+    copy never had. This is a deliberate, disclosed side effect of unifying the two
+    implementations (closing a real duplication, see the module design doc), not a bug:
+    a leaked label in operator-submitted vo_script is exactly the defect class
+    _strip_label_prefix()/_clean_vo() already exist to catch everywhere else in this
+    pipeline. vo_script itself is untouched (only on_screen_text derivation sees the
+    stripped text) -- the operator's literal submitted text is still what gets stored
+    and spoken."""
+    beats = _beats()
+    changed = set_beat_field(beats, 1, "vo_script", "Guardiola: We need composure in the final third.")
+    assert changed is True
+    assert beats[1]["vo_script"] == "Guardiola: We need composure in the final third."
+    assert beats[1]["on_screen_text"] == ["We need composure in the"]   # label stripped, then word-wrapped to 28 chars
+
+
 def test_set_beat_field_vo_script_stored_side_with_its_own_crlf_is_not_a_change():
     """Second review-round regression: the STORED value can itself carry
     line-ending quirks that pre-date this feature and were never normalized --
@@ -117,6 +136,18 @@ def test_set_beat_field_on_screen_text_resubmit_is_not_a_change():
     beats[1]["on_screen_text"] = ["Line one", "Line two"]
     changed = set_beat_field(beats, 1, "on_screen_text", ["Line one", "Line two"])
     assert changed is False
+
+
+def test_set_beat_field_on_screen_text_normalizes_the_stored_side_too():
+    """Same review-round regression class as visual_direction/vo_script above, for the
+    4th field: a STORED on_screen_text list can already carry incidental whitespace or a
+    blank entry (never itself normalized) -- an untouched resubmit must not look changed
+    just because the submission always comes back cleanly split/stripped."""
+    beats = _beats()
+    beats[1]["on_screen_text"] = ["Line one  ", "", "Line two"]   # trailing whitespace + a blank
+    changed = set_beat_field(beats, 1, "on_screen_text", ["Line one\nLine two"])
+    assert changed is False
+    assert beats[1]["on_screen_text"] == ["Line one  ", "", "Line two"]   # untouched, not rewritten
 
 
 def test_set_beat_field_unknown_field_raises():

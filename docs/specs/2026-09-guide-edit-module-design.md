@@ -7,8 +7,8 @@
 logic inline inside an HTTP handler: CRLF/strip normalization applied to both the
 submitted and the already-stored value before comparing (a false-positive bug class
 that took two separate review rounds to close correctly — see CLAUDE.md's Key
-conventions entry on `Cut.rendered_guide_fingerprint`), on-screen-text dedup/truncation
-to 5, and a `guide_changed` flag gating whether `cut.guide` gets reassigned at all.
+conventions entry on `Cut.rendered_guide_fingerprint`), on-screen-text blank-stripping and
+truncation to 5 (no dedup — matches the pre-existing inline behavior unchanged), and a `guide_changed` flag gating whether `cut.guide` gets reassigned at all.
 Despite that documented bug history, none of it had a test surface of its own — every
 test exercising this logic (`tests/test_cuts_publish_router.py`,
 `tests/test_variants_router.py`) went through a full FastAPI `TestClient`, a real DB
@@ -92,3 +92,53 @@ re-derivation from the `vo_script` branch — the rederive test failed on the mi
 of returning a new object — the no-mutation test failed, proving the original guide's
 `vo_script` had changed. All three restored and the full `test_guide_edit.py` suite
 re-verified green after each.
+
+## 5. Corrections — deep 4-persona review on the opened PR
+
+Security/Red-Team and Documentation-Consistency found no behavioral or security defects.
+Correctness/Edge-Case, Test-Quality Auditor, and Documentation-Consistency each found one
+real gap, closed before merge:
+
+**Correctness/Edge-Case**: the `derive_on_screen` unification is not, in one specific
+respect, byte-identical to `main` — `script_parser.derive_on_screen()` calls `_clean_vo()`
+(strips a leaked structural label prefix, e.g. `"Guardiola: "`) before deriving
+on-screen-text, which `postprocess.py`'s old, now-deleted `_derive_on_screen()` copy never
+did. Two new code paths now reach this stripping for the first time: `guide_edit.py`'s
+`set_beat_field("vo_script", ...)`/`replace_beat_vo()` (operator-submitted edits and
+hook-variant swaps), and `postprocess.py::clean_guide()`'s non-voiceover branch (the
+`music_only`/`silent` fallback, which re-derives on-screen-text from a `vo_script` that —
+unlike the voiceover branch — was never run through `_strip_label_prefix()` first). This
+is a deliberate, disclosed trade of the unification, not a defect: a leaked structural
+label in any vo_script is exactly the defect class `_strip_label_prefix()`/`_clean_vo()`
+already exist to catch everywhere else in this pipeline (and the voiceover branch of
+`clean_guide()` was already *coincidentally* unaffected, since `_strip_label_prefix()`'s
+regex there already strips the identical pattern before `derive_on_screen()` ever runs).
+`vo_script` itself is never touched by this — only the *derived* on-screen-text segment
+sees the stripped text. Closed with
+`tests/test_guide_edit.py::test_set_beat_field_vo_script_strips_a_leaked_label_prefix`,
+which locks in and documents the new behavior rather than leaving it silent, confirmed
+non-vacuous by computing the old (unstripped) output for the same input and showing it
+genuinely differs (`['Guardiola: We need composure']` vs. the new
+`['We need composure in the']`).
+
+**Test-Quality Auditor** (independently corroborated by Correctness/Edge-Case's own
+read): `on_screen_text` was the one of the 4 editable fields missing a "stored side
+already dirty" regression test — `visual_direction` and `vo_script` both have one, but
+`on_screen_text`'s existing `..._resubmit_is_not_a_change` test used a fixture that was
+already clean on both sides, so it couldn't distinguish "both sides normalized" from
+"only the submitted side normalized." Confirmed as a live gap by mutation-testing:
+reverting `on_screen_text`'s stored-side normalization to a raw, unnormalized read
+passed the entire pre-fix `test_guide_edit.py` suite silently. Closed with
+`test_set_beat_field_on_screen_text_normalizes_the_stored_side_too`, mutation-tested
+against the same reversion and confirmed to fail (`assert True is False`) before being
+restored.
+
+**Documentation-Consistency**: "dedup" was claimed in three places (this doc, and two
+spots in CLAUDE.md) for `guide_edit.py`'s `on_screen_text` handling, but
+`_normalize_lines()` only strips blanks and caps at 5 — it never deduplicates repeated
+lines (this was already true of the pre-extraction inline code in `api/routers/cuts.py`;
+the inaccurate word was carried into new prose describing unchanged behavior, not
+introduced by this PR). Also found one pre-existing, untouched `CLAUDE.md` Key-Conventions
+bullet ("on_screen_text") still describing the deleted `_derive_on_screen()` name as
+current. Both corrected — see the `guide_edit.py` module-layout entry, the
+`test_guide_edit.py` test-list entry, and the `on_screen_text` Key-Conventions bullet.
