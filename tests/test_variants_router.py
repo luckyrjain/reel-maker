@@ -175,6 +175,25 @@ def test_stream_thumbnail_serves_the_candidate_file(client, tmp_path):
     assert resp.content == b"fake-jpeg-bytes"
 
 
+def test_stream_thumbnail_serves_the_requested_index_not_always_the_first(client, tmp_path):
+    """Review-round regression: nothing else in this file exercises a multi-candidate list,
+    so a bug that always served thumbnail_candidates[0] regardless of the requested index
+    would have shipped silently."""
+    thumb0 = tmp_path / "1" / "thumb_0.jpg"
+    thumb1 = tmp_path / "1" / "thumb_1.jpg"
+    thumb0.parent.mkdir(parents=True)
+    thumb0.write_bytes(b"first-candidate-bytes")
+    thumb1.write_bytes(b"second-candidate-bytes")
+    cut_id = _make_cut(
+        client._session_factory, models.CutStatus.in_review,
+        thumbnail_candidates=[str(thumb0), str(thumb1)],
+    )
+    with patch("api.routers.cuts.settings.video_store_dir", str(tmp_path)):
+        resp = client.get(f"/api/cuts/{cut_id}/thumbnail/1")
+    assert resp.status_code == 200
+    assert resp.content == b"second-candidate-bytes"
+
+
 def test_stream_thumbnail_404s_on_out_of_range_index(client, tmp_path):
     cut_id = _make_cut(
         client._session_factory, models.CutStatus.in_review,

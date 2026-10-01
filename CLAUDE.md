@@ -47,7 +47,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 824 tests across 30+ files, default run (11 test_compositor tests need ffmpeg
+.venv/bin/pytest                            # 828 tests across 30+ files, default run (11 test_compositor tests need ffmpeg
                                              # on PATH; 1 kokoro voice test skips without the kokoro package; 1 golden-reel
                                              # test is deselected by default — see below)
 .venv/bin/pytest -m golden                  # the golden-reel smoke test (real edge-tts + real ffmpeg, ~20s, needs network)
@@ -986,7 +986,7 @@ tests/
                               streams at the correct dimensions; mutation-verified against the real historical
                               zero-audio bug (reintroduced .audio_fadein()/.audio_fadeout(), confirmed this test fails
                               with the same error the live incident produced, restored the fix)
-  test_variants_router.py      21 tests — POST /cuts/{id}/hook-variant (swap + rederive on_screen_text, wrong status, out-of-range index, no variants), POST /cuts/{id}/thumbnail (choose, wrong status, out-of-range, no candidates), GET /cuts/{id}/thumbnail/{index} (serves file, 404 out-of-range, 403 outside VIDEO_STORE_DIR);
+  test_variants_router.py      22 tests — POST /cuts/{id}/hook-variant (swap + rederive on_screen_text, wrong status, out-of-range index, no variants), POST /cuts/{id}/thumbnail (choose, wrong status, out-of-range, no candidates), GET /cuts/{id}/thumbnail/{index} (serves file, serves the requested index specifically — not always candidates[0], a review-round mutation-confirmed gap closed with a 2-candidate fixture — 404 out-of-range, 403 outside VIDEO_STORE_DIR);
                               GET /cuts/{id}/subtitles (Phase 5d) — serves the .srt file with the correct Content-Type,
                               404 when subtitle_path is unset or the cut doesn't exist, 403 outside VIDEO_STORE_DIR
                               (same shared guard as stream_video/stream_thumbnail — see below); 2 direct tests

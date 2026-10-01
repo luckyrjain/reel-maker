@@ -44,8 +44,8 @@ New tests in `tests/test_variants_router.py` (the existing home of `stream_thumb
 - `stream_thumbnail`'s and `stream_subtitles`' existing tests (happy path, 404s, reject) kept
   completely unmodified — they're wiring coverage for the call sites, not narrowed away.
 
-21 tests total in the file (15 existing + 6 new). All 824 tests in the suite pass (818 existing +
-6 new).
+22 tests total in the file (15 existing + 7 new). All 828 tests in the suite pass (821 existing +
+7 new).
 
 Mutation-tested: (1) removed the `if ... raise HTTPException` check from the helper entirely —
 all 4 reject-case tests (`stream_video`, `stream_subtitles`, `stream_thumbnail`, and the direct
@@ -56,6 +56,22 @@ wiring test isn't vacuous (it actually exercises the call, not just the helper i
 restored and re-verified.
 
 ## Corrections
+
+**A deep 4-persona review on the opened PR** found Security/Red-Team and Correctness/Edge-Case
+clean (independently confirmed byte-for-byte behavior preservation and no traversal hole
+reopened), and two real issues:
+
+- **Documentation-Consistency** found the test-count claims in this section and in CLAUDE.md's
+  Commands section were wrong — both used a stale `818` baseline (from several PRs ago) instead of
+  the real post-PR-#32 baseline of `821`, undercounting the total by 3. Fixed in both files.
+- **Test-Quality Auditor** found `stream_thumbnail` had no test proving the *requested* index is
+  actually forwarded to `_resolve_within_video_store()` — every existing thumbnail test used a
+  single-item `thumbnail_candidates` list, so a mutation hardcoding `thumbnail_candidates[0]`
+  regardless of the URL's `{index}` passed all 21 pre-fix tests silently. Closed with
+  `test_stream_thumbnail_serves_the_requested_index_not_always_the_first`, a 2-candidate fixture
+  asserting the response body matches the *second* candidate when index `1` is requested —
+  mutation-tested against the exact hardcoded-index-0 regression it guards, confirmed to fail for
+  the right reason, then restored.
 
 None yet — this section will be updated after the 4-persona review round on the opened PR, per
 this pipeline's standard practice.
