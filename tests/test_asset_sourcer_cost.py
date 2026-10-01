@@ -11,6 +11,7 @@ from api import models
 from engine.render.asset_sourcer import (
     HuggingFaceImageSource,
     HuggingFaceVideoSource,
+    _generate_gated_hf_asset,
     resolve_beat_assets,
 )
 
@@ -162,6 +163,78 @@ def test_no_reel_id_skips_cost_tracking_entirely(db_session):
     hf = _FakeHFSource(_asset_result(), was_generated=True)
     # No reel row is even created — reel_id=None must mean no StageEvent query/write happens.
     resolve_beat_assets(db, "a query", 5.0, _NoneSourcer(), wiki=None, hf_video=None, hf=hf, reel_id=None)
+    assert db.query(models.StageEvent).count() == 0
+
+
+# ── _generate_gated_hf_asset (CAR-candidate-2 extraction) ───────────────────
+
+def test_generate_gated_hf_asset_gated_real_call_records_cost(db_session):
+    db = db_session
+    reel = models.Reel(context="x", status=models.ReelStatus.generating)
+    db.add(reel)
+    db.commit()
+
+    source = _FakeHFSource(_asset_result(duration_s=4.0), was_generated=True)
+    result = _generate_gated_hf_asset(
+        db, reel.id, "asset_hf_video", source, "a query", lambda r: round(r.duration_s * 0.01, 4),
+    )
+    assert result is not None
+
+    events = db.query(models.StageEvent).filter(models.StageEvent.reel_id == reel.id).all()
+    assert len(events) == 1
+    assert events[0].stage == "asset_hf_video"
+    assert events[0].cost_usd == 0.04
+    assert events[0].detail["cache_hit"] is False
+
+
+def test_generate_gated_hf_asset_gated_cache_hit_records_zero_cost(db_session):
+    db = db_session
+    reel = models.Reel(context="x", status=models.ReelStatus.generating)
+    db.add(reel)
+    db.commit()
+
+    source = _FakeHFSource(_asset_result(), was_generated=False)
+    _generate_gated_hf_asset(db, reel.id, "asset_hf_image", source, "a query", lambda r: 0.003)
+
+    events = db.query(models.StageEvent).filter(models.StageEvent.reel_id == reel.id).all()
+    assert len(events) == 1
+    assert events[0].cost_usd in (None, 0.0)
+    assert events[0].detail["cache_hit"] is True
+
+
+def test_generate_gated_hf_asset_gated_no_result_still_records_event(db_session):
+    db = db_session
+    reel = models.Reel(context="x", status=models.ReelStatus.generating)
+    db.add(reel)
+    db.commit()
+
+    source = _FakeHFSource(None, was_generated=False)
+    result = _generate_gated_hf_asset(db, reel.id, "asset_hf_image", source, "a query", lambda r: 0.003)
+    assert result is None
+
+    events = db.query(models.StageEvent).filter(models.StageEvent.reel_id == reel.id).all()
+    assert len(events) == 1
+    assert events[0].detail["cache_hit"] is False
+    assert events[0].cost_usd is None
+
+
+def test_generate_gated_hf_asset_ungated_no_api_key_skips_stage_event(db_session):
+    db = db_session
+    reel = models.Reel(context="x", status=models.ReelStatus.generating)
+    db.add(reel)
+    db.commit()
+
+    source = _FakeHFSource(None, was_generated=False, api_key="")
+    result = _generate_gated_hf_asset(db, reel.id, "asset_hf_image", source, "a query", lambda r: 0.003)
+    assert result is None
+    assert db.query(models.StageEvent).filter(models.StageEvent.reel_id == reel.id).count() == 0
+
+
+def test_generate_gated_hf_asset_ungated_no_reel_id_skips_stage_event(db_session):
+    db = db_session
+    source = _FakeHFSource(_asset_result(), was_generated=True)
+    result = _generate_gated_hf_asset(db, None, "asset_hf_image", source, "a query", lambda r: 0.003)
+    assert result is not None
     assert db.query(models.StageEvent).count() == 0
 
 
