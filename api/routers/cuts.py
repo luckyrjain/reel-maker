@@ -9,7 +9,7 @@ from api import models
 from api.config import settings
 from api.db import get_db
 from api.state import CUT_TRANSITIONS, transition
-from engine.generation.postprocess import _derive_on_screen
+from engine.generation.guide_edit import replace_beat_vo, set_beat_field
 from worker.tasks.common import fail_unenqueued
 from worker.tasks.publish import publish_cut
 from worker.tasks.render import render_cut
@@ -198,68 +198,25 @@ async def update_cut(cut_id: int, request: Request, db: Session = Depends(get_db
                 except ValueError:
                     pass
                 else:
-                    if new_duration != beats[i].get("duration_s"):
-                        beats[i]["duration_s"] = new_duration
-                        guide_changed = True
+                    guide_changed |= set_beat_field(beats, i, "duration_s", new_duration)
             if form.get(f"beat_{i}_visual_direction", "").strip():
-                new_vd = form[f"beat_{i}_visual_direction"].strip()
-                # Normalize the STORED side the same way before comparing, not just the
-                # submitted side — caught in review: a stored value that already carried
-                # incidental whitespace (e.g. from LLM generation, never itself run
-                # through .strip()) would otherwise "change" on every untouched save,
-                # since the submitted form value always comes back through .strip().
-                if new_vd != (beats[i].get("visual_direction") or "").strip():
-                    beats[i]["visual_direction"] = new_vd
-                    guide_changed = True
+                guide_changed |= set_beat_field(
+                    beats, i, "visual_direction", form[f"beat_{i}_visual_direction"]
+                )
             if f"beat_{i}_vo_script" in form:
-                # Normalize the textarea's line endings back to the LF this guide's
-                # vo_script was actually stored with (script_parser.py joins section
-                # bodies with "\n") — an HTML form always re-encodes a <textarea>'s
-                # newlines on submit (CRLF, or a lone CR from some clients/OSes), touched
-                # or not, so comparing raw form output against the stored value would
-                # treat every single save of a multi-line vo_script as a content change
-                # even when nothing was edited. Caught in review: this exact false
-                # positive would spuriously trip Cut.rendered_guide_fingerprint's
-                # staleness gate (see engine/publish/gate.py::assert_video_matches_guide())
-                # on an untouched beat. The STORED side is normalized identically before
-                # comparing (a second review round caught that a stored value with its
-                # own incidental whitespace/line-ending quirks — pre-dating this feature,
-                # never itself normalized — would otherwise "change" on every untouched
-                # save too).
-                new_vo = form[f"beat_{i}_vo_script"].replace("\r\n", "\n").replace("\r", "\n").strip()
-                stored_vo = (beats[i].get("vo_script") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-                if new_vo != stored_vo:
-                    beats[i]["vo_script"] = new_vo
-                    beats[i]["on_screen_text"] = _derive_on_screen(new_vo, max_lines=5)
-                    guide_changed = True
+                guide_changed |= set_beat_field(beats, i, "vo_script", form[f"beat_{i}_vo_script"])
             if f"beat_{i}_on_screen_text" in form:
-                lines = [
-                    l.strip()
-                    for l in form[f"beat_{i}_on_screen_text"].replace("\r\n", "\n").replace("\r", "\n").splitlines()
-                    if l.strip()
-                ]
-                new_lines = lines[:5]
-                # Same stored-side normalization as vo_script/visual_direction above —
-                # an already-stored list with a blank/whitespace-only entry (or one
-                # itself containing a raw newline the LLM produced) must not look
-                # "changed" just because the new value re-derives it more strictly.
-                stored_lines = [
-                    l.strip()
-                    for l in (beats[i].get("on_screen_text") or [])
-                    for l in str(l).replace("\r\n", "\n").replace("\r", "\n").splitlines()
-                    if l.strip()
-                ][:5]
-                if new_lines != stored_lines:
-                    beats[i]["on_screen_text"] = new_lines
-                    guide_changed = True
+                guide_changed |= set_beat_field(
+                    beats, i, "on_screen_text", form[f"beat_{i}_on_screen_text"].splitlines()
+                )
         if guide_changed:
             # Only reassign cut.guide when a beat field's NORMALIZED value actually
             # differs from what's stored — a pure "Save changes" click that touched only
             # the caption/hashtags (both separate Cut columns, not part of `guide` at
             # all) must leave `guide` byte-for-byte untouched, or it would spuriously
             # change Cut.rendered_guide_fingerprint's comparison target for a render that
-            # never actually went stale. See the vo_script comment above and
-            # docs/specs/2026-09-stale-video-on-failed-rerender-system-design.md.
+            # never actually went stale. See engine/generation/guide_edit.py::set_beat_field()
+            # and docs/specs/2026-09-stale-video-on-failed-rerender-system-design.md.
             guide["beats"] = beats
             cut.guide = guide
 
@@ -421,14 +378,9 @@ async def choose_hook_variant(cut_id: int, request: Request, db: Session = Depen
     if not cut.hook_variants or not (0 <= index < len(cut.hook_variants)) or not cut.guide:
         raise HTTPException(status_code=422, detail="No such hook variant")
 
-    guide = dict(cut.guide)
-    beats = [dict(b) for b in guide.get("beats", [])]
+    beats = cut.guide.get("beats", [])
     if not beats or beats[0].get("type") != "hook":
         raise HTTPException(status_code=422, detail="This cut's guide has no hook beat")
-    new_vo = cut.hook_variants[index]
-    beats[0]["vo_script"] = new_vo
-    beats[0]["on_screen_text"] = _derive_on_screen(new_vo, max_lines=5)
-    guide["beats"] = beats
-    cut.guide = guide
+    cut.guide = replace_beat_vo(cut.guide, 0, cut.hook_variants[index])
     db.commit()
     return _cut_card(request, cut, db)
