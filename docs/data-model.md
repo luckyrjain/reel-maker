@@ -41,7 +41,9 @@ One row per platform per reel. All generated content for a platform lives here.
 | `caption` | text | Post caption (DB-stored value; the published caption additionally gets an attribution suffix appended at publish time only, via `build_published_caption()` — this column is never mutated with it) |
 | `hashtags` | JSON array | List of strings, no `#` prefix |
 | `video_path` | varchar(500) | Absolute path to rendered MP4 on disk |
-| `thumbnail_path` | varchar(500) | Absolute path to thumbnail JPEG |
+| `thumbnail_path` | varchar(500) | Absolute path to thumbnail JPEG — whichever of `thumbnail_candidates` is currently chosen, `[0]` by default |
+| `thumbnail_candidates` | JSON, nullable | All 4 candidate frames `render_cut` samples across the reel (the original ~0.5s-in frame plus 3 more). Operator picks one via `POST /cuts/{id}/thumbnail`; a re-render replaces the list wholesale, discarding any prior pick. |
+| `hook_variants` | JSON, nullable | Up to 3 alternate opening-line strings for the hook beat, generated once per accepted guide (`generate_hook_variants()`, best-effort — never fails the job). `None` if generation failed or the paid-call budget was already spent. Operator swaps one in via `POST /cuts/{id}/hook-variant` (gated to `in_review`, beat 0 only). |
 | `black_frame_beat_indices` | JSON, nullable | 0-indexed beats where the asset-sourcer fallback chain (Wikipedia → Pexels → HF Video → HF Image) found nothing and the compositor rendered a black frame for that beat's full duration. `None` when every beat resolved real media. Written by `render_cut`, replaced wholesale on re-render. |
 | `rendered_pins_fingerprint` | varchar(64), nullable | Fingerprint of the `CutAsset` pins that built the currently-stored `video_path`, snapshotted at the moment a render succeeds via `engine/render/asset_sourcer.py::compute_pins_fingerprint_for_render()` — a real sha256 hash for a normal render, or the fixed `EMPTY_PINS_FINGERPRINT` sentinel (never the raw `compute_pins_fingerprint()`'s `None`) for a successful render that bound zero real assets (every beat black-framed), so a completed render is always distinguishable from "never rendered." `None` means "no completed render has ever written this column" — not yet rendered, or rendered before this column existed (a legacy row — treated as "unknown, don't block" by `engine/publish/gate.py::assert_video_matches_pins()`, not as a mismatch). Written by `render_cut`, replaced wholesale on re-render, same policy as `black_frame_beat_indices`/`thumbnail_candidates`/`video_path`. Compared against a freshly-computed current fingerprint at publish time to catch a re-render that re-pinned an asset and then failed before `video_path` caught up — see CLAUDE.md's Key conventions entry and `docs/specs/2026-09-video-pins-staleness-gate-system-design.md`. |
 | `rendered_guide_fingerprint` | varchar(64), nullable | The guide-content sibling of `rendered_pins_fingerprint` above, same `None`-means-not-yet-rendered semantics — a sha256 fingerprint (`engine/generation/guide_schema.py::compute_guide_fingerprint()`) of the `guide` dict that built the currently-stored `video_path`, snapshotted by `render_cut` alongside `rendered_pins_fingerprint`. Compared against a fresh fingerprint of the current `guide` at publish time by `engine/publish/gate.py::assert_video_matches_guide()` to catch a guide edit (`PATCH /cuts/{id}`, or a hook-variant swap) followed by a re-render that failed before `video_path` caught up — see CLAUDE.md's Key conventions entry and `docs/specs/2026-09-stale-video-on-failed-rerender-system-design.md`. |
@@ -135,21 +137,23 @@ Every async operation is a job row. API creates the row and enqueues the task wi
 |---|---|---|
 | `id` | integer PK | |
 | `type` | enum `JobType` | `enrich` \| `generate` \| `render` \| `publish` |
-| `reel_id` | FK → reels | Set for generate jobs |
+| `reel_id` | FK → reels | Set for enrich/generate jobs |
 | `cut_id` | FK → cuts | Set for render/publish jobs |
 | `status` | enum `JobStatus` | `pending` → `running` → `done` \| `failed` |
 | `progress` | integer | 0–100; updated at key milestones |
-| `error` | text | Exception message (≤ 2000 chars); `null` on success |
-| `attempts` | integer | Incremented once per run, after `prepare` succeeds (so a missing-row or budget failure does not count), including each retry delivery |
+| `error` | text | Exception message (≤ 2000 chars, NUL/surrogates stripped, `[parameters: …]` redacted); `null` on success |
+| `attempts` | integer, default `0` | Incremented once per run, after `prepare` succeeds (so a missing-row or budget failure does not count), including each retry delivery |
+| `reaper_resumes` | integer, default `0`, `server_default="0"` | How many times `reap_stuck_jobs` has resumed this row in place (`pending→running`, re-enqueued), checked against a per-job-type budget in `worker/tasks/maintenance.py::_RESUMABLE_TASKS` (`enrich`/`render`: 2, `generate`: 1, `publish`: never resumed). Migration `0013`. |
+| `claim_token` | integer, default `0`, `server_default="0"` | Fencing counter, bumped via a SQL-side increment on every `pending→running` claim and captured once per run (see CLAUDE.md's Key Conventions on why a plain re-read after a rollback would be unsafe). Lets a superseded (resumed-while-still-alive) run's writes be told apart from a fresher claim's even while `status` alone still reads `running`. Migration `0013`. |
 | `started_at` | timestamptz | Set after `prepare`, when the body is about to run (the claim moves the job to `running` a moment earlier) |
 | `heartbeat_at` | timestamptz | Refreshed every 30 s by a background thread in `job_task` (until the task's `max_runtime_s`) and at every `heartbeat()` call; used by the stuck-job reaper |
-| `meta` | JSON | Enrich job: `{"generation_path": "auto\|structured\|standard", "context_score": N, "context_issues": [...], "enriched": bool}`. Generate job: `{"generation_path": ..., "context_score": N, "path": "structured\|standard", "stub_count": N, "quality_score": N, "structured_score": N, "structured_fallback": bool, "performance_note_ids": [N, ...]}` |
+| `meta` | JSON | Enrich job: `{"generation_path": "auto\|structured\|standard", "context_score": N, "context_issues": [...], "enriched": bool}`. Generate job: `{"generation_path": ..., "context_score": N, "path": "structured\|standard", "stub_count": N, "quality_score": N, "structured_score": N, "structured_fallback": bool, "performance_note_ids": [N, ...]}` — `generate_guide` strips `structured_fallback`/`structured_score`/`path` at function entry so a prior killed-and-resumed attempt's leftovers can't leak into a clean run's final meta. |
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
 
-**Stuck-job detection**: if `status=running` and `heartbeat_at < now() - 5 min`, the `reap_stuck_jobs` task (Celery beat, 60 s interval) marks it `failed` and rolls back the owning reel/cut.
+**Stuck-job detection**: `reap_stuck_jobs` (Celery beat, 60 s interval) handles three stale cases — `status=running` with `heartbeat_at` older than 5 min (resumes in place for a resumable type under budget, else fails it and rolls back the owning reel/cut); `status=pending` with `updated_at` older than 240 min (never picked up); and `status=done` with no error whose owner is still mid-flight for 15 min (the `after_commit_failed` fail-stamp itself never landed). See `docs/architecture.md`'s Reliability section and CLAUDE.md's Key Conventions for the full fencing-token mechanism this depends on.
 
-**Idempotency**: only a `pending` job runs (`job_task`'s atomic `UPDATE … WHERE status='pending'` claim). `done`/`running` = redelivery no-op (a live sibling is already working; the reaper handles dead ones). `failed` is terminal: an operator retry creates a new Job, so a late redelivery of a reaped job never runs.
+**Idempotency**: only a `pending` job runs (`job_task`'s atomic `UPDATE … WHERE status='pending'` claim, which also bumps `claim_token`). `done`/`running` = redelivery no-op (a live sibling is already working, or the reaper will eventually reap a dead one). `failed` is terminal: an operator retry creates a new Job, so a late redelivery of a reaped job never runs.
 
 ---
 
@@ -160,39 +164,43 @@ Instrumentation for each slow pipeline stage. One row per stage invocation.
 | Column | Type | Notes |
 |---|---|---|
 | `id` | integer PK | |
-| `reel_id` | FK → reels | |
-| `cut_id` | FK → cuts | Null for generation stages |
-| `stage` | varchar(50) | `enrich` \| `generate` \| `judge` \| `composite` |
-| `provider` | varchar(100) | `ollama` \| `nvidia` \| `edge` |
+| `reel_id` | FK → reels, not nullable | |
+| `cut_id` | FK → cuts, nullable | Null for reel-level (enrich/generate) stages |
+| `stage` | varchar(50) | `context_enrich` \| `enrich` \| `enrich_conflict` \| `visuals` \| `generate` \| `judge` \| `caption_hashtags` \| `composite` \| `asset_hf_video` \| `asset_hf_image` \| `publish` \| `captions_upload` \| `instagram_metrics` |
+| `provider` | varchar(100) | `ollama` \| `nvidia` \| `edge` \| `huggingface` |
 | `model_name` | varchar(255) | LLM model identifier |
 | `latency_ms` | integer | Wall-clock time for the stage |
-| `tokens_in` | integer | Input tokens (not yet populated) |
-| `tokens_out` | integer | Output tokens (not yet populated) |
-| `cost_usd` | float | Computed cost (not yet populated) |
+| `tokens_in` | integer | Input tokens — populated for NVIDIA LLM calls via `OllamaProvider`'s usage capture |
+| `tokens_out` | integer | Output tokens — same as above |
+| `cost_usd` | float | Computed cost — populated for NVIDIA LLM calls (`engine/generation/pricing.py`) and HF asset generation (`engine/render/pricing.py`); both `0.0` until the operator sets a real per-unit rate in `Settings`. `asset_hf_*` stages only charge `cost_usd` on an actual generation call, never a cache hit. |
 | `attempt` | integer | Retry number (1, 2, 3) for multi-attempt stages |
 | `score` | integer | Quality score (for eval stages) |
-| `ok` | boolean | `true` = completed without exception |
-| `detail` | JSON | Stage-specific payload: error text, failure reasons, raw lengths, etc. |
+| `ok` | boolean | `true` = completed without exception (also explicitly set `false` for a "never raises, but still tell the truth" best-effort step — e.g. `captions_upload`, `instagram_metrics` metric-name drift) |
+| `detail` | JSON | Stage-specific payload: error text, failure reasons, `missing_metrics`, raw lengths, etc. |
 | `created_at` | timestamptz | |
 
-Written by `record_stage()` context manager in `engine/observability.py`. A row is written even on failure (`ok=false`, `detail.error=repr(exc)`).
+Written by `record_stage()` context manager in `engine/observability.py`. A row is written even on failure (`ok=false`, `detail.error=repr(exc)`), and `record_stage()` always re-raises on an exception inside its `with` block — a step that must never fail its caller (captions upload, Instagram metrics) sets `ev.ok = False` explicitly from *inside* the block and returns normally instead of relying on the context manager to swallow anything.
+
+The `/api/reels/{id}` pipeline panel's headline `total_cost`/`total_latency_ms` sums exclude `instagram_metrics` (it fires every 6 h indefinitely for a published cut, unlike every bounded generation/render stage) but the per-stage `stage_summary` table stays unfiltered.
 
 ---
 
 ### `credentials`
 
-OAuth tokens for publishing (Phase 4+). `token_blob` is encrypted at rest.
+OAuth tokens for publishing. `token_blob`/`refresh_token_blob` are encrypted at rest and transparently decrypted on read — application code never calls `crypto.open_()`/`seal()` directly, just assigns/reads the attribute.
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | integer PK | |
-| `provider` | varchar(100) | `youtube` \| `instagram` |
-| `account_label` | varchar(255) | Human-readable account name |
-| `token_blob` | Encrypted text | Fernet-encrypted OAuth token JSON; transparent via TypeDecorator |
-| `scopes` | JSON | OAuth scopes granted |
-| `expires_at` | timestamptz | |
+| `provider` | varchar(100) | `youtube` \| `instagram` (not the `CutPlatform` value — see `credential_provider_for_platform()`) |
+| `account_label` | varchar(255) | Human-readable account name (e.g. `"Instagram business account {id}"`) |
+| `token_blob` | Encrypted text | Fernet-encrypted access token; transparent via the `Encrypted` TypeDecorator |
+| `refresh_token_blob` | Encrypted text, nullable | Fernet-encrypted OAuth refresh token (YouTube only — Instagram's long-lived token has no refresh token) |
+| `provider_account_id` | varchar(255), nullable | A provider-specific ID discovered during OAuth that isn't itself a scope — e.g. the Instagram Business Account ID behind a connected Facebook Page |
+| `scopes` | JSON | OAuth scopes granted, split from the token response's space-separated `scope` string |
+| `expires_at` | timestamptz, nullable | |
 
-Set `CREDENTIALS_KEY` in `.env` (a 32-byte URL-safe base64 Fernet key). Rotating the key invalidates stored tokens — just re-auth. If the key is not set, values are stored as plaintext with a logged warning.
+Set `CREDENTIALS_KEY` in `.env` (a 32-byte URL-safe base64 Fernet key). Rotating the key invalidates stored tokens — just re-auth. If the key is not set, values are stored as plaintext with a logged warning — safe for dev, not for production.
 
 ---
 
@@ -220,9 +228,15 @@ reels (1) ──── (N) cuts
 reels (1) ──── (N) jobs
 reels (1) ──── (N) stage_events
 cuts  (1) ──── (N) cut_assets ──── (N) assets
-cuts  (1) ──── (N) jobs        [render jobs]
+cuts  (1) ──── (N) jobs                  [render/publish jobs]
 cuts  (1) ──── (N) stage_events
+cuts  (1) ──── (N) cut_metric_snapshots
+
+credentials         — standalone, keyed by `provider`, no FK to reels/cuts
+performance_notes   — standalone, no FK — a general observation, not tied to one reel
 ```
+
+No ORM `relationship`/`back_populates` is declared for `cut_metric_snapshots` or `stage_events` — both are queried directly rather than through a collection, matching `StageEvent`'s own pre-existing pattern.
 
 ---
 
@@ -251,6 +265,8 @@ draft ──► enriching ──► generating ──► guide_ready
 | `generating` | `failed` | `generate_guide` exception |
 | `failed` | `draft` | Manual retry / reaper rollback |
 
+`REEL_TRANSITIONS` (`api/state.py`) also permits `draft → generating` and `guide_ready → failed` directly. Neither edge is exercised by any current code path (no router or task transitions a reel straight from `draft` to `generating`, and `guide_ready` is not an owned in-flight state in `JOB_IN_FLIGHT` for any job to roll back) — they appear to be defined defensively rather than reachable today; verify against `api/state.py` before relying on either.
+
 ### Cut
 
 ```
@@ -259,9 +275,10 @@ draft ──► enriching ──► generating ──► guide_ready
 draft ──► rendering ──► in_review ──► rendering  (re-render)
                │              │
                │              └──► approved ──► publishing ──► published
-               │                        │
+               │                        │             │
                │                        └──► scheduled ──► publishing
-               └──► failed ──► draft ──► rendering
+               └──► failed ──┬──► draft (render retry)
+                              └──► approved (publish retry)
 ```
 
 | From | To | Trigger |
@@ -271,12 +288,15 @@ draft ──► rendering ──► in_review ──► rendering  (re-render)
 | `rendering` | `failed` | `render_cut` exception |
 | `in_review` | `rendering` | Re-render button |
 | `in_review` | `approved` | Approve → `POST /api/cuts/{id}/approve` |
-| `failed` | `draft` | Render retry (via `trigger_render`) / reaper rollback |
-| `approved` | `publishing` | Phase 4 publish action |
-| `approved` | `scheduled` | Phase 4 schedule action |
-| `scheduled` | `publishing` | Phase 4 scheduler worker |
-| `publishing` | `published` | Phase 4 upload success |
-| `publishing` | `failed` | Phase 4 upload error |
+| `approved` | `publishing` | `POST /api/cuts/{id}/publish` |
+| `approved` | `scheduled` | No trigger exists yet — the transition is defined and `publish_cut` handles a cut already in `scheduled`, but nothing currently moves a cut *into* it (no date/time picker, no beat-driven scheduler) |
+| `scheduled` | `publishing` | Same `POST /api/cuts/{id}/publish` endpoint handles a cut already in `scheduled` |
+| `publishing` | `published` | `publish_cut` success (upload live, `platform_post_id` committed) |
+| `publishing` | `failed` | `publish_cut` exception (safety/staleness gate, upload error) |
+| `failed` | `draft` | Render retry — `trigger_render()` auto-resets `failed` → `draft` before re-rendering, or reaper rollback after a failed render job |
+| `failed` | `approved` | Publish retry — `trigger_publish()` auto-resets `failed` → `approved` (no re-render needed: bad credentials, network error, a safety/staleness gate), or reaper rollback after a failed publish job |
+
+`"failed"` is deliberately ambiguous between a failed render and a failed publish — see `api/state.py::CUT_TRANSITIONS`'s own comment. Which retry target applies is decided by which endpoint the operator hits, not tracked on the Cut itself. `latest_failed_job_for_cut()` (`api/routers/cuts.py`) surfaces the real `job.error` for whichever failure actually happened, regardless of this ambiguity.
 
 ---
 
