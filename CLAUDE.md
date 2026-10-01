@@ -47,7 +47,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 797 tests across 30+ files, default run (11 test_compositor tests need ffmpeg
+.venv/bin/pytest                            # 811 tests across 30+ files, default run (11 test_compositor tests need ffmpeg
                                              # on PATH; 1 kokoro voice test skips without the kokoro package; 1 golden-reel
                                              # test is deselected by default — see below)
 .venv/bin/pytest -m golden                  # the golden-reel smoke test (real edge-tts + real ffmpeg, ~20s, needs network)
@@ -164,7 +164,13 @@ api/
                       script_parser.py-style) value would otherwise treat every untouched
                       multi-line vo_script as a content change and spuriously trip
                       Cut.rendered_guide_fingerprint's staleness gate on a pure caption-only edit
-                      — see Key conventions
+                      — the normalize/diff logic itself now lives in
+                      engine/generation/guide_edit.py::set_beat_field() (extracted so it has a
+                      direct, DB-free test surface instead of only being provable through the full
+                      PATCH endpoint — see that module's own entry below and Key conventions);
+                      choose_hook_variant() calls guide_edit.py::replace_beat_vo() the same way,
+                      keeping its own "beat 0 must be a hook beat" validation (an HTTP-level rule)
+                      in the router
     credentials.py    GET /api/credentials (connect/disconnect UI), GET /{provider}/authorize,
                       GET /{provider}/callback, POST /{provider}/disconnect
     insights.py       GET /api/insights (quality↔engagement correlation + top/bottom performer
@@ -308,7 +314,11 @@ engine/
     estimate.py       estimate_generation() — pre-generation call-count/time/cost estimate for the
                       create-reel form, cost sourced from this operator's own StageEvent history
     prompt.py         build_messages(prior_feedback=) + build_visuals_messages() — visuals system prompt anchors LLM to per-beat VO only
-    script_parser.py  BeatStub + parse() + is_structured() — structured-script extractor
+    script_parser.py  BeatStub + parse() + is_structured() — structured-script extractor;
+                      derive_on_screen(vo, max_items=3) is the single, canonical VO→on-screen-
+                      text word-wrap implementation (strips label prefixes via _clean_vo() first)
+                      — postprocess.py and engine/generation/guide_edit.py both import this one,
+                      no longer each having their own copy (see Key conventions)
     visual_fallback.py  Fallback visual_direction synthesis — section/VO keyword tables
     beat_enrichment.py  Tactical insight enrichment + conflict-beat synthesis (topic-fenced)
     evaluator.py      score_guide(context, guide, target_length_s, axis_multipliers=None) — 17-axis rule
@@ -337,6 +347,20 @@ engine/
                       docs/specs/2026-09-score-guide-decomposition-module-design.md
     llm_judge.py      judge_guide() — LLM semantic judge; 5 dims × 0–20 = 100 pts
     postprocess.py    clean_guide() — strips label prefixes; derives up to 5 on_screen_text segments
+                      via script_parser.derive_on_screen() (own copy removed, see Key conventions)
+    guide_edit.py     Operator-driven edits to an already-generated guide (the PATCH beat-edit form,
+                      the hook-variant swap) — as opposed to postprocess.py, which fixes up a
+                      freshly-LLM-generated guide before its first save. set_beat_field(beats, index,
+                      field, new_value) -> bool writes one beat field only when its normalized value
+                      genuinely differs from what's stored (both sides normalized identically —
+                      CRLF/strip for vo_script, strip for visual_direction, dedup+cap-5 for
+                      on_screen_text, plain compare for duration_s), re-deriving on_screen_text as a
+                      side effect when vo_script actually changes; replace_beat_vo(guide, beat_index,
+                      new_vo) -> dict is the hook-swap's copy→mutate→reassign dance, returning a NEW
+                      guide dict (never mutating the input) since SQLAlchemy's JSON column only
+                      detects attribute reassignment. No HTTP/FastAPI knowledge — api/routers/cuts.py
+                      owns validation (e.g. "beat 0 must be a hook beat") and calls these as thin HTTP
+                      glue. See docs/specs/2026-09-guide-edit-module-design.md and Key conventions.
     hook_variants.py  generate_hook_variants() — one best-effort LLM call for N_VARIANTS (3) alternate
                       hook-beat lines, given the current hook vo_script + context + niche; [] on any
                       failure (never raises — this runs after the guide already cleared the quality gate)
@@ -570,7 +594,23 @@ tests/
                               in the decomposition itself (Security/Red-Team and Correctness/Edge-Case
                               both independently confirmed the extracted code is a verbatim, behavior-
                               preserving transcription of the original)
-  test_script_parser.py       11 tests — parse() routing, beat splitting, _derive_on_screen
+  test_script_parser.py       11 tests — parse() routing, beat splitting, derive_on_screen (now the
+                              single canonical word-wrap implementation — postprocess.py and
+                              engine/generation/guide_edit.py both import it, see Key conventions)
+  test_guide_edit.py          14 tests (new) — set_beat_field() for all 4 editable beat fields
+                              (duration_s, visual_direction, vo_script, on_screen_text): writes
+                              through a genuine change, no-op when normalized values match, both
+                              review-round regressions this logic was extracted from (submitted-side
+                              normalization, and the stored-side-also-needs-it follow-up) covered
+                              directly for visual_direction and vo_script, on_screen_text dedup/cap-
+                              to-5, unknown-field raises; replace_beat_vo() swaps + re-derives
+                              on_screen_text and returns a NEW guide dict rather than mutating the
+                              input (SQLAlchemy's JSON column only detects reassignment); 3 of these
+                              mutation-tested against the exact regressions they guard (reverted
+                              stored-side normalization, removed the on_screen_text re-derivation,
+                              made replace_beat_vo() mutate in place) — each confirmed to fail for
+                              the predicted reason, then restored. See
+                              docs/specs/2026-09-guide-edit-module-design.md
   test_state.py               11 tests — REEL_TRANSITIONS, CUT_TRANSITIONS, invalid moves
   test_enrichment.py          15 tests — coerce_beat_type, _enrich_batch response parsing, topic fence
   test_audio_text_sync.py     16 tests — clean_guide() regeneration, _build_text_filter() proportional timing + whisper fallback, PATCH re-derivation, visual direction anchoring;
@@ -1025,6 +1065,7 @@ Video files live on disk (`VIDEO_STORE_DIR`); Wikipedia images in `ASSET_STORE_D
 - **`score_guide()` decomposition — a pure refactor, no behavior change** (Phase 7s, `engine/generation/evaluator.py`, `docs/specs/2026-09-score-guide-decomposition-module-design.md`): closes CAR-2, a "Worth exploring" architecture-review candidate. Before this, `score_guide()` was one ~650-line function scoring all 17 axes inline, with 41 tests in `tests/test_evaluator.py` driving the whole function to isolate one axis's behavior. The original review downgraded this candidate's recommendation strength because `docs/evaluation.md` documented that "a few axes (`emotion`, `duration`, `caption_hashtag`) accumulate from more than one code path into the same key" — re-reading that claim against the actual code before implementing found it describes multiple deduction statements *within* one axis's own already-contiguous, comment-delimited section (e.g. emotion's 4 conditional branches), not literal scattering across the function; `docs/evaluation.md` itself confirms the `axis_multipliers` correction block only ever reads each axis's *final* per-key total regardless of how many internal writes produced it. This reverses the original downgrade — extraction was not actually blocked by the counterevidence, only by a stricter reading of it than the code supports. Extracted `_ScoringContext` (the same bundling-over-individual-threading choice `_GenerationContext` made for CAR-1 — 15 shared precomputed values, different overlapping subsets needed per axis) and 17 `_score_<axis>(ctx) -> (deduction, issues)` functions, one per axis, listed in `_AXIS_SCORERS`; `score_guide()` is now a short orchestration loop applying each non-zero result to `score`/`deductions`/`issues`, then running the existing score-overflow diagnostic and `axis_multipliers` correction block completely unchanged. Verified as a pure refactor, not just asserted: all 41 pre-existing tests pass completely unmodified against the decomposed code, checked before a single test was touched. Mutation-tested: removed `_score_alignment` from `_AXIS_SCORERS` (simulating the axis silently dropping out) and confirmed `test_alignment_axis_still_penalizes_a_real_mismatch_when_a_signal_applies` fails with `assert 0 > 0`, then restored.
 
   **A deep 4-persona review on the opened PR found no code defects — Security/Red-Team and Correctness/Edge-Case both independently confirmed, via direct line-by-line diff against the original (not just "tests pass"), that every extracted function is a verbatim, behavior-preserving transcription — but Test-Quality Auditor, independently corroborated by Correctness/Edge-Case, found 5 real, mutation-confirmed test-coverage gaps.** All 41 pre-existing tests exercise `score_guide()` as one black box, so a sub-axis contribution that no fixture ever isolated could be silently broken with zero test failures: `_score_duration()`/`_score_caption_hashtag()`'s multi-cut accumulation (`deduction += ...` inside a `for cut in guide.cuts:` loop — no fixture ever gave two cuts genuinely different violations), `_score_emotion()`'s distribution sub-block (additive on top of its density elif chain, never exercised in isolation), `_score_retention()`'s momentum sub-axis, and `_score_audio()`'s hook-vs-body pacing weight (×4 vs ×2) — both one of several additive contributions into a shared key with no isolating fixture. Both reviewers independently mutation-tested each and confirmed all 5 survived silently (e.g. collapsing duration's accumulator to a plain assignment, or equalizing audio's pacing weights, both passed all 41 tests). Closed with 5 new regression tests in `tests/test_evaluator.py`, each built to isolate exactly one sub-axis and each mutation-tested against the exact regression it guards. See `docs/specs/2026-09-score-guide-decomposition-module-design.md`'s §7 Corrections for the full account.
+- **`engine/generation/guide_edit.py` — operator-driven guide edits get their own interface, extracted from `api/routers/cuts.py`'s `update_cut()`/`choose_hook_variant()`** (`docs/specs/2026-09-guide-edit-module-design.md`): closes a deepening candidate surfaced by a full-repo architecture review (the `improve-codebase-architecture`/`grilling` skill pair) — `update_cut()` carried ~75 lines of pure dict-diff/normalize logic with no test surface of its own, provable only by driving the full PATCH endpoint through `TestClient` + a real DB + row locking + a template render, despite CLAUDE.md already documenting two separate review rounds that found real false-positive bugs in exactly this logic. `set_beat_field(beats, index, field, new_value) -> bool` now owns the normalize-both-sides-before-comparing rule for all 4 editable beat fields uniformly (including `duration_s`, which never had a normalization bug — kept in the same interface rather than carved out as a special case for no principled reason); `replace_beat_vo(guide, beat_index, new_vo) -> dict` owns the hook-swap's copy→mutate→reassign dance (needed because SQLAlchemy's JSON column type only detects attribute reassignment), returning a new dict rather than mutating the input. Neither function has HTTP/FastAPI knowledge — `choose_hook_variant()`'s own "beat 0 must be a hook beat" check stays in the router, a deliberate choice from the grilling session: that's an HTTP-level business rule, not a guide-editing mechanic, and keeping it out means `guide_edit.py` could be called from something other than a FastAPI route later without dragging HTTP semantics along. A smaller, related duplication was folded into the same pass: `derive_on_screen` (the VO→on-screen-text word-wrap algorithm) existed as two separate, slightly-diverged implementations in `script_parser.py` and `postprocess.py`, with one caller (`worker/tasks/generate.py`) already needing an alias-import to use both side by side — `script_parser.derive_on_screen()` is now the single canonical implementation, `postprocess.py` imports it instead of maintaining its own copy. All pre-existing tests across 5 test files pass completely unmodified; the existing HTTP-level tests were deliberately kept (not narrowed) as wiring coverage, with 14 new direct, DB-free tests in `tests/test_guide_edit.py` added alongside rather than replacing them — this module's own documented bug history is specifically why both layers of coverage are worth keeping, not a reason to consolidate down to one. 3 of the new tests mutation-tested against the exact regressions they guard (see that test file's own entry above).
 - **Evaluator thresholds**: `MAX_WPS=4.0` (body/CTA beats), `MAX_WPS_HOOK=3.0` (hook beats — tighter cap; hook violation costs 4 pts vs 2 pts for body; Axis 9 max deduction 10 pts total), `MAX_OPENER_WORDS=16`. Narrative insight tactical sub-axis gives 2/4 baseline to non-tactical reels so they aren't penalised for missing football jargon.
 - **Structured script enrichment guard**: `enrich_context.py` imports `script_parser.is_structured()` (≥3 labelled sections — the exact test `parse()` applies). Single source of truth: never add a second header regex, or the guard and the parser will disagree about the same input. When True, `llm_enrich()` is skipped even if score < 60 — the script's topic is already locked in; enrichment would cause context drift. `job.meta["enrich_skipped"]` records the reason (`"structured_script"` or `"score_above_threshold"`).
 - **Audio fade in compositor**: `composite_cut()` applies `.with_effects([AudioFadeIn(0.12), AudioFadeOut(0.12)])` to each beat's `AudioFileClip`. Order: subclip if too long → fade → `.with_start(t)`. Fade before `with_start` is required — fades compute against the clip's own timeline, not the composite. `AudioFileClip` has no `.audio_fadein()`/`.audio_fadeout()` methods in MoviePy 2.x — fades are effects, not chainable methods. The exception from calling the non-existent methods was caught by a bare `except Exception: pass` around the VO track builder, so this shipped for months rendering every video with zero audio before a live end-to-end run caught it; the handler now logs via `_log.exception()` instead of swallowing silently.

@@ -21,7 +21,7 @@ from engine.generation.guide_schema import Beat, MasterGuide, PlatformGuide
 from engine.generation.hook_variants import generate_hook_variants
 from engine.generation.llm import get_llm_provider, get_enrichment_provider, is_nvidia_generation
 from engine.generation.llm_judge import judge_guide
-from engine.generation.postprocess import clean_guide, _derive_on_screen as _postprocess_derive_on_screen
+from engine.generation.postprocess import clean_guide
 from engine.generation.pricing import llm_cost_usd
 from engine.generation.prompt import build_messages, build_visuals_messages
 from engine.generation.script_parser import BeatStub
@@ -349,7 +349,7 @@ def _enrich_standard_path_guide(guide: MasterGuide, context: str, enrichment_llm
             if stub and stub.vo_script != beat.vo_script:
                 beat.vo_script = stub.vo_script
                 beat.duration_s = stub.duration_s
-                beat.on_screen_text = _postprocess_derive_on_screen(stub.vo_script, max_lines=5)
+                beat.on_screen_text = script_parser.derive_on_screen(stub.vo_script, max_items=5)
 
 
 def _prepare_generate(db, job):
