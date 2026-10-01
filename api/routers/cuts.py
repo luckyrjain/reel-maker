@@ -300,15 +300,24 @@ def publish_status_fragment(
     )
 
 
+def _resolve_within_video_store(path_str: str) -> Path:
+    """Resolve path_str and confirm it falls under VIDEO_STORE_DIR, raising 403 otherwise.
+    The one implementation of the path-traversal guard shared by every file-streaming
+    endpoint below — previously copy-pasted three times (see CAR candidate 1, the
+    improve-codebase-architecture review)."""
+    video_store = Path(settings.video_store_dir).resolve()
+    resolved = Path(path_str).resolve()
+    if not resolved.is_relative_to(video_store):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return resolved
+
+
 @router.get("/cuts/{cut_id}/video")
 def stream_video(cut_id: int, db: Session = Depends(get_db)):
     cut = db.get(models.Cut, cut_id)
     if not cut or not cut.video_path:
         raise HTTPException(status_code=404, detail="Video not found")
-    video_store = Path(settings.video_store_dir).resolve()
-    resolved = Path(cut.video_path).resolve()
-    if not resolved.is_relative_to(video_store):
-        raise HTTPException(status_code=403, detail="Forbidden")
+    resolved = _resolve_within_video_store(cut.video_path)
     return FileResponse(
         resolved,
         media_type="video/mp4",
@@ -321,10 +330,7 @@ def stream_subtitles(cut_id: int, db: Session = Depends(get_db)):
     cut = db.get(models.Cut, cut_id)
     if not cut or not cut.subtitle_path:
         raise HTTPException(status_code=404, detail="Subtitles not found")
-    video_store = Path(settings.video_store_dir).resolve()
-    resolved = Path(cut.subtitle_path).resolve()
-    if not resolved.is_relative_to(video_store):   # see stream_video
-        raise HTTPException(status_code=403, detail="Forbidden")
+    resolved = _resolve_within_video_store(cut.subtitle_path)
     return FileResponse(
         resolved,
         media_type="application/x-subrip",
@@ -337,10 +343,7 @@ def stream_thumbnail(cut_id: int, index: int, db: Session = Depends(get_db)):
     cut = db.get(models.Cut, cut_id)
     if not cut or not cut.thumbnail_candidates or not (0 <= index < len(cut.thumbnail_candidates)):
         raise HTTPException(status_code=404, detail="Thumbnail not found")
-    video_store = Path(settings.video_store_dir).resolve()
-    resolved = Path(cut.thumbnail_candidates[index]).resolve()
-    if not resolved.is_relative_to(video_store):   # see stream_video
-        raise HTTPException(status_code=403, detail="Forbidden")
+    resolved = _resolve_within_video_store(cut.thumbnail_candidates[index])
     return FileResponse(resolved, media_type="image/jpeg")
 
 
