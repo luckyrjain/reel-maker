@@ -494,6 +494,30 @@ def _cache_asset(db, result: SourcedAsset, asset_type: str) -> tuple["models.Ass
     return asset, result.local_path
 
 
+def _generate_gated_hf_asset(db, reel_id, stage, source, query, cost_fn):
+    """Runs source.generate(query), gated on (reel_id is not None and source.api_key) exactly
+    like the two call sites below used to inline separately. Gated means wrapped in
+    record_stage(..., stage, provider="huggingface") — a StageEvent is written only for a
+    call that was actually attempted (generate() is a guaranteed no-op with no api_key, and
+    hf_video/hf are always constructed regardless of whether the key is set, so this gate
+    can't be pushed onto the caller). cost_fn(result) -> float lets each call site supply its
+    own cost shape (hf_video_cost_usd() needs the generated result's duration_s; hf_image_cost_usd()
+    takes no args) without this helper knowing which source it's wrapping.
+
+    Returns the raw SourcedAsset | None only — never early-returns from resolve_beat_assets()
+    and never calls _cache_asset(): that control-flow decision stays in the caller, which owns
+    the fallback-chain tiering (Wikipedia → Pexels → HF Video → HF Image → None).
+    """
+    if reel_id is not None and source.api_key:
+        with record_stage(db, reel_id, stage, provider="huggingface") as ev:
+            result = source.generate(query)
+            ev.detail["cache_hit"] = result is not None and not source.last_call_was_generated
+            if source.last_call_was_generated:
+                ev.cost_usd = cost_fn(result)
+        return result
+    return source.generate(query)
+
+
 def resolve_beat_assets(
     db,
     query: str,
@@ -538,26 +562,18 @@ def resolve_beat_assets(
         # StageEvent for a call that was never attempted. hf_video/hf are
         # always constructed by render_cut regardless of whether the key is
         # set, so this check can't be pushed onto the caller.
-        if reel_id is not None and hf_video.api_key:
-            with record_stage(db, reel_id, "asset_hf_video", provider="huggingface") as ev:
-                hf_vid_result = hf_video.generate(query)
-                ev.detail["cache_hit"] = hf_vid_result is not None and not hf_video.last_call_was_generated
-                if hf_video.last_call_was_generated:
-                    ev.cost_usd = hf_video_cost_usd(hf_vid_result.duration_s if hf_vid_result else 0.0)
-        else:
-            hf_vid_result = hf_video.generate(query)
+        hf_vid_result = _generate_gated_hf_asset(
+            db, reel_id, "asset_hf_video", hf_video, query,
+            lambda r: hf_video_cost_usd(r.duration_s if r else 0.0),
+        )
         if hf_vid_result:
             return [_cache_asset(db, hf_vid_result, "footage")]
 
     if hf:
-        if reel_id is not None and hf.api_key:
-            with record_stage(db, reel_id, "asset_hf_image", provider="huggingface") as ev:
-                hf_result = hf.generate(query)
-                ev.detail["cache_hit"] = hf_result is not None and not hf.last_call_was_generated
-                if hf.last_call_was_generated:
-                    ev.cost_usd = hf_image_cost_usd()
-        else:
-            hf_result = hf.generate(query)
+        hf_result = _generate_gated_hf_asset(
+            db, reel_id, "asset_hf_image", hf, query,
+            lambda r: hf_image_cost_usd(),
+        )
         if hf_result:
             return [_cache_asset(db, hf_result, "photo")]
 
