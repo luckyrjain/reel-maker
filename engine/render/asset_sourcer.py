@@ -507,6 +507,12 @@ def _generate_gated_hf_asset(db, reel_id, stage, source, query, cost_fn):
     Returns the raw SourcedAsset | None only — never early-returns from resolve_beat_assets()
     and never calls _cache_asset(): that control-flow decision stays in the caller, which owns
     the fallback-chain tiering (Wikipedia → Pexels → HF Video → HF Image → None).
+
+    cost_fn must not raise: it runs inside record_stage()'s `with` block, which re-raises on
+    exit rather than swallowing — a raising cost_fn aborts this beat's whole fallback chain,
+    unlike every sourcer in this module's own degrade-silently-and-move-to-the-next-tier
+    convention (pre-existing behavior, unchanged by this extraction — the inline cost
+    calculations this helper replaced had the identical propagation).
     """
     if reel_id is not None and source.api_key:
         with record_stage(db, reel_id, stage, provider="huggingface") as ev:

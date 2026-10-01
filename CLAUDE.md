@@ -47,7 +47,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 818 tests across 30+ files, default run (11 test_compositor tests need ffmpeg
+.venv/bin/pytest                            # 821 tests across 30+ files, default run (11 test_compositor tests need ffmpeg
                                              # on PATH; 1 kokoro voice test skips without the kokoro package; 1 golden-reel
                                              # test is deselected by default — see below)
 .venv/bin/pytest -m golden                  # the golden-reel smoke test (real edge-tts + real ffmpeg, ~20s, needs network)
@@ -372,8 +372,10 @@ engine/
                       resolve_beat_assets() still available for non-pinned use; records "asset_hf_video"/
                       "asset_hf_image" StageEvents (cost_usd only on an actual generation call, not a
                       cache hit — tracked via last_call_was_generated) via _generate_gated_hf_asset(db,
-                      reel_id, stage, source, query, cost_fn) -> SourcedAsset | None (CAR candidate 2,
-                      a full-repo architecture review) — the single gate/record_stage/cost-recording
+                      reel_id, stage, source, query, cost_fn) -> SourcedAsset | None (candidate 2 of
+                      the improve-codebase-architecture review that also produced guide_edit.py, PR
+                      #30 — distinct from the earlier CAR-1/CAR-2/CAR-3 trio, a different review run) —
+                      the single gate/record_stage/cost-recording
                       shell shared by the HF-video and HF-image tiers in resolve_beat_assets(), which
                       used to each inline a near-identical ~10-line block; cost_fn(result) -> float lets
                       each tier supply its own cost shape (hf_video_cost_usd() needs the generated
@@ -766,9 +768,10 @@ tests/
                               compute_pins_fingerprint_for_render — returns EMPTY_PINS_FINGERPRINT (not None) for
                               zero pins, delegates to the real hash otherwise (independent-review-driven addition
                               closing the black-frame staleness gap — see engine/render/asset_sourcer.py's entry)
-  test_asset_sourcer_cost.py   14 tests — HF cost StageEvents charged only on real generation, not cache hits
-                              (9 original resolve_beat_assets()-level tests, kept unmodified per the CAR-
-                              candidate-2 grilling decision — see below); 5 new direct tests of
+  test_asset_sourcer_cost.py   15 tests — HF cost StageEvents charged only on real generation, not cache hits
+                              (10 original tests — 5 resolve_beat_assets()-level, 5 testing the HF source
+                              objects' generate() directly — all kept unmodified per the HF-asset-gate-
+                              extraction grilling decision — see below); 5 new direct tests of
                               _generate_gated_hf_asset() itself (gated+real-call, gated+cache-hit,
                               gated+no-result, ungated+no-api-key, ungated+no-reel-id)
   test_wikipedia_image_source.py  6 tests (Phase 7h) — _fetch_license()'s titles= param is

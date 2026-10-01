@@ -49,7 +49,8 @@ for `_generate_gated_hf_asset()` itself: gated+real-call (cost recorded), gated+
 (zero cost), gated+no-result (event still recorded, cache_hit=False), ungated+no-api-key
 (no event), ungated+no-reel-id (no event).
 
-All 818 tests (813 + 5 new) pass unmodified against the extraction.
+All 821 default-run tests (816 on `main` + 5 new) pass unmodified against the extraction
+(822 total including the `golden`-marked test, deselected by default).
 
 Mutation-tested: (1) removed the `if source.last_call_was_generated: ev.cost_usd =
 cost_fn(result)` block — 3 tests failed for the right reason (`cost_usd` stayed `None`),
