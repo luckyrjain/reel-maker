@@ -109,7 +109,7 @@ Quality score and context score on success are in `job.meta.quality_score` and `
 
 ## Cuts
 
-All `/cuts/{cut_id}/*` routes are defined in `api/routers/cuts.py`. Row-mutating routes (`render`, `PATCH`, `approve`, `publish`, `thumbnail`, `hook-variant`) take the cut row `SELECT ... FOR UPDATE` so a double-click or two concurrent actions on the same cut serialize instead of both passing the same status guard.
+Most `/cuts/{cut_id}/*` routes are defined in `api/routers/cuts.py`; the 3 `GET` file-streaming routes (`video`, `subtitles`, `thumbnail/{index}`) live in `api/routers/cut_media.py` — split out as candidate 2 of the `improve-codebase-architecture` review (see `docs/specs/2026-09-cut-media-router-split-module-design.md`), both mounted under the same `/api` prefix so the URL paths below are unaffected. Row-mutating routes (`render`, `PATCH`, `approve`, `publish`, `thumbnail`, `hook-variant`) take the cut row `SELECT ... FOR UPDATE` so a double-click or two concurrent actions on the same cut serialize instead of both passing the same status guard.
 
 ### `POST /api/cuts/{cut_id}/render`
 

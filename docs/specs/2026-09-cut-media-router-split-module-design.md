@@ -1,4 +1,4 @@
-# cut_media.py router split — module design
+# cut_media.py router split — module design (Phase 7t)
 
 ## Problem
 
@@ -45,13 +45,23 @@ new home.
 828 tests total (unchanged — pure move, no tests added or removed).
 
 Mutation-tested: commented out `cut_media.router`'s `include_router()` line in
-`api/main.py` — 7 of 14 `test_cut_media.py` tests failed (every test that makes a real
-HTTP request through the `TestClient`; the 7 that passed were the pure-function
-`_resolve_within_video_store()` direct-call tests and 404-for-nonexistent-cut variants
-that don't depend on the route being mounted), confirming the router wiring is genuinely
-load-bearing. Restored and re-verified all 828 tests pass.
+`api/main.py` — 7 of 14 `test_cut_media.py` tests failed (every test that asserts a
+200/403 through a real `TestClient` request; the other 7 pass vacuously — 5 already
+expect 404 for an unrelated reason, and 2 call `_resolve_within_video_store()` directly,
+bypassing routing entirely), confirming the mounting is genuinely load-bearing for the
+tests that actually exercise it. Restored and re-verified all 828 tests pass.
 
 ## Corrections
 
-None yet — this section will be updated after the 4-persona review round on the opened
-PR, per this pipeline's standard practice.
+A deep 4-persona review on the opened PR found Security/Red-Team and Correctness/Edge-
+Case clean — independently confirmed byte-identical code at both the source and live
+FastAPI-route level (no collision between `cuts.router` and `cut_media.router`), and the
+mutation-testing numbers above independently reproduced exactly (7/14, as stated here —
+this file's own wording was already accurate; a companion summary in CLAUDE.md had
+overstated it as "every test fails" and was corrected to match). Documentation-
+Consistency found `docs/architecture.md`'s module table and `docs/api.md`'s opening
+sentence were left stale by the first pass — both still said every `/cuts/{cut_id}/*`
+route, including the 3 file streams, lived in `cuts.py`. Fixed: `docs/architecture.md`
+gained a `cut_media.py` row, and `docs/api.md`'s sentence now names both files. Also
+added this doc's own `Phase 7t` label (CLAUDE.md used it throughout but this file hadn't,
+until now).
