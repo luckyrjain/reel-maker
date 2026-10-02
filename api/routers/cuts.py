@@ -5,9 +5,9 @@ from sqlalchemy.orm import Session
 
 from api import models
 from api.db import get_db
+from api.enqueue import enqueue_job
 from api.state import CUT_TRANSITIONS, transition
 from engine.generation.guide_edit import replace_beat_vo, set_beat_field
-from worker.tasks.common import fail_unenqueued
 from worker.tasks.publish import publish_cut
 from worker.tasks.render import render_cut
 
@@ -129,17 +129,7 @@ def trigger_render(cut_id: int, request: Request, db: Session = Depends(get_db))
         status=models.JobStatus.pending,
         progress=0,
     )
-    db.add(job)
-    db.flush()
-    job_id = job.id
-    db.commit()   # nothing may be open across .delay(): a slow broker failure would outlive an idle-in-transaction timeout
-
-    try:
-        render_cut.delay(job_id)
-    except Exception as exc:
-        fail_unenqueued(db, job_id, models.JobType.render.value, exc)
-        raise HTTPException(status_code=503, detail="Could not queue the render — try again") from exc
-    db.refresh(job)
+    enqueue_job(db, job, render_cut, what="render")
 
     return templates.TemplateResponse(
         request, "fragments/render_status.html",
@@ -265,17 +255,7 @@ def trigger_publish(cut_id: int, request: Request, db: Session = Depends(get_db)
         status=models.JobStatus.pending,
         progress=0,
     )
-    db.add(job)
-    db.flush()
-    job_id = job.id
-    db.commit()   # see trigger_render
-
-    try:
-        publish_cut.delay(job_id)
-    except Exception as exc:
-        fail_unenqueued(db, job_id, models.JobType.publish.value, exc)
-        raise HTTPException(status_code=503, detail="Could not queue the publish — try again") from exc
-    db.refresh(job)
+    enqueue_job(db, job, publish_cut, what="publish")
 
     return templates.TemplateResponse(
         request, "fragments/publish_status.html",
