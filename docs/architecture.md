@@ -168,7 +168,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `tts.py` | `EdgeTTSProvider`/`KokoroProvider`/`SilentProvider`; `synthesize()` + `synth_to_budget()` (±25% rate adjustment); `CURATED_EDGE_VOICES` |
 | `captions.py` | `transcribe_audio()` — one Whisper pass producing both `.words` (burned-in text) and `.segments` (SRT export); no-op if Whisper isn't installed |
 | `srt.py` | `write_srt()` — pure `list[CaptionSegment]` → `.srt` formatter, no ffmpeg/network |
-| `compositor.py` | `composite_cut()` — MoviePy stage + FFmpeg drawtext stage, returns `(duration, thumbnail_candidates, subtitle_path)`; reader lifetime managed via `contextlib.ExitStack` (Phase 7r) rather than manual tuple-threading; `_build_collage_clip()` for a 2-item beat; `CURATED_TEXT_COLORS`; music mixing with sidechain ducking; atomic `os.replace()` |
+| `compositor.py` | `composite_cut()` — MoviePy stage + FFmpeg drawtext stage, returns `(duration, thumbnail_candidates, subtitle_path)`; reader lifetime managed via `contextlib.ExitStack` (Phase 7r) rather than manual tuple-threading; `_build_collage_clip()` for a 2-item beat; `CURATED_TEXT_COLORS`; `_proportional_spans()`/`_split_vo_sentences()` (Phase 7y) — the shared placement core of the no-Whisper drawtext and SRT timing fallbacks; music mixing with sidechain ducking; atomic `os.replace()` |
 
 #### `engine/publish/`
 
@@ -191,7 +191,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 ### `tests/`
 
-54 test files + `conftest.py`, **1026 tests run by default / 1027 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
+55 test files + `conftest.py`, **1051 tests run by default / 1052 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
 
 | File | Tests | File | Tests |
 |---|---|---|---|
@@ -220,6 +220,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_names.py` | 109 | `test_visual_fallback.py` | 17 |
 | `test_asset_sourcer_names.py` | 7 | `test_enqueue.py` | 13 |
 | `test_pricing.py` | 4 | `test_config.py` | 2 |
+| `test_proportional_timing.py` | 25 | | |
 | `test_llm_judge.py` | 3 | `test_main.py` | 3 |
 | `test_observability.py` | 3 | `test_golden_reel.py` | 1 (deselected) |
 

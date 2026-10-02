@@ -11,7 +11,12 @@ import re
 
 import pytest
 
-from engine.render.compositor import _build_text_filter, _proportional_caption_cues
+from engine.render.compositor import (
+    _build_text_filter,
+    _proportional_caption_cues,
+    _proportional_spans,
+    _split_vo_sentences,
+)
 
 
 def _windows(beats, durations):
@@ -139,3 +144,59 @@ def test_drawtext_floor_drops_lines_that_do_not_fit_current_behavior():
 def test_drawtext_zero_duration_places_nothing():
     beat = {"vo_script": "A b. C d.", "on_screen_text": ["a", "b"]}
     assert _windows([beat], [0.0]) == []
+
+
+# ── shared core: _proportional_spans / _split_vo_sentences ───────────────────
+
+def test_spans_share_duration_by_weight():
+    spans = _proportional_spans([1, 3], 4, 8.0)
+    assert spans == pytest.approx([(0, 0.0, 2.0), (1, 2.0, 8.0)])
+
+
+def test_spans_start_offsets_absolute_time():
+    spans = _proportional_spans([1, 1], 2, 4.0, start=10.0)
+    assert spans == pytest.approx([(0, 10.0, 12.0), (1, 12.0, 14.0)])
+
+
+def test_spans_total_weight_is_independent_of_weights():
+    """The drawtext caller places 1 of 3 sentences' worth of lines: the denominator is
+    the caller's, so a lone weight-1 item out of 4 gets only a quarter of the beat
+    (then is stretched to the end, being the last placed)."""
+    spans = _proportional_spans([1], 4, 8.0)
+    assert spans == [(0, 0.0, 8.0)]
+    spans = _proportional_spans([1, 1], 4, 8.0)
+    assert spans == pytest.approx([(0, 0.0, 2.0), (1, 2.0, 8.0)])
+
+
+def test_spans_stretch_last_span_to_the_end():
+    assert _proportional_spans([1, 1], 4, 8.0)[-1][2] == 8.0
+
+
+def test_spans_stop_placing_once_the_end_is_reached():
+    spans = _proportional_spans([1, 1, 1, 1], 2, 8.0)
+    assert [i for i, _, _ in spans] == [0, 1]
+
+
+def test_spans_apply_minimum_span_floor():
+    spans = _proportional_spans([1, 1], 1000, 10.0)
+    assert spans[0] == pytest.approx((0, 0.0, 0.3))
+    assert spans[1][1] == pytest.approx(0.3)
+
+
+def test_spans_overrunning_span_ends_exactly_at_the_end():
+    spans = _proportional_spans([100], 100, 0.2)
+    assert spans == [(0, 0.0, 0.2)]
+
+
+def test_spans_zero_duration_and_empty_weights_place_nothing():
+    assert _proportional_spans([1, 1], 2, 0.0) == []
+    assert _proportional_spans([], 1, 5.0) == []
+
+
+def test_split_vo_sentences_boundaries_and_stripping():
+    assert _split_vo_sentences(" One. Two! Three? Four \u2014 five ") == [
+        "One", "Two", "Three", "Four", "five",
+    ]
+    assert _split_vo_sentences("...") == []
+    assert _split_vo_sentences("") == []
+    assert _split_vo_sentences(None) == []
