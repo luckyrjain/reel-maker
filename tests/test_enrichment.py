@@ -334,7 +334,7 @@ def test_enrich_with_insight_threads_niche_into_every_batch():
     assert all("personal finance" in m and "football" not in m.lower() for m in llm.system_messages)
 
 
-@pytest.mark.parametrize("niche", [None, "", "   ", "Football", " football ", "Premier League Football", "soccer", "futbol"])
+@pytest.mark.parametrize("niche", [None, "", "   ", "\x00", "\n\t\x07", "Football", " football ", "Premier League Football", "soccer", "futbol"])
 def test_is_football_niche_true_for_unset_or_football_like(niche):
     from engine.generation.beat_enrichment import _is_football_niche
 

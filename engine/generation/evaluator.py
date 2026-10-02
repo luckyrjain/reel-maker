@@ -1063,7 +1063,8 @@ def score_guide(
     17 Repetition               (5 pts)  body beats use distinct vocabulary across the script
 
     Tactical/action/context vocabulary selected by guide.niche:
-      football/soccer/futbol → full football-specific patterns
+      niche containing football/soccer/futbol (substring match, engine/generation/niche.py)
+                             → full football-specific patterns
       all other niches       → universal sport patterns
     """
     issues: list[str] = []
