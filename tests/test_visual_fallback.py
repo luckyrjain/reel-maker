@@ -26,6 +26,11 @@ def test_existing_player_wins_over_any_name_in_the_vo():
     # and a clause-opening capital is no longer mistaken for a first name
     ("Angel Di Maria scores", "Angel Di Maria"),
     ("Because Messi scored", ""),
+    # an interrogative hook's opener is stripped, the player kept
+    ("Is Vinicius Junior the best player alive?", "Vinicius Junior"),
+    # clubs named "X United"/"X City" are not players (the old regex blocked these anywhere)
+    ("Leeds United won", ""),
+    ("Cardiff City scored", ""),
 ])
 def test_first_person_current_behavior(vo, expected):
     assert _first_person(vo, "") == expected

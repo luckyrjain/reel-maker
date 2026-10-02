@@ -18,10 +18,12 @@ class _RecordingWiki:
         return None
 
 
-def _wiki_lookups(query: str) -> list[str]:
+def _wiki_lookups(query: str, sleeps: list | None = None) -> list[str]:
     wiki = _RecordingWiki()
-    with patch("engine.render.asset_sourcer.time.sleep"):
+    with patch("engine.render.asset_sourcer.time.sleep") as sleep:
         resolve_beat_assets(None, query, 5.0, _NoneSourcer(), wiki=wiki)
+    if sleeps is not None:
+        sleeps.extend(c.args[0] for c in sleep.call_args_list)
     return wiki.names
 
 
@@ -48,3 +50,15 @@ def test_non_person_phrases_are_not_looked_up():
 
 def test_no_names_means_no_lookup():
     assert _wiki_lookups("stadium crowd wide shot") == []
+
+
+def test_rate_limit_pause_happens_between_names_only():
+    one, two = [], []
+    _wiki_lookups("Lionel Messi through-ball", one)
+    _wiki_lookups("Lionel Messi and Cristian Romero", two)
+    assert one == []
+    assert two == [0.5]
+
+
+def test_a_leading_opener_does_not_leak_into_the_wikipedia_query():
+    assert _wiki_lookups("Is Vinicius Junior the best?") == ["Vinicius Junior"]
