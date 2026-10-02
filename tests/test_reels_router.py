@@ -601,6 +601,7 @@ def test_create_reel_that_cannot_be_enqueued_fails_fast_instead_of_polling_forev
         mock_enrich.delay.side_effect = ConnectionError("broker down")
         resp = client.post("/api/reels", data={"context": "A" * 60})
     assert resp.status_code == 503
+    assert resp.json()["detail"] == "Could not queue the job — try again"
     db = client._session_factory()
     reel = db.query(models.Reel).order_by(models.Reel.id.desc()).first()
     assert reel.status == models.ReelStatus.failed

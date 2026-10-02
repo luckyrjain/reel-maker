@@ -228,6 +228,7 @@ def test_render_that_cannot_be_enqueued_fails_fast_and_frees_the_cut(client):
         mock_task.delay.side_effect = ConnectionError("broker down")
         resp = client.post(f"/api/cuts/{cut_id}/render")
     assert resp.status_code == 503
+    assert resp.json()["detail"] == "Could not queue the render — try again"
     db = client._session_factory()
     assert db.get(models.Cut, cut_id).status == models.CutStatus.failed
     job = db.query(models.Job).filter(models.Job.cut_id == cut_id).one()
@@ -242,6 +243,7 @@ def test_publish_that_cannot_be_enqueued_fails_fast_and_frees_the_cut(client):
         mock_task.delay.side_effect = ConnectionError("broker down")
         resp = client.post(f"/api/cuts/{cut_id}/publish")
     assert resp.status_code == 503
+    assert resp.json()["detail"] == "Could not queue the publish — try again"
     db = client._session_factory()
     assert db.get(models.Cut, cut_id).status == models.CutStatus.failed
     assert db.query(models.Job).filter(models.Job.cut_id == cut_id).one().status == models.JobStatus.failed

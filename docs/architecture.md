@@ -107,6 +107,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `config.py` | `pydantic-settings` `Settings` — LLM/NVIDIA/HuggingFace/Pexels keys, `credentials_key`, OAuth client id/secret pairs, `public_base_url`, `music_library_dir`, `max_paid_llm_calls_per_reel`, `evaluator_axis_weight_multipliers` (dict, the first dict-typed setting) |
 | `crypto.py` | Fernet `seal()`/`open_()` + `Encrypted` SQLAlchemy TypeDecorator for encrypted columns (`Credential.token_blob`/`refresh_token_blob`) |
 | `db.py` | SQLAlchemy engine (`pool_pre_ping=True`, `hide_parameters=True`), `SessionLocal`, `get_db()` FastAPI dependency |
+| `enqueue.py` | `enqueue_job(db, job, task, *, what)` — the one router-side add → commit → `task.delay` → unwind-on-failure (`fail_unenqueued` + 503) sequence, used by `create_reel`, `trigger_render`, `trigger_publish` |
 | `models.py` | All ORM models and status enums — `Reel`, `Cut`, `CutMetricSnapshot`, `Asset`, `CutAsset`, `Job`, `StageEvent`, `PerformanceNote`, `Credential` |
 | `oauth.py` | Generic OAuth2 authorization-code flow; `YouTubeOAuth`, `InstagramOAuth`; `new_state()`/`consume_state()` (process-local CSRF state) |
 | `schemas.py` | `JobResponse` — the one JSON endpoint's response shape |
@@ -190,7 +191,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 ### `tests/`
 
-53 test files + `conftest.py`, **1013 tests run by default / 1014 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
+54 test files + `conftest.py`, **1026 tests run by default / 1027 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
 
 | File | Tests | File | Tests |
 |---|---|---|---|
@@ -202,7 +203,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_audio_text_sync.py` | 16 | `test_guide_edit.py` | 16 |
 | `test_render_task.py` | 16 | `test_tts.py` | 16 |
 | `test_asset_sourcer_cost.py` | 15 | `test_enrichment.py` | 38 |
-| `test_state.py` | 15 | `test_variants_router.py` | 15 |
+| `test_state.py` | 15 | `test_variants_router.py` | 8 |
 | `test_asset_sourcer.py` | 14 | `test_context_enricher.py` | 14 |
 | `test_enrich_context_task.py` | 14 | `test_oauth.py` | 14 |
 | `test_publish_task.py` | 14 | `test_llm_provider.py` | 13 |
@@ -217,7 +218,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_tasks_real_db.py` | 7 | `test_wikipedia_image_source.py` | 6 |
 | `test_niche.py` | 22 | `test_cut_media.py` | 14 |
 | `test_names.py` | 109 | `test_visual_fallback.py` | 17 |
-| `test_asset_sourcer_names.py` | 7 | | |
+| `test_asset_sourcer_names.py` | 7 | `test_enqueue.py` | 13 |
 | `test_pricing.py` | 4 | `test_config.py` | 2 |
 | `test_llm_judge.py` | 3 | `test_main.py` | 3 |
 | `test_observability.py` | 3 | `test_golden_reel.py` | 1 (deselected) |
