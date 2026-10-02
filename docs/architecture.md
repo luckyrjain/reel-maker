@@ -152,7 +152,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `llm_judge.py` | `judge_guide()` — LLM semantic judge, 5 dimensions × 0–20 |
 | `postprocess.py` | `clean_guide()` — strips label prefixes; derives up to 5 `on_screen_text` segments via `script_parser.derive_on_screen()` |
 | `visual_fallback.py` | Fallback `visual_direction` synthesis from VO keywords when the LLM returns a degenerate one |
-| `beat_enrichment.py` | `_enrich_with_insight()` / `_make_conflict_stub()` — topic-fenced structured-path enrichment |
+| `beat_enrichment.py` | `_enrich_with_insight()` (both generation paths, niche-aware: football vs. generic vocabulary/prompt) / `_make_conflict_stub()` (structured path only) — topic-fenced |
 | `guide_edit.py` | `set_beat_field()` / `replace_beat_vo()` — operator-driven guide edits (PATCH beat-edit form, hook-variant swap), extracted from `api/routers/cuts.py` with no HTTP knowledge |
 | `hook_variants.py` | `generate_hook_variants()` — one best-effort LLM call for 3 alternate hook lines; `[]` on any failure |
 
@@ -196,10 +196,10 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_maintenance.py` | 52 | `test_reels_router.py` | 38 |
 | `test_r3_proposed.py` | 38 | `test_cuts_publish_router.py` | 34 |
 | `test_compositor.py` | 30 | `test_r4_gaps.py` | 30 |
-| `test_generate_task.py` | 20 | `test_common.py` | 18 |
+| `test_generate_task.py` | 25 | `test_common.py` | 18 |
 | `test_audio_text_sync.py` | 16 | `test_guide_edit.py` | 16 |
 | `test_render_task.py` | 16 | `test_tts.py` | 16 |
-| `test_asset_sourcer_cost.py` | 15 | `test_enrichment.py` | 15 |
+| `test_asset_sourcer_cost.py` | 15 | `test_enrichment.py` | 37 |
 | `test_state.py` | 15 | `test_variants_router.py` | 15 |
 | `test_asset_sourcer.py` | 14 | `test_context_enricher.py` | 14 |
 | `test_enrich_context_task.py` | 14 | `test_oauth.py` | 14 |
@@ -621,7 +621,6 @@ MasterGuide:
 
 - **TikTok publishing**: `CutPlatform.tiktok` exists (render/review works); `TikTokPublisher.publish()` raises `NotImplementedError` on purpose — the Content Posting API needs a separate audited app review, unlike YouTube/Instagram's self-serve OAuth
 - **Scheduling trigger**: `scheduled` cut status and `publish_cut` both handle a cut already sitting in `scheduled`; nothing currently transitions a cut *into* it (no date/time picker, no beat-driven scheduled publish)
-- **Insight enrichment for the standard LLM path**: currently only applied to structured-script beats
 - **Multi-image collage beyond 2 items**: a beat with 3+ resolved media items still cycles sequentially; a 2-item beat gets the side-by-side collage (shipped — see "Render pipeline detail")
 - **Unpublish / re-publish flows**: a published cut has no "take down" or "publish again" action
 - **Analytics beyond raw views/likes/comments and quality↔views correlation**: `cut_metric_snapshots` (Phase 7p) now accumulates history, but no chart/trend UI reads it yet; no engagement-rate normalization, no per-axis correlation (which of the 17 evaluator axes predicts engagement), no per-niche correlation, no likes/comments composite metric

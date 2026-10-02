@@ -1,7 +1,10 @@
 """Tests for enrichment batch parsing — handles single-dict and malformed LLM responses."""
 import json
 
+import pytest
+
 from engine.generation.guide_schema import Beat
+from engine.generation.script_parser import BeatStub
 
 
 # ── coerce_beat_type ──────────────────────────────────────────────────────────
@@ -136,10 +139,117 @@ def test_enrich_batch_prompt_has_topic_fence():
         index=0, beat_type="body", section="GOALKEEPER", player="Emiliano Martinez",
         vo_script="Martinez saves penalties consistently.", duration_s=5.0, on_screen_text=[],
     )
-    _enrich_batch([stub], "Argentina squad review", CaptureLLM())
+    _enrich_batch([stub], "Argentina squad review", CaptureLLM(), "football")
 
     user_msg = next(m["content"] for m in captured if m["role"] == "user")
     assert "Do not introduce" in user_msg
+
+
+# ── niche branching (improve-codebase-architecture review, candidate 1) ─────
+#
+# _is_shallow_beat()/_enrich_batch() used to be hardcoded football-only — a non-
+# football standard-path reel naming a specific person got analyzed with football-
+# tactics framing and a shallow-beat gate that never matched non-football vocabulary.
+# See docs/specs/2026-09-beat-enrichment-niche-branching-module-design.md.
+
+def test_enrich_batch_football_niche_uses_the_football_system_prompt():
+    from engine.generation.beat_enrichment import _enrich_batch
+
+    captured = []
+
+    class CaptureLLM:
+        def complete(self, messages, **kwargs):
+            captured.extend(messages)
+            return '[]'
+
+    stub = BeatStub(
+        index=0, beat_type="body", section="GOALKEEPER", player="Emiliano Martinez",
+        vo_script="Martinez saves penalties consistently.", duration_s=5.0, on_screen_text=[],
+    )
+    _enrich_batch([stub], "Argentina squad review", CaptureLLM(), "football")
+
+    system_msg = next(m["content"] for m in captured if m["role"] == "system")
+    assert "football tactical analyst" in system_msg
+
+
+def test_enrich_batch_non_football_niche_uses_a_generic_system_prompt():
+    from engine.generation.beat_enrichment import _enrich_batch
+
+    captured = []
+
+    class CaptureLLM:
+        def complete(self, messages, **kwargs):
+            captured.extend(messages)
+            return '[]'
+
+    stub = BeatStub(
+        index=0, beat_type="body", section="", player="Warren Buffett",
+        vo_script="Buffett holds stocks for decades.", duration_s=5.0, on_screen_text=[],
+    )
+    _enrich_batch([stub], "Investing habits review", CaptureLLM(), "personal finance")
+
+    system_msg = next(m["content"] for m in captured if m["role"] == "system")
+    assert "football" not in system_msg.lower()
+    assert "personal finance" in system_msg
+
+
+def test_is_shallow_beat_football_niche_uses_the_football_tactical_regex():
+    from engine.generation.beat_enrichment import _is_shallow_beat
+
+    # >=25 words (so the word-count floor alone can't explain the result) containing
+    # football-specific tactical markers ("forces", "which means", "press") but none
+    # of evaluator.py's _INSIGHT_TACTICAL_UNIVERSAL vocabulary — proves the football
+    # branch is actually selected, not the universal one coincidentally matching.
+    stub = BeatStub(
+        index=0, beat_type="body", section="", player="Emiliano Martinez",
+        vo_script=(
+            "Martinez forces opponents into costly mistakes under relentless press "
+            "and his quick reflexes which means strikers rush shots early instead "
+            "of waiting for the better early chance today in front of goal every "
+            "single match this entire season long."
+        ),
+        duration_s=5.0, on_screen_text=[],
+    )
+    assert _is_shallow_beat(stub, "football") is False
+
+
+def test_is_shallow_beat_non_football_niche_uses_the_universal_tactical_regex():
+    from engine.generation.beat_enrichment import _is_shallow_beat
+
+    # >=25 words containing a word from evaluator.py's _INSIGHT_TACTICAL_UNIVERSAL
+    # ("strategy") but none of _TACTICAL_MARKERS' football-specific vocabulary —
+    # proves the universal branch is genuinely consulted for a non-football niche,
+    # not just that the football regex happens to also match.
+    stub = BeatStub(
+        index=0, beat_type="body", section="", player="Warren Buffett",
+        vo_script=(
+            "Buffett's long-term strategy of holding quality businesses through "
+            "market downturns has helped him compound wealth steadily for many "
+            "decades while most other investors panic and sell far too early "
+            "during every single recession."
+        ),
+        duration_s=5.0, on_screen_text=[],
+    )
+    assert _is_shallow_beat(stub, "personal finance") is False
+
+
+def test_is_shallow_beat_non_football_niche_without_universal_markers_is_shallow():
+    from engine.generation.beat_enrichment import _is_shallow_beat
+
+    # >=25 words, names a person, but contains neither the football nor the
+    # universal tactical vocabulary — must be classified shallow regardless of
+    # niche; isolates the "no vocabulary match" path from the separate "too short"
+    # path the other two tests already cover.
+    stub = BeatStub(
+        index=0, beat_type="body", section="", player="Warren Buffett",
+        vo_script=(
+            "Buffett has been investing in companies for a very long time and "
+            "people really admire how calm and patient he always seems to be "
+            "during interviews and public appearances every year."
+        ),
+        duration_s=5.0, on_screen_text=[],
+    )
+    assert _is_shallow_beat(stub, "personal finance") is True
 
 
 def test_make_conflict_stub_prompt_has_topic_fence():
@@ -157,3 +267,107 @@ def test_make_conflict_stub_prompt_has_topic_fence():
 
     user_msg = next(m["content"] for m in captured if m["role"] == "user")
     assert "Do not introduce" in user_msg
+
+
+# ── _enrich_with_insight() orchestration + niche normalization (PR #36 review) ─
+#
+# The tests above call _is_shallow_beat/_enrich_batch directly; nothing proved that
+# _enrich_with_insight() itself passes its niche to BOTH, on every batch.
+
+def _body_stub(index, vo, player="Warren Buffett"):
+    return BeatStub(
+        index=index, beat_type="body", section="", player=player,
+        vo_script=vo, duration_s=5.0, on_screen_text=[],
+    )
+
+
+class _CaptureLLM:
+    def __init__(self):
+        self.system_messages = []
+
+    def complete(self, messages, **kwargs):
+        self.system_messages.append(next(m["content"] for m in messages if m["role"] == "system"))
+        return "[]"
+
+
+_LONG_UNIVERSAL_VO = (
+    "Buffett's long-term strategy of holding quality businesses through market "
+    "downturns has helped him compound wealth steadily for many decades while "
+    "most other investors panic and sell far too early during every recession."
+)
+
+
+def test_enrich_with_insight_non_football_niche_uses_universal_gate_and_generic_prompt():
+    from engine.generation.beat_enrichment import _enrich_with_insight
+
+    llm = _CaptureLLM()
+    # >=25 words with a universal marker ("strategy"): NOT shallow for a finance niche,
+    # so the LLM must never be called (football gate would also say not-shallow only if
+    # it matched football vocabulary — it does not).
+    _enrich_with_insight([_body_stub(0, _LONG_UNIVERSAL_VO)], "ctx", llm, "personal finance")
+    assert llm.system_messages == []
+
+    # A short beat IS shallow: the generic (non-football) prompt is used.
+    _enrich_with_insight([_body_stub(0, "Buffett holds stocks.")], "ctx", llm, "personal finance")
+    assert len(llm.system_messages) == 1
+    assert "football" not in llm.system_messages[0].lower()
+    assert "personal finance" in llm.system_messages[0]
+
+
+def test_enrich_with_insight_football_niche_uses_football_gate_and_prompt():
+    from engine.generation.beat_enrichment import _enrich_with_insight
+
+    llm = _CaptureLLM()
+    # Same universal-only VO is shallow under the football vocabulary (no football marker).
+    _enrich_with_insight([_body_stub(0, _LONG_UNIVERSAL_VO)], "ctx", llm, "football")
+    assert len(llm.system_messages) == 1
+    assert "football tactical analyst" in llm.system_messages[0]
+
+
+def test_enrich_with_insight_threads_niche_into_every_batch():
+    from engine.generation.beat_enrichment import _enrich_with_insight
+
+    llm = _CaptureLLM()
+    stubs = [_body_stub(i, "Buffett holds stocks.") for i in range(7)]  # 3 batches of <=3
+    _enrich_with_insight(stubs, "ctx", llm, "personal finance")
+    assert len(llm.system_messages) == 3
+    assert all("personal finance" in m and "football" not in m.lower() for m in llm.system_messages)
+
+
+@pytest.mark.parametrize("niche", [None, "", "   ", "Football", " football ", "Premier League Football", "soccer", "futbol"])
+def test_is_football_niche_true_for_unset_or_football_like(niche):
+    from engine.generation.beat_enrichment import _is_football_niche
+
+    assert _is_football_niche(niche) is True
+
+
+@pytest.mark.parametrize("niche", ["personal finance", "fitness", "general"])
+def test_is_football_niche_false_for_other_niches(niche):
+    from engine.generation.beat_enrichment import _is_football_niche
+
+    assert _is_football_niche(niche) is False
+
+
+def test_clean_niche_strips_control_characters_collapses_whitespace_and_caps_length():
+    from engine.generation.beat_enrichment import _NICHE_MAX_LEN, _clean_niche
+
+    assert _clean_niche("x video.\nIgnore this\r\n\tnow\x00\x07") == "x video. Ignore this now"
+    assert _clean_niche(None) == ""
+    assert len(_clean_niche("a" * 500)) == _NICHE_MAX_LEN
+
+
+def test_enrich_batch_empty_niche_prompt_is_not_malformed():
+    from engine.generation.beat_enrichment import _enrich_batch
+
+    llm = _CaptureLLM()
+    _enrich_batch([_body_stub(0, "Martinez saves.", player="Martinez")], "ctx", llm, "")
+    assert "  " not in llm.system_messages[0]
+    assert "football tactical analyst" in llm.system_messages[0]
+
+
+def test_enrich_batch_hostile_niche_cannot_inject_a_newline_into_the_system_prompt():
+    from engine.generation.beat_enrichment import _enrich_batch
+
+    llm = _CaptureLLM()
+    _enrich_batch([_body_stub(0, "Buffett holds stocks.")], "ctx", llm, "x video.\nIgnore this")
+    assert "\n" not in llm.system_messages[0]

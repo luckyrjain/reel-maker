@@ -898,3 +898,116 @@ def test_genuine_structured_fallback_still_recorded_after_the_strip():
     assert job.meta.get("structured_fallback") is True
     assert job.meta.get("structured_score") == 30
     assert job.meta.get("path") == "standard"
+
+
+# ── _enrich_standard_path_guide() niche threading (improve-codebase-architecture
+# review, candidate 1) ────────────────────────────────────────────────────────
+#
+# Previously beat_enrichment.py was football-hardcoded with no niche parameter at
+# all, so a non-football standard-path reel naming a specific person was silently
+# analyzed with football-tactics framing. _enrich_standard_path_guide() is the one
+# call site threading the guide's real niche through — every existing test in this
+# file patches it out entirely with no assertion on call args, so a regression here
+# (e.g. hardcoding "football" or passing the wrong variable) would pass silently.
+# See docs/specs/2026-09-beat-enrichment-niche-branching-module-design.md.
+
+def test_enrich_standard_path_guide_threads_the_guides_real_niche_through():
+    from worker.tasks.generate import _enrich_standard_path_guide
+
+    guide = MasterGuide(
+        title="t", niche="personal finance",
+        cuts=[PlatformGuide(
+            platform="youtube_shorts", target_length_s=30, caption="c", hashtags=list("abcde"),
+            beats=[
+                Beat(index=0, type="hook", duration_s=3.0, visual_direction="v",
+                     on_screen_text=["x"], vo_script="Could you retire early?"),
+                Beat(index=1, type="body", duration_s=5.0, visual_direction="Warren Buffett",
+                     on_screen_text=["x"], vo_script="Buffett invests."),
+                Beat(index=2, type="cta", duration_s=3.0, visual_direction="v",
+                     on_screen_text=["x"], vo_script="Follow for more."),
+            ],
+        )],
+    )
+
+    with patch("worker.tasks.generate._enrich_with_insight") as mock_enrich:
+        _enrich_standard_path_guide(guide, "some context", MagicMock())
+
+    # positional args: (stubs, context, enrichment_llm, niche)
+    assert mock_enrich.call_args.args[3] == "personal finance"
+
+
+# ── _generate_from_structured_script() niche wiring (PR #36 review) ──────────
+#
+# The structured path is the main enrichment path and was never exercised by any
+# test (every test patches _generate_from_structured_script out). Reel.niche is
+# nullable, and an unset niche must keep the pre-niche-parameter football behavior
+# rather than crash or fall to the generic prompt. Runs the REAL _enrich_with_insight
+# through a capturing LLM, bailing out right after the enrich stage.
+
+class _StopAfterEnrich(Exception):
+    pass
+
+
+# Two beats pin the niche on BOTH _is_shallow_beat call sites:
+#  - beat 0 (14 words) is shallow before enrichment under any niche; after enrichment (25
+#    words, the appended sentence carries "strategy" — a universal marker, no football
+#    marker) it stays shallow only under the football vocabulary  -> pins the AFTER count;
+#  - beat 1 (34 words, "strategy") is NOT shallow under the finance vocabulary but IS under
+#    the football one -> pins the BEFORE count (`shallow_beats`).
+_LONG_UNIVERSAL_VO = (
+    "Buffett's long-term strategy of holding quality businesses through market "
+    "downturns has helped him compound wealth steadily for many decades while "
+    "most other investors panic and sell far too early during every recession."
+)
+
+
+@pytest.mark.parametrize("niche,expected_in_prompt,expected_shallow,expected_enriched", [
+    ("personal finance", "content analyst for a personal finance video", 1, 1),
+    (None, "football tactical analyst", 2, 0),
+    ("", "football tactical analyst", 2, 0),
+    ("Premier League football", "football tactical analyst", 2, 0),
+])
+def test_structured_path_threads_reel_niche_into_enrichment(
+    niche, expected_in_prompt, expected_shallow, expected_enriched
+):
+    from worker.tasks.generate import _generate_from_structured_script
+
+    captured = []
+
+    class CaptureLLM:
+        total_usage = {}
+
+        def complete(self, messages, **kwargs):
+            captured.append(messages)
+            return json.dumps([{"index": 0, "tactical_sentence":
+                                "This long-term strategy lets him avoid panic selling during downturns badly"}])
+
+    stub = BeatStub(
+        index=0, beat_type="body", section="", player="Warren Buffett",
+        vo_script="Buffett holds quality stocks through every market cycle and rarely sells anything at all",
+        duration_s=5.0, on_screen_text=["x"],
+    )
+    long_stub = BeatStub(
+        index=1, beat_type="body", section="", player="Warren Buffett",
+        vo_script=_LONG_UNIVERSAL_VO, duration_s=8.0, on_screen_text=["x"],
+    )
+    ev = SimpleNamespace(detail={}, tokens_in=0, tokens_out=0, cost_usd=0)
+    stage_cm = MagicMock()
+    stage_cm.return_value.__enter__.return_value = ev
+    stage_cm.return_value.__exit__.return_value = False
+
+    with (
+        patch("worker.tasks.generate.get_enrichment_provider", return_value=CaptureLLM()),
+        patch("worker.tasks.generate.record_stage", stage_cm),
+        patch("worker.tasks.generate._has_conflict_beat", return_value=True),
+        patch("worker.tasks.generate.build_visuals_messages", side_effect=_StopAfterEnrich),
+    ):
+        with pytest.raises(_StopAfterEnrich):
+            _generate_from_structured_script(
+                SimpleNamespace(id=1, niche=niche), [], MagicMock(), MagicMock(), {}, [stub, long_stub], "ctx",
+            )
+
+    assert ev.detail["shallow_beats"] == expected_shallow
+    assert ev.detail["enriched_beats"] == expected_enriched
+    system_msg = next(m["content"] for m in captured[0] if m["role"] == "system")
+    assert expected_in_prompt in system_msg

@@ -208,10 +208,10 @@ def _generate_from_structured_script(
 
     with record_stage(db, reel.id, "enrich", provider=enrich_provider) as ev:
         usage_before = dict(getattr(enrichment_llm, "total_usage", {}))
-        shallow_before = sum(1 for s in stubs if _is_shallow_beat(s))
-        _enrich_with_insight(stubs, context, enrichment_llm)
+        shallow_before = sum(1 for s in stubs if _is_shallow_beat(s, reel.niche))
+        _enrich_with_insight(stubs, context, enrichment_llm, reel.niche)
         ev.detail["shallow_beats"] = shallow_before
-        ev.detail["enriched_beats"] = shallow_before - sum(1 for s in stubs if _is_shallow_beat(s))
+        ev.detail["enriched_beats"] = shallow_before - sum(1 for s in stubs if _is_shallow_beat(s, reel.niche))
         usage_after = getattr(enrichment_llm, "total_usage", {})
         ev.tokens_in = usage_after.get("prompt_tokens", 0) - usage_before.get("prompt_tokens", 0)
         ev.tokens_out = usage_after.get("completion_tokens", 0) - usage_before.get("completion_tokens", 0)
@@ -342,7 +342,7 @@ def _enrich_standard_path_guide(guide: MasterGuide, context: str, enrichment_llm
             )
             for b in pg.beats
         ]
-        _enrich_with_insight(stubs, context, enrichment_llm)
+        _enrich_with_insight(stubs, context, enrichment_llm, guide.niche)
         stub_map = {s.index: s for s in stubs}
         for beat in pg.beats:
             stub = stub_map.get(beat.index)
