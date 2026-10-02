@@ -496,6 +496,7 @@ def test_hf_image_cache_key_follows_the_prompt(tmp_path):
 @pytest.mark.parametrize("content_type,ext", [
     ("video/mp4", "mp4"),
     ("image/gif", "gif"),
+    ("image/gif; charset=binary", "gif"),     # "gif" anywhere in the type, not only at the end
     ("application/octet-stream", "mp4"),
 ])
 def test_hf_video_extension_follows_the_content_type(tmp_path, content_type, ext):
@@ -739,7 +740,7 @@ def test_hf_image_missing_content_type_is_rejected(tmp_path):
 
 def test_hf_image_content_type_must_start_with_image(tmp_path):
     source = HuggingFaceImageSource(api_key="k", model="m", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("text/x-image-error")):
+    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("text/image/png")):
         assert source.generate("p") is None
 
 

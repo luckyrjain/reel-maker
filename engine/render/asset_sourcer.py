@@ -135,7 +135,8 @@ class WikipediaImageSource:
             return None
 
         try:
-            safe = urllib.parse.quote(page_title.replace(" ", "_"))
+            # safe="": the title is ONE path segment, so a "/" in it ("AC/DC") must become %2F
+            safe = urllib.parse.quote(page_title.replace(" ", "_"), safe="")
             resp = httpx.get(f"{self._SUMMARY}/{safe}", headers=self._HEADERS, timeout=10.0)
             resp.raise_for_status()
             data = resp.json()
