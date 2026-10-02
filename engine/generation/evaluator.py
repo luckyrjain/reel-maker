@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 from engine.generation.guide_schema import MasterGuide
 from engine.generation.niche import is_football_niche
+from engine.names import person_names
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -29,34 +30,6 @@ def _keyword_set(text: str) -> set[str]:
 
 def _word_count(text: str) -> int:
     return len(text.split())
-
-
-_NAME_RE = re.compile(r"\b([A-ZÁÉÍÓÚÑ][a-záéíóúñ]{2,}(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]{2,})+)\b")
-
-_NON_PERSON_WORDS = {
-    "world cup", "copa america", "copa libertadores", "premier league",
-    "champions league", "ask france", "ask colombia", "ask anyone",
-    "can argentina", "south america", "north america", "united states",
-    "real madrid", "manchester city", "inter milan",
-    # nationality/demonym forms that the regex also catches
-    "south american", "north american", "central american",
-    "south american side", "premier division",
-}
-
-
-def _person_names(text: str) -> list[str]:
-    candidates = _NAME_RE.findall(text)
-    result = []
-    for name in candidates:
-        if name.lower() in _NON_PERSON_WORDS:
-            continue
-        first = name.split()[0].lower()
-        if first in {"ask", "can", "the", "this", "that", "and", "but", "for",
-                     "because", "although", "however", "without", "despite",
-                     "unlike", "within", "against", "between", "during"}:
-            continue
-        result.append(name)
-    return result
 
 
 def _beat_energy(vo: str) -> str:
@@ -438,7 +411,7 @@ def _score_narrative(ctx: _ScoringContext) -> tuple[int, list[str]]:
     has_hook_stage = bool(hook_beats)
     # Context: a body beat that names someone specific or references a real event/tournament
     has_context_stage = any(
-        bool(_person_names(b.vo_script)) or bool(context_re.search(b.vo_script))
+        bool(person_names(b.vo_script)) or bool(context_re.search(b.vo_script))
         for b in body_beats
     )
     has_analysis_stage = any(_ANALYSIS_MARKERS.search(b.vo_script) for b in body_beats)
@@ -529,7 +502,7 @@ def _score_alignment(ctx: _ScoringContext) -> tuple[int, list[str]]:
     otherwise have every sub-signal's *_total stay 0, collapsing this whole axis to a
     flat 20-point deduction regardless of how well the visuals actually match the
     script — confirmed empirically: a realistic, well-aligned personal-finance guide
-    scored align_deduction=20 (the maximum) purely because _person_names()/actions_re/
+    scored align_deduction=20 (the maximum) purely because person_names()/actions_re/
     context_re found nothing to check, not because anything was actually misaligned.
     Redistributing the 20 points across only the applicable sub-signals — and treating
     zero applicable sub-signals as full credit rather than zero — mirrors the same
@@ -549,7 +522,7 @@ def _score_alignment(ctx: _ScoringContext) -> tuple[int, list[str]]:
         vis = beat.visual_direction
         vis_lower = vis.lower()
 
-        names = _person_names(beat.vo_script)
+        names = person_names(beat.vo_script)
         if names:
             entity_total += 1
             n_matched = sum(
@@ -607,7 +580,7 @@ def _score_clip_availability(ctx: _ScoringContext) -> tuple[int, list[str]]:
     clip_pts = 0
     for beat in all_beats:
         vis = beat.visual_direction.strip()
-        has_name = bool(_person_names(vis))
+        has_name = bool(person_names(vis))
         has_action = bool(actions_re.search(vis)) or bool(tactical_re.search(vis))
         has_ctx = bool(context_re.search(vis))
         is_abstract = bool(_ABSTRACT_VISUAL.search(vis))
@@ -924,7 +897,7 @@ def _score_throughline(ctx: _ScoringContext) -> tuple[int, list[str]]:
     cta_beats, hook_beats, first_vo = ctx.cta_beats, ctx.hook_beats, ctx.first_vo
     if cta_beats and hook_beats:
         cta_vo_all = " ".join(b.vo_script for b in cta_beats)
-        hook_names = _person_names(first_vo)
+        hook_names = person_names(first_vo)
         name_callback = any(
             n.split()[0].lower() in cta_vo_all.lower() for n in hook_names
         ) if hook_names else False

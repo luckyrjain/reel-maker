@@ -3,7 +3,7 @@
 import re
 
 from engine.generation.guide_schema import Beat, MasterGuide, PlatformGuide
-from engine.generation.evaluator import score_guide, _person_names
+from engine.generation.evaluator import score_guide
 
 
 def _axis_deduction(issues: list[str], axis: str) -> int:
@@ -696,17 +696,6 @@ def test_score_overflow_appends_issue():
 
 
 # ── helper unit tests ─────────────────────────────────────────────────────────
-
-def test_person_names_extracts_correctly():
-    names = _person_names("Lionel Messi and Cristian Romero play for Argentina in the World Cup.")
-    assert "Lionel Messi" in names
-    assert "Cristian Romero" in names
-
-
-def test_person_names_excludes_non_persons():
-    names = _person_names("World Cup and Premier League are tournaments. Real Madrid won.")
-    assert not any(n.lower() in {"world cup", "premier league", "real madrid"} for n in names)
-
 
 # ── multi-platform de-duplication ─────────────────────────────────────────────
 

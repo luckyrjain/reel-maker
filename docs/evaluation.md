@@ -152,7 +152,7 @@ whose VO never names a person or uses action/event vocabulary (personal finance,
 reviews, cooking) has every sub-signal inapplicable; the axis now gives **full credit**
 rather than collapsing to the max deduction. Before this fix, a well-aligned personal-finance
 guide scored `alignment:-20` — the maximum possible deduction — purely because
-`_person_names()`/`_VO_ACTIONS_UNIVERSAL`/`_SPECIFIC_CONTEXT_UNIVERSAL` found nothing to
+`person_names()` (`engine/names.py`)/`_VO_ACTIONS_UNIVERSAL`/`_SPECIFIC_CONTEXT_UNIVERSAL` found nothing to
 check, not because anything was actually misaligned:
 
 ```

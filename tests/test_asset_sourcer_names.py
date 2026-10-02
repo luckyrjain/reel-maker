@@ -1,4 +1,4 @@
-"""Characterization of which capitalized phrases resolve_beat_assets() sends to Wikipedia."""
+"""Which capitalized phrases resolve_beat_assets() sends to Wikipedia as person names."""
 from unittest.mock import patch
 
 from engine.render.asset_sourcer import resolve_beat_assets
@@ -38,10 +38,12 @@ def test_short_name_particles_are_kept_in_the_lookup():
     assert _wiki_lookups("Rodrigo De Paul presses") == ["Rodrigo De Paul"]
 
 
-def test_non_person_phrases_are_currently_looked_up_too():
-    # CURRENT behavior: no exclusion list at all. Changed on purpose by the shared-names PR.
-    assert _wiki_lookups("Real Madrid Bernabeu stadium") == ["Real Madrid Bernabeu"]
-    assert _wiki_lookups("Premier League highlights") == ["Premier League"]
+def test_non_person_phrases_are_not_looked_up():
+    # Changed by the shared engine/names.py: the sourcer used to have no exclusions at all and
+    # sent clubs and tournaments to Wikipedia as if they were people.
+    assert _wiki_lookups("Real Madrid Bernabeu stadium") == []
+    assert _wiki_lookups("Premier League highlights") == []
+    assert _wiki_lookups("Real Madrid derby with Lionel Messi") == ["Lionel Messi"]
 
 
 def test_no_names_means_no_lookup():
