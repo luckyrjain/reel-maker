@@ -191,7 +191,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 ### `tests/`
 
-54 test files + `conftest.py`, **1022 tests run by default / 1023 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
+54 test files + `conftest.py`, **1026 tests run by default / 1027 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
 
 | File | Tests | File | Tests |
 |---|---|---|---|
@@ -203,7 +203,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_audio_text_sync.py` | 16 | `test_guide_edit.py` | 16 |
 | `test_render_task.py` | 16 | `test_tts.py` | 16 |
 | `test_asset_sourcer_cost.py` | 15 | `test_enrichment.py` | 38 |
-| `test_state.py` | 15 | `test_variants_router.py` | 15 |
+| `test_state.py` | 15 | `test_variants_router.py` | 8 |
 | `test_asset_sourcer.py` | 14 | `test_context_enricher.py` | 14 |
 | `test_enrich_context_task.py` | 14 | `test_oauth.py` | 14 |
 | `test_publish_task.py` | 14 | `test_llm_provider.py` | 13 |
@@ -218,7 +218,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_tasks_real_db.py` | 7 | `test_wikipedia_image_source.py` | 6 |
 | `test_niche.py` | 22 | `test_cut_media.py` | 14 |
 | `test_names.py` | 109 | `test_visual_fallback.py` | 17 |
-| `test_asset_sourcer_names.py` | 7 | `test_enqueue.py` | 9 |
+| `test_asset_sourcer_names.py` | 7 | `test_enqueue.py` | 13 |
 | `test_pricing.py` | 4 | `test_config.py` | 2 |
 | `test_llm_judge.py` | 3 | `test_main.py` | 3 |
 | `test_observability.py` | 3 | `test_golden_reel.py` | 1 (deselected) |

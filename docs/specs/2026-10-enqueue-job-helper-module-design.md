@@ -7,8 +7,8 @@ Candidate 8 of the full-codebase `improve-codebase-architecture` review ("Strong
 
 `api/routers/reels.py::create_reel`, `api/routers/cuts.py::trigger_render` and `trigger_publish`
 each repeated the same sequence: add the Job, flush for its id, commit, `task.delay(job_id)`, on
-failure `fail_unenqueued(...)` + a 503, then `db.refresh(job)`. One copy literally said
-"see trigger_render" instead of calling anything. The sequence is a correctness policy that lived
+failure `fail_unenqueued(...)` + a 503, then `db.refresh(job)`. Two of the copies
+pointed at `trigger_render` in a comment instead of calling anything. The sequence is a correctness policy that lived
 nowhere as a named interface:
 
 - the owner-state change and the Job commit together;
@@ -53,13 +53,15 @@ Different failure policies and no HTTP; the helper's docstring says so.
 ## Test strategy
 
 All 227 existing router / job-lifecycle tests ran unmodified against the extracted code first
-(proof of no behavior change) and stay as wiring coverage. `tests/test_enqueue.py` (9) uses real
+(proof of no behavior change) and stay as wiring coverage. `tests/test_enqueue.py` (13) uses real
 sessions with the default `expire_on_commit=True`: success commits, calls `delay(job.id)` and leaves
 the job refreshed; the owner mutation and the Job land in one commit; commit precedes delay; no
 transaction is open while delay runs; a broker failure raises a 503 whose text names the thing,
-fails the Job and frees the owner; delay is never called twice. 8 mutations (delay before commit, no
-unwind, no refresh, id read after commit, wrong job type, text ignoring `what`, no flush, swallowing
-the failure) each fail at least one test. 1019 default-run tests pass (+9).
+fails the Job and frees the owner for every realistic failure type (`ConnectionError`,
+`TimeoutError`, `RuntimeError`, a kombu `OperationalError`); delay is never called twice.
+12 mutations (delay before commit, no unwind, no refresh, id read after commit, wrong job type,
+text ignoring `what`, no flush, swallowing the failure, a narrowed `except`, and a wrong `what` in
+each of the three routes) each fail at least one test. 1026 default-run tests pass (+13).
 
 One test-design catch worth recording: the first "job is refreshed" assertion read `job.id` before
 inspecting expiry, which lazily reloads the row and hid a missing `db.refresh` — the no-refresh
@@ -67,4 +69,23 @@ mutation passed. The expiry state is now read before touching any attribute.
 
 ## Corrections
 
-None yet — updated after the 4-persona review on the opened PR.
+A 4-persona review on the opened PR (#39). Security and Correctness: clean (the new body is
+statement-for-statement the old sequence; lock release, ordering, 503 texts, `job.type.value` vs the
+old constants all verified identical). Real issues, all fixed:
+
+1. **Test gap (Test-Quality, mutation-confirmed):** every broker-failure test raised
+   `ConnectionError`, so narrowing `except Exception` to `except ConnectionError` left all 81 tests
+   green. A real outage is a kombu `OperationalError`, a timeout or a bare `RuntimeError` — narrowing
+   would reintroduce the exact bug the helper exists to prevent (a 500, the Job left pending, the
+   owner stuck in flight). The failure test is now parametrized over four exception types.
+2. **Test gap:** the 503 detail text was asserted only through `enqueue_job`, so a wrong `what` in any
+   of the three routes survived. Each route-level 503 test now asserts the exact text.
+3. **Docs:** the spec's test count (1019 was the pytest "passed" figure, excluding 3 skips; the
+   default-run count is 1022 at PR open, 1026 after this round); "one copy" said "see
+   trigger_render" — two did (`create_reel` and `trigger_publish`); a pre-existing wrong row in
+   docs/architecture.md (`test_variants_router.py` 15, really 8).
+4. **Process slip:** the first commit went up without its CLAUDE.md / architecture.md / api.md edits
+   (a quoting bug in the edit script); a follow-up commit added them before any review started.
+
+Not changed: a failure in `db.refresh(job)` after a successful `delay` would 500 on a job that does
+run, and a raising `fail_unenqueued` replaces the 503 — both identical to main, not regressions.

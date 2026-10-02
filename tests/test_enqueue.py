@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from fastapi import HTTPException
+from kombu.exceptions import OperationalError
 from sqlalchemy import create_engine, event, inspect
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -99,6 +100,35 @@ def test_no_transaction_is_open_while_delay_runs(session_factory):
     assert seen["open"] is False
 
 
+# A real broker outage is a kombu OperationalError (not a ConnectionError subclass), a timeout, or
+# a bare RuntimeError from a client library — narrowing `except Exception` would turn any of these
+# into a 500 with the Job left pending and the owner stuck in flight.
+_BROKER_FAILURES = [
+    ConnectionError("broker down"),
+    TimeoutError("broker timed out"),
+    RuntimeError("client library blew up"),
+    OperationalError("Connection refused"),
+]
+
+
+@pytest.mark.parametrize("failure", _BROKER_FAILURES, ids=lambda e: type(e).__name__)
+def test_any_broker_failure_fails_the_job_and_frees_the_owner_with_a_503(session_factory, failure):
+    db = session_factory()
+    cut = _cut(db)
+    transition(cut, "rendering", CUT_TRANSITIONS)
+    task = MagicMock()
+    task.delay.side_effect = failure
+
+    with pytest.raises(HTTPException) as exc:
+        enqueue_job(db, _render_job(cut), task, what="render")
+
+    assert exc.value.status_code == 503
+    assert exc.value.__cause__ is failure
+    other = session_factory()
+    assert other.query(models.Job).filter_by(cut_id=cut.id).one().status == models.JobStatus.failed
+    assert other.get(models.Cut, cut.id).status == models.CutStatus.failed
+
+
 @pytest.mark.parametrize("what", ["render", "publish", "job"])
 def test_a_broker_failure_raises_a_503_naming_the_thing(session_factory, what):
     db = session_factory()
@@ -130,7 +160,7 @@ def test_a_broker_failure_fails_the_job_and_frees_the_owner(session_factory):
     assert other.get(models.Cut, cut.id).status == models.CutStatus.failed
 
 
-def test_a_broker_failure_does_not_refresh_or_double_enqueue(session_factory):
+def test_a_broker_failure_enqueues_exactly_once(session_factory):
     db = session_factory()
     cut = _cut(db)
     task = MagicMock()
