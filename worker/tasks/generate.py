@@ -342,7 +342,7 @@ def _enrich_standard_path_guide(guide: MasterGuide, context: str, enrichment_llm
             )
             for b in pg.beats
         ]
-        _enrich_with_insight(stubs, context, enrichment_llm, guide.niche)
+        _enrich_with_insight(stubs, context, enrichment_llm, guide.niche or "general")
         stub_map = {s.index: s for s in stubs}
         for beat in pg.beats:
             stub = stub_map.get(beat.index)

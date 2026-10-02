@@ -8,25 +8,15 @@ import json
 import re as _re
 
 from engine.generation.evaluator import _INSIGHT_TACTICAL_UNIVERSAL
+from engine.generation.niche import clean_niche, is_football_niche
 from engine.generation.script_parser import BeatStub, calc_duration, derive_on_screen
-
-_FOOTBALL_KEYWORDS = ("football", "soccer", "futbol")
-_NICHE_MAX_LEN = 64
-
-
-def _clean_niche(niche: str | None) -> str:
-    """Operator/LLM-supplied free text bound for a system prompt: drop control characters
-    (newlines included), collapse whitespace, cap length."""
-    printable = "".join(ch for ch in (niche or "") if ch.isprintable() or ch.isspace())
-    return " ".join(printable.split())[:_NICHE_MAX_LEN]
 
 
 def _is_football_niche(niche: str | None) -> bool:
     """An unset niche counts as football: this module was football-only before it took a niche,
     and the structured-script path (the one that can reach here with Reel.niche None) is
-    football-shaped by design. Substring, not exact, match so "Premier League football" works."""
-    cleaned = _clean_niche(niche).lower()
-    return not cleaned or any(k in cleaned for k in _FOOTBALL_KEYWORDS)
+    football-shaped by design. Everything else defers to the shared niche.is_football_niche()."""
+    return not clean_niche(niche) or is_football_niche(niche)
 
 
 _TACTICAL_MARKERS = _re.compile(
@@ -63,7 +53,7 @@ def _enrich_batch(batch: list[BeatStub], context: str, llm, niche: str | None) -
         for s in batch
     )
     is_football = _is_football_niche(niche)
-    niche_label = _clean_niche(niche)
+    niche_label = clean_niche(niche)
     system_content = (
         "You are a football tactical analyst. "
         "Return ONLY valid JSON — a list, one object per beat, "

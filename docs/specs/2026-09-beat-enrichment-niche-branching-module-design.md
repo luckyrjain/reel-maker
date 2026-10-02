@@ -1,5 +1,12 @@
 # beat_enrichment.py niche branching — module design (Phase 7u)
 
+> **Partly superseded by Phase 7v** (`2026-10-niche-helper-followups-module-design.md`): the
+> football match and niche cleaning now live in `engine/generation/niche.py` (`clean_niche()`,
+> `is_football_niche()`, `NICHE_MAX_LEN`), `evaluator.py` imports the same helper (so Correction 1's
+> "evaluator still exact-match" no longer holds), and the standard path passes
+> `guide.niche or "general"`. Read the text below as the Phase 7u record; function names
+> `_clean_niche`/`_NICHE_MAX_LEN` there are now `niche.clean_niche`/`niche.NICHE_MAX_LEN`.
+
 ## Problem
 
 `engine/generation/beat_enrichment.py` had no `niche` parameter anywhere in its
