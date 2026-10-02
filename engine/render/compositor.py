@@ -10,6 +10,7 @@ Pipeline:
 import logging
 import math
 import os
+import re
 import subprocess
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -310,6 +311,54 @@ CURATED_TEXT_COLORS: list[tuple[str, str]] = [
 _CURATED_TEXT_COLOR_NAMES = {c for c, _ in CURATED_TEXT_COLORS}
 
 
+# Shortest on-screen / caption window the proportional fallbacks will place.
+_MIN_SPAN_S = 0.3
+
+# VO sentence boundaries for the proportional fallbacks: . ! ? and the em dash.
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?\u2014]+")
+
+
+def _split_vo_sentences(vo: str | None) -> list[str]:
+    """Non-empty, stripped VO sentences — the weights unit of both no-Whisper timing
+    fallbacks (`_build_text_filter()`'s drawtext windows, `_proportional_caption_cues()`)."""
+    return [s.strip() for s in _SENTENCE_SPLIT_RE.split(vo or "") if s.strip()]
+
+
+def _proportional_spans(
+    weights: list[int],
+    total_weight: float,
+    duration: float,
+    start: float = 0.0,
+) -> list[tuple[int, float, float]]:
+    """Place items one after another across `duration`, each taking its share
+    `weight / total_weight` of it. Returns `(index, span_start, span_end)` per PLACED
+    item, in absolute time (`start` is the beat's own start; pass 0.0 for beat-relative).
+
+    `total_weight` is explicit rather than `sum(weights)` because the drawtext caller
+    divides by the word count of ALL VO sentences while placing only its (<= 5)
+    on-screen lines. Policy shared by both callers, deliberately in one place:
+    a span is at least `_MIN_SPAN_S`; nothing is placed once the cursor reaches the
+    end; the last placed span is stretched to exactly the end (which is also what
+    bounds a span that would overrun it — no separate clamp is needed).
+
+    Known quirk, preserved verbatim from the two original copies: when
+    `duration / n < _MIN_SPAN_S` the floor makes the cursor outrun the beat, so later
+    items are not placed at all.
+    """
+    end = start + duration
+    spans: list[tuple[int, float, float]] = []
+    t = start
+    for i, w in enumerate(weights):
+        seg = max(_MIN_SPAN_S, duration * w / total_weight)
+        if t < end:
+            spans.append((i, t, t + seg))
+        t += seg
+    if spans:
+        i, span_start, _ = spans[-1]
+        spans[-1] = (i, span_start, end)
+    return spans
+
+
 def _build_text_filter(
     beats: list[dict],
     beat_durations: list[float],
@@ -348,28 +397,17 @@ def _build_text_filter(
             # Use ALL VO sentences for the denominator so each line's duration
             # reflects its true fraction of the audio, even when on_screen_text
             # has fewer lines than sentences.
-            import re as _re
-            vo = beat.get("vo_script", "")
-            sentences = [s.strip() for s in _re.split(r"[.!?—]+", vo) if s.strip()]
-            all_wcs = [len(s.split()) for s in sentences]
+            all_wcs = [len(s.split()) for s in _split_vo_sentences(beat.get("vo_script", ""))]
             W_total = sum(all_wcs) if all_wcs else n
             # Per-line word counts: real sentence for the first len(sentences) lines,
             # weight=1 for any extra lines beyond the sentence count.
             line_wcs = [all_wcs[i] if i < len(all_wcs) else 1 for i in range(n)]
-            timed = []
-            t = t_start
-            beat_end = t_start + duration
-            for line, wc in zip(lines, line_wcs):
-                seg = max(0.3, duration * wc / W_total)
-                seg_end = min(t + seg, beat_end)
-                if t < beat_end:
-                    timed.append((line, t, seg_end))
-                t += seg
-                if t >= beat_end:
-                    break
-            # Stretch last segment to fill any remaining beat time
-            if timed:
-                timed[-1] = (timed[-1][0], timed[-1][1], beat_end)
+            timed = [
+                (lines[i], seg_start, seg_end)
+                for i, seg_start, seg_end in _proportional_spans(
+                    line_wcs, W_total, duration, t_start
+                )
+            ]
 
         for line, seg_start, seg_end in timed:
             escaped = _escape_drawtext(line)
@@ -544,30 +582,18 @@ def _proportional_caption_cues(vo_script: str, duration: float) -> list:
     docs/specs/2026-09-srt-caption-export-system-design.md §3.2). Returns
     beat-relative `CaptionSegment` cues — the caller shifts to absolute time.
     """
-    import re as _re
-
     from engine.render.captions import CaptionSegment
 
-    sentences = [s.strip() for s in _re.split(r"[.!?—]+", vo_script or "") if s.strip()]
+    sentences = _split_vo_sentences(vo_script)
     if not sentences:
         return []
 
     word_counts = [len(s.split()) for s in sentences]
     total_words = sum(word_counts) or len(sentences)
-
-    cues: list[CaptionSegment] = []
-    t = 0.0
-    for sentence, wc in zip(sentences, word_counts):
-        seg = max(0.3, duration * wc / total_words)
-        seg_end = min(t + seg, duration)
-        if t < duration:
-            cues.append(CaptionSegment(text=sentence, start_s=t, end_s=seg_end))
-        t += seg
-        if t >= duration:
-            break
-    if cues:
-        cues[-1].end_s = duration
-    return cues
+    return [
+        CaptionSegment(text=sentences[i], start_s=start, end_s=end)
+        for i, start, end in _proportional_spans(word_counts, total_words, duration)
+    ]
 
 
 # Extra candidate timestamps as fractions of total duration, sampled alongside the
