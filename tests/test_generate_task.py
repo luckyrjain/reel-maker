@@ -936,6 +936,33 @@ def test_enrich_standard_path_guide_threads_the_guides_real_niche_through():
     assert mock_enrich.call_args.args[3] == "personal finance"
 
 
+def test_enrich_standard_path_guide_blank_niche_defaults_to_general_not_football():
+    """prompt.py substitutes "general" for a blank niche, and the standard path is
+    niche-generic — a blank guide.niche must reach enrichment as "general" (generic
+    vocabulary/prompt), not as "" (which beat_enrichment treats as football)."""
+    from worker.tasks.generate import _enrich_standard_path_guide
+
+    guide = MasterGuide(
+        title="t", niche="",
+        cuts=[PlatformGuide(
+            platform="youtube_shorts", target_length_s=30, caption="c", hashtags=list("abcde"),
+            beats=[
+                Beat(index=0, type="hook", duration_s=3.0, visual_direction="v",
+                     on_screen_text=["x"], vo_script="Could you retire early?"),
+                Beat(index=1, type="body", duration_s=5.0, visual_direction="Warren Buffett",
+                     on_screen_text=["x"], vo_script="Buffett invests."),
+                Beat(index=2, type="cta", duration_s=3.0, visual_direction="v",
+                     on_screen_text=["x"], vo_script="Follow for more."),
+            ],
+        )],
+    )
+
+    with patch("worker.tasks.generate._enrich_with_insight") as mock_enrich:
+        _enrich_standard_path_guide(guide, "some context", MagicMock())
+
+    assert mock_enrich.call_args.args[3] == "general"
+
+
 # ── _generate_from_structured_script() niche wiring (PR #36 review) ──────────
 #
 # The structured path is the main enrichment path and was never exercised by any

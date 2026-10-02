@@ -133,7 +133,7 @@ deduction = clamp(15 - insight_pts, 0, 15)
 ❌ `"Romero is a good defender."` — 0 pts → −15  
 ✅ `"Romero's press forces turnovers in the final third, letting Argentina defend 15 yards higher than 90% of rivals."` — stat + causal + tactical + comparison → 5+ pts
 
-Niche routing: football/soccer/futbol uses football-specific tactical vocabulary; all other niches use universal sport patterns.
+Niche routing: a niche containing football/soccer/futbol (substring match via `engine/generation/niche.py::is_football_niche()`, so "Premier League football" counts; blank is not football) uses football-specific tactical vocabulary; all other niches use universal sport patterns.
 
 ---
 

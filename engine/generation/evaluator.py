@@ -2,6 +2,7 @@ import re
 from dataclasses import dataclass
 
 from engine.generation.guide_schema import MasterGuide
+from engine.generation.niche import is_football_niche
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -341,7 +342,7 @@ def _build_scoring_context(context: str, guide: MasterGuide) -> _ScoringContext:
     first_sents = _vo_sentences(first_vo)
 
     # Select vocabulary based on niche
-    _football = guide.niche.lower() in {"football", "soccer", "futbol"}
+    _football = is_football_niche(guide.niche)
     tactical_re = _INSIGHT_TACTICAL           if _football else _INSIGHT_TACTICAL_UNIVERSAL
     actions_re  = _VO_ACTIONS                 if _football else _VO_ACTIONS_UNIVERSAL
     context_re  = _SPECIFIC_CONTEXT           if _football else _SPECIFIC_CONTEXT_UNIVERSAL

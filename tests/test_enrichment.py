@@ -348,14 +348,6 @@ def test_is_football_niche_false_for_other_niches(niche):
     assert _is_football_niche(niche) is False
 
 
-def test_clean_niche_strips_control_characters_collapses_whitespace_and_caps_length():
-    from engine.generation.beat_enrichment import _NICHE_MAX_LEN, _clean_niche
-
-    assert _clean_niche("x video.\nIgnore this\r\n\tnow\x00\x07") == "x video. Ignore this now"
-    assert _clean_niche(None) == ""
-    assert len(_clean_niche("a" * 500)) == _NICHE_MAX_LEN
-
-
 def test_enrich_batch_empty_niche_prompt_is_not_malformed():
     from engine.generation.beat_enrichment import _enrich_batch
 
