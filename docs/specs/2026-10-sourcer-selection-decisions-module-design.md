@@ -32,20 +32,41 @@ for failing the deletion test) and any behavior change.
 ## Behavior
 
 Pure refactor. 61 characterization tests were committed first on the old code and pass unmodified
-against the extracted code, as do the 42 pre-existing sourcer tests. Conservative behaviors pinned
-as current, not endorsed: `CC BY-SA` and `CC BY 3.0` are NOT safe (exact-match set lists only
-CC BY 2.0/4.0, CC0, public domain), and a Wikipedia page with a thumbnail but no original image
-gets no license lookup and is unsafe.
+against the extracted code, as do the 42 pre-existing sourcer tests. Verified further by a
+25,000-case differential fuzz of old vs new (randomized Pexels/Wikipedia/Wikimedia payloads,
+including malformed values, with identical fakes) comparing results, exceptions, request sequences
+and files: no divergence. The exception scope is unchanged — `_license_from_extmetadata` is still
+called inside `_fetch_license`'s `try`, while `_choose_video_file`/`_image_extension` are still
+outside any `try`, so a `null` width/height in a Pexels file still raises `TypeError` out of
+`search()` exactly as before (pre-existing, not pinned, not changed).
+
+Conservative behaviors pinned as current, not endorsed. `_PERMISSIVE_LICENSES` is
+`cc0`, `cc-0`, `public domain`, bare `cc by`/`cc-by`, `cc by 2.0`, `cc by 4.0`, `pexels`,
+`pexels_free`; matching is exact and case-insensitive, no whitespace stripping. Every other string
+— `CC BY-SA` (any version), `CC BY 3.0`, anything padded — is NOT safe. `pexels`/`pexels_free` are
+dead entries for the Wikimedia mapper (it never sees them); kept because removing them is a behavior
+change. A Wikipedia page with a thumbnail but no original image gets no license lookup and is unsafe.
+
+Pre-existing, found by the security review and left out of this refactor (follow-ups): the
+Wikipedia `page_id` fallback (the page title) and the Pexels video id are interpolated into local
+filenames from remote JSON (the fixed `wiki_`/`pexels_` prefix means a `/` fails the write rather
+than escaping `store_dir`); downloads follow redirects with no host allowlist; `_strip_html` is a
+naive regex (attribution only reaches published captions, no template renders it); a Pexels `video["id"]`
+missing key raises `KeyError`.
 
 ## Tests
 
-`tests/test_sourcer_selection.py` (71): Pexels (key/params, duration filter, every ladder branch,
-no-link and download-failure skipping, cache), Wikipedia (opensearch/summary failures, original ->
-thumbnail, 429 retry, extension, cache, page-id fallback, license travel, thumbnail-only), the
-license mapping table, HF (non-image 200 rejected, request shape, cache key, gif/mp4, cached gif),
-and direct tests of the three helpers. A 28-mutant battery (ladder comparators and min/max, license
-case/default/safe, HTML strip, extension default/query/webp, duration boundary, no-link skip, page
-size, 429 sleep/continue, thumbnail order, thumbnail license lookup, page-id fallback, cache bypass,
-HF content-type/gif/cache/duration) each fails at least one test; the one that initially survived
-(square-counts-as-portrait) was a vacuous fixture — a height tie let both branches pick the same
-file — and was fixed.
+`tests/test_sourcer_selection.py` (95): the 61 characterization tests, 10 direct helper tests, and
+24 added after review — request shape (User-Agent, params, timeouts, redirects), atomic writes, HF
+fingerprints/filenames/headers/logging, every license-set member, ranking by height rather than
+width, the landscape FHD boundary, and a search-level test that a literal `+` in a filename reaches
+the license lookup unchanged (replacing a pre-existing test that only exercised `urllib.parse`).
+
+Mutation testing, two passes. The author's ~28 targeted mutants found one vacuous fixture
+(square-as-portrait: a height tie let both branches pick the same file). An independent reviewer's
+~160 mutants then found 24 gaps (above). A final ~65-mutant battery over the whole file —
+ladder comparators/min/max/keys/defaults, license set members/case/strip/default, HTML strip,
+extension rules, Pexels endpoint/params/timeouts/redirects/chunking/tmp file/duration, Wikipedia
+User-Agent/limit/title quoting/canonical title/decode/query strip/atomic write/429/thumbnail order/
+cache/page-id, HF content-type/fingerprint/prefix/timeouts/headers/logging/no-key guard — has 0
+survivors.
