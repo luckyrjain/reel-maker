@@ -113,7 +113,8 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `state.py` | `REEL_TRANSITIONS`, `CUT_TRANSITIONS` dicts + `transition()` guard; `JOB_IN_FLIGHT` — the owner state each job type rolls back to `failed` |
 | `routers/reels.py` | `POST /api/reels`, `POST /api/reels/estimate`, `GET /api/reels`, `GET /api/reels/{id}/active-job-fragment`, `GET /api/reels/{id}` (pipeline cost/latency/quality panel; embeds live render/publish status and failure reasons per cut) |
 | `routers/jobs.py` | `GET /api/jobs/{id}` (JSON) — the only JSON endpoint |
-| `routers/cuts.py` | Render/PATCH/approve/publish/render-status/publish-status, video/subtitle/thumbnail streams, thumbnail-pick and hook-variant-swap endpoints |
+| `routers/cuts.py` | Render/PATCH/approve/publish/render-status/publish-status, thumbnail-pick and hook-variant-swap endpoints (both share `_cut_card()` with the lifecycle routes — see Key conventions) |
+| `routers/cut_media.py` | Video/subtitle/thumbnail file streams (`GET`, raw bytes, no template) + `_resolve_within_video_store()` — split out of `cuts.py` (CAR candidate 2, `improve-codebase-architecture` review) |
 | `routers/credentials.py` | Connect/disconnect UI, OAuth authorize/callback per provider |
 | `routers/insights.py` | Quality↔engagement correlation + top/bottom performers + `PerformanceNote` CRUD |
 

@@ -1,0 +1,239 @@
+"""Tests for the Cut file-streaming routes and their shared path-traversal guard.
+
+GET /api/cuts/{id}/video, GET /api/cuts/{id}/subtitles, GET /api/cuts/{id}/thumbnail/{index}.
+
+Split out of test_variants_router.py — closes candidate 2 of the improve-codebase-
+architecture review, mirroring the api/routers/cuts.py -> cut_media.py production split.
+See docs/specs/2026-09-cut-media-router-split-module-design.md.
+"""
+from unittest.mock import patch
+
+import pytest
+from fastapi import HTTPException
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from api import models
+from api.db import get_db
+from api.main import app
+from api.routers.cut_media import _resolve_within_video_store
+
+
+@pytest.fixture()
+def client():
+    engine = create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool,
+    )
+    models.Base.metadata.create_all(engine)
+    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+    def _override_get_db():
+        db = TestingSessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = _override_get_db
+    with TestClient(app) as c:
+        c._session_factory = TestingSessionLocal
+        yield c
+    app.dependency_overrides.clear()
+
+
+def _make_cut(session_factory, status, *, thumbnail_candidates=None,
+              thumbnail_path=None, subtitle_path=None, video_path=None):
+    db = session_factory()
+    try:
+        reel = models.Reel(context="x", status=models.ReelStatus.guide_ready)
+        db.add(reel)
+        db.flush()
+        cut = models.Cut(
+            reel_id=reel.id, platform=models.CutPlatform.youtube_shorts, status=status,
+            thumbnail_candidates=thumbnail_candidates, thumbnail_path=thumbnail_path,
+            subtitle_path=subtitle_path, video_path=video_path,
+        )
+        db.add(cut)
+        db.commit()
+        return cut.id
+    finally:
+        db.close()
+
+
+# ── GET /cuts/{id}/thumbnail/{index} ─────────────────────────────────────────
+
+def test_stream_thumbnail_serves_the_candidate_file(client, tmp_path):
+    thumb = tmp_path / "1" / "youtube_shorts_thumb.jpg"
+    thumb.parent.mkdir(parents=True)
+    thumb.write_bytes(b"fake-jpeg-bytes")
+    cut_id = _make_cut(
+        client._session_factory, models.CutStatus.in_review,
+        thumbnail_candidates=[str(thumb)], thumbnail_path=str(thumb),
+    )
+    with patch("api.routers.cut_media.settings.video_store_dir", str(tmp_path)):
+        resp = client.get(f"/api/cuts/{cut_id}/thumbnail/0")
+    assert resp.status_code == 200
+    assert resp.content == b"fake-jpeg-bytes"
+
+
+def test_stream_thumbnail_serves_the_requested_index_not_always_the_first(client, tmp_path):
+    """Review-round regression: nothing else in this file exercises a multi-candidate list,
+    so a bug that always served thumbnail_candidates[0] regardless of the requested index
+    would have shipped silently."""
+    thumb0 = tmp_path / "1" / "thumb_0.jpg"
+    thumb1 = tmp_path / "1" / "thumb_1.jpg"
+    thumb0.parent.mkdir(parents=True)
+    thumb0.write_bytes(b"first-candidate-bytes")
+    thumb1.write_bytes(b"second-candidate-bytes")
+    cut_id = _make_cut(
+        client._session_factory, models.CutStatus.in_review,
+        thumbnail_candidates=[str(thumb0), str(thumb1)],
+    )
+    with patch("api.routers.cut_media.settings.video_store_dir", str(tmp_path)):
+        resp = client.get(f"/api/cuts/{cut_id}/thumbnail/1")
+    assert resp.status_code == 200
+    assert resp.content == b"second-candidate-bytes"
+
+
+def test_stream_thumbnail_404s_on_out_of_range_index(client, tmp_path):
+    cut_id = _make_cut(
+        client._session_factory, models.CutStatus.in_review,
+        thumbnail_candidates=["/data/videos/1/thumb.jpg"],
+    )
+    with patch("api.routers.cut_media.settings.video_store_dir", str(tmp_path)):
+        resp = client.get(f"/api/cuts/{cut_id}/thumbnail/9")
+    assert resp.status_code == 404
+
+
+def test_stream_thumbnail_rejects_a_path_outside_the_video_store(client, tmp_path):
+    """Same path-guard as stream_video — a candidate path can never point outside VIDEO_STORE_DIR."""
+    outside = tmp_path.parent / "outside_thumb.jpg"
+    outside.write_bytes(b"nope")
+    cut_id = _make_cut(
+        client._session_factory, models.CutStatus.in_review,
+        thumbnail_candidates=[str(outside)],
+    )
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    with patch("api.routers.cut_media.settings.video_store_dir", str(store_dir)):
+        resp = client.get(f"/api/cuts/{cut_id}/thumbnail/0")
+    assert resp.status_code == 403
+
+
+# ── GET /cuts/{id}/subtitles ──────────────────────────────────────────────────
+
+def test_stream_subtitles_serves_the_srt_file(client, tmp_path):
+    srt = tmp_path / "1" / "youtube_shorts.srt"
+    srt.parent.mkdir(parents=True)
+    srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello.\n", encoding="utf-8")
+    cut_id = _make_cut(
+        client._session_factory, models.CutStatus.in_review, subtitle_path=str(srt),
+    )
+    with patch("api.routers.cut_media.settings.video_store_dir", str(tmp_path)):
+        resp = client.get(f"/api/cuts/{cut_id}/subtitles")
+    assert resp.status_code == 200
+    assert resp.content == b"1\n00:00:00,000 --> 00:00:01,000\nHello.\n"
+    assert resp.headers["content-type"].startswith("application/x-subrip")
+
+
+def test_stream_subtitles_404s_when_subtitle_path_unset(client, tmp_path):
+    cut_id = _make_cut(client._session_factory, models.CutStatus.in_review, subtitle_path=None)
+    with patch("api.routers.cut_media.settings.video_store_dir", str(tmp_path)):
+        resp = client.get(f"/api/cuts/{cut_id}/subtitles")
+    assert resp.status_code == 404
+
+
+def test_stream_subtitles_404s_for_a_missing_cut(client, tmp_path):
+    with patch("api.routers.cut_media.settings.video_store_dir", str(tmp_path)):
+        resp = client.get("/api/cuts/999999/subtitles")
+    assert resp.status_code == 404
+
+
+def test_stream_subtitles_rejects_a_path_outside_the_video_store(client, tmp_path):
+    """Same path-guard as stream_video/stream_thumbnail — subtitle_path can never
+    point outside VIDEO_STORE_DIR."""
+    outside = tmp_path.parent / "outside_captions.srt"
+    outside.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello.\n", encoding="utf-8")
+    cut_id = _make_cut(
+        client._session_factory, models.CutStatus.in_review, subtitle_path=str(outside),
+    )
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    with patch("api.routers.cut_media.settings.video_store_dir", str(store_dir)):
+        resp = client.get(f"/api/cuts/{cut_id}/subtitles")
+    assert resp.status_code == 403
+
+
+# ── _resolve_within_video_store (CAR candidate 1, improve-codebase-architecture review) ──
+#
+# Direct tests of the shared path-traversal guard extracted from stream_video/stream_
+# subtitles/stream_thumbnail's three previously-independent copies — see
+# api/routers/cut_media.py and docs/specs/2026-09-video-store-guard-module-design.md.
+
+def test_resolve_within_video_store_returns_the_resolved_path_when_inside(tmp_path):
+    inside = tmp_path / "1" / "file.mp4"
+    inside.parent.mkdir(parents=True)
+    inside.write_bytes(b"x")
+    with patch("api.routers.cut_media.settings.video_store_dir", str(tmp_path)):
+        resolved = _resolve_within_video_store(str(inside))
+    assert resolved == inside.resolve()
+
+
+def test_resolve_within_video_store_rejects_a_path_outside(tmp_path):
+    outside = tmp_path.parent / "outside.mp4"
+    outside.write_bytes(b"x")
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    with patch("api.routers.cut_media.settings.video_store_dir", str(store_dir)):
+        with pytest.raises(HTTPException) as exc_info:
+            _resolve_within_video_store(str(outside))
+    assert exc_info.value.status_code == 403
+
+
+# ── GET /cuts/{id}/video ──────────────────────────────────────────────────────
+#
+# Previously had zero direct test coverage at all (independent-review-caught gap,
+# closed alongside the guard extraction above).
+
+def test_stream_video_serves_the_mp4_file(client, tmp_path):
+    video = tmp_path / "1" / "youtube_shorts.mp4"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"fake-mp4-bytes")
+    cut_id = _make_cut(
+        client._session_factory, models.CutStatus.in_review, video_path=str(video),
+    )
+    with patch("api.routers.cut_media.settings.video_store_dir", str(tmp_path)):
+        resp = client.get(f"/api/cuts/{cut_id}/video")
+    assert resp.status_code == 200
+    assert resp.content == b"fake-mp4-bytes"
+    assert resp.headers["content-type"].startswith("video/mp4")
+
+
+def test_stream_video_404s_when_video_path_unset(client, tmp_path):
+    cut_id = _make_cut(client._session_factory, models.CutStatus.in_review, video_path=None)
+    with patch("api.routers.cut_media.settings.video_store_dir", str(tmp_path)):
+        resp = client.get(f"/api/cuts/{cut_id}/video")
+    assert resp.status_code == 404
+
+
+def test_stream_video_404s_for_a_missing_cut(client, tmp_path):
+    with patch("api.routers.cut_media.settings.video_store_dir", str(tmp_path)):
+        resp = client.get("/api/cuts/999999/video")
+    assert resp.status_code == 404
+
+
+def test_stream_video_rejects_a_path_outside_the_video_store(client, tmp_path):
+    """Same path-guard as stream_subtitles/stream_thumbnail — video_path can never
+    point outside VIDEO_STORE_DIR."""
+    outside = tmp_path.parent / "outside_video.mp4"
+    outside.write_bytes(b"nope")
+    cut_id = _make_cut(
+        client._session_factory, models.CutStatus.in_review, video_path=str(outside),
+    )
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    with patch("api.routers.cut_media.settings.video_store_dir", str(store_dir)):
+        resp = client.get(f"/api/cuts/{cut_id}/video")
+    assert resp.status_code == 403
