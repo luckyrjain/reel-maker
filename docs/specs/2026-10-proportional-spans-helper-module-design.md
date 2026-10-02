@@ -49,6 +49,11 @@ Known quirk, preserved and pinned by a labeled characterization test in each cop
 caption track silently missing text. How to degrade (compress, merge, drop) is a product decision,
 left as a follow-up.
 
+One intentional hardening, found by differential fuzzing in review (400k comparisons otherwise
+byte-identical to `main`): a beat whose `vo_script` key is present but `None` used to raise
+`TypeError` in the drawtext path (`re.split(None)`); it now takes the empty-VO equal-split path.
+The SRT copy already tolerated `None`.
+
 ## Dead logic found by mutation testing
 
 The original loops clamped each span to the beat end and `break`-ed once the cursor passed it.
@@ -58,8 +63,7 @@ identical.
 
 ## Tests
 
-`tests/test_proportional_timing.py` (25): 14 characterization tests of the two callers (committed
-first) and 11 direct tests of the helpers. Mutations that each fail at least one test: no
+`tests/test_proportional_timing.py` (28): 19 caller-level tests (16 committed first on the old code, 3 added in review: the 5-line cap, a line-less beat still advancing the cursor, and `vo_script=None`) and 9 direct tests of the helpers. `test_compositor.py` gains a real-ffmpeg guard for the SRT offset shift on the fallback path (previously unguarded). Mutations that each fail at least one test: no
 last-span stretch, floor changed, `start` ignored, denominator replaced by `sum(weights)`,
 drawtext denominator narrowed, em dash dropped from the split, the `t < end` placement guard
 removed.

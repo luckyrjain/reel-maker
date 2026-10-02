@@ -826,3 +826,38 @@ def test_build_collage_clip_with_one_missing_path_renders_a_black_half(tmp_path)
             f"missing-path half should render near-black, got {right_pixel}"
         )
     tracker.assert_every_opened_reader_was_closed()
+
+
+def test_composite_cut_shifts_fallback_srt_cues_to_the_reel_timeline(tmp_path):
+    """Phase 5d offset rule on the no-Whisper fallback path: a later beat's cues sit at
+    that beat's absolute start (the running sum of earlier beat durations), not at its
+    own beat-relative 0. Whisper output is forced empty so the proportional fallback
+    supplies every cue regardless of whether Whisper is installed."""
+    from unittest.mock import patch
+
+    vo_paths = []
+    for i, secs in enumerate((2, 3)):
+        vo = tmp_path / f"beat{i}.wav"
+        sf.write(str(vo), np.zeros(24000 * secs, dtype=np.float32), 24000)
+        vo_paths.append(vo)
+    beats = [
+        {"duration_s": 2.0, "vo_script": "First beat narration.", "on_screen_text": ["First"]},
+        {"duration_s": 3.0, "vo_script": "Second beat narration.", "on_screen_text": ["Second"]},
+    ]
+    with patch("engine.render.compositor._build_beat_transcripts", return_value=[None, None]):
+        _, _, srt_path = composite_cut(
+            beats=beats,
+            beat_video_paths=[[None], [None]],
+            beat_vo_paths=vo_paths,
+            output_path=tmp_path / "out.mp4",
+            thumbnail_path=tmp_path / "thumb.jpg",
+        )
+
+    cues = srt_path.read_text(encoding="utf-8").strip().split("\n\n")
+    assert len(cues) == 2
+    first_start, first_end = cues[0].splitlines()[1].split(" --> ")
+    second_start, second_end = cues[1].splitlines()[1].split(" --> ")
+    assert first_start == "00:00:00,000"
+    assert first_end == "00:00:02,000"
+    assert second_start == "00:00:02,000"
+    assert second_end == "00:00:05,000"

@@ -141,6 +141,35 @@ def test_drawtext_floor_drops_lines_that_do_not_fit_current_behavior():
     )
 
 
+def test_drawtext_caps_displayed_lines_at_five():
+    beat = {
+        "vo_script": ". ".join(f"w{i}" for i in range(7)) + ".",
+        "on_screen_text": [f"l{i}" for i in range(7)],
+    }
+    wins = _windows([beat], [14.0])
+    assert [w[0] for w in wins] == ["l0", "l1", "l2", "l3", "l4"]
+    assert wins[-1][2] == 14.0
+
+
+def test_drawtext_beat_without_lines_still_advances_the_cursor():
+    beats = [
+        {"vo_script": "a b.", "on_screen_text": []},
+        {"vo_script": "a b.", "on_screen_text": ["x"]},
+    ]
+    wins = _windows(beats, [3.0, 4.0])
+    assert len(wins) == 1
+    assert wins[0][0] == "x"
+    assert wins[0][1:] == pytest.approx((3.0, 7.0))
+
+
+def test_drawtext_none_vo_script_is_treated_as_empty():
+    """vo_script=None (key present) used to raise TypeError in re.split; it now takes
+    the empty-VO equal-split path."""
+    beat = {"vo_script": None, "on_screen_text": ["a", "b"]}
+    wins = _windows([beat], [4.0])
+    assert [w[1:] for w in wins] == pytest.approx([(0.0, 2.0), (2.0, 4.0)])
+
+
 def test_drawtext_zero_duration_places_nothing():
     beat = {"vo_script": "A b. C d.", "on_screen_text": ["a", "b"]}
     assert _windows([beat], [0.0]) == []
@@ -159,13 +188,13 @@ def test_spans_start_offsets_absolute_time():
 
 
 def test_spans_total_weight_is_independent_of_weights():
-    """The drawtext caller places 1 of 3 sentences' worth of lines: the denominator is
-    the caller's, so a lone weight-1 item out of 4 gets only a quarter of the beat
-    (then is stretched to the end, being the last placed)."""
-    spans = _proportional_spans([1], 4, 8.0)
-    assert spans == [(0, 0.0, 8.0)]
+    """The denominator is the caller's, not sum(weights). With total_weight 4 and
+    duration 8 each weight-1 item gets 2 s (a quarter of the beat), not 4 s; the last
+    PLACED span is then stretched to the end."""
     spans = _proportional_spans([1, 1], 4, 8.0)
-    assert spans == pytest.approx([(0, 0.0, 2.0), (1, 2.0, 8.0)])
+    assert spans[0] == pytest.approx((0, 0.0, 2.0))      # 2 s, not sum(weights)'s 4 s
+    assert spans[1] == pytest.approx((1, 2.0, 8.0))      # placed 2-4, stretched to 8
+    assert _proportional_spans([1], 4, 8.0) == [(0, 0.0, 8.0)]
 
 
 def test_spans_stretch_last_span_to_the_end():
