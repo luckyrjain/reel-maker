@@ -3,7 +3,7 @@
 import re
 
 from engine.generation.guide_schema import Beat, MasterGuide, PlatformGuide
-from engine.generation.evaluator import score_guide, _person_names
+from engine.generation.evaluator import score_guide
 
 
 def _axis_deduction(issues: list[str], axis: str) -> int:
@@ -697,17 +697,6 @@ def test_score_overflow_appends_issue():
 
 # ── helper unit tests ─────────────────────────────────────────────────────────
 
-def test_person_names_extracts_correctly():
-    names = _person_names("Lionel Messi and Cristian Romero play for Argentina in the World Cup.")
-    assert "Lionel Messi" in names
-    assert "Cristian Romero" in names
-
-
-def test_person_names_excludes_non_persons():
-    names = _person_names("World Cup and Premier League are tournaments. Real Madrid won.")
-    assert not any(n.lower() in {"world cup", "premier league", "real madrid"} for n in names)
-
-
 # ── multi-platform de-duplication ─────────────────────────────────────────────
 
 def test_identical_platform_cuts_score_the_same_as_one():
@@ -849,7 +838,7 @@ def test_unknown_axis_name_in_multipliers_is_a_no_op_not_a_keyerror():
 # vocabulary) found two real, confirmed bugs, both fixed here:
 #
 # 1. Script→Visual Alignment collapsed to a flat 20-point deduction whenever a niche's
-#    VO never triggered _person_names()/_VO_ACTIONS_UNIVERSAL/_SPECIFIC_CONTEXT_UNIVERSAL
+#    VO never triggered person_names()/_VO_ACTIONS_UNIVERSAL/_SPECIFIC_CONTEXT_UNIVERSAL
 #    anywhere — which is the normal case for personal finance, tech reviews, cooking,
 #    anything without named individuals or competition-style action verbs. A perfectly
 #    well-aligned finance guide scored align_deduction=20 (the max) purely because there
@@ -1208,3 +1197,35 @@ def test_audio_hook_pacing_problems_are_weighted_double_body_pacing_problems():
     _, issues_body = score_guide(_CTX, rushed_body, 45)
     assert _axis_deduction(issues_hook, "audio") == 4, issues_hook
     assert _axis_deduction(issues_body, "audio") == 2, issues_body
+
+
+# ── shared person-name extractor (engine/names.py) at score_guide level ────────
+
+def _name_guide(hook, cta, visual="Angel Di Maria warming up"):
+    return _guide(
+        _beat(0, "hook", 5, hook, "stadium crowd"),
+        _beat(1, "body", 10, "Romero presses and forces mistakes in midfield every match.", visual),
+        _beat(2, "cta", 5, cta, "logo"),
+    )
+
+
+def test_clip_availability_credits_a_short_particle_name_in_visual_direction():
+    # "Angel Di Maria" is one name now ("Di" is 2 letters); "Angel di Maria" is not a name.
+    with_name = _axis_deduction(score_guide(_CTX, _name_guide("Hook line here?", "Follow for more.", "Angel Di Maria warming up"), 20)[1], "clip")
+    without = _axis_deduction(score_guide(_CTX, _name_guide("Hook line here?", "Follow for more.", "Angel di Maria warming up"), 20)[1], "clip")
+    assert with_name < without
+
+
+def test_throughline_sees_the_player_in_an_interrogative_hook():
+    # Before the opener fix, "Is" was glued onto the name, so the CTA callback to "Vinicius" missed.
+    hook = "Is Vinicius Junior the best player alive?"
+    called_back = score_guide(_CTX, _name_guide(hook, "Vinicius or Mbappe? Drop your take."), 20)[1]
+    unrelated = score_guide(_CTX, _name_guide(hook, "Follow for more clips."), 20)[1]
+    assert _axis_deduction(called_back, "throughline") == 0
+    assert _axis_deduction(unrelated, "throughline") == 5
+
+
+def test_throughline_name_callback_is_case_insensitive():
+    hook = "Is Vinicius Junior the best player alive?"
+    shouted = score_guide(_CTX, _name_guide(hook, "VINICIUS or Mbappe? Drop your take."), 20)[1]
+    assert _axis_deduction(shouted, "throughline") == 0

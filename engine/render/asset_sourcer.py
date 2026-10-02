@@ -11,27 +11,17 @@ import httpx
 
 from api import models
 from api.config import settings
+from engine.names import person_names
 from engine.observability import record_stage
 from engine.render.pricing import hf_image_cost_usd, hf_video_cost_usd
 
 _log = logging.getLogger(__name__)
 
 
-_NAME_RE = re.compile(r'\b[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)+\b')
-
 _PERMISSIVE_LICENSES = {
     "cc0", "cc-0", "public domain", "cc by", "cc-by", "cc by 2.0", "cc by 4.0",
     "pexels", "pexels_free",
 }
-
-
-def _extract_first_person_name(query: str) -> str | None:
-    matches = _NAME_RE.findall(query)
-    return matches[0] if matches else None
-
-
-def _extract_all_person_names(query: str) -> list[str]:
-    return _NAME_RE.findall(query)
 
 
 def _strip_html(text: str) -> str:
@@ -545,7 +535,7 @@ def resolve_beat_assets(
     HuggingFace*Source.last_call_was_generated).
     """
     if wiki:
-        names = _extract_all_person_names(query)
+        names = person_names(query)
         found = []
         for i, name in enumerate(names):
             if i > 0:

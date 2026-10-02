@@ -4,9 +4,9 @@ Pure content generation — no Celery, no db, no Job. Imported by
 worker/tasks/generate.py when the LLM returns a degenerate or missing
 visual_direction for a beat.
 """
-import re as _re
 
 from engine.generation.script_parser import BeatStub
+from engine.names import first_person_name
 
 
 _SECTION_FALLBACK_VISUALS: dict[str, str] = {
@@ -70,25 +70,9 @@ def _fallback_visual(stub: BeatStub) -> str:
     )
 
 
-_VO_NAME_RE = _re.compile(
-    r'\b([A-ZÁÉÍÓÚÑ][a-záéíóúñ]{2,}(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]{2,})+)\b'
-)
-_NON_PERSON = {"South American", "Premier League", "Copa America", "World Cup",
-               "Champions League", "North American", "West European"}
-_NON_PERSON_PREFIXES = _re.compile(
-    r'\b(South|North|West|East|Premier|Copa|Champions|United|Real|Inter)\b'
-)
-
-
 def _first_person(vo: str, existing: str) -> str:
     """Return the first plausible person name in `vo`, or `existing` if already known."""
-    if existing:
-        return existing
-    for m in _VO_NAME_RE.finditer(vo):
-        name = m.group(1)
-        if name not in _NON_PERSON and not _NON_PERSON_PREFIXES.search(name):
-            return name
-    return ""
+    return existing or first_person_name(vo) or ""
 
 
 _DEGENERATE_SUFFIXES = (" footage", " highlights", " action shot", " close-up action shot")

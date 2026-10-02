@@ -135,6 +135,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 | File | Responsibility |
 |---|---|
+| `names.py` | `person_names()` / `first_person_name()` — the one shared person-name extractor — strips leading sentence openers, excludes clubs/leagues/tournaments (stdlib-only; used by `evaluator.py`, `visual_fallback.py` and `asset_sourcer.py`) |
 | `observability.py` | `record_stage()` context manager — writes a `StageEvent` row on exit (success or failure); `paid_call_count()`; `latest_quality_scores()` (shared by the reel list/detail pages and `engine/analytics/correlation.py`) |
 
 #### `engine/generation/`
@@ -189,11 +190,11 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 ### `tests/`
 
-50 test files + `conftest.py`, **879 tests run by default / 880 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
+53 test files + `conftest.py`, **1013 tests run by default / 1014 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
 
 | File | Tests | File | Tests |
 |---|---|---|---|
-| `test_job_lifecycle.py` | 133 | `test_evaluator.py` | 46 |
+| `test_job_lifecycle.py` | 133 | `test_evaluator.py` | 47 |
 | `test_maintenance.py` | 52 | `test_reels_router.py` | 38 |
 | `test_r3_proposed.py` | 38 | `test_cuts_publish_router.py` | 34 |
 | `test_compositor.py` | 30 | `test_r4_gaps.py` | 30 |
@@ -215,6 +216,8 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_instagram_publisher.py` | 7 | `test_publish_registry.py` | 7 |
 | `test_tasks_real_db.py` | 7 | `test_wikipedia_image_source.py` | 6 |
 | `test_niche.py` | 22 | `test_cut_media.py` | 14 |
+| `test_names.py` | 109 | `test_visual_fallback.py` | 17 |
+| `test_asset_sourcer_names.py` | 7 | | |
 | `test_pricing.py` | 4 | `test_config.py` | 2 |
 | `test_llm_judge.py` | 3 | `test_main.py` | 3 |
 | `test_observability.py` | 3 | `test_golden_reel.py` | 1 (deselected) |
@@ -515,7 +518,7 @@ Every drawtext clause carries `:expansion=none` — disables ffmpeg's own `%`-ex
 
 ### Player photos (`WikipediaImageSource`)
 
-- Triggered when a multi-word capitalized name is found in `visual_direction`
+- Triggered when a person name (`engine/names.py::person_names()` — clubs and tournaments are excluded) is found in `visual_direction`
 - Flow: opensearch → page summary REST → image download + `extmetadata` license fetch (filename `urllib.parse.unquote()`-decoded before the MediaWiki `titles=` lookup — an encoded filename otherwise matches no page and silently defaults to `license="unknown"`)
 - Rate-limit handling: 0.5 s between players, 2 s retry on 429
 - License fields stored: `license`, `license_url`, `attribution`, `safe_to_publish`
