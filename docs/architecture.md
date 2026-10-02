@@ -196,7 +196,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_maintenance.py` | 52 | `test_reels_router.py` | 38 |
 | `test_r3_proposed.py` | 38 | `test_cuts_publish_router.py` | 34 |
 | `test_compositor.py` | 30 | `test_r4_gaps.py` | 30 |
-| `test_generate_task.py` | 20 | `test_common.py` | 18 |
+| `test_generate_task.py` | 25 | `test_common.py` | 18 |
 | `test_audio_text_sync.py` | 16 | `test_guide_edit.py` | 16 |
 | `test_render_task.py` | 16 | `test_tts.py` | 16 |
 | `test_asset_sourcer_cost.py` | 15 | `test_enrichment.py` | 37 |

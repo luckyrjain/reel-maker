@@ -64,7 +64,7 @@ tactical-regex selection x3, isolating the "neither vocabulary matches" path fro
 (`_enrich_standard_path_guide()` had zero direct tests). Mutation-tested: hardcoding the
 vocabulary selection and hardcoding the standard-path call site each failed the right test.
 
-The review round added 17 more (see §Corrections): `_enrich_with_insight()` end-to-end for
+The review round added 21 more — 17 in `test_enrichment.py`, 4 in `test_generate_task.py` (see §Corrections): `_enrich_with_insight()` end-to-end for
 both vocabularies and across multiple batches, `_is_football_niche()`/`_clean_niche()` unit
 tests, the empty/hostile-niche prompt tests, and a parametrized test of
 `_generate_from_structured_script()` itself (niche "personal finance", `None`, `""`,
@@ -94,7 +94,7 @@ issues, all fixed before merge:
 4. **Test gaps (Test-Quality, mutation-confirmed):** `_enrich_with_insight()` had no direct
    test (dropping its niche from either callee passed everything), the structured-path wiring
    and `reel.niche=None` were untested, and the defaulted `niche=""` parameter is what made
-   a silently dropped niche possible — it is now required. Closed by the 17 new tests.
+   a silently dropped niche possible — it is now required. Closed by the 21 new tests (a second review round caught the structured-path test's first fixture — one beat, shallow under any niche — as vacuous on the two `_is_shallow_beat` call sites; its two-beat replacement pins `shallow_beats` and `enriched_beats`, mutation-tested at all 5 wiring sites).
 5. **Documentation (Docs):** CLAUDE.md claimed "3 pre-existing `reel.niche or ...` guards"
    (main has 5: three `or ""`, two `or "general"`); docs/architecture.md still described
    `beat_enrichment.py` as structured-path-only and listed 15 enrichment tests, and two docs

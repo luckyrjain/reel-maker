@@ -239,8 +239,6 @@ is not yet built" — these are the real, currently-documented gaps, not an inve
 - **Scheduled publishing has no trigger UI** — the `scheduled` cut status and `publish_cut` both
   handle a cut already sitting in `scheduled`, but nothing currently transitions a cut *into*
   it (no date/time picker, no beat-driven scheduler).
-- **Insight enrichment for the standard LLM path** — currently applied only to structured-script
-  beats.
 - **Multi-image collage beyond 2 items** — a beat with 3+ resolved media items still cycles
   sequentially; no grid layout. An explicit, bounded non-goal, not an oversight.
 - **No Pixabay Music API** — Pixabay's public REST API has never documented a Music search

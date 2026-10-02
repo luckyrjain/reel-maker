@@ -948,13 +948,28 @@ class _StopAfterEnrich(Exception):
     pass
 
 
-@pytest.mark.parametrize("niche,expected_in_prompt", [
-    ("personal finance", "content analyst for a personal finance video"),
-    (None, "football tactical analyst"),
-    ("", "football tactical analyst"),
-    ("Premier League football", "football tactical analyst"),
+# Two beats pin the niche on BOTH _is_shallow_beat call sites:
+#  - beat 0 (14 words) is shallow before enrichment under any niche; after enrichment (25
+#    words, the appended sentence carries "strategy" — a universal marker, no football
+#    marker) it stays shallow only under the football vocabulary  -> pins the AFTER count;
+#  - beat 1 (34 words, "strategy") is NOT shallow under the finance vocabulary but IS under
+#    the football one -> pins the BEFORE count (`shallow_beats`).
+_LONG_UNIVERSAL_VO = (
+    "Buffett's long-term strategy of holding quality businesses through market "
+    "downturns has helped him compound wealth steadily for many decades while "
+    "most other investors panic and sell far too early during every recession."
+)
+
+
+@pytest.mark.parametrize("niche,expected_in_prompt,expected_shallow,expected_enriched", [
+    ("personal finance", "content analyst for a personal finance video", 1, 1),
+    (None, "football tactical analyst", 2, 0),
+    ("", "football tactical analyst", 2, 0),
+    ("Premier League football", "football tactical analyst", 2, 0),
 ])
-def test_structured_path_threads_reel_niche_into_enrichment(niche, expected_in_prompt):
+def test_structured_path_threads_reel_niche_into_enrichment(
+    niche, expected_in_prompt, expected_shallow, expected_enriched
+):
     from worker.tasks.generate import _generate_from_structured_script
 
     captured = []
@@ -965,11 +980,16 @@ def test_structured_path_threads_reel_niche_into_enrichment(niche, expected_in_p
         def complete(self, messages, **kwargs):
             captured.append(messages)
             return json.dumps([{"index": 0, "tactical_sentence":
-                                "This discipline lets him avoid panic selling during downturns"}])
+                                "This long-term strategy lets him avoid panic selling during downturns badly"}])
 
     stub = BeatStub(
         index=0, beat_type="body", section="", player="Warren Buffett",
-        vo_script="Buffett holds stocks.", duration_s=5.0, on_screen_text=["x"],
+        vo_script="Buffett holds quality stocks through every market cycle and rarely sells anything at all",
+        duration_s=5.0, on_screen_text=["x"],
+    )
+    long_stub = BeatStub(
+        index=1, beat_type="body", section="", player="Warren Buffett",
+        vo_script=_LONG_UNIVERSAL_VO, duration_s=8.0, on_screen_text=["x"],
     )
     ev = SimpleNamespace(detail={}, tokens_in=0, tokens_out=0, cost_usd=0)
     stage_cm = MagicMock()
@@ -984,9 +1004,10 @@ def test_structured_path_threads_reel_niche_into_enrichment(niche, expected_in_p
     ):
         with pytest.raises(_StopAfterEnrich):
             _generate_from_structured_script(
-                SimpleNamespace(id=1, niche=niche), [], MagicMock(), MagicMock(), {}, [stub], "ctx",
+                SimpleNamespace(id=1, niche=niche), [], MagicMock(), MagicMock(), {}, [stub, long_stub], "ctx",
             )
 
-    assert ev.detail["shallow_beats"] == 1
+    assert ev.detail["shallow_beats"] == expected_shallow
+    assert ev.detail["enriched_beats"] == expected_enriched
     system_msg = next(m["content"] for m in captured[0] if m["role"] == "system")
     assert expected_in_prompt in system_msg
