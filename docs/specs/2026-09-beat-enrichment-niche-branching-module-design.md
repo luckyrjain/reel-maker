@@ -26,23 +26,26 @@ and untested.
 
 ## Decision (settled via `/grilling`)
 
-Thread `niche: str` into `_is_shallow_beat()`, `_enrich_batch()`, and
-`_enrich_with_insight()` symmetrically — structured path passes `reel.niche or ""`
+Thread `niche` into `_is_shallow_beat()`, `_enrich_batch()`, and
+`_enrich_with_insight()` symmetrically — structured path passes `reel.niche`
 (the column is nullable, unlike `MasterGuide.niche` which Pydantic requires non-null),
 standard path passes `guide.niche` directly. Both call sites already had the value at
-hand; no new plumbing needed.
+hand; no new plumbing needed. (The first version of this fix passed `reel.niche or ""`
+and used an exact-set-membership football check — see §Corrections for why that was
+replaced.)
 
 The non-football tactical-marker vocabulary reuses `evaluator.py`'s existing
 `_INSIGHT_TACTICAL_UNIVERSAL` regex (same conceptual gate — "does this VO already
-contain substantive reasoning" — rather than inventing a 5th independently-drifting
-vocabulary table, echoing a sibling finding from the same review round about 4 duplicated
-person-name regexes). No import cycle exists between the two modules in either direction.
+contain substantive reasoning" — rather than inventing another independently-drifting
+vocabulary table; a separate finding from the same review round noted duplicated
+person-name regexes elsewhere). No import cycle exists between the two modules in either direction.
 
 The system prompt and its BAD/GOOD worked example both branch on niche: football keeps
 its existing wording verbatim; every other niche gets `"You are a content analyst for a
-{niche} video."` and a generic finance-flavored worked example — `Reel.niche` is
-operator-entered free text (not untrusted user content), so interpolating it directly is
-fine.
+{niche} video."` and a generic finance-flavored worked example. The niche is operator-entered free text on the
+structured path and LLM-generated on the standard path, so it passes through
+`_clean_niche()` (control characters/newlines stripped, whitespace collapsed, capped at 64)
+before being interpolated into the system prompt — added after review, see §Corrections.
 
 Deliberately out of scope: `_make_conflict_stub()`'s "You are writing voiceover for a
 sports video" framing is left untouched — it's only ever called from the structured
@@ -54,35 +57,50 @@ architecture review didn't raise.
 
 ## Test strategy
 
-5 new tests in `tests/test_enrichment.py`:
-- `test_enrich_batch_football_niche_uses_the_football_system_prompt` /
-  `..._non_football_niche_uses_a_generic_system_prompt` — confirm the right system
-  prompt is selected.
-- `test_is_shallow_beat_football_niche_uses_the_football_tactical_regex` /
-  `..._non_football_niche_uses_the_universal_tactical_regex` /
-  `..._non_football_niche_without_universal_markers_is_shallow` — confirm the regex
-  branch is genuinely exercised (not just coincidentally matching both ways), and that
-  the "neither vocabulary matches" path is distinct from the "too short" path
-  `_is_shallow_beat()`'s `len() < 25` OR'd condition already covers.
+Original 6 tests: 5 in `tests/test_enrichment.py` (system-prompt selection x2,
+tactical-regex selection x3, isolating the "neither vocabulary matches" path from the
+"too short" path `_is_shallow_beat()`'s `len() < 25` OR'd condition already covers) and 1 in
+`tests/test_generate_task.py` closing the standard-path wiring gap
+(`_enrich_standard_path_guide()` had zero direct tests). Mutation-tested: hardcoding the
+vocabulary selection and hardcoding the standard-path call site each failed the right test.
 
-1 new test in `tests/test_generate_task.py` — `_enrich_standard_path_guide()` had zero
-direct tests before this (every existing test patches it out with no assertion on call
-args), so the niche-threading wiring itself — as opposed to the pure function's own
-branching logic — was untested. `test_enrich_standard_path_guide_threads_the_guides_real_
-niche_through()` closes that: calls the real function with a real `MasterGuide`, mocks
-only `_enrich_with_insight`, and asserts the niche argument it receives matches
-`guide.niche`.
-
-834 default-run tests pass (828 existing + 6 new; 835 total including the deselected
-golden test).
-
-Mutation-tested: (1) hardcoded the vocabulary selection in `_is_shallow_beat()` to
-always use the football branch — the non-football universal-vocabulary test failed
-correctly. (2) hardcoded the wiring call site in `_enrich_standard_path_guide()` to pass
-`"football"` instead of `guide.niche` — the new wiring test failed correctly. Both
-restored and re-verified.
+The review round added 17 more (see §Corrections): `_enrich_with_insight()` end-to-end for
+both vocabularies and across multiple batches, `_is_football_niche()`/`_clean_niche()` unit
+tests, the empty/hostile-niche prompt tests, and a parametrized test of
+`_generate_from_structured_script()` itself (niche "personal finance", `None`, `""`,
+"Premier League football") running the real `_enrich_with_insight()` through a capturing
+LLM. 855 default-run tests pass (856 including the deselected golden test); 5 mutations
+(wrong niche to the shallow gate, wrong niche to the batch prompt, hardcoded structured-path
+niche, substring→exact match, no cleaning) each fail at least one test.
 
 ## Corrections
 
-None yet — this section will be updated after the 4-persona review round on the opened
-PR, per this pipeline's standard practice.
+A deep 4-persona review on the opened PR (#36) found no security defect and these real
+issues, all fixed before merge:
+
+1. **Behavior regression on the structured path (3 of 4 personas independently).** The first
+   version copied `evaluator.py`'s exact-set-membership check (`niche.lower() in
+   {"football","soccer","futbol"}`) and passed `reel.niche or ""`. The structured-script path
+   is football-shaped by design and `Reel.niche` is an optional free-text field, so a football
+   script with a blank niche, or "Premier League football", silently moved from the football
+   prompt/vocabulary (the module's only behavior before this PR) to the generic branch. The
+   design's own claim that the structured path was "unaffected" was wrong for exactly this
+   input. Fixed: `_is_football_niche()` treats an unset/blank niche as football and matches by
+   substring. This deliberately diverges from `evaluator.py`'s exact match; that axis has the
+   same limitation but was not touched here.
+2. **Empty niche produced a malformed prompt** ("content analyst for a  video") — closed by (1).
+3. **Unsanitized niche in a system prompt** (Security, Low): the same exposure `prompt.py`
+   already has, so no new capability, but cheap to close — `_clean_niche()`.
+4. **Test gaps (Test-Quality, mutation-confirmed):** `_enrich_with_insight()` had no direct
+   test (dropping its niche from either callee passed everything), the structured-path wiring
+   and `reel.niche=None` were untested, and the defaulted `niche=""` parameter is what made
+   a silently dropped niche possible — it is now required. Closed by the 17 new tests.
+5. **Documentation (Docs):** CLAUDE.md claimed "3 pre-existing `reel.niche or ...` guards"
+   (main has 5: three `or ""`, two `or "general"`); docs/architecture.md still described
+   `beat_enrichment.py` as structured-path-only and listed 15 enrichment tests, and two docs
+   still said standard-path insight enrichment was not wired (it has been since Phase 3.6,
+   roadmap §5e) — all corrected.
+6. **Not changed (inherited):** `_INSIGHT_TACTICAL_UNIVERSAL` is itself sports-flavored
+   vocabulary, so a non-football beat's enriched sentence rarely matches it and the `enrich`
+   StageEvent's `enriched_beats` reads ~0 even on success — the same weakness `evaluator.py`'s
+   Insight Density axis already has.

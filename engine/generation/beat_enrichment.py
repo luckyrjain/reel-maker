@@ -10,7 +10,24 @@ import re as _re
 from engine.generation.evaluator import _INSIGHT_TACTICAL_UNIVERSAL
 from engine.generation.script_parser import BeatStub, calc_duration, derive_on_screen
 
-_FOOTBALL_NICHES = {"football", "soccer", "futbol"}
+_FOOTBALL_KEYWORDS = ("football", "soccer", "futbol")
+_NICHE_MAX_LEN = 64
+
+
+def _clean_niche(niche: str | None) -> str:
+    """Operator/LLM-supplied free text bound for a system prompt: drop control characters
+    (newlines included), collapse whitespace, cap length."""
+    printable = "".join(ch for ch in (niche or "") if ch.isprintable() or ch.isspace())
+    return " ".join(printable.split())[:_NICHE_MAX_LEN]
+
+
+def _is_football_niche(niche: str | None) -> bool:
+    """An unset niche counts as football: this module was football-only before it took a niche,
+    and the structured-script path (the one that can reach here with Reel.niche None) is
+    football-shaped by design. Substring, not exact, match so "Premier League football" works."""
+    cleaned = _clean_niche(niche).lower()
+    return not cleaned or any(k in cleaned for k in _FOOTBALL_KEYWORDS)
+
 
 _TACTICAL_MARKERS = _re.compile(
     r"\b(allows?|enables?|because|which means|forces?|creates?|"
@@ -20,13 +37,13 @@ _TACTICAL_MARKERS = _re.compile(
 )
 
 
-def _is_shallow_beat(stub: BeatStub, niche: str) -> bool:
+def _is_shallow_beat(stub: BeatStub, niche: str | None) -> bool:
     """niche selects the tactical-marker vocabulary — football gets the football-specific
     regex above, every other niche gets evaluator.py's own universal vocabulary (the same
     niche-branching evaluator.py already does for its Insight Density axis, reused here
     rather than re-invented — see docs/specs/2026-09-beat-enrichment-niche-branching-
     module-design.md)."""
-    tactical_re = _TACTICAL_MARKERS if niche.lower() in _FOOTBALL_NICHES else _INSIGHT_TACTICAL_UNIVERSAL
+    tactical_re = _TACTICAL_MARKERS if _is_football_niche(niche) else _INSIGHT_TACTICAL_UNIVERSAL
     return (
         stub.beat_type == "body"
         and bool(stub.player)
@@ -40,18 +57,19 @@ def _is_shallow_beat(stub: BeatStub, niche: str) -> bool:
 _ENRICH_BATCH = 3
 
 
-def _enrich_batch(batch: list[BeatStub], context: str, llm, niche: str) -> dict[int, str]:
+def _enrich_batch(batch: list[BeatStub], context: str, llm, niche: str | None) -> dict[int, str]:
     beat_lines = "\n".join(
         f'  {{"index": {s.index}, "player": "{s.player}", "vo": "{s.vo_script[:100]}"}}'
         for s in batch
     )
-    is_football = niche.lower() in _FOOTBALL_NICHES
+    is_football = _is_football_niche(niche)
+    niche_label = _clean_niche(niche)
     system_content = (
         "You are a football tactical analyst. "
         "Return ONLY valid JSON — a list, one object per beat, "
         "each with 'index' (int) and 'tactical_sentence' (string)."
     ) if is_football else (
-        f"You are a content analyst for a {niche} video. "
+        f"You are a content analyst for a {niche_label} video. "
         "Return ONLY valid JSON — a list, one object per beat, "
         "each with 'index' (int) and 'tactical_sentence' (string)."
     )
@@ -93,7 +111,7 @@ def _enrich_batch(batch: list[BeatStub], context: str, llm, niche: str) -> dict[
         return {}
 
 
-def _enrich_with_insight(stubs: list[BeatStub], context: str, llm, niche: str = "") -> None:
+def _enrich_with_insight(stubs: list[BeatStub], context: str, llm, niche: str | None) -> None:
     shallow = [s for s in stubs if _is_shallow_beat(s, niche)]
     if not shallow:
         return

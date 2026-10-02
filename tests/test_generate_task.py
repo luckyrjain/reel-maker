@@ -934,3 +934,59 @@ def test_enrich_standard_path_guide_threads_the_guides_real_niche_through():
 
     # positional args: (stubs, context, enrichment_llm, niche)
     assert mock_enrich.call_args.args[3] == "personal finance"
+
+
+# ── _generate_from_structured_script() niche wiring (PR #36 review) ──────────
+#
+# The structured path is the main enrichment path and was never exercised by any
+# test (every test patches _generate_from_structured_script out). Reel.niche is
+# nullable, and an unset niche must keep the pre-niche-parameter football behavior
+# rather than crash or fall to the generic prompt. Runs the REAL _enrich_with_insight
+# through a capturing LLM, bailing out right after the enrich stage.
+
+class _StopAfterEnrich(Exception):
+    pass
+
+
+@pytest.mark.parametrize("niche,expected_in_prompt", [
+    ("personal finance", "content analyst for a personal finance video"),
+    (None, "football tactical analyst"),
+    ("", "football tactical analyst"),
+    ("Premier League football", "football tactical analyst"),
+])
+def test_structured_path_threads_reel_niche_into_enrichment(niche, expected_in_prompt):
+    from worker.tasks.generate import _generate_from_structured_script
+
+    captured = []
+
+    class CaptureLLM:
+        total_usage = {}
+
+        def complete(self, messages, **kwargs):
+            captured.append(messages)
+            return json.dumps([{"index": 0, "tactical_sentence":
+                                "This discipline lets him avoid panic selling during downturns"}])
+
+    stub = BeatStub(
+        index=0, beat_type="body", section="", player="Warren Buffett",
+        vo_script="Buffett holds stocks.", duration_s=5.0, on_screen_text=["x"],
+    )
+    ev = SimpleNamespace(detail={}, tokens_in=0, tokens_out=0, cost_usd=0)
+    stage_cm = MagicMock()
+    stage_cm.return_value.__enter__.return_value = ev
+    stage_cm.return_value.__exit__.return_value = False
+
+    with (
+        patch("worker.tasks.generate.get_enrichment_provider", return_value=CaptureLLM()),
+        patch("worker.tasks.generate.record_stage", stage_cm),
+        patch("worker.tasks.generate._has_conflict_beat", return_value=True),
+        patch("worker.tasks.generate.build_visuals_messages", side_effect=_StopAfterEnrich),
+    ):
+        with pytest.raises(_StopAfterEnrich):
+            _generate_from_structured_script(
+                SimpleNamespace(id=1, niche=niche), [], MagicMock(), MagicMock(), {}, [stub], "ctx",
+            )
+
+    assert ev.detail["shallow_beats"] == 1
+    system_msg = next(m["content"] for m in captured[0] if m["role"] == "system")
+    assert expected_in_prompt in system_msg
