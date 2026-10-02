@@ -7,8 +7,10 @@ players not mentioned...") to stop the LLM drifting into unrelated events.
 import json
 import re as _re
 
+from engine.generation.evaluator import _INSIGHT_TACTICAL_UNIVERSAL
 from engine.generation.script_parser import BeatStub, calc_duration, derive_on_screen
 
+_FOOTBALL_NICHES = {"football", "soccer", "futbol"}
 
 _TACTICAL_MARKERS = _re.compile(
     r"\b(allows?|enables?|because|which means|forces?|creates?|"
@@ -18,13 +20,19 @@ _TACTICAL_MARKERS = _re.compile(
 )
 
 
-def _is_shallow_beat(stub: BeatStub) -> bool:
+def _is_shallow_beat(stub: BeatStub, niche: str) -> bool:
+    """niche selects the tactical-marker vocabulary — football gets the football-specific
+    regex above, every other niche gets evaluator.py's own universal vocabulary (the same
+    niche-branching evaluator.py already does for its Insight Density axis, reused here
+    rather than re-invented — see docs/specs/2026-09-beat-enrichment-niche-branching-
+    module-design.md)."""
+    tactical_re = _TACTICAL_MARKERS if niche.lower() in _FOOTBALL_NICHES else _INSIGHT_TACTICAL_UNIVERSAL
     return (
         stub.beat_type == "body"
         and bool(stub.player)
         and (
             len(stub.vo_script.split()) < 25
-            or not _TACTICAL_MARKERS.search(stub.vo_script)
+            or not tactical_re.search(stub.vo_script)
         )
     )
 
@@ -32,23 +40,37 @@ def _is_shallow_beat(stub: BeatStub) -> bool:
 _ENRICH_BATCH = 3
 
 
-def _enrich_batch(batch: list[BeatStub], context: str, llm) -> dict[int, str]:
+def _enrich_batch(batch: list[BeatStub], context: str, llm, niche: str) -> dict[int, str]:
     beat_lines = "\n".join(
         f'  {{"index": {s.index}, "player": "{s.player}", "vo": "{s.vo_script[:100]}"}}'
         for s in batch
     )
+    is_football = niche.lower() in _FOOTBALL_NICHES
+    system_content = (
+        "You are a football tactical analyst. "
+        "Return ONLY valid JSON — a list, one object per beat, "
+        "each with 'index' (int) and 'tactical_sentence' (string)."
+    ) if is_football else (
+        f"You are a content analyst for a {niche} video. "
+        "Return ONLY valid JSON — a list, one object per beat, "
+        "each with 'index' (int) and 'tactical_sentence' (string)."
+    )
+    example = (
+        "BAD: 'Romero defends with passion.'\n"
+        "GOOD: 'Romero's line-stepping lets Argentina defend 15 yards higher, "
+        "creating turnovers in dangerous zones.'"
+    ) if is_football else (
+        "BAD: 'Buffett invests with wisdom.'\n"
+        "GOOD: 'Buffett's long-term-holding discipline lets him avoid panic-selling "
+        "during downturns, compounding returns others give up early.'"
+    )
     messages = [
-        {"role": "system", "content":
-            "You are a football tactical analyst. "
-            "Return ONLY valid JSON — a list, one object per beat, "
-            "each with 'index' (int) and 'tactical_sentence' (string)."},
+        {"role": "system", "content": system_content},
         {"role": "user", "content": (
             f"CONTEXT:\n{context[:800]}\n\n"
-            "For each beat write ONE sentence: what the player ENABLES tactically, "
-            "not how they feel. Use specific mechanisms.\n\n"
-            "BAD: 'Romero defends with passion.'\n"
-            "GOOD: 'Romero's line-stepping lets Argentina defend 15 yards higher, "
-            "creating turnovers in dangerous zones.'\n\n"
+            "For each beat write ONE sentence: what this person's expertise or action "
+            "ENABLES, not how they feel. Use specific mechanisms.\n\n"
+            f"{example}\n\n"
             "IMPORTANT: Only reference players, events, and facts already present in "
             "each beat. Do not introduce matches, tournaments, scorelines, or players "
             "not mentioned in the beat text.\n\n"
@@ -71,14 +93,14 @@ def _enrich_batch(batch: list[BeatStub], context: str, llm) -> dict[int, str]:
         return {}
 
 
-def _enrich_with_insight(stubs: list[BeatStub], context: str, llm) -> None:
-    shallow = [s for s in stubs if _is_shallow_beat(s)]
+def _enrich_with_insight(stubs: list[BeatStub], context: str, llm, niche: str = "") -> None:
+    shallow = [s for s in stubs if _is_shallow_beat(s, niche)]
     if not shallow:
         return
     stub_map = {s.index: s for s in shallow}
     for i in range(0, len(shallow), _ENRICH_BATCH):
         batch = shallow[i:i + _ENRICH_BATCH]
-        sentences = _enrich_batch(batch, context, llm)
+        sentences = _enrich_batch(batch, context, llm, niche)
         for idx, sentence in sentences.items():
             stub = stub_map.get(idx)
             if stub and sentence and len(sentence.split()) >= 5:
