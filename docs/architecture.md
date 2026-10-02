@@ -163,7 +163,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 | File | Responsibility |
 |---|---|
-| `asset_sourcer.py` | `PexelsVideoSource` + `WikipediaImageSource` (+ license metadata) + `HuggingFaceVideoSource`/`HuggingFaceImageSource`; fallback chain Wikipedia → Pexels → HF Video → HF Image → black frame; `_generate_gated_hf_asset()` — shared gate/record_stage/cost shell for both HF tiers; `resolve_or_reuse()` — per-beat asset pinning; `LocalMusicSource.find()`; `compute_pins_fingerprint()` / `compute_pins_fingerprint_for_render()` |
+| `asset_sourcer.py` | `PexelsVideoSource` + `WikipediaImageSource` (+ license metadata) + `HuggingFaceVideoSource`/`HuggingFaceImageSource`; pure selection decisions `_choose_video_file()` / `_license_from_extmetadata()` / `_image_extension()` (Phase 7z); fallback chain Wikipedia → Pexels → HF Video → HF Image → black frame; `_generate_gated_hf_asset()` — shared gate/record_stage/cost shell for both HF tiers; `resolve_or_reuse()` — per-beat asset pinning; `LocalMusicSource.find()`; `compute_pins_fingerprint()` / `compute_pins_fingerprint_for_render()` |
 | `pricing.py` | `hf_image_cost_usd()` / `hf_video_cost_usd()` — HF asset-generation cost (0 until configured) |
 | `tts.py` | `EdgeTTSProvider`/`KokoroProvider`/`SilentProvider`; `synthesize()` + `synth_to_budget()` (±25% rate adjustment); `CURATED_EDGE_VOICES` |
 | `captions.py` | `transcribe_audio()` — one Whisper pass producing both `.words` (burned-in text) and `.segments` (SRT export); no-op if Whisper isn't installed |
@@ -191,7 +191,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 ### `tests/`
 
-55 test files + `conftest.py`, **1055 tests run by default / 1056 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
+56 test files + `conftest.py`, **1126 tests run by default / 1127 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
 
 | File | Tests | File | Tests |
 |---|---|---|---|
@@ -220,7 +220,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_names.py` | 109 | `test_visual_fallback.py` | 17 |
 | `test_asset_sourcer_names.py` | 7 | `test_enqueue.py` | 13 |
 | `test_pricing.py` | 4 | `test_config.py` | 2 |
-| `test_proportional_timing.py` | 28 | | |
+| `test_proportional_timing.py` | 28 | `test_sourcer_selection.py` | 71 |
 | `test_llm_judge.py` | 3 | `test_main.py` | 3 |
 | `test_observability.py` | 3 | `test_golden_reel.py` | 1 (deselected) |
 

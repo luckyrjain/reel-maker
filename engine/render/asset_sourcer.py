@@ -43,6 +43,49 @@ def _atomic_write(path: Path, data: bytes) -> None:
         raise
 
 
+_FHD = 1920   # Pexels returns 4K by default; cap downloads at <= FHD height
+_IMAGE_EXTS = ("jpg", "jpeg", "png", "webp")
+
+
+def _choose_video_file(files: list[dict], max_height: int = _FHD) -> dict:
+    """Pick the Pexels `video_files` entry to download. `files` must be non-empty.
+
+    Order of preference: the tallest portrait file within `max_height`; else the smallest
+    portrait file (every one is over the cap); else the tallest file within the cap (no
+    portrait at all); else the first file. A square file counts as portrait.
+    """
+    portrait = [f for f in files if f.get("width", 1) <= f.get("height", 1)]
+    fhd_portrait = [f for f in portrait if f.get("height", 0) <= max_height]
+    if fhd_portrait:
+        return max(fhd_portrait, key=lambda f: f.get("height", 0))
+    if portrait:
+        return min(portrait, key=lambda f: f.get("height", 0))
+    fhd_any = [f for f in files if f.get("height", 0) <= max_height]
+    return max(fhd_any, key=lambda f: f.get("height", 0)) if fhd_any else files[0]
+
+
+def _license_from_extmetadata(meta: dict) -> dict:
+    """Map a Wikimedia `extmetadata` block to the license fields stored on an Asset.
+
+    `safe_to_publish` is True only for an exact (case-insensitive) match against
+    `_PERMISSIVE_LICENSES` — deliberately conservative: share-alike and unlisted CC
+    versions are NOT safe, and the publish gate enforces whatever this returns.
+    """
+    short = meta.get("LicenseShortName", {}).get("value", "unknown")
+    return {
+        "license": short,
+        "license_url": meta.get("LicenseUrl", {}).get("value"),
+        "attribution": _strip_html(meta.get("Artist", {}).get("value", "")),
+        "safe_to_publish": short.lower() in _PERMISSIVE_LICENSES,
+    }
+
+
+def _image_extension(url: str) -> str:
+    """File extension for a downloaded Wikipedia image; anything unrecognized is jpg."""
+    ext = url.rsplit(".", 1)[-1].split("?")[0].lower()
+    return ext if ext in _IMAGE_EXTS else "jpg"
+
+
 class WikipediaImageSource:
     _SEARCH = "https://en.wikipedia.org/w/api.php"
     _SUMMARY = "https://en.wikipedia.org/api/rest_v1/page/summary"
@@ -71,13 +114,7 @@ class WikipediaImageSource:
             pages = resp.json().get("query", {}).get("pages", {})
             page = next(iter(pages.values()), {})
             meta = (page.get("imageinfo") or [{}])[0].get("extmetadata", {})
-            short = meta.get("LicenseShortName", {}).get("value", "unknown")
-            return {
-                "license": short,
-                "license_url": meta.get("LicenseUrl", {}).get("value"),
-                "attribution": _strip_html(meta.get("Artist", {}).get("value", "")),
-                "safe_to_publish": short.lower() in _PERMISSIVE_LICENSES,
-            }
+            return _license_from_extmetadata(meta)
         except Exception:
             return {"license": "unknown", "license_url": None, "attribution": None, "safe_to_publish": False}
 
@@ -127,10 +164,7 @@ class WikipediaImageSource:
 
         local_path = None
         for img_url in candidate_urls:
-            ext = img_url.rsplit(".", 1)[-1].split("?")[0].lower()
-            if ext not in ("jpg", "jpeg", "png", "webp"):
-                ext = "jpg"
-            lp = self.store_dir / f"wiki_{page_id}.{ext}"
+            lp = self.store_dir / f"wiki_{page_id}.{_image_extension(img_url)}"
             if lp.exists():
                 local_path = lp
                 break
@@ -211,17 +245,7 @@ class PexelsVideoSource:
             if not files:
                 continue
 
-            _FHD = 1920
-            portrait = [f for f in files if f.get("width", 1) <= f.get("height", 1)]
-            fhd_portrait = [f for f in portrait if f.get("height", 0) <= _FHD]
-
-            if fhd_portrait:
-                chosen = max(fhd_portrait, key=lambda f: f.get("height", 0))
-            elif portrait:
-                chosen = min(portrait, key=lambda f: f.get("height", 0))
-            else:
-                fhd_any = [f for f in files if f.get("height", 0) <= _FHD]
-                chosen = max(fhd_any, key=lambda f: f.get("height", 0)) if fhd_any else files[0]
+            chosen = _choose_video_file(files)
 
             if not chosen.get("link"):
                 continue

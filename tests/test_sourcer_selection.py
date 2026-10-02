@@ -15,6 +15,10 @@ import httpx
 import pytest
 
 from engine.render.asset_sourcer import (
+    _FHD,
+    _choose_video_file,
+    _image_extension,
+    _license_from_extmetadata,
     HuggingFaceImageSource,
     HuggingFaceVideoSource,
     PexelsVideoSource,
@@ -138,7 +142,9 @@ def test_pexels_with_only_over_fhd_portrait_takes_the_smallest_one(tmp_path):
 
 
 def test_pexels_square_counts_as_portrait(tmp_path):
-    files = [_vf(1080, 1080), _vf(1920, 1080)]
+    # The landscape file is taller than the square one, so if the square were NOT portrait
+    # the no-portrait branch (tallest within FHD) would pick the landscape file instead.
+    files = [_vf(1080, 1080), _vf(1280, 1100)]
     _, streamed, _ = _pexels(tmp_path, [_video(1, files)])
     assert streamed == ["https://cdn/1080x1080.mp4"]
 
@@ -523,3 +529,50 @@ def test_hf_video_without_api_key_makes_no_request(tmp_path):
     with patch(f"{_MOD}.httpx.post") as post:
         assert source.generate("a prompt") is None
     post.assert_not_called()
+
+
+# ── the extracted pure decisions, directly ───────────────────────────────────
+
+def _f(w, h):
+    return {"width": w, "height": h}
+
+
+def test_choose_video_file_ladder():
+    assert _choose_video_file([_f(720, 1280), _f(1080, 1920), _f(2160, 3840)]) == _f(1080, 1920)
+    assert _choose_video_file([_f(2880, 5120), _f(2160, 3840)]) == _f(2160, 3840)
+    assert _choose_video_file([_f(1280, 720), _f(1920, 1080), _f(3840, 2160)]) == _f(1920, 1080)
+    assert _choose_video_file([_f(5120, 2880), _f(3840, 2160)]) == _f(5120, 2880)
+
+
+def test_choose_video_file_cap_boundary_is_inclusive_and_configurable():
+    assert _FHD == 1920
+    assert _choose_video_file([_f(1080, 1920), _f(1088, 1930)]) == _f(1080, 1920)
+    assert _choose_video_file([_f(540, 960), _f(720, 1280)], max_height=1000) == _f(540, 960)
+
+
+def test_choose_video_file_missing_dimensions_default_to_portrait_candidates():
+    """width defaults to 1 and height to 1: a file with no size is 'square', i.e. portrait."""
+    assert _choose_video_file([{"link": "x"}]) == {"link": "x"}
+
+
+def test_license_from_extmetadata_defaults_and_html_stripping():
+    assert _license_from_extmetadata({}) == {
+        "license": "unknown", "license_url": None, "attribution": "", "safe_to_publish": False,
+    }
+    info = _license_from_extmetadata({
+        "LicenseShortName": {"value": "CC0"},
+        "LicenseUrl": {"value": "https://u"},
+        "Artist": {"value": "<b>Jane</b> <i>Doe</i>"},
+    })
+    assert info == {
+        "license": "CC0", "license_url": "https://u",
+        "attribution": "Jane Doe", "safe_to_publish": True,
+    }
+
+
+@pytest.mark.parametrize("url,ext", [
+    ("https://x/a.jpg", "jpg"), ("https://x/a.JPEG", "jpeg"), ("https://x/a.png?x=1", "png"),
+    ("https://x/a.webp", "webp"), ("https://x/a.gif", "jpg"), ("https://x/a", "jpg"),
+])
+def test_image_extension(url, ext):
+    assert _image_extension(url) == ext
