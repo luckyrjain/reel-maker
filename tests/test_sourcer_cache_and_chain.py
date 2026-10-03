@@ -293,8 +293,8 @@ def test_flag_starts_false_on_both_hf_sources(tmp_path):
 
 
 # ── sixth pass: cache-hit return value, heal semantics, opensearch scope ─────
-# cache hit: the generator's result must still be returned (a None here is a black frame): _generate_gated_hf_asset must return the cache-hit result (return None on cache hit
-# would turn every cached re-render into a black frame)
+# _generate_gated_hf_asset must still RETURN the generator's result on a cache hit: a None here
+# would turn every cached re-render into a black frame.
 def test_gated_hf_returns_the_result_on_a_cache_hit(db_session):
     reel = models.Reel(context="x", status=models.ReelStatus.generating)
     db_session.add(reel); db_session.commit()
@@ -354,11 +354,76 @@ def test_heal_overwrites_attribution_with_none(db_session):
 # opensearch: opensearch answering 200 with a MediaWiki error object / short list is a miss, not a crash
 @pytest.mark.parametrize("payload", [{"error": {"code": "x"}}, [], ["only-query"]])
 def test_wikipedia_malformed_opensearch_is_a_miss(tmp_path, payload):
-    result, _ = _wiki(tmp_path, summary={"pageid": 1}, opensearch=payload)
+    """Must stop at the opensearch step: a usable summary is offered, and must never be requested."""
+    result, calls = _wiki(tmp_path, summary=_summary(), opensearch=payload)
     assert result is None
+    assert not any(c.startswith(AS.WikipediaImageSource._SUMMARY) for c in calls)
 
 
 # ladder: a single over-cap portrait still wins over an in-cap landscape
 def test_single_over_cap_portrait_beats_an_in_cap_landscape():
     files = [_vf(1080, 2560), _vf(1920, 1080)]
     assert _choose_video_file(files)["height"] == 2560
+
+
+# ── seventh pass: every tier supplied at once, as render_cut does ────────────
+def _hit(source, ref):
+    return SourcedAsset(source=source, source_ref=ref, local_path=Path("/x/" + ref), license_str="l",
+                        duration_s=1.0, safe_to_publish=True)
+
+
+class _Rec:
+    def __init__(self, result=None, gen=True, key="k"):
+        self.result, self.gen, self.api_key, self.calls = result, gen, key, []
+        self.last_call_was_generated = False
+
+    def search(self, *a):
+        self.calls.append(a)
+        return self.result
+
+    def generate(self, p):
+        self.calls.append(p)
+        self.last_call_was_generated = self.gen
+        return self.result
+
+
+def _all(wiki=None, pex=None, vid=None, img=None):
+    return dict(wiki=wiki or _Rec(), sourcer=pex or _Rec(), hf_video=vid or _Rec(), hf=img or _Rec())
+
+
+def _run(db, q, t):
+    return resolve_beat_assets(db, q, 5.0, t["sourcer"], wiki=t["wiki"], hf_video=t["hf_video"], hf=t["hf"])
+
+
+def test_wiki_hit_wins_over_every_other_tier_and_queries_none_of_them(db_session):
+    t = _all(wiki=_Rec(_hit("wikipedia", "w")), pex=_Rec(_hit("pexels", "p")),
+             vid=_Rec(_hit("huggingface_video", "v")), img=_Rec(_hit("huggingface", "i")))
+    out = _run(db_session, "Lionel Messi scores", t)
+    assert [a.source for a, _ in out] == ["wikipedia"]
+    assert t["sourcer"].calls == [] and t["hf_video"].calls == [] and t["hf"].calls == []
+
+
+def test_pexels_hit_wins_with_hf_tiers_present_and_never_calls_generate(db_session):
+    t = _all(pex=_Rec(_hit("pexels", "p")), vid=_Rec(_hit("huggingface_video", "v")), img=_Rec(_hit("huggingface", "i")))
+    out = _run(db_session, "stadium", t)
+    assert [a.source for a, _ in out] == ["pexels"]
+    assert t["hf_video"].calls == [] and t["hf"].calls == []
+
+
+def test_hf_video_hit_wins_and_image_tier_is_never_called(db_session):
+    t = _all(vid=_Rec(_hit("huggingface_video", "v")), img=_Rec(_hit("huggingface", "i")))
+    out = _run(db_session, "stadium", t)
+    assert [a.source for a, _ in out] == ["huggingface_video"]
+    assert t["hf"].calls == []
+
+
+def test_wiki_rate_limit_pause_sits_between_the_two_searches(db_session):
+    events = []
+
+    class W:
+        def search(self, name):
+            events.append(("search", name))
+            return None
+    with patch(f"{_MOD}.time.sleep", side_effect=lambda s: events.append(("sleep", s))):
+        resolve_beat_assets(db_session, "Lionel Messi and Cristian Romero", 5.0, _Rec(), wiki=W())
+    assert events == [("search", "Lionel Messi"), ("sleep", 0.5), ("search", "Cristian Romero")]

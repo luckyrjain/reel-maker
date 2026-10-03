@@ -578,3 +578,94 @@ def test_gated_hf_call_forwards_query_case_preserved():
         rs.return_value.__enter__.return_value = SimpleNamespace(detail={}, cost_usd=None)
         AS._generate_gated_hf_asset(MagicMock(), 1, "s", src, "Exact Q", lambda r: 0.0)
     src.generate.assert_called_once_with("Exact Q")
+
+
+# ── sixth pass: license wiring, wrong-shape bodies, Pexels ordering/rename ───
+def _meta(short, url):
+    m = {"LicenseShortName": {"value": short}}
+    if url:
+        m["LicenseUrl"] = {"value": url}
+    return m
+
+
+# 1. search() must wire safe_to_publish from the license MAPPING, not from "has a license url"
+@pytest.mark.parametrize("short,url,safe", [
+    ("CC BY-SA 4.0", "https://creativecommons.org/licenses/by-sa/4.0/", False),   # url present, NOT permissive
+    ("CC BY 4.0", None, True),                                                     # permissive, no url
+])
+def test_wikipedia_search_safe_flag_comes_from_the_license_not_url_presence(tmp_path, short, url, safe):
+    result, _ = _wiki(tmp_path, summary=_summary(), downloads={_ORIG: _bytes_resp()},
+                      license_meta=_meta(short, url))
+    assert result.license_str == short and result.safe_to_publish is safe
+
+
+# 2. wrong-SHAPE (valid JSON) license / opensearch bodies must still fail closed, never raise
+@pytest.mark.parametrize("body", [[], None, "x", {"query": None}, {"query": {"pages": []}}])
+def test_wikipedia_license_wrong_shape_json_is_unknown_and_unsafe(tmp_path, body):
+    def fake_get(url, **kw):
+        a = (kw.get("params") or {}).get("action")
+        if a == "opensearch":
+            return _json_resp(["x", ["Lionel Messi"], [], []])
+        if a == "query":
+            return _json_resp(body)
+        if url.startswith(WikipediaImageSource._SUMMARY):
+            return _json_resp(_summary())
+        return _bytes_resp(b"i")
+    with patch(f"{_MOD}.httpx.get", side_effect=fake_get):
+        r = WikipediaImageSource(tmp_path).search("Lionel Messi")
+    assert r is not None and r.license_str == "unknown" and r.safe_to_publish is False
+
+
+def test_wikipedia_opensearch_null_body_is_a_miss(tmp_path):
+    def fake_get(url, **kw):
+        return _json_resp(None)
+    with patch(f"{_MOD}.httpx.get", side_effect=fake_get):
+        assert WikipediaImageSource(tmp_path).search("Lionel Messi") is None
+
+
+# 3. a cached THUMBNAIL (not just a cached original) must be reused when the original fails
+def test_wikipedia_cached_thumbnail_is_reused_without_redownload(tmp_path):
+    orig, thumb = "https://u/x/Messi.png", "https://u/x/320px-Messi.jpg"
+    summ = {"pageid": 5, "originalimage": {"source": orig}, "thumbnail": {"source": thumb}}
+    (tmp_path / "wiki_5.jpg").write_bytes(b"cached")
+    result, calls = _wiki(tmp_path, summary=summ, downloads={orig: httpx.ConnectError("x")})
+    assert result.local_path.read_bytes() == b"cached"
+    assert thumb not in calls
+
+
+# 4. Pexels: first qualifying video in API (relevance) order wins
+@pytest.mark.parametrize("durs", [[8, 20, 12], [20, 8, 12]])
+def test_pexels_first_qualifying_video_wins_not_sorted_by_duration(tmp_path, durs):
+    vids = [_video(i + 1, [_vf(1080, 1920)], duration=d) for i, d in enumerate(durs)]
+    result, _, _ = _pexels(tmp_path, vids)
+    assert result.source_ref == "1"
+
+
+# 5. Pexels: fractional min duration is not truncated
+def test_pexels_fractional_minimum_is_not_truncated(tmp_path):
+    src = PexelsVideoSource("k", tmp_path)
+    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)], duration=5.2)]})), \
+            patch(f"{_MOD}.httpx.stream", _stream_factory([])):
+        assert src.search("q", 5.5) is None
+
+
+# 6. Pexels: long / unicode query verbatim; filename keyed by VIDEO id even if rendition has its own id
+def test_pexels_long_query_verbatim_and_filename_uses_video_id(tmp_path):
+    q = "Lionel Messi celebrating a last-minute winner in front of a roaring Buenos Aires crowd, café"
+    vid = _video(7, [{"id": 999, "width": 1080, "height": 1920, "link": "https://cdn/a.mp4"}])
+    src = PexelsVideoSource("k", tmp_path)
+    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [vid]})) as get, \
+            patch(f"{_MOD}.httpx.stream", _stream_factory([])):
+        r = src.search(q, 5.0)
+    assert get.call_args.kwargs["params"]["query"] == q
+    assert r.local_path.name == "pexels_7.mp4"
+
+
+# 7. Pexels: a failing final rename must be skipped like any other download failure, tmp cleaned
+def test_pexels_failed_rename_is_a_skip_not_a_crash_and_leaves_no_tmp(tmp_path):
+    src = PexelsVideoSource("k", tmp_path)
+    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]})), \
+            patch(f"{_MOD}.httpx.stream", _stream_factory([])), \
+            patch(f"{_MOD}.os.replace", side_effect=OSError("exdev")):
+        assert src.search("q", 5.0) is None
+    assert list(tmp_path.iterdir()) == []

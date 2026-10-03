@@ -85,7 +85,7 @@ fingerprints/filenames/headers/logging, every license-set member, ranking by hei
 width, the landscape FHD boundary, and a search-level test that a literal `+` in a filename reaches
 the license lookup unchanged (replacing a pre-existing test that only exercised `urllib.parse`).
 
-`tests/test_sourcer_contracts.py` (75), from a second independent mutation review (216 mutants,
+`tests/test_sourcer_contracts.py` (89), from a second independent mutation review (216 mutants,
 92 survivors): the fail-closed license set pinned exactly (additions are as dangerous as removals),
 `SourcedAsset`'s fail-closed default, `_atomic_write`, the four factories, `mkdir(parents)`,
 `raise_for_status`/malformed-body handling on every HTTP call, Pexels method/stale-tmp/failure paths,
@@ -99,7 +99,7 @@ lookup title decoded exactly once, no lookup for an empty filename, the 429 retr
 candidate and only on 429, near-miss and fractional duration boundaries, multi-digit video ids, any
 `image/*` content type, the gated StageEvent's `cut_id` and exact `detail`, all-whitespace HTML stripping.
 
-Mutation testing, eight batches. The author's ~28 targeted mutants found one vacuous fixture
+Mutation testing, nine batches. The author's ~28 targeted mutants found one vacuous fixture
 (square-as-portrait: a height tie let both branches pick the same file). An independent reviewer's
 ~160 mutants then found 24 gaps (above). A final ~65-mutant battery over the whole file —
 ladder comparators/min/max/keys/defaults, license set members/case/strip/default, HTML strip,
@@ -112,9 +112,12 @@ survivors. The fourth batch, the 216-mutant review above, is the one behind
 sixth, from a fourth review, added 11 tests and was re-verified the same way (12 claimed kills, 0
 survivors); a seventh, from a fifth review, added 14 to `test_sourcer_contracts.py` (15 claimed
 kills, 0 survivors); an eighth, from a sixth review (489 mutants, 7 meaningful survivors), added 11
-to `test_sourcer_cache_and_chain.py` (7 claimed kills, 0 survivors).
+to `test_sourcer_cache_and_chain.py` (7 claimed kills, 0 survivors); a ninth, from a seventh review
+(1,112 mutants, 20 meaningful survivors in 7 groups), added 14 tests to `test_sourcer_contracts.py`
+and 4 to `test_sourcer_cache_and_chain.py` (15 representative mutants covering every group
+re-verified killed, 0 survivors).
 
-`tests/test_sourcer_cache_and_chain.py` (39), from a third, fourth and sixth review: `_cache_asset` lookup
+`tests/test_sourcer_cache_and_chain.py` (43), from a third through seventh review: `_cache_asset` lookup
 and heal rules,
 `resolve_beat_assets` ordering/argument forwarding and the `reel_id=None` gate (the pre-existing
 "no StageEvent" assertions were vacuous because `record_stage` swallows the NOT NULL failure), and
@@ -127,6 +130,10 @@ the HF flag's initial value, and, from the sixth review, a cached HF asset still
 `None` would turn every cached re-render into a black frame), the license heal keyed on
 `license_url` only and overwriting `safe_to_publish`/`attribution`, the opensearch step's exception
 scope, a lone over-cap portrait beating an in-cap landscape file, and a long query reaching the HF
-tiers unchanged. Deliberately out of scope and
+tiers unchanged. The seventh review added: `safe_to_publish` wired from the license mapping and
+not from license-URL presence, wrong-shape (valid JSON) bodies failing closed, a cached Wikipedia
+thumbnail reused after the original fails, Pexels taking the first qualifying video in API order,
+a failed final rename skipped, and `resolve_beat_assets` with every tier supplied at once, as
+`render_cut` does (a skipped tier would silently trigger paid HF calls). Deliberately out of scope and
 left as separate test debt: the `resolve_or_reuse` pin ledger, `compute_pins_fingerprint`, and
 `LocalMusicSource` — the same file, but not the sourcers' selection logic this candidate is about.
