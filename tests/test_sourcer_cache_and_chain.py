@@ -269,7 +269,8 @@ def test_three_named_people_are_all_searched(db_session):
     with patch(f"{_LOG}.time.sleep"):
         out = resolve_beat_assets(db_session, "Lionel Messi, Cristian Romero and Rodrigo Palacios",
                                   1.0, _NoneSrc(), wiki=W())
-    assert len(seen) == 3 and len(out) == 3
+    assert seen == ["Lionel Messi", "Cristian Romero", "Rodrigo Palacios"]
+    assert len(out) == 3
 
 
 def test_hf_image_is_still_tried_when_the_hf_video_tier_yields_nothing(db_session):

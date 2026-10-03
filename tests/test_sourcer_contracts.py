@@ -10,6 +10,7 @@ Tests marked "characterization" pin current behavior that is not necessarily int
 import hashlib
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -24,6 +25,7 @@ from engine.render.asset_sourcer import (
     SourcedAsset,
     WikipediaImageSource,
     _atomic_write,
+    _strip_html,
     _cache_asset,
     _choose_video_file,
     get_asset_sourcer,
@@ -32,7 +34,8 @@ from engine.render.asset_sourcer import (
     get_wiki_sourcer,
 )
 from tests.test_sourcer_selection import (
-    _MOD, _ORIG, _THUMB, _bytes_resp, _hf_resp, _json_resp, _pexels, _summary, _vf, _video, _wiki,
+    _MOD, _ORIG, _THUMB, _bytes_resp, _hf_resp, _json_resp, _pexels, _stream_factory, _summary, _vf,
+    _video, _wiki,
 )
 
 
@@ -471,3 +474,107 @@ def test_hf_image_tier_stage_event_records_the_provider(db_session):
 def test_strip_html_leaves_a_bare_empty_tag_marker():
     """`<>` is not a tag (`<[^>]+>` needs at least one character): current behavior."""
     assert AS._strip_html("a<>b <i>c</i>") == "a<>b c"
+
+
+# ── fifth pass: case preservation, boundaries, retry scoping ─────────────────
+def test_strip_html_strips_all_whitespace_kinds():
+    assert _strip_html("<b>x</b>\n\t ") == "x"
+    assert _strip_html("\n<i>y</i>") == "y"
+
+
+def test_license_lookup_decodes_exactly_once(tmp_path):
+    # "%2541" is a literal "%41" in the real title; a second decode would turn it into "A".
+    orig = "https://upload.wikimedia.org/wikipedia/commons/a/ab/A%2541.jpg"
+    with patch.object(WikipediaImageSource, "_fetch_license", return_value={
+            "license": "l", "license_url": None, "attribution": None, "safe_to_publish": False}) as fl:
+        _wiki(tmp_path, summary=_summary(original=orig, thumbnail=None),
+              downloads={orig: _bytes_resp(b"i")})
+    fl.assert_called_once_with("A%41.jpg")
+
+
+def test_no_license_lookup_when_original_url_has_an_empty_filename(tmp_path):
+    orig = "https://upload.wikimedia.org/wikipedia/commons/dir/"
+    with patch.object(WikipediaImageSource, "_fetch_license") as fl:
+        result, _ = _wiki(tmp_path, summary=_summary(original=orig, thumbnail=None),
+                          downloads={orig: _bytes_resp(b"i")})
+    fl.assert_not_called()
+    assert result.safe_to_publish is False and result.license_str == "unknown"
+
+
+def test_429_retry_refetches_the_same_candidate_not_the_first(tmp_path):
+    sleeps = []
+    downloads = {_ORIG: _bytes_resp(status=500), _THUMB: [_bytes_resp(status=429), _bytes_resp(b"t")]}
+    result, calls = _wiki(tmp_path, summary=_summary(), downloads=downloads, sleeps=sleeps)
+    assert result is not None and sleeps == [2.0]
+    assert calls[-2:] == [_THUMB, _THUMB]
+
+
+def test_only_429_triggers_the_sleep_and_retry(tmp_path):
+    sleeps = []
+    downloads = {_ORIG: _bytes_resp(status=503), _THUMB: _bytes_resp(b"t")}
+    result, calls = _wiki(tmp_path, summary=_summary(), downloads=downloads, sleeps=sleeps)
+    assert sleeps == [] and calls.count(_ORIG) == 1
+
+
+def test_pexels_query_is_sent_verbatim_case_preserved(tmp_path):
+    src = PexelsVideoSource("k", tmp_path)
+    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": []})) as get:
+        src.search("Lionel MESSI Goal", 5.0)
+    assert get.call_args.kwargs["params"]["query"] == "Lionel MESSI Goal"
+
+
+def _pexels_min(tmp_path, videos, min_d):
+    src = PexelsVideoSource("k", tmp_path)
+    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": videos})), \
+            patch(f"{_MOD}.httpx.stream", _stream_factory([])):
+        return src.search("q", min_d)
+
+
+def test_pexels_duration_just_below_minimum_is_rejected(tmp_path):
+    assert _pexels_min(tmp_path, [_video(1, [_vf(1080, 1920)], duration=4)], 5.0) is None
+
+
+def test_pexels_fractional_duration_above_fractional_minimum_qualifies(tmp_path):
+    r = _pexels_min(tmp_path, [_video(1, [_vf(1080, 1920)], duration=5.5)], 5.2)
+    assert r is not None and r.duration_s == 5.5
+
+
+def test_pexels_multi_digit_video_id_is_kept_whole(tmp_path):
+    result, _, _ = _pexels(tmp_path, [_video(1234567, [_vf(1080, 1920)])])
+    assert result.source_ref == "1234567"
+    assert result.local_path.name == "pexels_1234567.mp4"
+
+
+@pytest.mark.parametrize("cls,resp", [(HuggingFaceImageSource, _hf_resp("image/png")),
+                                      (HuggingFaceVideoSource, _hf_resp("video/mp4"))])
+def test_hf_model_id_is_used_case_preserved_in_the_url(cls, resp, tmp_path):
+    src = cls(api_key="k", model="Org/Model-X.1", store_dir=tmp_path)
+    with patch(f"{_MOD}.httpx.post", return_value=resp) as post:
+        src.generate("p")
+    assert post.call_args.args[0].endswith("/Org/Model-X.1")
+
+
+def test_hf_image_accepts_any_image_content_type(tmp_path):
+    src = HuggingFaceImageSource(api_key="k", model="m", store_dir=tmp_path)
+    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("image/jpeg")):
+        assert src.generate("p") is not None
+    assert src.last_call_was_generated is True
+
+
+def test_gated_stage_event_has_no_cut_and_exact_detail(db_session):
+    from api import models
+    reel = models.Reel(context="x", status=models.ReelStatus.generating)
+    db_session.add(reel); db_session.commit()
+    src = SimpleNamespace(api_key="k", last_call_was_generated=True,
+                          generate=MagicMock(return_value=SimpleNamespace(duration_s=0.0)))
+    AS._generate_gated_hf_asset(db_session, reel.id, "asset_hf_image", src, "q", lambda r: 0.5)
+    ev = db_session.query(models.StageEvent).one()
+    assert ev.cut_id is None and ev.detail == {"cache_hit": False} and ev.cost_usd == 0.5
+
+
+def test_gated_hf_call_forwards_query_case_preserved():
+    src = SimpleNamespace(api_key="k", last_call_was_generated=False, generate=MagicMock(return_value=None))
+    with patch(f"{_MOD}.record_stage") as rs:
+        rs.return_value.__enter__.return_value = SimpleNamespace(detail={}, cost_usd=None)
+        AS._generate_gated_hf_asset(MagicMock(), 1, "s", src, "Exact Q", lambda r: 0.0)
+    src.generate.assert_called_once_with("Exact Q")

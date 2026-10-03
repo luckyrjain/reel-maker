@@ -85,7 +85,7 @@ fingerprints/filenames/headers/logging, every license-set member, ranking by hei
 width, the landscape FHD boundary, and a search-level test that a literal `+` in a filename reaches
 the license lookup unchanged (replacing a pre-existing test that only exercised `urllib.parse`).
 
-`tests/test_sourcer_contracts.py` (61), from a second independent mutation review (216 mutants,
+`tests/test_sourcer_contracts.py` (75), from a second independent mutation review (216 mutants,
 92 survivors): the fail-closed license set pinned exactly (additions are as dangerous as removals),
 `SourcedAsset`'s fail-closed default, `_atomic_write`, the four factories, `mkdir(parents)`,
 `raise_for_status`/malformed-body handling on every HTTP call, Pexels method/stale-tmp/failure paths,
@@ -93,9 +93,13 @@ HF URLs/auth/bytes/fingerprints/license fields/cache order/gif detection, `_cach
 `resolve_beat_assets` tiers. Re-running the 216-mutant harness against the merged suite leaves 12
 survivors: 11 equivalent (missing-dimension defaults Pexels always supplies, a second 429 check a
 5xx already preempts, `reel_id=0`, a tmp suffix, a docstring) and the `<>` HTML-strip case, which
-then got its own test.
+then got its own test. A fifth review (457 mutants, 15 meaningful survivors, all re-verified killed)
+added 14 more: case preservation of the Pexels query / HF model id / forwarded HF query, the license
+lookup title decoded exactly once, no lookup for an empty filename, the 429 retry refetching the same
+candidate and only on 429, near-miss and fractional duration boundaries, multi-digit video ids, any
+`image/*` content type, the gated StageEvent's `cut_id` and exact `detail`, all-whitespace HTML stripping.
 
-Mutation testing, six batches. The author's ~28 targeted mutants found one vacuous fixture
+Mutation testing, seven batches. The author's ~28 targeted mutants found one vacuous fixture
 (square-as-portrait: a height tie let both branches pick the same file). An independent reviewer's
 ~160 mutants then found 24 gaps (above). A final ~65-mutant battery over the whole file —
 ladder comparators/min/max/keys/defaults, license set members/case/strip/default, HTML strip,
@@ -105,7 +109,8 @@ cache/page-id, HF content-type/fingerprint/prefix/timeouts/headers/logging/no-ke
 survivors. The fourth batch, the 216-mutant review above, is the one behind
 `test_sourcer_contracts.py`. A fifth batch, from a third review, is behind
 `test_sourcer_cache_and_chain.py`; its 22 claimed-kill mutants were re-verified with 0 survivors; a sixth, from a fourth review,
-added 11 tests and was re-verified the same way (12 claimed kills, 0 survivors).
+added 11 tests and was re-verified the same way (12 claimed kills, 0 survivors); a seventh, from a
+fifth review, added 14 (15 claimed kills, 0 survivors).
 
 `tests/test_sourcer_cache_and_chain.py` (28), from a third and fourth review: `_cache_asset` lookup and heal rules,
 `resolve_beat_assets` ordering/argument forwarding and the `reel_id=None` gate (the pre-existing
