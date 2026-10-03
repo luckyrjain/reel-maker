@@ -9,7 +9,8 @@ behavior that is not necessarily intended. Out of scope here (separate test debt
 """
 import logging
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -21,9 +22,13 @@ from engine.render.asset_sourcer import (
     HuggingFaceVideoSource,
     SourcedAsset,
     _cache_asset,
+    _choose_video_file,
+    _image_extension,
     resolve_beat_assets,
 )
-from tests.test_sourcer_selection import _MOD, _bytes_resp, _hf_resp, _pexels, _video, _wiki
+from tests.test_sourcer_selection import (
+    _MOD, _bytes_resp, _hf_resp, _pexels, _summary, _vf, _video, _wiki,
+)
 
 _LOG = "engine.render.asset_sourcer"
 
@@ -192,3 +197,93 @@ def test_hf_video_flag_stays_false_when_the_write_fails(tmp_path):
     assert s.last_call_was_generated is False
 
 
+# ── fourth pass: list-position blind spots and chain wiring ──────────────────
+def test_tallest_fhd_portrait_wins_regardless_of_list_position():
+    files = [_vf(1080, 1280), _vf(1080, 1920), _vf(720, 960)]
+    assert _choose_video_file(files)["height"] == 1920
+
+
+def test_no_portrait_and_nothing_within_cap_returns_the_first_file_not_the_tallest():
+    files = [_vf(3840, 2160, "https://cdn/first"), _vf(5120, 2880, "https://cdn/second")]
+    assert _choose_video_file(files)["link"] == "https://cdn/first"
+
+
+def test_image_extension_with_a_real_dotted_hostname():
+    """Every earlier png/webp case used a host-less URL, so a split on the first '.' passed."""
+    assert _image_extension("https://upload.wikimedia.org/a/b/Messi.png") == "png"
+    assert _image_extension("https://upload.wikimedia.org/a/b/Messi.WEBP?x=1") == "webp"
+
+
+def test_wikipedia_summary_url_percent_encodes_parentheses(tmp_path):
+    orig = _summary()["originalimage"]["source"]
+    _, calls = _wiki(tmp_path, summary=_summary(), downloads={orig: _bytes_resp(b"i")},
+                     opensearch=["x", ["Ronaldo (footballer)"], [], []])
+    summary_calls = [c for c in calls if c.startswith(AS.WikipediaImageSource._SUMMARY)]
+    assert summary_calls == [AS.WikipediaImageSource._SUMMARY + "/Ronaldo_%28footballer%29"]
+
+
+def test_wikipedia_cache_hit_on_original_skips_every_download(tmp_path):
+    orig = "https://upload.wikimedia.org/x/Messi.jpg"
+    thumb = "https://upload.wikimedia.org/x/320px-Messi.png"
+    (tmp_path / "wiki_5.jpg").write_bytes(b"cached")
+    result, calls = _wiki(
+        tmp_path,
+        summary={"pageid": 5, "originalimage": {"source": orig}, "thumbnail": {"source": thumb}},
+        downloads={orig: _bytes_resp(b"new"), thumb: _bytes_resp(b"new")},
+    )
+    assert result.local_path == tmp_path / "wiki_5.jpg"
+    assert orig not in calls and thumb not in calls
+
+
+def test_atomic_write_propagates_the_original_error_when_the_tmp_was_never_created(tmp_path):
+    class Boom(Exception):
+        pass
+    with patch.object(Path, "write_bytes", side_effect=Boom("disk")):
+        with pytest.raises(Boom):
+            AS._atomic_write(tmp_path / "x.bin", b"d")
+
+
+def test_cache_asset_new_row_returns_the_results_local_path(db_session):
+    r = _sa("pexels", "77")
+    _, p = _cache_asset(db_session, r, "footage")
+    assert p == r.local_path
+
+
+def test_gated_hf_call_forwards_the_exact_query_to_generate():
+    src = SimpleNamespace(api_key="k", last_call_was_generated=False,
+                          generate=MagicMock(return_value=None))
+    with patch(f"{_LOG}.record_stage") as rs:
+        rs.return_value.__enter__.return_value = SimpleNamespace(detail={}, cost_usd=None)
+        AS._generate_gated_hf_asset(MagicMock(), 1, "asset_hf_image", src, " exact q ", lambda r: 0.0)
+    src.generate.assert_called_once_with(" exact q ")
+
+
+def test_three_named_people_are_all_searched(db_session):
+    seen = []
+
+    class W:
+        def search(self, name):
+            seen.append(name)
+            return _sa("wikipedia", name.split()[0], safe_to_publish=True)
+
+    with patch(f"{_LOG}.time.sleep"):
+        out = resolve_beat_assets(db_session, "Lionel Messi, Cristian Romero and Rodrigo Palacios",
+                                  1.0, _NoneSrc(), wiki=W())
+    assert len(seen) == 3 and len(out) == 3
+
+
+def test_hf_image_is_still_tried_when_the_hf_video_tier_yields_nothing(db_session):
+    class VidNone:
+        api_key, last_call_was_generated = "k", False
+
+        def generate(self, p):
+            return None
+
+    out = resolve_beat_assets(db_session, "q", 1.0, _NoneSrc(), hf_video=VidNone(),
+                              hf=_HF("huggingface"))
+    assert out[0][0] is not None and out[0][0].source == "huggingface"
+
+
+def test_flag_starts_false_on_both_hf_sources(tmp_path):
+    assert HuggingFaceImageSource("k", "m", tmp_path / "a").last_call_was_generated is False
+    assert HuggingFaceVideoSource("k", "m", tmp_path / "b").last_call_was_generated is False

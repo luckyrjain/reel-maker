@@ -95,7 +95,7 @@ survivors: 11 equivalent (missing-dimension defaults Pexels always supplies, a s
 5xx already preempts, `reel_id=0`, a tmp suffix, a docstring) and the `<>` HTML-strip case, which
 then got its own test.
 
-Mutation testing, four batches. The author's ~28 targeted mutants found one vacuous fixture
+Mutation testing, six batches. The author's ~28 targeted mutants found one vacuous fixture
 (square-as-portrait: a height tie let both branches pick the same file). An independent reviewer's
 ~160 mutants then found 24 gaps (above). A final ~65-mutant battery over the whole file —
 ladder comparators/min/max/keys/defaults, license set members/case/strip/default, HTML strip,
@@ -103,12 +103,18 @@ extension rules, Pexels endpoint/params/timeouts/redirects/chunking/tmp file/dur
 User-Agent/limit/title quoting/canonical title/decode/query strip/atomic write/429/thumbnail order/
 cache/page-id, HF content-type/fingerprint/prefix/timeouts/headers/logging/no-key guard — has 0
 survivors. The fourth batch, the 216-mutant review above, is the one behind
-`test_sourcer_contracts.py`.
+`test_sourcer_contracts.py`. A fifth batch, from a third review, is behind
+`test_sourcer_cache_and_chain.py`; its 22 claimed-kill mutants were re-verified with 0 survivors; a sixth, from a fourth review,
+added 11 tests and was re-verified the same way (12 claimed kills, 0 survivors).
 
-`tests/test_sourcer_cache_and_chain.py` (17), from a third review: `_cache_asset` lookup and heal rules,
+`tests/test_sourcer_cache_and_chain.py` (28), from a third and fourth review: `_cache_asset` lookup and heal rules,
 `resolve_beat_assets` ordering/argument forwarding and the `reel_id=None` gate (the pre-existing
 "no StageEvent" assertions were vacuous because `record_stage` swallows the NOT NULL failure), and
 adapter details (Pexels `source_ref`, Wikipedia original==thumbnail, per-candidate extension,
-page-title fallback, HF failure logging, HF flag on a failed write). Deliberately out of scope and
+page-title fallback, HF failure logging, HF flag on a failed write) and, from the fourth review
+(385 mutants, 12 meaningful survivors), list-position independence of the tallest-portrait pick,
+png/webp on a dotted host, parentheses in the summary URL, a cache hit stopping the candidate loop,
+`_atomic_write`'s original error, three named people, the HF image tier after an empty video tier, and
+the HF flag's initial value. Deliberately out of scope and
 left as separate test debt: the `resolve_or_reuse` pin ledger, `compute_pins_fingerprint`, and
 `LocalMusicSource` — the same file, but not the sourcers' selection logic this candidate is about.
