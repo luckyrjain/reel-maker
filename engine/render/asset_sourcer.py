@@ -194,7 +194,7 @@ _SAFE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 def _numeric_id(raw) -> "str | None":
-    """`str(raw)` for a non-negative int or a string of at most 20 ASCII digits, else None."""
+    """`str(raw)` for a non-negative int or an ASCII digit string whose decimal form is 1-20 digits, else None."""
     if isinstance(raw, bool):
         return None
     if isinstance(raw, int):

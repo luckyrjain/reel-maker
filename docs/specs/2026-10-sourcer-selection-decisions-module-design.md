@@ -144,7 +144,7 @@ left as separate test debt: the `resolve_or_reuse` pin ledger, `compute_pins_fin
 
 ## Follow-up fixes
 
-Three of the pre-existing gaps above were closed afterwards, tests first, one commit each.
+Three of the pre-existing gaps above were closed afterwards, one commit each (tests written first, red before the fix, and committed with it).
 
 **1. `PexelsVideoSource.search()` degrades instead of raising.** `resp.json()` and the `videos`
 list are now read inside the request `try` (a non-JSON body, or a body that is not an object with a
@@ -177,7 +177,7 @@ cap the body, Wikipedia image downloads moved from `httpx.get` to `httpx.stream`
 once after 2 s is unchanged). The check guards the download only: a file already cached on disk is
 served without a request, as before.
 
-Test changes beyond the new `tests/test_sourcer_download_guards.py` (191 tests; 100 before review rounds 1-2): the three tests
+Test changes beyond the new `tests/test_sourcer_download_guards.py` (199 tests; 100 before the review rounds): the three tests
 that pinned `follow_redirects=True` now pin `False`; fake image hosts (`https://x/...`, `https://u/...`)
 became `upload.wikimedia.org`; and the legacy Wikipedia fakes, which describe a download as a
 response returned from a patched `httpx.get`, are adapted to `httpx.stream` by one autouse fixture
@@ -206,11 +206,11 @@ summary URL cannot encode it, so `search()` returns `None`.
 float, negative, traversal, Arabic-Indic digits, trailing newline, 21 digits, a 5000-character id),
 Wikipedia page-id fallback, plain-title identity, digest ids for unsafe titles, the 5000-character
 title (no `ENAMETOOLONG`), digest determinism and cache reuse. Follow-up 1 replaced one test in
-`test_sourcer_contracts.py` (the `ValueError` characterization) and added 35 more (89 -> 124).
+`test_sourcer_contracts.py` (the `ValueError` characterization) and added 24 more (89 -> 113); review rounds 1-2 added 11 more (-> 124).
 
 ### Review round 1 (deep 4-persona review of PR #43)
 
-No exploitable allowlist or redirect bypass was found. Fixed afterwards, tests first:
+No exploitable allowlist or redirect bypass was found. Fixed afterwards (tests written first):
 
 - **`_pick` could still raise** on a 400-digit `duration` (`OverflowError` from `float()`), and JSON
   `NaN`/`Infinity` passed as durations. Now `math.isfinite` first, and `ArithmeticError` joins the
@@ -248,7 +248,7 @@ skipped (now visible as a WARNING) and the render falls through to HF or a black
 Round 2 of the same 4-persona review confirmed round 1's host-differential (300k fuzzed URL mutations,
 0 mismatches against `httpx.URL`), gzip, NaN/overflow and malformed-summary fixes closed, a 95-scenario
 old-vs-new differential showed only the intended divergences, and a live fetch of a real
-`upload.wikimedia.org` image passed the stricter guard. It found, and this round fixed (tests first):
+`upload.wikimedia.org` image passed the stricter guard (the Pexels host was not checked live). It found, and this round fixed (tests written first):
 
 - **The deadline still did not fire for a slow body.** `iter_bytes(chunk_size=65536)` makes httpx buffer
   64 KB before yielding anything, so the per-chunk check ran only per 64 KB (1 byte every 0.1 s: still
@@ -274,3 +274,26 @@ Known and left open (unchanged): no content sniffing, uncapped JSON/HF responses
 `_title_id` on case-insensitive filesystems, empty (0-byte) 200 bodies are cached by the existing
 `exists()` caches, and the JSON API calls (`opensearch`, summary, `imageinfo`, Pexels search) still send
 the default `Accept-Encoding: gzip`.
+
+### Review round 3
+
+Round 3 confirmed round 2's fixes (a real-httpx trickle now stops at the deadline through `_open_download`
++ `_iter_capped` and through the real `search()` paths; a redirect chain and the 429 retry share one
+budget; a 20 MB body downloads in ~0.02 s with `iter_bytes()`; 200k tiny chunks in ~1.5 s) and found no
+defect of medium severity or higher. Fixed (tests first): `_host_for_log` raised on bytes input and had a
+dead `.lower()`; four test gaps from a 104-mutant audit (the Pexels body sharing the connect-phase budget,
+the pre-hop deadline boundary, the exact 253-character host bound, a hostile host reaching the log raw
+through the download path); dead test code and a stale test name. Documented instead of changed, as
+deliberate scope decisions:
+
+- **A dripped chunked-encoding size line / chunk extension, or response headers**, produce no body event,
+  so the deadline never runs (h11 caps the line at ~80 KB; a byte per read-timeout is ~110 days). A
+  socket-shutdown watchdog (`threading.Timer` on the connection's socket) fixed it in a prototype, but it
+  reaches into httpx's `network_stream` extension; left as a follow-up.
+- **A read can overrun the budget by up to its httpx timeout** (the timeout is not clamped to the time
+  remaining).
+- **`SoftTimeLimitExceeded` is swallowed** by the pre-existing broad `except Exception` in the Pexels and
+  Wikipedia loops (same on `main`), so the real outer bound is the hard limit (soft + 120 s, then the
+  reaper), not the soft one. Re-raising it in both loops is a follow-up.
+- A deterministic shared `.tmp` name means two concurrent renders downloading the same asset could truncate
+  each other (render concurrency is 1; pre-existing).
