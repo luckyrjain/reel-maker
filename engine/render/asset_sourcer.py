@@ -218,6 +218,30 @@ class PexelsVideoSource:
         self.store_dir = store_dir
         store_dir.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _pick(video, min_duration_s: float) -> "tuple[str, float, str] | None":
+        """(id, duration_s, download link) for a usable search hit, else None.
+
+        The response is remote JSON: a missing or null field, or a value of the wrong type,
+        skips just this hit (like a too-short one) rather than raising into the render task.
+        """
+        try:
+            duration = video.get("duration")
+            if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+                return None
+            if duration < min_duration_s:
+                return None
+            files = video.get("video_files", [])
+            if not files:
+                return None
+            link = _choose_video_file(files).get("link")
+            if not link or not isinstance(link, str):
+                return None
+            return str(video["id"]), float(duration), link
+        except (KeyError, TypeError, ValueError, AttributeError):
+            _log.warning("Skipping a malformed Pexels search result", exc_info=True)
+            return None
+
     def search(self, query: str, min_duration_s: float) -> SourcedAsset | None:
         if not self.api_key:
             return None
@@ -235,30 +259,24 @@ class PexelsVideoSource:
                 timeout=30.0,
             )
             resp.raise_for_status()
+            videos = resp.json().get("videos", [])
+            if not isinstance(videos, list):
+                return None
         except Exception:
             return None
 
-        for video in resp.json().get("videos", []):
-            if video.get("duration", 0) < min_duration_s:
+        for video in videos:
+            picked = self._pick(video, min_duration_s)
+            if picked is None:
                 continue
-
-            files = video.get("video_files", [])
-            if not files:
-                continue
-
-            chosen = _choose_video_file(files)
-
-            if not chosen.get("link"):
-                continue
-
-            vid_id = str(video["id"])
+            vid_id, duration, link = picked
             local_path = self.store_dir / f"pexels_{vid_id}.mp4"
 
             if not local_path.exists():
                 tmp_path = local_path.with_suffix(".tmp")
                 try:
                     with httpx.stream(
-                        "GET", chosen["link"], follow_redirects=True, timeout=120.0
+                        "GET", link, follow_redirects=True, timeout=120.0
                     ) as r:
                         r.raise_for_status()
                         with open(tmp_path, "wb") as fh:
@@ -277,7 +295,7 @@ class PexelsVideoSource:
                 license_url="https://www.pexels.com/license/",
                 attribution=None,
                 safe_to_publish=True,
-                duration_s=float(video["duration"]),
+                duration_s=duration,
             )
 
         return None
