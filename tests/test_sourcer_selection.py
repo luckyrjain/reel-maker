@@ -807,7 +807,7 @@ def test_pexels_download_goes_through_a_tmp_file_in_chunks(tmp_path):
     @contextmanager
     def fake_stream(method, url, **kw):
         r = MagicMock(); r.raise_for_status.side_effect = None
-        def it(chunk_size):
+        def it(chunk_size=None):
             state["chunk"] = chunk_size
             state["final_exists_mid_write"] = (tmp_path / "pexels_1.mp4").exists()
             yield b"x"
@@ -816,7 +816,8 @@ def test_pexels_download_goes_through_a_tmp_file_in_chunks(tmp_path):
     with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]})), \
             patch(f"{_MOD}.httpx.stream", fake_stream):
         assert PexelsVideoSource("k", tmp_path).search("q", 1.0) is not None
-    assert state == {"chunk": 65536, "final_exists_mid_write": False}
+    # chunk_size is deliberately NOT passed (httpx would buffer 64 KB before the deadline check runs)
+    assert state == {"chunk": None, "final_exists_mid_write": False}
 
 
 def test_pexels_http_error_status_on_the_download_is_a_failure(tmp_path):
