@@ -57,10 +57,9 @@ change. A Wikipedia page with a thumbnail but no original image gets no license 
 Pre-existing, found by the security reviews and left out of this refactor (follow-ups, none
 introduced here):
 
-- The Wikipedia `page_id` fallback (the page title) and the Pexels video id are interpolated into
-  local filenames from remote JSON. The fixed `wiki_`/`pexels_` prefix means a `/` fails the write
-  inside a `try` rather than escaping `store_dir` (no traversal), but `wiki_{page_id}` is unbounded
-  in length, so an over-long title can raise `ENAMETOOLONG` from `lp.exists()` outside the `try`.
+- ~~The Wikipedia `page_id` fallback (the page title) and the Pexels video id are interpolated into
+  local filenames from remote JSON; an over-long title can raise `ENAMETOOLONG`~~ — fixed
+  (follow-up 3, see "Follow-up fixes" below).
 - ~~Download URLs come straight from remote JSON with no host check, redirects are followed, no
   size cap~~ — fixed for the Pexels and Wikipedia downloads (follow-up 2, see "Follow-up fixes"
   below). Still open: no size cap on HuggingFace `resp.content` (fixed host, trusted API, but the
@@ -184,3 +183,18 @@ response returned from a patched `httpx.get`, are adapted to `httpx.stream` by o
 sourcer test files) instead of rewriting ~60 call sites. Mutation-checked: dropping the host check,
 either size check, the redirect bound, relative-`Location` resolution, the scheme, userinfo, port,
 `wikimedia` exactness and apex checks, or `follow_redirects=False` each fails a test.
+
+**3. Ids that become file names are validated.** `pexels_{id}.mp4` and `wiki_{id}.{ext}` are built
+from remote JSON. A Pexels id must now be a non-negative integer (not a bool) or a string of at most
+20 ASCII digits (`_numeric_id`; `fullmatch` on `[0-9]`, so a trailing newline or Arabic-Indic digits
+do not pass); a hit with any other id is skipped like any other malformed hit, before the cache is
+consulted. A Wikipedia page id uses the same numeric rule; when `pageid` is missing or unusable the
+id comes from the underscored title (`_title_id`): the title itself if it is `[A-Za-z0-9_-]{1,64}`
+(so `Lionel_Messi` still gives `wiki_Lionel_Messi.jpg`, byte-identical to before), otherwise `t` plus
+the first 16 hex of its SHA-256 (deterministic, so the cache still hits). That removes the
+`ENAMETOOLONG` from `lp.exists()` (a 5000-character title now works) and means `/`, `..`, `.`,
+control characters and non-ASCII never reach a path. Behavior change for the fallback only: an
+accented or dotted title without a `pageid` used to be cached as `wiki_<that title>.jpg` and is now
+`wiki_t<digest>.jpg` (one re-download; the Wikipedia summary endpoint returns `pageid` for real
+pages, so this is a defensive path). A title with a lone surrogate was already unreachable: the
+summary URL cannot encode it, so `search()` returns `None`.
