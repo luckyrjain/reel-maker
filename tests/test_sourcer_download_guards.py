@@ -543,55 +543,125 @@ def test_iter_capped_never_yields_a_chunk_past_the_cap():
     assert got == [b"123456"]
 
 
-def test_iter_capped_passes_the_chunk_size_to_the_response():
+def test_iter_capped_does_not_ask_for_a_fixed_chunk_size():
+    """A fixed size makes httpx buffer 64 KB before yielding, so a slow body is never checked."""
     seen = {}
     class R(_Resp):
         def iter_bytes(self, chunk_size=None):
             seen["n"] = chunk_size
             return iter([b"a"])
     list(AS._iter_capped(R(), 10))
-    assert seen["n"] == 65536
+    assert seen["n"] is None
+
+
+def test_real_httpx_the_deadline_is_checked_on_every_network_read():
+    """Real httpx buffers to `chunk_size` bytes if one is given: 50 bytes would arrive as ONE chunk."""
+    def body():
+        for _ in range(5):
+            yield b"a" * 10
+    with httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(200, content=body()))) as c:
+        with c.stream("GET", "https://videos.pexels.com/x.mp4") as r:
+            clock = _fake_clock(1.0, 2.0, 999.0)
+            AS._monotonic, saved = clock, AS._monotonic
+            try:
+                got = []
+                with pytest.raises(ValueError, match="too slow|deadline"):
+                    for chunk in AS._iter_capped(r, 1000, deadline_at=100.0):
+                        got.append(chunk)
+            finally:
+                AS._monotonic = saved
+    assert len(got) == 2
 
 
 # ── a wall-clock deadline (httpx timeouts are per read, so a trickle never trips them) ────────
 
+def _fake_clock(*ticks, after=999.0):
+    """A clock returning `ticks` in order, then `after` forever (no zero-slack StopIteration)."""
+    it = iter(ticks)
+    return lambda: next(it, after)
+
+
 def test_a_body_that_takes_too_long_is_cut_off_even_if_each_read_is_fast(monkeypatch):
-    clock = iter([0.0, 5.0, 50.0, 500.0])
-    monkeypatch.setattr(AS, "_monotonic", lambda: next(clock))
+    monkeypatch.setattr(AS, "_monotonic", _fake_clock(5.0, 50.0, 500.0))
     got = []
     with pytest.raises(ValueError, match="too slow|deadline"):
-        for c in AS._iter_capped(_Resp(chunks=(b"a", b"b", b"c")), 100, deadline_s=100.0):
+        for c in AS._iter_capped(_Resp(chunks=(b"a", b"b", b"c")), 100, deadline_at=100.0):
             got.append(c)
     assert got == [b"a", b"b"]
 
 
 def test_a_body_within_the_deadline_is_read_in_full(monkeypatch):
-    clock = iter([0.0, 1.0, 2.0, 3.0])
-    monkeypatch.setattr(AS, "_monotonic", lambda: next(clock))
-    assert list(AS._iter_capped(_Resp(chunks=(b"a", b"b", b"c")), 100, deadline_s=100.0)) == [b"a", b"b", b"c"]
+    monkeypatch.setattr(AS, "_monotonic", _fake_clock(1.0, 2.0, 3.0))
+    assert list(AS._iter_capped(_Resp(chunks=(b"a", b"b", b"c")), 100, deadline_at=100.0)) == [b"a", b"b", b"c"]
+
+
+def test_reaching_the_deadline_exactly_is_still_allowed(monkeypatch):
+    monkeypatch.setattr(AS, "_monotonic", _fake_clock(100.0, 100.5))
+    got = []
+    with pytest.raises(ValueError):
+        for c in AS._iter_capped(_Resp(chunks=(b"a", b"b")), 100, deadline_at=100.0):
+            got.append(c)
+    assert got == [b"a"]                                        # `>` not `>=`: the 100.0 tick passes
 
 
 def test_the_deadlines_are_sane_numbers():
-    assert 60 <= AS._IMAGE_DEADLINE_S <= AS._VIDEO_DEADLINE_S <= 3600
+    assert 60 <= AS._IMAGE_DEADLINE_S < AS._VIDEO_DEADLINE_S <= 3600
 
 
-def test_pexels_a_trickling_download_is_dropped_and_leaves_no_tmp(tmp_path, monkeypatch):
+def test_pexels_uses_the_video_deadline_and_not_the_image_one(tmp_path, monkeypatch):
     monkeypatch.setattr(AS, "_VIDEO_DEADLINE_S", 10.0)
-    clock = iter([0.0, 1.0, 999.0])
-    monkeypatch.setattr(AS, "_monotonic", lambda: next(clock))
+    monkeypatch.setattr(AS, "_IMAGE_DEADLINE_S", 1e9)
+    # caller: deadline_at = 0 + 10; hop check at 0; chunk a at 1; chunk b at 999 (> 10)
+    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 1.0, 999.0))
     stream = _Stream({PEXELS_OK: _Resp(chunks=(b"a", b"b"))})
     assert _pexels(tmp_path, [_video(1, [_vf(1080, 1920, link=PEXELS_OK)])], stream) is None
     assert list(tmp_path.iterdir()) == []
 
 
-def test_wikipedia_a_trickling_original_falls_back_to_the_thumbnail(tmp_path, monkeypatch):
+def test_pexels_a_download_inside_the_video_deadline_is_kept_even_past_the_image_one(tmp_path, monkeypatch):
+    monkeypatch.setattr(AS, "_VIDEO_DEADLINE_S", 1e9)
     monkeypatch.setattr(AS, "_IMAGE_DEADLINE_S", 10.0)
-    # original: start 0, first chunk at 1, second chunk at 999 (past the deadline); thumbnail: 0, 1
-    clock = iter([0.0, 1.0, 999.0, 0.0, 1.0])
-    monkeypatch.setattr(AS, "_monotonic", lambda: next(clock))
+    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 1.0, 999.0))
+    stream = _Stream({PEXELS_OK: _Resp(chunks=(b"a", b"b"))})
+    assert _pexels(tmp_path, [_video(1, [_vf(1080, 1920, link=PEXELS_OK)])], stream).local_path.read_bytes() == b"ab"
+
+
+def test_wikipedia_uses_the_image_deadline_and_not_the_video_one(tmp_path, monkeypatch):
+    monkeypatch.setattr(AS, "_IMAGE_DEADLINE_S", 10.0)
+    monkeypatch.setattr(AS, "_VIDEO_DEADLINE_S", 1e9)
+    # original: deadline_at 10, hop at 0, chunk a at 1, chunk b at 999 -> cut off.
+    # thumbnail: deadline_at 0 + 10, hop at 0, chunk at 1 -> kept.
+    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 1.0, 999.0, 0.0, 0.0, 1.0))
     stream = _Stream({WIKI_OK: _Resp(chunks=(b"a", b"b")), WIKI_THUMB: _Resp(chunks=(b"t",))})
     result = _wiki(tmp_path, _summary(), stream)
     assert stream.urls == [WIKI_OK, WIKI_THUMB] and result.local_path.read_bytes() == b"t"
+
+
+def test_wikipedia_a_download_inside_the_image_deadline_is_kept_even_past_the_video_one(tmp_path, monkeypatch):
+    monkeypatch.setattr(AS, "_IMAGE_DEADLINE_S", 1e9)
+    monkeypatch.setattr(AS, "_VIDEO_DEADLINE_S", 10.0)
+    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 1.0, 999.0))
+    stream = _Stream({WIKI_OK: _Resp(chunks=(b"a", b"b"))})
+    assert _wiki(tmp_path, _summary(thumbnail=None), stream).local_path.read_bytes() == b"ab"
+
+
+def test_the_budget_covers_the_redirect_hops_too(tmp_path, monkeypatch):
+    """A chain of slow-to-answer hops cannot each get a fresh budget."""
+    other = "https://videos.pexels.com/video-files/2/b.mp4"
+    monkeypatch.setattr(AS, "_VIDEO_DEADLINE_S", 10.0)
+    # deadline_at 10; first hop at 0 (ok); second hop at 999 -> refused before it is requested
+    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 999.0))
+    stream = _Stream({PEXELS_OK: _redirect(other), other: _Resp()})
+    assert _pexels(tmp_path, [_video(1, [_vf(1080, 1920, link=PEXELS_OK)])], stream) is None
+    assert stream.urls == [PEXELS_OK]
+
+
+def test_the_budget_covers_the_429_retry_too(tmp_path, monkeypatch):
+    monkeypatch.setattr(AS, "_IMAGE_DEADLINE_S", 10.0)
+    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 999.0))
+    stream = _Stream({WIKI_OK: [_Resp(status=429), _Resp(chunks=(b"ok",))]})
+    assert _wiki(tmp_path, _summary(thumbnail=None), stream) is None
+    assert stream.urls == [WIKI_OK]                             # the retry was refused: budget spent
 
 
 # ── guard rejections are logged (host only), not silent ───────────────────────────────────────
@@ -652,16 +722,6 @@ def test_real_httpx_a_gzip_response_is_rejected_and_identity_was_requested(tmp_p
     assert requested == ["identity"] and list(tmp_path.iterdir()) == []
 
 
-def test_real_httpx_content_length_header_is_read_case_insensitively(tmp_path, monkeypatch):
-    monkeypatch.setattr(AS, "_MAX_VIDEO_BYTES", 10)
-    def handler(request):
-        return httpx.Response(200, content=b"x" * 11)
-    src = PexelsVideoSource(api_key="k", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920, link=PEXELS_OK)])]})), \
-            patch(f"{_MOD}.httpx.stream", _real_stream(handler)):
-        assert src.search("q", 1.0) is None
-
-
 # ── Wikipedia: malformed summary JSON degrades instead of raising ────────────────────────────
 
 @pytest.mark.parametrize("summary", [
@@ -685,3 +745,46 @@ def test_wikipedia_a_malformed_original_does_not_stop_a_valid_thumbnail(tmp_path
     summary = {"pageid": 4, "originalimage": {"source": 5}, "thumbnail": {"source": WIKI_THUMB}}
     result = _wiki(tmp_path, summary, _Stream({WIKI_THUMB: _Resp(chunks=(b"t",))}))
     assert result.local_path.read_bytes() == b"t"
+
+
+def test_userinfo_in_a_rejected_url_is_never_logged(tmp_path, caplog):
+    caplog.set_level("WARNING", logger=AS.__name__)
+    _pexels(tmp_path, [_video(1, [_vf(1080, 1920, link="https://user:secret@evil.example/a.mp4")])], _Stream({}))
+    assert "evil.example" in caplog.text and "secret" not in caplog.text and "user" not in caplog.text.replace("Refusing", "")
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("https://evil.example/x?token=1", "evil.example"),
+    ("https://EVIL.example/x", "evil.example"),
+    ("https://evil\x1bc\x07.com/x", "?"),
+    ("https://a.com\x85ERROR fake/x", "?"),
+    ("https://" + "a" * 300 + ".com/x", "?"),
+    ("https://[::1/x", "?"),
+    ("not a url", "?"),
+    ("", "?"),
+    (5, "?"),
+    (None, "?"),
+])
+def test_host_for_log_returns_a_short_plain_host_or_a_placeholder(url, expected):
+    assert AS._host_for_log(url) == expected
+
+
+def test_a_malformed_pexels_hit_is_logged_with_its_traceback(tmp_path, caplog):
+    caplog.set_level("WARNING", logger=AS.__name__)
+    _pexels(tmp_path, [{"duration": 10, "video_files": [_vf(1080, 1920)]}], _Stream({}))      # no id
+    rec = [r for r in caplog.records if "malformed Pexels" in r.getMessage()]
+    assert len(rec) == 1 and rec[0].levelname == "WARNING" and rec[0].exc_info
+
+
+def test_a_literal_non_ascii_path_character_is_accepted():
+    assert AS._wikimedia_url_ok("https://upload.wikimedia.org/wikipedia/commons/a/ab/\u00c9.jpg") is True
+
+
+def test_real_httpx_a_declared_content_length_over_the_cap_is_rejected_on_its_own(tmp_path, monkeypatch):
+    """The body is within the cap, so only the Content-Length check can reject this one."""
+    monkeypatch.setattr(AS, "_MAX_VIDEO_BYTES", 10)
+    def handler(request):
+        return httpx.Response(200, content=b"x" * 10, headers={"content-length": "11"})
+    r = httpx.Response(200, content=b"x" * 10, headers={"Content-Length": "11"})
+    with pytest.raises(ValueError, match="Content-Length"):
+        list(AS._iter_capped(r, 10))

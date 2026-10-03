@@ -56,8 +56,11 @@ _MAX_VIDEO_BYTES = 250 * 1024 * 1024   # FHD portrait Pexels clips are tens of M
 _MAX_IMAGE_BYTES = 50 * 1024 * 1024    # Wikipedia originals are rarely over ~20 MB
 _MAX_REDIRECTS = 3
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
-_CHUNK = 65536
-# httpx timeouts are per read, so a body that trickles in never trips them: bound the wall clock too.
+# httpx timeouts are per read, so a server that trickles never trips them: each download also gets a
+# wall-clock budget, shared by its redirect hops / 429 retry and checked on every network read.
+# Not covered: a server dripping response *headers* just inside the read timeout (h11 caps that at
+# ~16 KB), and the up-to-15 Pexels hits / 2 Wikipedia candidates each getting their own budget -- the
+# render task's soft_time_limit is the outer bound.
 _VIDEO_DEADLINE_S = 600.0
 _IMAGE_DEADLINE_S = 120.0
 _monotonic = time.monotonic     # indirection so tests can drive a fake clock
@@ -103,19 +106,26 @@ def _wikimedia_url_ok(url) -> bool:
 
 
 def _host_for_log(url) -> str:
-    """Host of `url` for a log line (never the path or query, which may carry tokens)."""
+    """Host of `url` for a log line: a short plain `[a-z0-9.-]` host, else "?".
+
+    Never the path, query or userinfo (tokens), and never raw control characters or an unbounded
+    string from a hostile upstream.
+    """
     try:
-        return urllib.parse.urlsplit(url).hostname or "?"
-    except ValueError:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except (ValueError, AttributeError):
         return "?"
+    return host if len(host) <= 253 and _HOST_RE.fullmatch(host) else "?"
 
 
 @contextmanager
-def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = None):
+def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = None,
+                   deadline_at: "float | None" = None):
     """Stream a GET of `url`, following redirects by hand so every hop is checked by `url_ok`.
 
     Raises ValueError for a disallowed URL (first or redirected), a redirect with no Location, or
-    more than `_MAX_REDIRECTS` hops. Yields the final (non-redirect) response; the caller still
+    more than `_MAX_REDIRECTS` hops, or if the wall-clock `deadline_at` has passed before a hop.
+    Yields the final (non-redirect) response; the caller still
     owns `raise_for_status()` and the status handling. `Accept-Encoding: identity` is always sent
     (media is not worth compressing, and a gzip body would inflate far past its Content-Length
     before the size cap could see it); `_iter_capped` rejects a response that is encoded anyway.
@@ -126,6 +136,8 @@ def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = N
         "headers": {**(headers or {}), "Accept-Encoding": "identity"},
     }
     for _ in range(_MAX_REDIRECTS + 1):
+        if deadline_at is not None and _monotonic() > deadline_at:
+            raise ValueError("download too slow: deadline exceeded before the request")
         if not url_ok(url):
             _log.warning("Refusing download from a disallowed URL (host %s)", _host_for_log(url))
             raise ValueError(f"download URL not allowed: {url!r}")
@@ -140,11 +152,13 @@ def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = N
     raise ValueError("too many redirects")
 
 
-def _iter_capped(r, limit: int, deadline_s: "float | None" = None):
-    """Yield `r`'s body in chunks; ValueError once it exceeds `limit` bytes or `deadline_s` seconds.
+def _iter_capped(r, limit: int, deadline_at: "float | None" = None):
+    """Yield `r`'s body in chunks; ValueError once it exceeds `limit` bytes or passes `deadline_at`.
 
     Also refuses a response with a non-identity Content-Encoding, whose decoded size is not what
-    Content-Length (or the network read) says.
+    Content-Length (or the network read) says. `iter_bytes()` is called without a chunk size on
+    purpose: with one, httpx buffers that many bytes before yielding anything, so a slow body would
+    never reach the deadline check; without it, every network read does.
     """
     encoding = r.headers.get("content-encoding")
     if isinstance(encoding, str) and encoding.strip().lower() not in ("", "identity"):
@@ -155,14 +169,13 @@ def _iter_capped(r, limit: int, deadline_s: "float | None" = None):
         declared = None
     if declared is not None and declared > limit:
         raise ValueError(f"download too large: Content-Length {declared} > {limit}")
-    started = _monotonic() if deadline_s is not None else 0.0
     total = 0
-    for chunk in r.iter_bytes(chunk_size=_CHUNK):
+    for chunk in r.iter_bytes():
         total += len(chunk)
         if total > limit:
             raise ValueError(f"download too large: more than {limit} bytes")
-        if deadline_s is not None and _monotonic() - started > deadline_s:
-            raise ValueError(f"download too slow: deadline of {deadline_s} s exceeded")
+        if deadline_at is not None and _monotonic() > deadline_at:
+            raise ValueError("download too slow: deadline exceeded")
         yield chunk
 
 
@@ -274,11 +287,13 @@ class WikipediaImageSource:
         A 429 is retried once after a 2 s pause. Any other failure raises (the caller moves on
         to the next candidate URL).
         """
+        deadline_at = _monotonic() + _IMAGE_DEADLINE_S
         for attempt in (0, 1):
-            with _open_download(url, _wikimedia_url_ok, timeout=30.0, headers=self._HEADERS) as r:
+            with _open_download(url, _wikimedia_url_ok, timeout=30.0, headers=self._HEADERS,
+                                deadline_at=deadline_at) as r:
                 if r.status_code != 429:
                     r.raise_for_status()
-                    return b"".join(_iter_capped(r, _MAX_IMAGE_BYTES, _IMAGE_DEADLINE_S))
+                    return b"".join(_iter_capped(r, _MAX_IMAGE_BYTES, deadline_at))
             if attempt == 0:
                 time.sleep(2.0)
         return None
@@ -449,10 +464,12 @@ class PexelsVideoSource:
             if not local_path.exists():
                 tmp_path = local_path.with_suffix(".tmp")
                 try:
-                    with _open_download(link, _pexels_url_ok, timeout=120.0) as r:
+                    deadline_at = _monotonic() + _VIDEO_DEADLINE_S
+                    with _open_download(link, _pexels_url_ok, timeout=120.0,
+                                        deadline_at=deadline_at) as r:
                         r.raise_for_status()
                         with open(tmp_path, "wb") as fh:
-                            for chunk in _iter_capped(r, _MAX_VIDEO_BYTES, _VIDEO_DEADLINE_S):
+                            for chunk in _iter_capped(r, _MAX_VIDEO_BYTES, deadline_at):
                                 fh.write(chunk)
                     os.replace(tmp_path, local_path)
                 except Exception:

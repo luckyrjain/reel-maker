@@ -295,6 +295,15 @@ def test_pexels_a_cached_file_is_not_served_for_a_hit_with_an_unusable_link(tmp_
         assert PexelsVideoSource("k", tmp_path).search("q", 1.0) is None
 
 
+@pytest.mark.parametrize("dur", [True, False])
+def test_pexels_a_bool_duration_is_not_a_number_even_when_it_would_pass_the_minimum(tmp_path, dur):
+    """`True` == 1, so with a 0.5 s minimum only the bool guard can reject it."""
+    vids = [{"id": 1, "duration": dur, "video_files": [_vf(1080, 1920)]}]
+    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": vids})), \
+            patch(f"{_MOD}.httpx.stream", _stream_factory([])):
+        assert PexelsVideoSource("k", tmp_path).search("q", 0.0 if dur is False else 0.5) is None
+
+
 def test_pexels_missing_duration_is_skipped_even_with_no_minimum(tmp_path):
     """No `duration` is not "0 seconds": with min_duration_s=0 it used to KeyError at the end."""
     src = PexelsVideoSource(api_key="k", store_dir=tmp_path)
