@@ -271,6 +271,12 @@ _GOOD = _video(9, [_vf(1080, 1920)])
     {"id": 1, "duration": 10, "video_files": [None]},
     {"id": 1, "duration": 10, "video_files": None},
     {"id": 1, "duration": 10, "video_files": [{"width": 1080, "height": 1920, "link": 5}]},
+    {"id": 1, "duration": True, "video_files": [_vf(1080, 1920)]},          # a bool is not a duration
+    {"id": 1, "duration": False, "video_files": [_vf(1080, 1920)]},
+    {"id": 1, "duration": 10**400, "video_files": [_vf(1080, 1920)]},        # float() would OverflowError
+    {"id": 1, "duration": float("inf"), "video_files": [_vf(1080, 1920)]},   # json.loads accepts Infinity/NaN
+    {"id": 1, "duration": float("-inf"), "video_files": [_vf(1080, 1920)]},
+    {"id": 1, "duration": float("nan"), "video_files": [_vf(1080, 1920)]},
     None, "x", 3, [],
 ], ids=lambda b: repr(b)[:50])
 def test_pexels_a_malformed_video_entry_is_skipped_not_raised(tmp_path, bad):
@@ -278,6 +284,15 @@ def test_pexels_a_malformed_video_entry_is_skipped_not_raised(tmp_path, bad):
     result, streamed, _ = _pexels(tmp_path, [bad, _GOOD])
     assert result is not None and result.source_ref == "9"
     assert streamed == [_GOOD["video_files"][0]["link"]]
+
+
+@pytest.mark.parametrize("bad_link", [None, "", 5])
+def test_pexels_a_cached_file_is_not_served_for_a_hit_with_an_unusable_link(tmp_path, bad_link):
+    (tmp_path / "pexels_1.mp4").write_bytes(b"cached")
+    vid = {"id": 1, "duration": 10, "video_files": [{"width": 1080, "height": 1920, "link": bad_link}]}
+    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [vid]})), \
+            patch(f"{_MOD}.httpx.stream", _stream_factory([])):
+        assert PexelsVideoSource("k", tmp_path).search("q", 1.0) is None
 
 
 def test_pexels_missing_duration_is_skipped_even_with_no_minimum(tmp_path):

@@ -653,7 +653,8 @@ def test_pexels_endpoint_timeouts_and_redirect_options(tmp_path):
         source.search("q", 1.0)
     assert get.call_args.args[0] == "https://api.pexels.com/videos/search"
     assert get.call_args.kwargs["timeout"] == 30.0
-    assert seen == {"follow_redirects": False, "timeout": 120.0}   # redirects are followed by hand, hop-checked
+    assert seen == {"follow_redirects": False, "timeout": 120.0,   # redirects are followed by hand, hop-checked
+                    "headers": {"Accept-Encoding": "identity"}}
 
 
 def test_pexels_partial_download_leaves_no_tmp_file(tmp_path):
@@ -689,7 +690,7 @@ def test_wikipedia_every_request_carries_the_user_agent_params_and_timeouts(tmp_
     run()
     ua = {"User-Agent": "reel-maker/1.0"}
     assert len(seen) == 4
-    assert all(kw["headers"] == ua for _, kw in seen)
+    assert all(kw["headers"] == ua for _, kw in seen[:3])      # API calls: User-Agent only
     assert seen[0][1]["params"] == {"action": "opensearch", "search": "Leo Messi", "limit": 1, "format": "json"}
     assert seen[0][1]["timeout"] == 10.0
     # summary URL is built from the *canonical* title returned by opensearch, underscored and percent-encoded
@@ -699,6 +700,7 @@ def test_wikipedia_every_request_carries_the_user_agent_params_and_timeouts(tmp_
                                     "prop": "imageinfo", "iiprop": "extmetadata", "format": "json"}
     assert seen[2][1]["timeout"] == 10.0
     assert seen[3][1]["follow_redirects"] is False and seen[3][1]["timeout"] == 30.0
+    assert seen[3][1]["headers"] == {**ua, "Accept-Encoding": "identity"}
 
 
 def test_wikipedia_429_retry_keeps_headers_redirects_and_timeout(tmp_path):
@@ -711,7 +713,7 @@ def test_wikipedia_429_retry_keeps_headers_redirects_and_timeout(tmp_path):
         return _bytes_resp(status=429)
     with patch(f"{_MOD}.httpx.get", side_effect=fake_get), patch(f"{_MOD}.time.sleep"):
         assert WikipediaImageSource(tmp_path).search("Lionel Messi") is None
-    assert len(seen) == 2 and all(k["headers"] == {"User-Agent": "reel-maker/1.0"} and k["follow_redirects"] is False and k["timeout"] == 30.0 for k in seen)
+    assert len(seen) == 2 and all(k["headers"] == {"User-Agent": "reel-maker/1.0", "Accept-Encoding": "identity"} and k["follow_redirects"] is False and k["timeout"] == 30.0 for k in seen)
 
 
 def test_wikipedia_download_is_written_atomically(tmp_path):
