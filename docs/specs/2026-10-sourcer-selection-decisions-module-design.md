@@ -61,11 +61,10 @@ introduced here):
   local filenames from remote JSON. The fixed `wiki_`/`pexels_` prefix means a `/` fails the write
   inside a `try` rather than escaping `store_dir` (no traversal), but `wiki_{page_id}` is unbounded
   in length, so an over-long title can raise `ENAMETOOLONG` from `lp.exists()` outside the `try`.
-- Download URLs (`chosen["link"]` for Pexels, `originalimage`/`thumbnail` `source` for Wikipedia)
-  come straight from remote JSON with no host check at all, and redirects are then followed — blind
-  SSRF if an upstream response is tampered with. The Pexels bytes are saved as `.mp4` and handed to
-  MoviePy/ffmpeg, which probes by content. Precondition is a hostile or compromised upstream over
-  HTTPS (low to medium). There is also no size cap on downloads or on HuggingFace `resp.content`.
+- ~~Download URLs come straight from remote JSON with no host check, redirects are followed, no
+  size cap~~ — fixed for the Pexels and Wikipedia downloads (follow-up 2, see "Follow-up fixes"
+  below). Still open: no size cap on HuggingFace `resp.content` (fixed host, trusted API, but the
+  body is read whole into memory).
 - `_strip_html` is a naive regex and `Artist` is editable by any Commons uploader (attribution only
   reaches published captions; no template renders it).
 - ~~Pexels `video["id"]` missing raises `KeyError`, `duration: null` / `height: null` raise
@@ -156,3 +155,32 @@ list are now read inside the request `try` (a non-JSON body, or a body that is n
 not an object skips just that hit (logged at WARNING) and the loop moves on to the next. A missing
 `duration` is now "skip" even with `min_duration_s <= 0` (it used to `KeyError` at the end). Successful
 searches are unchanged; the one test that pinned `ValueError` propagation now pins `None`.
+
+**2. Guarded downloads (Pexels video, Wikipedia image).** Every download is now https-only to an
+expected host: `*.pexels.com` (`_pexels_url_ok`; the apex and look-alikes such as `evilpexels.com`,
+`videos.pexels.com.evil.com`, `videos.pexels.com@evil.com` are rejected) and `upload.wikimedia.org`
+(`_wikimedia_url_ok`; both `originalimage.source` and `thumbnail.source` point at it, as the
+existing fakes' URLs already did). `_https_host()` additionally rejects userinfo, any port but 443,
+a trailing-dot host and a non-ASCII netloc (`str.lower()` maps U+212A "K" to ASCII `k`). The Pexels
+`link` shape is `https://videos.pexels.com/video-files/<id>/<id>-hd_1080_1920_25fps.mp4`; the
+test fakes used `https://cdn/...` and were moved to that shape.
+
+Redirects: httpx is never asked to follow them. `_open_download()` streams one hop at a time with
+`follow_redirects=False`, re-validates each `Location` (relative ones resolved against the current
+URL) with the same predicate, and gives up after `_MAX_REDIRECTS` (3) hops, so an allowed host
+cannot bounce the worker to an arbitrary one. Size: `_iter_capped()` rejects a declared
+`Content-Length` over the cap before reading and otherwise counts bytes, raising as soon as the
+cap is exceeded (`_MAX_VIDEO_BYTES` 250 MB, `_MAX_IMAGE_BYTES` 50 MB); a Pexels partial `.tmp` is
+removed and the next hit tried, an oversized Wikipedia original falls back to the thumbnail. To
+cap the body, Wikipedia image downloads moved from `httpx.get` to `httpx.stream` (the 429 retry
+once after 2 s is unchanged). The check guards the download only: a file already cached on disk is
+served without a request, as before.
+
+Test changes beyond the new `tests/test_sourcer_download_guards.py` (100 tests): the three tests
+that pinned `follow_redirects=True` now pin `False`; fake image hosts (`https://x/...`, `https://u/...`)
+became `upload.wikimedia.org`; and the legacy Wikipedia fakes, which describe a download as a
+response returned from a patched `httpx.get`, are adapted to `httpx.stream` by one autouse fixture
+(`_wikipedia_downloads_via_get_fakes` in `test_sourcer_selection.py`, re-exported to the other
+sourcer test files) instead of rewriting ~60 call sites. Mutation-checked: dropping the host check,
+either size check, the redirect bound, relative-`Location` resolution, the scheme, userinfo, port,
+`wikimedia` exactness and apex checks, or `follow_redirects=False` each fails a test.
