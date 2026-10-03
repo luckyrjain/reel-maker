@@ -4,6 +4,7 @@ import os
 import re
 import time
 import urllib.parse
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,6 +42,91 @@ def _atomic_write(path: Path, data: bytes) -> None:
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
+
+
+# ── guarded downloads ────────────────────────────────────────────────────────
+# Download URLs (Pexels `link`, Wikipedia `originalimage`/`thumbnail` `source`) come straight from
+# remote JSON, so a tampered or compromised upstream response could otherwise point the worker at
+# any URL (blind SSRF) or hand it an unbounded body. Every download is https-only to an expected
+# host, re-checked on each redirect hop (httpx is never asked to follow redirects itself), and
+# size-capped.
+
+_MAX_VIDEO_BYTES = 250 * 1024 * 1024   # FHD portrait Pexels clips are tens of MB
+_MAX_IMAGE_BYTES = 50 * 1024 * 1024    # Wikipedia originals are rarely over ~20 MB
+_MAX_REDIRECTS = 3
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+_CHUNK = 65536
+
+
+def _https_host(url) -> "str | None":
+    """Lowercased host of an https URL on the default port with no userinfo, else None."""
+    if not isinstance(url, str):
+        return None
+    try:
+        parts = urllib.parse.urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme != "https" or parts.username is not None or parts.password is not None:
+        return None
+    if port not in (None, 443):
+        return None
+    if not parts.netloc.isascii():      # hostname.lower() would map e.g. U+212A (Kelvin) to "k"
+        return None
+    return (parts.hostname or "").lower() or None
+
+
+def _pexels_url_ok(url) -> bool:
+    """`*.pexels.com` (videos.pexels.com serves the files), not the apex or a look-alike."""
+    host = _https_host(url)
+    return host is not None and host.endswith(".pexels.com") and host != ".pexels.com" \
+        and ".." not in host
+
+
+def _wikimedia_url_ok(url) -> bool:
+    """upload.wikimedia.org: the image CDN both `originalimage` and `thumbnail` point at."""
+    return _https_host(url) == "upload.wikimedia.org"
+
+
+@contextmanager
+def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = None):
+    """Stream a GET of `url`, following redirects by hand so every hop is checked by `url_ok`.
+
+    Raises ValueError for a disallowed URL (first or redirected), a redirect with no Location, or
+    more than `_MAX_REDIRECTS` hops. Yields the final (non-redirect) response; the caller still
+    owns `raise_for_status()` and the status handling.
+    """
+    kwargs = {"follow_redirects": False, "timeout": timeout}
+    if headers is not None:
+        kwargs["headers"] = headers
+    for _ in range(_MAX_REDIRECTS + 1):
+        if not url_ok(url):
+            raise ValueError(f"download URL not allowed: {url!r}")
+        with httpx.stream("GET", url, **kwargs) as r:
+            if r.status_code not in _REDIRECT_STATUSES:
+                yield r
+                return
+            location = r.headers.get("location")
+        if not location or not isinstance(location, str):
+            raise ValueError(f"redirect without a Location from {url!r}")
+        url = urllib.parse.urljoin(url, location)
+    raise ValueError("too many redirects")
+
+
+def _iter_capped(r, limit: int):
+    """Yield `r`'s body in chunks, raising ValueError as soon as it exceeds `limit` bytes."""
+    try:
+        declared = int(r.headers.get("content-length"))
+    except (TypeError, ValueError):
+        declared = None
+    if declared is not None and declared > limit:
+        raise ValueError(f"download too large: Content-Length {declared} > {limit}")
+    total = 0
+    for chunk in r.iter_bytes(chunk_size=_CHUNK):
+        total += len(chunk)
+        if total > limit:
+            raise ValueError(f"download too large: more than {limit} bytes")
+        yield chunk
 
 
 _FHD = 1920   # Pexels returns 4K by default; cap downloads at <= FHD height
@@ -118,6 +204,21 @@ class WikipediaImageSource:
         except Exception:
             return {"license": "unknown", "license_url": None, "attribution": None, "safe_to_publish": False}
 
+    def _download(self, url: str) -> "bytes | None":
+        """Image bytes from a checked, size-capped GET; None if rate-limited twice.
+
+        A 429 is retried once after a 2 s pause. Any other failure raises (the caller moves on
+        to the next candidate URL).
+        """
+        for attempt in (0, 1):
+            with _open_download(url, _wikimedia_url_ok, timeout=30.0, headers=self._HEADERS) as r:
+                if r.status_code != 429:
+                    r.raise_for_status()
+                    return b"".join(_iter_capped(r, _MAX_IMAGE_BYTES))
+            if attempt == 0:
+                time.sleep(2.0)
+        return None
+
     def search(self, person_name: str) -> "SourcedAsset | None":
         try:
             resp = httpx.get(
@@ -170,14 +271,10 @@ class WikipediaImageSource:
                 local_path = lp
                 break
             try:
-                r = httpx.get(img_url, headers=self._HEADERS, timeout=30.0, follow_redirects=True)
-                if r.status_code == 429:
-                    time.sleep(2.0)
-                    r = httpx.get(img_url, headers=self._HEADERS, timeout=30.0, follow_redirects=True)
-                if r.status_code == 429:
+                content = self._download(img_url)
+                if content is None:
                     continue
-                r.raise_for_status()
-                _atomic_write(lp, r.content)
+                _atomic_write(lp, content)
                 local_path = lp
                 break
             except Exception:
@@ -275,12 +372,10 @@ class PexelsVideoSource:
             if not local_path.exists():
                 tmp_path = local_path.with_suffix(".tmp")
                 try:
-                    with httpx.stream(
-                        "GET", link, follow_redirects=True, timeout=120.0
-                    ) as r:
+                    with _open_download(link, _pexels_url_ok, timeout=120.0) as r:
                         r.raise_for_status()
                         with open(tmp_path, "wb") as fh:
-                            for chunk in r.iter_bytes(chunk_size=65536):
+                            for chunk in _iter_capped(r, _MAX_VIDEO_BYTES):
                                 fh.write(chunk)
                     os.replace(tmp_path, local_path)
                 except Exception:

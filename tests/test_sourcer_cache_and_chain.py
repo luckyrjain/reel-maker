@@ -29,7 +29,8 @@ from engine.render.asset_sourcer import (
     _image_extension,
     resolve_beat_assets,
 )
-from tests.test_sourcer_selection import (
+from tests.test_sourcer_selection import (  # noqa: F401  (the autouse fixture is re-exported on purpose)
+    _wikipedia_downloads_via_get_fakes,
     _MOD, _bytes_resp, _hf_resp, _json_resp, _pexels, _stream_factory, _summary, _vf, _video, _wiki,
 )
 from tests.test_asset_sourcer_cost import _FakeHFSource, _asset_result
@@ -140,7 +141,7 @@ def test_reel_id_none_never_enters_record_stage_even_with_an_api_key(db_session)
 
 # ---- Pexels / Wikipedia -----------------------------------------------------------------------
 def test_pexels_source_ref_is_the_video_id_not_the_chosen_files_id(tmp_path):
-    vid = _video(7, [{"id": 999, "width": 1080, "height": 1920, "link": "https://cdn/a.mp4"}])
+    vid = _video(7, [{"id": 999, "width": 1080, "height": 1920, "link": "https://videos.pexels.com/video-files/a.mp4"}])
     result, _, _ = _pexels(tmp_path, [vid])
     assert result.source_ref == "7"
 
@@ -162,7 +163,7 @@ def test_wikipedia_missing_pageid_falls_back_to_the_underscored_page_title_not_t
 
 
 def test_wikipedia_each_candidate_gets_its_own_extension_and_success_stops_the_loop(tmp_path):
-    orig, thumb = "https://u/x/Messi.png", "https://u/x/320px-Messi.jpg"
+    orig, thumb = "https://upload.wikimedia.org/x/Messi.png", "https://upload.wikimedia.org/x/320px-Messi.jpg"
     result, calls = _wiki(tmp_path, summary={"pageid": 5, "originalimage": {"source": orig},
                                              "thumbnail": {"source": thumb}},
                           downloads={orig: httpx.ConnectError("x"), thumb: _bytes_resp(b"t")})
@@ -208,8 +209,8 @@ def test_tallest_fhd_portrait_wins_regardless_of_list_position():
 
 
 def test_no_portrait_and_nothing_within_cap_returns_the_first_file_not_the_tallest():
-    files = [_vf(3840, 2160, "https://cdn/first"), _vf(5120, 2880, "https://cdn/second")]
-    assert _choose_video_file(files)["link"] == "https://cdn/first"
+    files = [_vf(3840, 2160, "https://videos.pexels.com/video-files/first"), _vf(5120, 2880, "https://videos.pexels.com/video-files/second")]
+    assert _choose_video_file(files)["link"] == "https://videos.pexels.com/video-files/first"
 
 
 def test_image_extension_with_a_real_dotted_hostname():

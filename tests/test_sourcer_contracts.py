@@ -33,7 +33,8 @@ from engine.render.asset_sourcer import (
     get_hf_video_sourcer,
     get_wiki_sourcer,
 )
-from tests.test_sourcer_selection import (
+from tests.test_sourcer_selection import (  # noqa: F401  (the autouse fixture is re-exported on purpose)
+    _wikipedia_downloads_via_get_fakes,
     _MOD, _ORIG, _THUMB, _bytes_resp, _hf_resp, _json_resp, _pexels, _stream_factory, _summary, _vf,
     _video, _wiki,
 )
@@ -315,7 +316,7 @@ def test_pexels_non_http_download_errors_still_skip_to_next(tmp_path):
     def fake_stream(method, url, **kw):
         if "bad" in url: raise OSError("disk full")
         r = MagicMock(); r.iter_bytes.return_value = iter([b"v"]); yield r
-    vids = [_video(1, [_vf(1080, 1920, link="https://cdn/bad.mp4")]), _video(2, [_vf(1080, 1920)])]
+    vids = [_video(1, [_vf(1080, 1920, link="https://videos.pexels.com/video-files/bad.mp4")]), _video(2, [_vf(1080, 1920)])]
     with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": vids})), patch(f"{_MOD}.httpx.stream", fake_stream):
         assert PexelsVideoSource("k", tmp_path).search("q", 1.0).source_ref == "2"
 
@@ -697,7 +698,7 @@ def test_pexels_fractional_minimum_is_not_truncated(tmp_path):
 # 6. Pexels: long / unicode query verbatim; filename keyed by VIDEO id even if rendition has its own id
 def test_pexels_long_query_verbatim_and_filename_uses_video_id(tmp_path):
     q = "Lionel Messi celebrating a last-minute winner in front of a roaring Buenos Aires crowd, café"
-    vid = _video(7, [{"id": 999, "width": 1080, "height": 1920, "link": "https://cdn/a.mp4"}])
+    vid = _video(7, [{"id": 999, "width": 1080, "height": 1920, "link": "https://videos.pexels.com/video-files/a.mp4"}])
     src = PexelsVideoSource("k", tmp_path)
     with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [vid]})) as get, \
             patch(f"{_MOD}.httpx.stream", _stream_factory([])):
