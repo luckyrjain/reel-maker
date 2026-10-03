@@ -108,11 +108,13 @@ User-Agent/limit/title quoting/canonical title/decode/query strip/atomic write/4
 cache/page-id, HF content-type/fingerprint/prefix/timeouts/headers/logging/no-key guard — has 0
 survivors. The fourth batch, the 216-mutant review above, is the one behind
 `test_sourcer_contracts.py`. A fifth batch, from a third review, is behind
-`test_sourcer_cache_and_chain.py`; its 22 claimed-kill mutants were re-verified with 0 survivors; a sixth, from a fourth review,
-added 11 tests and was re-verified the same way (12 claimed kills, 0 survivors); a seventh, from a
-fifth review, added 14 (15 claimed kills, 0 survivors).
+`test_sourcer_cache_and_chain.py`; its 22 claimed-kill mutants were re-verified with 0 survivors. A
+sixth, from a fourth review, added 11 tests and was re-verified the same way (12 claimed kills, 0
+survivors); a seventh, from a fifth review, added 14 to `test_sourcer_contracts.py` (15 claimed
+kills, 0 survivors).
 
-`tests/test_sourcer_cache_and_chain.py` (28), from a third and fourth review: `_cache_asset` lookup and heal rules,
+`tests/test_sourcer_cache_and_chain.py` (28), from a third and fourth review: `_cache_asset` lookup
+and heal rules,
 `resolve_beat_assets` ordering/argument forwarding and the `reel_id=None` gate (the pre-existing
 "no StageEvent" assertions were vacuous because `record_stage` swallows the NOT NULL failure), and
 adapter details (Pexels `source_ref`, Wikipedia original==thumbnail, per-candidate extension,
