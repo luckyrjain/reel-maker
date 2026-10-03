@@ -240,12 +240,57 @@ def test_pexels_200_without_a_videos_key_is_none(tmp_path):
         assert PexelsVideoSource("k", tmp_path).search("q", 1.0) is None
 
 
-def test_pexels_malformed_search_json_currently_propagates_characterization(tmp_path):
+def test_pexels_malformed_search_json_is_none(tmp_path):
     bad = _json_resp(None); bad.json.side_effect = ValueError("x")
-    # characterization, not endorsement: json() is outside the try, so it propagates
     with patch(f"{_MOD}.httpx.get", return_value=bad):
-        with pytest.raises(ValueError):
-            PexelsVideoSource("k", tmp_path).search("q", 1.0)
+        assert PexelsVideoSource("k", tmp_path).search("q", 1.0) is None
+
+
+@pytest.mark.parametrize("body", [[], "oops", 7, None, {"videos": None}, {"videos": "x"}, {"videos": {"a": 1}}])
+def test_pexels_wrong_shape_search_body_is_none(tmp_path, body):
+    streamed = []
+    with patch(f"{_MOD}.httpx.get", return_value=_json_resp(body)), \
+            patch(f"{_MOD}.httpx.stream", _stream_factory(streamed)):
+        assert PexelsVideoSource("k", tmp_path).search("q", 1.0) is None
+    assert streamed == []
+
+
+_GOOD = _video(9, [_vf(1080, 1920)])
+
+
+@pytest.mark.parametrize("bad", [
+    {"duration": 10, "video_files": [_vf(1080, 1920)]},                      # no id
+    {"id": 1, "video_files": [_vf(1080, 1920)]},                             # no duration
+    {"id": 1, "duration": None, "video_files": [_vf(1080, 1920)]},
+    {"id": 1, "duration": "10", "video_files": [_vf(1080, 1920)]},
+    {"id": 1, "duration": 10, "video_files": [{"width": None, "height": None, "link": "https://videos.pexels.com/a.mp4"}]},
+    {"id": 1, "duration": 10, "video_files": [{"width": 1080, "height": None, "link": "https://videos.pexels.com/a.mp4"}]},
+    {"id": 1, "duration": 10, "video_files": [{"width": "1080", "height": 1920, "link": "https://videos.pexels.com/a.mp4"}]},
+    {"id": 1, "duration": 10, "video_files": "nope"},
+    {"id": 1, "duration": 10, "video_files": [None]},
+    {"id": 1, "duration": 10, "video_files": None},
+    {"id": 1, "duration": 10, "video_files": [{"width": 1080, "height": 1920, "link": 5}]},
+    None, "x", 3, [],
+], ids=lambda b: repr(b)[:50])
+def test_pexels_a_malformed_video_entry_is_skipped_not_raised(tmp_path, bad):
+    """One bad entry must not abort the search: the good entry after it is still used."""
+    result, streamed, _ = _pexels(tmp_path, [bad, _GOOD])
+    assert result is not None and result.source_ref == "9"
+    assert streamed == [_GOOD["video_files"][0]["link"]]
+
+
+def test_pexels_missing_duration_is_skipped_even_with_no_minimum(tmp_path):
+    """No `duration` is not "0 seconds": with min_duration_s=0 it used to KeyError at the end."""
+    src = PexelsVideoSource(api_key="k", store_dir=tmp_path)
+    vids = [{"id": 1, "video_files": [_vf(1080, 1920)]}]
+    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": vids})), \
+            patch(f"{_MOD}.httpx.stream", _stream_factory([])):
+        assert src.search("q", 0.0) is None
+
+
+def test_pexels_only_malformed_entries_is_none(tmp_path):
+    result, streamed, _ = _pexels(tmp_path, [{"duration": 10}, None])
+    assert result is None and streamed == []
 
 
 def test_pexels_download_uses_a_get_stream(tmp_path):

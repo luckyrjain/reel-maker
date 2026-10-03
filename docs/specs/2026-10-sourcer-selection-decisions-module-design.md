@@ -40,8 +40,8 @@ extracted code, as do 41 of the 42 pre-existing sourcer tests (the 42nd, a stdli
 including malformed values, with identical fakes) comparing results, exceptions, request sequences
 and files: no divergence. The exception scope is unchanged — `_license_from_extmetadata` is still
 called inside `_fetch_license`'s `try`, while `_choose_video_file`/`_image_extension` are still
-outside any `try`, so a `null` width/height in a Pexels file still raises `TypeError` out of
-`search()` exactly as before (pre-existing, not pinned, not changed).
+outside any `try`, so a `null` width/height in a Pexels file still raised `TypeError` out of
+`search()` exactly as before (fixed afterwards, see "Follow-up fixes").
 
 One deliberate bug fix, in its own commit: the Wikipedia summary URL used `quote()`'s default
 `safe="/"`, so a title containing a slash ("AC/DC") requested `.../summary/AC/DC` rather than one
@@ -68,10 +68,9 @@ introduced here):
   HTTPS (low to medium). There is also no size cap on downloads or on HuggingFace `resp.content`.
 - `_strip_html` is a naive regex and `Artist` is editable by any Commons uploader (attribution only
   reaches published captions; no template renders it).
-- Pexels `video["id"]` missing raises `KeyError`, `duration: null` / `height: null` raise
-  `TypeError`, and a 200 response with a non-JSON body raises `ValueError` from `resp.json()` — all
-  outside any `try` in `search()`, so they propagate into the render task (pinned for the last one
-  as characterization).
+- ~~Pexels `video["id"]` missing raises `KeyError`, `duration: null` / `height: null` raise
+  `TypeError`, and a non-JSON 200 body raises `ValueError`~~ — fixed (follow-up 1, see
+  "Follow-up fixes" below).
 - The publish gate checks the license string only, not that an attribution is present: bare
   `CC BY` / 2.0 / 4.0 with no `Artist` is "safe" with an empty attribution, which
   `build_attribution_block` then omits. `LicenseShortName` is itself uploader-editable, so
@@ -144,3 +143,16 @@ after the query split, per-instance `store_dir`, the gated provider literal, the
 settings on every call, and `%`/`?` escaped in the summary URL. Deliberately out of scope and
 left as separate test debt: the `resolve_or_reuse` pin ledger, `compute_pins_fingerprint`, and
 `LocalMusicSource` — the same file, but not the sourcers' selection logic this candidate is about.
+
+## Follow-up fixes
+
+Three of the pre-existing gaps above were closed afterwards, tests first, one commit each.
+
+**1. `PexelsVideoSource.search()` degrades instead of raising.** `resp.json()` and the `videos`
+list are now read inside the request `try` (a non-JSON body, or a body that is not an object with a
+`videos` list, gives `None`). Each hit is validated by `PexelsVideoSource._pick()`, which returns
+`(id, duration_s, link)` or `None`: a missing/`null`/non-numeric `duration`, a missing `id`, a
+`video_files` entry with a `null` or non-numeric width/height, a non-string `link`, or a hit that is
+not an object skips just that hit (logged at WARNING) and the loop moves on to the next. A missing
+`duration` is now "skip" even with `min_duration_s <= 0` (it used to `KeyError` at the end). Successful
+searches are unchanged; the one test that pinned `ValueError` propagation now pins `None`.
