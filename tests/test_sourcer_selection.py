@@ -53,7 +53,7 @@ def _bytes_resp(content=b"img", status=200):
 
 def _vf(width, height, link=None):
     """A Pexels video_files entry; `link` defaults to a URL that encodes the size."""
-    return {"width": width, "height": height, "link": link or f"https://cdn/{width}x{height}.mp4"}
+    return {"width": width, "height": height, "link": link or f"https://videos.pexels.com/video-files/{width}x{height}.mp4"}
 
 
 def _video(vid_id, files, duration=10):
@@ -82,6 +82,29 @@ def _pexels(tmp_path, videos, *, fail_urls=()):
             patch(f"{_MOD}.httpx.stream", _stream_factory(streamed, fail_urls)):
         result = source.search("messi", min_duration_s=5.0)
     return result, streamed, get
+
+
+@pytest.fixture(autouse=True)
+def _wikipedia_downloads_via_get_fakes():
+    """Serve `httpx.stream` from whatever `httpx.get` is patched to in these legacy fakes.
+
+    Wikipedia image downloads used to be `httpx.get(...)`; they are `httpx.stream(...)` now (so
+    the body can be size-capped), but these tests' URL-dispatching fakes still describe a download
+    as a `_bytes_resp` returned from `httpx.get`. This adapts one to the other so the fakes keep
+    pinning the same selection/caching/429 behavior; the streaming-specific guards (host check,
+    redirects, size cap) are tested in test_sourcer_download_guards.py with real stream fakes.
+    Pexels tests patch `httpx.stream` themselves, which takes precedence over this.
+    """
+    @contextmanager
+    def stream_from_get(method, url, **kwargs):
+        resp = httpx.get(url, **kwargs)
+        content = resp.content
+        resp.headers = {}
+        resp.iter_bytes = lambda chunk_size=None: iter([content])
+        yield resp
+
+    with patch(f"{_MOD}.httpx.stream", stream_from_get):
+        yield
 
 
 # ── PexelsVideoSource.search ─────────────────────────────────────────────────
@@ -134,13 +157,13 @@ def test_pexels_skips_a_video_with_no_files(tmp_path):
 def test_pexels_prefers_the_tallest_portrait_file_within_fhd(tmp_path):
     files = [_vf(720, 1280), _vf(1080, 1920), _vf(2160, 3840)]
     _, streamed, _ = _pexels(tmp_path, [_video(1, files)])
-    assert streamed == ["https://cdn/1080x1920.mp4"]
+    assert streamed == ["https://videos.pexels.com/video-files/1080x1920.mp4"]
 
 
 def test_pexels_with_only_over_fhd_portrait_takes_the_smallest_one(tmp_path):
     files = [_vf(2880, 5120), _vf(2160, 3840)]
     _, streamed, _ = _pexels(tmp_path, [_video(1, files)])
-    assert streamed == ["https://cdn/2160x3840.mp4"]
+    assert streamed == ["https://videos.pexels.com/video-files/2160x3840.mp4"]
 
 
 def test_pexels_square_counts_as_portrait(tmp_path):
@@ -148,50 +171,50 @@ def test_pexels_square_counts_as_portrait(tmp_path):
     # the no-portrait branch (tallest within FHD) would pick the landscape file instead.
     files = [_vf(1080, 1080), _vf(1280, 1100)]
     _, streamed, _ = _pexels(tmp_path, [_video(1, files)])
-    assert streamed == ["https://cdn/1080x1080.mp4"]
+    assert streamed == ["https://videos.pexels.com/video-files/1080x1080.mp4"]
 
 
 def test_pexels_with_no_portrait_takes_the_tallest_landscape_within_fhd(tmp_path):
     files = [_vf(1280, 720), _vf(1920, 1080), _vf(3840, 2160)]
     _, streamed, _ = _pexels(tmp_path, [_video(1, files)])
-    assert streamed == ["https://cdn/1920x1080.mp4"]
+    assert streamed == ["https://videos.pexels.com/video-files/1920x1080.mp4"]
 
 
 def test_pexels_with_nothing_within_fhd_and_no_portrait_takes_the_first_file(tmp_path):
     files = [_vf(5120, 2880), _vf(3840, 2160)]
     _, streamed, _ = _pexels(tmp_path, [_video(1, files)])
-    assert streamed == ["https://cdn/5120x2880.mp4"]
+    assert streamed == ["https://videos.pexels.com/video-files/5120x2880.mp4"]
 
 
 def test_pexels_a_portrait_file_beats_a_taller_landscape_one(tmp_path):
     files = [_vf(1080, 1920), _vf(1920, 1080), _vf(3840, 2160)]
     _, streamed, _ = _pexels(tmp_path, [_video(1, files)])
-    assert streamed == ["https://cdn/1080x1920.mp4"]
+    assert streamed == ["https://videos.pexels.com/video-files/1080x1920.mp4"]
 
 
 def test_pexels_chosen_file_without_a_link_skips_to_the_next_video(tmp_path):
     no_link = {"width": 1080, "height": 1920, "link": None}
     result, streamed, _ = _pexels(tmp_path, [_video(1, [no_link]), _video(2, [_vf(720, 1280)])])
     assert result.source_ref == "2"
-    assert streamed == ["https://cdn/720x1280.mp4"]
+    assert streamed == ["https://videos.pexels.com/video-files/720x1280.mp4"]
 
 
 def test_pexels_download_failure_skips_to_the_next_video_and_leaves_no_partial(tmp_path):
     videos = [
-        _video(1, [_vf(1080, 1920, link="https://cdn/bad.mp4")]),
-        _video(2, [_vf(1080, 1920, link="https://cdn/good.mp4")]),
+        _video(1, [_vf(1080, 1920, link="https://videos.pexels.com/video-files/bad.mp4")]),
+        _video(2, [_vf(1080, 1920, link="https://videos.pexels.com/video-files/good.mp4")]),
     ]
-    result, streamed, _ = _pexels(tmp_path, videos, fail_urls={"https://cdn/bad.mp4"})
+    result, streamed, _ = _pexels(tmp_path, videos, fail_urls={"https://videos.pexels.com/video-files/bad.mp4"})
     assert result.source_ref == "2"
-    assert streamed == ["https://cdn/bad.mp4", "https://cdn/good.mp4"]
+    assert streamed == ["https://videos.pexels.com/video-files/bad.mp4", "https://videos.pexels.com/video-files/good.mp4"]
     assert not (tmp_path / "pexels_1.mp4").exists()
     assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_pexels_every_download_failing_returns_none(tmp_path):
     result, _, _ = _pexels(
-        tmp_path, [_video(1, [_vf(1080, 1920, link="https://cdn/bad.mp4")])],
-        fail_urls={"https://cdn/bad.mp4"},
+        tmp_path, [_video(1, [_vf(1080, 1920, link="https://videos.pexels.com/video-files/bad.mp4")])],
+        fail_urls={"https://videos.pexels.com/video-files/bad.mp4"},
     )
     assert result is None
 
@@ -347,11 +370,11 @@ def test_wikipedia_every_download_failing_returns_none(tmp_path):
 
 
 @pytest.mark.parametrize("url,ext", [
-    ("https://x/y/P.PNG", "png"),
-    ("https://x/y/P.webp?width=300", "webp"),
-    ("https://x/y/P.jpeg", "jpeg"),
-    ("https://x/y/P.svg", "jpg"),
-    ("https://x/y/P", "jpg"),
+    ("https://upload.wikimedia.org/y/P.PNG", "png"),
+    ("https://upload.wikimedia.org/y/P.webp?width=300", "webp"),
+    ("https://upload.wikimedia.org/y/P.jpeg", "jpeg"),
+    ("https://upload.wikimedia.org/y/P.svg", "jpg"),
+    ("https://upload.wikimedia.org/y/P", "jpg"),
 ])
 def test_wikipedia_file_extension_is_normalized_to_a_known_image_type(tmp_path, url, ext):
     result, _ = _wiki(
@@ -630,7 +653,8 @@ def test_pexels_endpoint_timeouts_and_redirect_options(tmp_path):
         source.search("q", 1.0)
     assert get.call_args.args[0] == "https://api.pexels.com/videos/search"
     assert get.call_args.kwargs["timeout"] == 30.0
-    assert seen == {"follow_redirects": True, "timeout": 120.0}
+    assert seen == {"follow_redirects": False, "timeout": 120.0,   # redirects are followed by hand, hop-checked
+                    "headers": {"Accept-Encoding": "identity"}}
 
 
 def test_pexels_partial_download_leaves_no_tmp_file(tmp_path):
@@ -659,14 +683,14 @@ def test_wikipedia_every_request_carries_the_user_agent_params_and_timeouts(tmp_
             if kw.get("params", {}).get("action") == "query":
                 return _json_resp({"query": {"pages": {"1": {"imageinfo": [{"extmetadata": {}}]}}}})
             if "/page/summary/" in url:
-                return _json_resp({"pageid": 5, "originalimage": {"source": "https://u/a/Mes%C3%A9_%28x%29.jpg?uselang=en"}})
+                return _json_resp({"pageid": 5, "originalimage": {"source": "https://upload.wikimedia.org/a/Mes%C3%A9_%28x%29.jpg?uselang=en"}})
             return _bytes_resp(b"x")
         with patch(f"{_MOD}.httpx.get", side_effect=fake_get):
             WikipediaImageSource(tmp_path).search("Leo Messi")
     run()
     ua = {"User-Agent": "reel-maker/1.0"}
     assert len(seen) == 4
-    assert all(kw["headers"] == ua for _, kw in seen)
+    assert all(kw["headers"] == ua for _, kw in seen[:3])      # API calls: User-Agent only
     assert seen[0][1]["params"] == {"action": "opensearch", "search": "Leo Messi", "limit": 1, "format": "json"}
     assert seen[0][1]["timeout"] == 10.0
     # summary URL is built from the *canonical* title returned by opensearch, underscored and percent-encoded
@@ -675,7 +699,8 @@ def test_wikipedia_every_request_carries_the_user_agent_params_and_timeouts(tmp_
     assert seen[2][1]["params"] == {"action": "query", "titles": "File:Mesé_(x).jpg",
                                     "prop": "imageinfo", "iiprop": "extmetadata", "format": "json"}
     assert seen[2][1]["timeout"] == 10.0
-    assert seen[3][1]["follow_redirects"] is True and seen[3][1]["timeout"] == 30.0
+    assert seen[3][1]["follow_redirects"] is False and seen[3][1]["timeout"] == 30.0
+    assert seen[3][1]["headers"] == {**ua, "Accept-Encoding": "identity"}
 
 
 def test_wikipedia_429_retry_keeps_headers_redirects_and_timeout(tmp_path):
@@ -688,7 +713,7 @@ def test_wikipedia_429_retry_keeps_headers_redirects_and_timeout(tmp_path):
         return _bytes_resp(status=429)
     with patch(f"{_MOD}.httpx.get", side_effect=fake_get), patch(f"{_MOD}.time.sleep"):
         assert WikipediaImageSource(tmp_path).search("Lionel Messi") is None
-    assert len(seen) == 2 and all(k["headers"] == {"User-Agent": "reel-maker/1.0"} and k["follow_redirects"] and k["timeout"] == 30.0 for k in seen)
+    assert len(seen) == 2 and all(k["headers"] == {"User-Agent": "reel-maker/1.0", "Accept-Encoding": "identity"} and k["follow_redirects"] is False and k["timeout"] == 30.0 for k in seen)
 
 
 def test_wikipedia_download_is_written_atomically(tmp_path):
@@ -777,12 +802,12 @@ def test_wikipedia_plus_in_a_filename_reaches_the_license_lookup_unchanged(tmp_p
     assert seen[2][1]["params"]["titles"] == "File:C++_conf.jpg"
 
 
-def test_pexels_download_goes_through_a_tmp_file_in_chunks(tmp_path):
+def test_pexels_download_goes_through_a_tmp_file_and_reads_per_network_chunk(tmp_path):
     state = {}
     @contextmanager
     def fake_stream(method, url, **kw):
         r = MagicMock(); r.raise_for_status.side_effect = None
-        def it(chunk_size):
+        def it(chunk_size=None):
             state["chunk"] = chunk_size
             state["final_exists_mid_write"] = (tmp_path / "pexels_1.mp4").exists()
             yield b"x"
@@ -791,7 +816,8 @@ def test_pexels_download_goes_through_a_tmp_file_in_chunks(tmp_path):
     with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]})), \
             patch(f"{_MOD}.httpx.stream", fake_stream):
         assert PexelsVideoSource("k", tmp_path).search("q", 1.0) is not None
-    assert state == {"chunk": 65536, "final_exists_mid_write": False}
+    # chunk_size is deliberately NOT passed (httpx would buffer 64 KB before the deadline check runs)
+    assert state == {"chunk": None, "final_exists_mid_write": False}
 
 
 def test_pexels_http_error_status_on_the_download_is_a_failure(tmp_path):

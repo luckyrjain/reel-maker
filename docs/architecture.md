@@ -163,7 +163,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 | File | Responsibility |
 |---|---|
-| `asset_sourcer.py` | `PexelsVideoSource` + `WikipediaImageSource` (+ license metadata) + `HuggingFaceVideoSource`/`HuggingFaceImageSource`; pure selection decisions `_choose_video_file()` / `_license_from_extmetadata()` / `_image_extension()` (Phase 7z); fallback chain Wikipedia → Pexels → HF Video → HF Image → black frame; `_generate_gated_hf_asset()` — shared gate/record_stage/cost shell for both HF tiers; `resolve_or_reuse()` — per-beat asset pinning; `LocalMusicSource.find()`; `compute_pins_fingerprint()` / `compute_pins_fingerprint_for_render()` |
+| `asset_sourcer.py` | `PexelsVideoSource` + `WikipediaImageSource` (+ license metadata) + `HuggingFaceVideoSource`/`HuggingFaceImageSource`; pure selection decisions `_choose_video_file()` / `_license_from_extmetadata()` / `_image_extension()` (Phase 7z); guarded downloads — `_open_download()` / `_iter_capped()` / `_pexels_url_ok()` / `_wikimedia_url_ok()`, remote-id validation `_numeric_id()` / `_title_id()`, `PexelsVideoSource._pick()` (Phase 7aa); fallback chain Wikipedia → Pexels → HF Video → HF Image → black frame; `_generate_gated_hf_asset()` — shared gate/record_stage/cost shell for both HF tiers; `resolve_or_reuse()` — per-beat asset pinning; `LocalMusicSource.find()`; `compute_pins_fingerprint()` / `compute_pins_fingerprint_for_render()` |
 | `pricing.py` | `hf_image_cost_usd()` / `hf_video_cost_usd()` — HF asset-generation cost (0 until configured) |
 | `tts.py` | `EdgeTTSProvider`/`KokoroProvider`/`SilentProvider`; `synthesize()` + `synth_to_budget()` (±25% rate adjustment); `CURATED_EDGE_VOICES` |
 | `captions.py` | `transcribe_audio()` — one Whisper pass producing both `.words` (burned-in text) and `.segments` (SRT export); no-op if Whisper isn't installed |
@@ -191,7 +191,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 ### `tests/`
 
-58 test files + `conftest.py`, **1295 tests run by default / 1296 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
+60 test files + `conftest.py`, **1606 tests run by default / 1607 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
 
 | File | Tests | File | Tests |
 |---|---|---|---|
@@ -221,7 +221,8 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_asset_sourcer_names.py` | 7 | `test_enqueue.py` | 13 |
 | `test_pricing.py` | 4 | `test_config.py` | 2 |
 | `test_proportional_timing.py` | 28 | `test_sourcer_selection.py` | 96 |
-| `test_sourcer_contracts.py` | 89 | `test_sourcer_cache_and_chain.py` | 56 |
+| `test_sourcer_contracts.py` | 124 | `test_sourcer_cache_and_chain.py` | 56 |
+| `test_sourcer_download_guards.py` | 199 | `test_sourcer_ids.py` | 77 |
 | `test_llm_judge.py` | 3 | `test_main.py` | 3 |
 | `test_observability.py` | 3 | `test_golden_reel.py` | 1 (deselected) |
 
@@ -516,7 +517,9 @@ Every drawtext clause carries `:expansion=none` — disables ffmpeg's own `%`-ex
 ### Stock footage (`PexelsVideoSource`)
 
 - Portraits at ≤ FHD (1920 px) preferred; falls back gracefully to landscape or 4K
-- Cached by `(source="pexels", source_ref=video_id)` in `assets` table
+- Cached by `(source="pexels", source_ref=video_id)` in `assets` table; `video_id` must be a non-negative integer or an ASCII digit string whose decimal form is 1-20 digits, otherwise that search hit is skipped
+- A malformed search hit (missing/non-numeric duration or id, null width/height, non-string link) or a non-JSON body is skipped / gives no result — it never raises into the render task
+- Downloads (Pexels and Wikipedia alike): https only, to `*.pexels.com` / `upload.wikimedia.org` (no userinfo, port 443, plain `[a-z0-9.-]` host); redirects are followed by hand with every hop re-checked (max 3), never by httpx; `Accept-Encoding: identity` is sent and an encoded response is rejected; the body is capped (250 MB video / 50 MB image) and bounded in wall-clock time (600 s / 120 s, one budget shared by the redirect hops and the 429 retry, checked on every network read). A download to a disallowed URL (first request or redirect target) is logged at WARNING by host; an oversized, encoded, too-slow or over-redirected one is rejected silently. Either way the search moves on to the next hit/candidate. Not bounded here: a server dripping response headers, and the per-hit budgets adding up (the outer bound is the render task's hard time limit, not its soft one: the search loops' broad `except Exception` swallows `SoftTimeLimitExceeded`); a read can also overrun the budget by up to its httpx timeout, and a dripped chunked-encoding size line is not covered
 - `safe_to_publish=True` (Pexels license is permissive)
 
 ### Player photos (`WikipediaImageSource`)
@@ -524,6 +527,7 @@ Every drawtext clause carries `:expansion=none` — disables ffmpeg's own `%`-ex
 - Triggered when a person name (`engine/names.py::person_names()` — clubs and tournaments are excluded) is found in `visual_direction`
 - Flow: opensearch → page summary REST → image download + `extmetadata` license fetch (filename `urllib.parse.unquote()`-decoded before the MediaWiki `titles=` lookup — an encoded filename otherwise matches no page and silently defaults to `license="unknown"`)
 - Rate-limit handling: 0.5 s between players, 2 s retry on 429
+- A malformed summary body (non-object, non-string image `source`) gives no photo instead of raising; the file name id is the numeric `pageid`, else the title if `[A-Za-z0-9_-]{1,64}`, else `t` + 16 hex of its sha256
 - License fields stored: `license`, `license_url`, `attribution`, `safe_to_publish`
 - `safe_to_publish` is `True` only for CC0/CC-BY/public domain — most player headshots are CC-BY-SA (attribution required at publish)
 

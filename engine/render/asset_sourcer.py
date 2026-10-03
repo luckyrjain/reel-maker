@@ -1,9 +1,11 @@
 import hashlib
 import logging
+import math
 import os
 import re
 import time
 import urllib.parse
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,6 +43,172 @@ def _atomic_write(path: Path, data: bytes) -> None:
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
+
+
+# ── guarded downloads ────────────────────────────────────────────────────────
+# Download URLs (Pexels `link`, Wikipedia `originalimage`/`thumbnail` `source`) come straight from
+# remote JSON, so a tampered or compromised upstream response could otherwise point the worker at
+# any URL (blind SSRF) or hand it an unbounded body. Every download is https-only to an expected
+# host, re-checked on each redirect hop (httpx is never asked to follow redirects itself), and
+# size-capped.
+
+_MAX_VIDEO_BYTES = 250 * 1024 * 1024   # FHD portrait Pexels clips are tens of MB
+_MAX_IMAGE_BYTES = 50 * 1024 * 1024    # Wikipedia originals are rarely over ~20 MB
+_MAX_REDIRECTS = 3
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+# httpx timeouts are per read, so a server that trickles never trips them: each download also gets a
+# wall-clock budget, shared by its redirect hops / 429 retry and checked before every hop and after
+# every network read. Not covered (a hostile *allowlisted* host only): a server dripping response
+# headers or a chunked-encoding size line / extension (h11 caps these at ~80 KB, but each byte may take
+# up to the read timeout), and a read that overruns the budget by up to its httpx timeout (120 s Pexels,
+# 30 s Wikipedia). The per-hit budgets also add up (up to 15 Pexels hits). The outer bound is the render
+# task's hard time limit (soft + 120 s, then the reaper) -- NOT its soft limit: the broad
+# `except Exception` in the search loops (pre-existing) swallows SoftTimeLimitExceeded.
+_VIDEO_DEADLINE_S = 600.0
+_IMAGE_DEADLINE_S = 120.0
+_monotonic = time.monotonic     # indirection so tests can drive a fake clock
+
+
+_HOST_RE = re.compile(r"[a-z0-9.-]+")
+
+
+def _https_host(url) -> "str | None":
+    """Lowercased host of an https URL on the default port with no userinfo, else None.
+
+    Deliberately stricter than urlsplit: it silently strips tab/CR/LF and accepts hosts that httpx
+    (the parser that actually connects) rejects or reads differently, so a URL with any whitespace,
+    control character or backslash is refused outright and the host must be plain `[a-z0-9.-]`.
+    """
+    if not isinstance(url, str) or any(c.isspace() or c == "\\" or ord(c) < 0x20 or ord(c) == 0x7F for c in url):
+        return None
+    try:
+        parts = urllib.parse.urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme != "https" or parts.username is not None or parts.password is not None:
+        return None
+    if port not in (None, 443):
+        return None
+    if not parts.netloc.isascii():      # hostname.lower() would map e.g. U+212A (Kelvin) to "k"
+        return None
+    host = (parts.hostname or "").lower()
+    return host if _HOST_RE.fullmatch(host) else None
+
+
+def _pexels_url_ok(url) -> bool:
+    """`*.pexels.com` (videos.pexels.com serves the files), not the apex or a look-alike."""
+    host = _https_host(url)
+    return host is not None and host.endswith(".pexels.com") and host != ".pexels.com" \
+        and ".." not in host
+
+
+def _wikimedia_url_ok(url) -> bool:
+    """upload.wikimedia.org: the image CDN both `originalimage` and `thumbnail` point at."""
+    return _https_host(url) == "upload.wikimedia.org"
+
+
+def _host_for_log(url) -> str:
+    """Host of `url` for a log line: a short plain `[a-z0-9.-]` host, else "?".
+
+    Never the path, query or userinfo (tokens), and never raw control characters or an unbounded
+    string from a hostile upstream.
+    """
+    if not isinstance(url, str):
+        return "?"
+    try:
+        host = urllib.parse.urlsplit(url).hostname or ""       # already lower-cased by urlsplit
+    except ValueError:
+        return "?"
+    return host if len(host) <= 253 and _HOST_RE.fullmatch(host) else "?"
+
+
+@contextmanager
+def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = None,
+                   deadline_at: "float | None" = None):
+    """Stream a GET of `url`, following redirects by hand so every hop is checked by `url_ok`.
+
+    Raises ValueError for a disallowed URL (first or redirected), a redirect with no Location, or
+    more than `_MAX_REDIRECTS` hops, or if the wall-clock `deadline_at` has passed before a hop.
+    Yields the final (non-redirect) response; the caller still
+    owns `raise_for_status()` and the status handling. `Accept-Encoding: identity` is always sent
+    (media is not worth compressing, and a gzip body would inflate far past its Content-Length
+    before the size cap could see it); `_iter_capped` rejects a response that is encoded anyway.
+    """
+    kwargs = {
+        "follow_redirects": False,
+        "timeout": timeout,
+        "headers": {**(headers or {}), "Accept-Encoding": "identity"},
+    }
+    for _ in range(_MAX_REDIRECTS + 1):
+        if deadline_at is not None and _monotonic() > deadline_at:
+            raise ValueError("download too slow: deadline exceeded before the request")
+        if not url_ok(url):
+            _log.warning("Refusing download from a disallowed URL (host %s)", _host_for_log(url))
+            raise ValueError(f"download URL not allowed: {url!r}")
+        with httpx.stream("GET", url, **kwargs) as r:
+            if r.status_code not in _REDIRECT_STATUSES:
+                yield r
+                return
+            location = r.headers.get("location")
+        if not location or not isinstance(location, str):
+            raise ValueError(f"redirect without a Location from {url!r}")
+        url = urllib.parse.urljoin(url, location)
+    raise ValueError("too many redirects")
+
+
+def _iter_capped(r, limit: int, deadline_at: "float | None" = None):
+    """Yield `r`'s body in chunks; ValueError once it exceeds `limit` bytes or passes `deadline_at`.
+
+    Also refuses a response with a non-identity Content-Encoding, whose decoded size is not what
+    Content-Length (or the network read) says. `iter_bytes()` is called without a chunk size on
+    purpose: with one, httpx buffers that many bytes before yielding anything, so a slow body would
+    never reach the deadline check; without it, every network read does.
+    """
+    encoding = r.headers.get("content-encoding")
+    if isinstance(encoding, str) and encoding.strip().lower() not in ("", "identity"):
+        raise ValueError(f"download is Content-Encoding {encoding!r}, expected identity")
+    try:
+        declared = int(r.headers.get("content-length"))
+    except (TypeError, ValueError):
+        declared = None
+    if declared is not None and declared > limit:
+        raise ValueError(f"download too large: Content-Length {declared} > {limit}")
+    total = 0
+    for chunk in r.iter_bytes():
+        total += len(chunk)
+        if total > limit:
+            raise ValueError(f"download too large: more than {limit} bytes")
+        if deadline_at is not None and _monotonic() > deadline_at:
+            raise ValueError("download too slow: deadline exceeded")
+        yield chunk
+
+
+# ── ids that become local file names ─────────────────────────────────────────
+# `pexels_{id}.mp4` / `wiki_{id}.{ext}` are built from remote JSON, so an id is validated against a
+# strict, bounded pattern before it is interpolated (a `/`, `..` or a very long title must never
+# reach the filesystem, not even just to be rejected by a failing `Path.exists()`/write).
+
+_NUMERIC_ID_RE = re.compile(r"[0-9]{1,20}")
+_SAFE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def _numeric_id(raw) -> "str | None":
+    """`str(raw)` for a non-negative int or an ASCII digit string whose decimal form is 1-20 digits, else None."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        raw = str(raw) if raw >= 0 else ""
+    if isinstance(raw, str) and _NUMERIC_ID_RE.fullmatch(raw):
+        return raw
+    return None
+
+
+def _title_id(title: str) -> str:
+    """File-name-safe id for a page title: itself if already `[A-Za-z0-9_-]{1,64}`, else a digest."""
+    if _SAFE_ID_RE.fullmatch(title):
+        return title
+    return "t" + hashlib.sha256(title.encode()).hexdigest()[:16]
 
 
 _FHD = 1920   # Pexels returns 4K by default; cap downloads at <= FHD height
@@ -118,6 +286,23 @@ class WikipediaImageSource:
         except Exception:
             return {"license": "unknown", "license_url": None, "attribution": None, "safe_to_publish": False}
 
+    def _download(self, url: str) -> "bytes | None":
+        """Image bytes from a checked, size-capped GET; None if rate-limited twice.
+
+        A 429 is retried once after a 2 s pause. Any other failure raises (the caller moves on
+        to the next candidate URL).
+        """
+        deadline_at = _monotonic() + _IMAGE_DEADLINE_S
+        for attempt in (0, 1):
+            with _open_download(url, _wikimedia_url_ok, timeout=30.0, headers=self._HEADERS,
+                                deadline_at=deadline_at) as r:
+                if r.status_code != 429:
+                    r.raise_for_status()
+                    return b"".join(_iter_capped(r, _MAX_IMAGE_BYTES, deadline_at))
+            if attempt == 0:
+                time.sleep(2.0)
+        return None
+
     def search(self, person_name: str) -> "SourcedAsset | None":
         try:
             resp = httpx.get(
@@ -143,13 +328,21 @@ class WikipediaImageSource:
         except Exception:
             return None
 
-        original = data.get("originalimage", {}).get("source")
-        thumbnail = data.get("thumbnail", {}).get("source")
+        if not isinstance(data, dict):
+            return None
+
+        def image_source(key: str) -> "str | None":
+            block = data.get(key)
+            src = block.get("source") if isinstance(block, dict) else None
+            return src if isinstance(src, str) and src else None
+
+        original = image_source("originalimage")
+        thumbnail = image_source("thumbnail")
         candidate_urls = [u for u in (original, thumbnail) if u]
         if not candidate_urls:
             return None
 
-        page_id = str(data.get("pageid", page_title.replace(" ", "_")))
+        page_id = _numeric_id(data.get("pageid")) or _title_id(page_title.replace(" ", "_"))
 
         # Fetch license metadata for rights tracking (needed at publish time)
         image_filename = original.rsplit("/", 1)[-1].rsplit("?", 1)[0] if original else ""
@@ -170,14 +363,10 @@ class WikipediaImageSource:
                 local_path = lp
                 break
             try:
-                r = httpx.get(img_url, headers=self._HEADERS, timeout=30.0, follow_redirects=True)
-                if r.status_code == 429:
-                    time.sleep(2.0)
-                    r = httpx.get(img_url, headers=self._HEADERS, timeout=30.0, follow_redirects=True)
-                if r.status_code == 429:
+                content = self._download(img_url)
+                if content is None:
                     continue
-                r.raise_for_status()
-                _atomic_write(lp, r.content)
+                _atomic_write(lp, content)
                 local_path = lp
                 break
             except Exception:
@@ -218,6 +407,35 @@ class PexelsVideoSource:
         self.store_dir = store_dir
         store_dir.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _pick(video, min_duration_s: float) -> "tuple[str, float, str] | None":
+        """(id, duration_s, download link) for a usable search hit, else None.
+
+        The response is remote JSON: a missing or null field, or a value of the wrong type,
+        skips just this hit (like a too-short one) rather than raising into the render task.
+        """
+        try:
+            duration = video.get("duration")
+            if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+                return None
+            if not math.isfinite(duration):     # NaN/Infinity parse from JSON; a huge int overflows here
+                return None
+            if duration < min_duration_s:
+                return None
+            files = video.get("video_files", [])
+            if not files:
+                return None
+            link = _choose_video_file(files).get("link")
+            if not link or not isinstance(link, str):
+                return None
+            vid_id = _numeric_id(video["id"])
+            if vid_id is None:
+                return None
+            return vid_id, float(duration), link
+        except (KeyError, TypeError, ValueError, AttributeError, ArithmeticError):
+            _log.warning("Skipping a malformed Pexels search result", exc_info=True)
+            return None
+
     def search(self, query: str, min_duration_s: float) -> SourcedAsset | None:
         if not self.api_key:
             return None
@@ -235,34 +453,28 @@ class PexelsVideoSource:
                 timeout=30.0,
             )
             resp.raise_for_status()
+            videos = resp.json().get("videos", [])
+            if not isinstance(videos, list):
+                return None
         except Exception:
             return None
 
-        for video in resp.json().get("videos", []):
-            if video.get("duration", 0) < min_duration_s:
+        for video in videos:
+            picked = self._pick(video, min_duration_s)
+            if picked is None:
                 continue
-
-            files = video.get("video_files", [])
-            if not files:
-                continue
-
-            chosen = _choose_video_file(files)
-
-            if not chosen.get("link"):
-                continue
-
-            vid_id = str(video["id"])
+            vid_id, duration, link = picked
             local_path = self.store_dir / f"pexels_{vid_id}.mp4"
 
             if not local_path.exists():
                 tmp_path = local_path.with_suffix(".tmp")
                 try:
-                    with httpx.stream(
-                        "GET", chosen["link"], follow_redirects=True, timeout=120.0
-                    ) as r:
+                    deadline_at = _monotonic() + _VIDEO_DEADLINE_S
+                    with _open_download(link, _pexels_url_ok, timeout=120.0,
+                                        deadline_at=deadline_at) as r:
                         r.raise_for_status()
                         with open(tmp_path, "wb") as fh:
-                            for chunk in r.iter_bytes(chunk_size=65536):
+                            for chunk in _iter_capped(r, _MAX_VIDEO_BYTES, deadline_at):
                                 fh.write(chunk)
                     os.replace(tmp_path, local_path)
                 except Exception:
@@ -277,7 +489,7 @@ class PexelsVideoSource:
                 license_url="https://www.pexels.com/license/",
                 attribution=None,
                 safe_to_publish=True,
-                duration_s=float(video["duration"]),
+                duration_s=duration,
             )
 
         return None
