@@ -245,7 +245,7 @@ def test_pexels_malformed_search_json_currently_propagates_characterization(tmp_
             PexelsVideoSource("k", tmp_path).search("q", 1.0)
 
 
-def test_pexels_uses_a_get_stream_and_the_search_endpoint_with_a_raw_key(tmp_path):
+def test_pexels_download_uses_a_get_stream(tmp_path):
     methods = []
     @contextmanager
     def fake_stream(method, url, **kw):
@@ -279,7 +279,7 @@ def test_pexels_empty_string_key_and_none_key_both_skip(tmp_path):
         get.assert_not_called()
 
 
-def test_pexels_endpoint_is_the_search_path_literal(tmp_path):
+def test_pexels_api_base_url_literal():
     assert PexelsVideoSource._API == "https://api.pexels.com/videos"
 
 
@@ -290,6 +290,7 @@ def test_hf_urls_and_auth_scheme(tmp_path):
     with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("image/png")) as post:
         HuggingFaceImageSource("k", "org/m", tmp_path).generate("p")
     assert post.call_args.args[0] == "https://api-inference.huggingface.co/models/org/m"
+    assert post.call_args.kwargs["headers"] == {"Authorization": "Bearer k"}
     with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("video/mp4")) as post:
         HuggingFaceVideoSource("k", "org/m", tmp_path).generate("p")
     assert post.call_args.args[0] == "https://api-inference.huggingface.co/models/org/m"
@@ -372,6 +373,8 @@ def test_cache_asset_new_row_carries_every_field_and_heal_copies_license_fields(
     _cache_asset(db, SourcedAsset("wikipedia", "1", Path("/x/a.jpg"), "CC0", 0.0,
                                   license_url="https://u", attribution="Jane", safe_to_publish=True), "photo")
     assert (a.license_url, a.attribution, a.safe_to_publish) == ("https://u", "Jane", True)
+    # characterization, not endorsement: the heal does not touch the `license` string itself
+    assert a.license == "unknown"
     b, _ = _cache_asset(db, SourcedAsset("pexels", "2", Path("/x/b.mp4"), "pexels_free", 5.0,
                                          safe_to_publish=True), "footage")
     assert (b.type, b.license, b.safe_to_publish) == ("footage", "pexels_free", True)

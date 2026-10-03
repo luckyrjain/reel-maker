@@ -27,12 +27,14 @@ Characterize first, then extract three pure functions (module-private, same file
 
 HTTP, caching, retry (Wikipedia 429) and the fallback chain stay in the adapters. Deliberately NOT
 done: a unified `MediaSource` interface across the four sourcers (rejected in the HF-gate design
-for failing the deletion test) and any behavior change.
+for failing the deletion test) and any behavior change (one separate-commit bug fix excepted,
+see Behavior).
 
 ## Behavior
 
-Pure refactor. 61 characterization tests were committed first on the old code and pass unmodified
-against the extracted code, as do 41 of the 42 pre-existing sourcer tests (the 42nd, a stdlib-only
+Pure refactor (extraction commit 3a01b49; the one bug fix is the separate commit ed0831a, below).
+61 characterization tests were committed first on the old code and pass unmodified against the
+extracted code, as do 41 of the 42 pre-existing sourcer tests (the 42nd, a stdlib-only
 `+`-decoding test, was replaced in review by a search-level test). Verified further by a
 25,000-case differential fuzz of old vs new (randomized Pexels/Wikipedia/Wikimedia payloads,
 including malformed values, with identical fakes) comparing results, exceptions, request sequences
@@ -66,8 +68,10 @@ introduced here):
   HTTPS (low to medium). There is also no size cap on downloads or on HuggingFace `resp.content`.
 - `_strip_html` is a naive regex and `Artist` is editable by any Commons uploader (attribution only
   reaches published captions; no template renders it).
-- Pexels `video["id"]` missing raises `KeyError`, and `duration: null` / `height: null` raise
-  `TypeError`, all outside any `try` in `search()`.
+- Pexels `video["id"]` missing raises `KeyError`, `duration: null` / `height: null` raise
+  `TypeError`, and a 200 response with a non-JSON body raises `ValueError` from `resp.json()` — all
+  outside any `try` in `search()`, so they propagate into the render task (pinned for the last one
+  as characterization).
 - The publish gate checks the license string only, not that an attribution is present: bare
   `CC BY` / 2.0 / 4.0 with no `Artist` is "safe" with an empty attribution, which
   `build_attribution_block` then omits. `LicenseShortName` is itself uploader-editable, so
@@ -91,11 +95,12 @@ survivors: 11 equivalent (missing-dimension defaults Pexels always supplies, a s
 5xx already preempts, `reel_id=0`, a tmp suffix, a docstring) and the `<>` HTML-strip case, which
 then got its own test.
 
-Mutation testing, two passes. The author's ~28 targeted mutants found one vacuous fixture
+Mutation testing, four batches. The author's ~28 targeted mutants found one vacuous fixture
 (square-as-portrait: a height tie let both branches pick the same file). An independent reviewer's
 ~160 mutants then found 24 gaps (above). A final ~65-mutant battery over the whole file —
 ladder comparators/min/max/keys/defaults, license set members/case/strip/default, HTML strip,
 extension rules, Pexels endpoint/params/timeouts/redirects/chunking/tmp file/duration, Wikipedia
 User-Agent/limit/title quoting/canonical title/decode/query strip/atomic write/429/thumbnail order/
 cache/page-id, HF content-type/fingerprint/prefix/timeouts/headers/logging/no-key guard — has 0
-survivors.
+survivors. The fourth batch, the 216-mutant review above, is the one behind
+`test_sourcer_contracts.py`.
