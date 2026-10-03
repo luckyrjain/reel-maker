@@ -802,7 +802,7 @@ def test_wikipedia_plus_in_a_filename_reaches_the_license_lookup_unchanged(tmp_p
     assert seen[2][1]["params"]["titles"] == "File:C++_conf.jpg"
 
 
-def test_pexels_download_goes_through_a_tmp_file_in_chunks(tmp_path):
+def test_pexels_download_goes_through_a_tmp_file_and_reads_per_network_chunk(tmp_path):
     state = {}
     @contextmanager
     def fake_stream(method, url, **kw):

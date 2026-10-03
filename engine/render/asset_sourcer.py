@@ -57,10 +57,13 @@ _MAX_IMAGE_BYTES = 50 * 1024 * 1024    # Wikipedia originals are rarely over ~20
 _MAX_REDIRECTS = 3
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 # httpx timeouts are per read, so a server that trickles never trips them: each download also gets a
-# wall-clock budget, shared by its redirect hops / 429 retry and checked on every network read.
-# Not covered: a server dripping response *headers* just inside the read timeout (h11 caps that at
-# ~16 KB), and the up-to-15 Pexels hits / 2 Wikipedia candidates each getting their own budget -- the
-# render task's soft_time_limit is the outer bound.
+# wall-clock budget, shared by its redirect hops / 429 retry and checked before every hop and after
+# every network read. Not covered (a hostile *allowlisted* host only): a server dripping response
+# headers or a chunked-encoding size line / extension (h11 caps these at ~80 KB, but each byte may take
+# up to the read timeout), and a read that overruns the budget by up to its httpx timeout (120 s Pexels,
+# 30 s Wikipedia). The per-hit budgets also add up (up to 15 Pexels hits). The outer bound is the render
+# task's hard time limit (soft + 120 s, then the reaper) -- NOT its soft limit: the broad
+# `except Exception` in the search loops (pre-existing) swallows SoftTimeLimitExceeded.
 _VIDEO_DEADLINE_S = 600.0
 _IMAGE_DEADLINE_S = 120.0
 _monotonic = time.monotonic     # indirection so tests can drive a fake clock
@@ -111,9 +114,11 @@ def _host_for_log(url) -> str:
     Never the path, query or userinfo (tokens), and never raw control characters or an unbounded
     string from a hostile upstream.
     """
+    if not isinstance(url, str):
+        return "?"
     try:
-        host = (urllib.parse.urlsplit(url).hostname or "").lower()
-    except (ValueError, AttributeError):
+        host = urllib.parse.urlsplit(url).hostname or ""       # already lower-cased by urlsplit
+    except ValueError:
         return "?"
     return host if len(host) <= 253 and _HOST_RE.fullmatch(host) else "?"
 
