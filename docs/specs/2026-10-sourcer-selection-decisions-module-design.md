@@ -104,3 +104,11 @@ User-Agent/limit/title quoting/canonical title/decode/query strip/atomic write/4
 cache/page-id, HF content-type/fingerprint/prefix/timeouts/headers/logging/no-key guard — has 0
 survivors. The fourth batch, the 216-mutant review above, is the one behind
 `test_sourcer_contracts.py`.
+
+`tests/test_sourcer_cache_and_chain.py` (17), from a third review: `_cache_asset` lookup and heal rules,
+`resolve_beat_assets` ordering/argument forwarding and the `reel_id=None` gate (the pre-existing
+"no StageEvent" assertions were vacuous because `record_stage` swallows the NOT NULL failure), and
+adapter details (Pexels `source_ref`, Wikipedia original==thumbnail, per-candidate extension,
+page-title fallback, HF failure logging, HF flag on a failed write). Deliberately out of scope and
+left as separate test debt: the `resolve_or_reuse` pin ledger, `compute_pins_fingerprint`, and
+`LocalMusicSource` — the same file, but not the sourcers' selection logic this candidate is about.
