@@ -99,7 +99,7 @@ lookup title decoded exactly once, no lookup for an empty filename, the 429 retr
 candidate and only on 429, near-miss and fractional duration boundaries, multi-digit video ids, any
 `image/*` content type, the gated StageEvent's `cut_id` and exact `detail`, all-whitespace HTML stripping.
 
-Mutation testing, seven batches. The author's ~28 targeted mutants found one vacuous fixture
+Mutation testing, eight batches. The author's ~28 targeted mutants found one vacuous fixture
 (square-as-portrait: a height tie let both branches pick the same file). An independent reviewer's
 ~160 mutants then found 24 gaps (above). A final ~65-mutant battery over the whole file —
 ladder comparators/min/max/keys/defaults, license set members/case/strip/default, HTML strip,
@@ -111,9 +111,10 @@ survivors. The fourth batch, the 216-mutant review above, is the one behind
 `test_sourcer_cache_and_chain.py`; its 22 claimed-kill mutants were re-verified with 0 survivors. A
 sixth, from a fourth review, added 11 tests and was re-verified the same way (12 claimed kills, 0
 survivors); a seventh, from a fifth review, added 14 to `test_sourcer_contracts.py` (15 claimed
-kills, 0 survivors).
+kills, 0 survivors); an eighth, from a sixth review (489 mutants, 7 meaningful survivors), added 11
+to `test_sourcer_cache_and_chain.py` (7 claimed kills, 0 survivors).
 
-`tests/test_sourcer_cache_and_chain.py` (28), from a third and fourth review: `_cache_asset` lookup
+`tests/test_sourcer_cache_and_chain.py` (39), from a third, fourth and sixth review: `_cache_asset` lookup
 and heal rules,
 `resolve_beat_assets` ordering/argument forwarding and the `reel_id=None` gate (the pre-existing
 "no StageEvent" assertions were vacuous because `record_stage` swallows the NOT NULL failure), and
@@ -122,6 +123,10 @@ page-title fallback, HF failure logging, HF flag on a failed write) and, from th
 (385 mutants, 12 meaningful survivors), list-position independence of the tallest-portrait pick,
 png/webp on a dotted host, parentheses in the summary URL, a cache hit stopping the candidate loop,
 `_atomic_write`'s original error, three named people, the HF image tier after an empty video tier, and
-the HF flag's initial value. Deliberately out of scope and
+the HF flag's initial value, and, from the sixth review, a cached HF asset still being returned (a
+`None` would turn every cached re-render into a black frame), the license heal keyed on
+`license_url` only and overwriting `safe_to_publish`/`attribution`, the opensearch step's exception
+scope, a lone over-cap portrait beating an in-cap landscape file, and a long query reaching the HF
+tiers unchanged. Deliberately out of scope and
 left as separate test debt: the `resolve_or_reuse` pin ledger, `compute_pins_fingerprint`, and
 `LocalMusicSource` — the same file, but not the sourcers' selection logic this candidate is about.

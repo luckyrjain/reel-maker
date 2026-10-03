@@ -23,12 +23,14 @@ from engine.render.asset_sourcer import (
     SourcedAsset,
     _cache_asset,
     _choose_video_file,
+    _generate_gated_hf_asset,
     _image_extension,
     resolve_beat_assets,
 )
 from tests.test_sourcer_selection import (
     _MOD, _bytes_resp, _hf_resp, _pexels, _summary, _vf, _video, _wiki,
 )
+from tests.test_asset_sourcer_cost import _FakeHFSource, _asset_result
 
 _LOG = "engine.render.asset_sourcer"
 
@@ -288,3 +290,75 @@ def test_hf_image_is_still_tried_when_the_hf_video_tier_yields_nothing(db_sessio
 def test_flag_starts_false_on_both_hf_sources(tmp_path):
     assert HuggingFaceImageSource("k", "m", tmp_path / "a").last_call_was_generated is False
     assert HuggingFaceVideoSource("k", "m", tmp_path / "b").last_call_was_generated is False
+
+
+# ── sixth pass: cache-hit return value, heal semantics, opensearch scope ─────
+# cache hit: the generator's result must still be returned (a None here is a black frame): _generate_gated_hf_asset must return the cache-hit result (return None on cache hit
+# would turn every cached re-render into a black frame)
+def test_gated_hf_returns_the_result_on_a_cache_hit(db_session):
+    reel = models.Reel(context="x", status=models.ReelStatus.generating)
+    db_session.add(reel); db_session.commit()
+    res = _asset_result()
+    out = _generate_gated_hf_asset(db_session, reel.id, "asset_hf_image",
+                                   _FakeHFSource(res, was_generated=False), "q", lambda r: 0.003)
+    assert out is res
+
+
+def test_resolve_returns_a_cached_hf_asset_when_reel_id_is_given(db_session):
+    reel = models.Reel(context="x", status=models.ReelStatus.generating)
+    db_session.add(reel); db_session.commit()
+    hi = _HF("huggingface"); hi.last_call_was_generated = False      # cache hit
+    out = resolve_beat_assets(db_session, "q", 1.0, _NoneSrc(), hf=hi, reel_id=reel.id)
+    assert out[0][0] is not None and out[0][0].source == "huggingface"
+    hv = _HF("huggingface_video"); hv.last_call_was_generated = False
+    out = resolve_beat_assets(db_session, "q2", 1.0, _NoneSrc(), hf_video=hv, reel_id=reel.id)
+    assert out[0][0] is not None and out[0][0].source == "huggingface_video"
+
+
+# gated path: the exact (long) query reaches hf_video / hf with a reel id (gated path)
+def test_long_query_reaches_hf_tiers_unchanged_in_the_gated_path(db_session):
+    reel = models.Reel(context="x", status=models.ReelStatus.generating)
+    db_session.add(reel); db_session.commit()
+    q = "a very long visual direction describing a stadium at night with floodlights"
+    hv, hi = _HF("huggingface_video"), _HF("huggingface")
+    resolve_beat_assets(db_session, q, 1.0, _NoneSrc(), hf_video=hv, reel_id=reel.id)
+    resolve_beat_assets(db_session, q, 1.0, _NoneSrc(), hf=hi, reel_id=reel.id)
+    assert hv.prompts == hi.prompts == [q]
+
+
+# heal: _cache_asset heal keys on license_url ONLY
+def test_heal_keys_on_existing_license_url_not_attribution(db_session):
+    a, _ = _cache_asset(db_session, _sa("wikipedia", "1", attribution="OLD", safe_to_publish=True), "photo")
+    _cache_asset(db_session, _sa("wikipedia", "1", license_url="https://u", attribution="NEW"), "photo")
+    assert (a.license_url, a.attribution, a.safe_to_publish) == ("https://u", "NEW", False)
+
+
+def test_existing_url_without_attribution_is_not_healed(db_session):
+    b, _ = _cache_asset(db_session, _sa("wikipedia", "2", license_url="https://A"), "photo")
+    _cache_asset(db_session, _sa("wikipedia", "2", license_url="https://B", attribution="Y", safe_to_publish=True), "photo")
+    assert (b.license_url, b.attribution, b.safe_to_publish) == ("https://A", None, False)
+
+
+def test_heal_overwrites_safe_to_publish_true_with_false(db_session):
+    a, _ = _cache_asset(db_session, _sa("wikipedia", "3", safe_to_publish=True), "photo")
+    _cache_asset(db_session, _sa("wikipedia", "3", license_url="https://u", attribution="J", safe_to_publish=False), "photo")
+    assert a.safe_to_publish is False
+
+
+def test_heal_overwrites_attribution_with_none(db_session):
+    a, _ = _cache_asset(db_session, _sa("wikipedia", "4", attribution="STALE"), "photo")
+    _cache_asset(db_session, _sa("wikipedia", "4", license_url="https://u", attribution=None), "photo")
+    assert a.attribution is None
+
+
+# opensearch: opensearch answering 200 with a MediaWiki error object / short list is a miss, not a crash
+@pytest.mark.parametrize("payload", [{"error": {"code": "x"}}, [], ["only-query"]])
+def test_wikipedia_malformed_opensearch_is_a_miss(tmp_path, payload):
+    result, _ = _wiki(tmp_path, summary={"pageid": 1}, opensearch=payload)
+    assert result is None
+
+
+# ladder: a single over-cap portrait still wins over an in-cap landscape
+def test_single_over_cap_portrait_beats_an_in_cap_landscape():
+    files = [_vf(1080, 2560), _vf(1920, 1080)]
+    assert _choose_video_file(files)["height"] == 2560
