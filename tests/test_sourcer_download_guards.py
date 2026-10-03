@@ -155,11 +155,11 @@ def _pexels(tmp_path, videos, stream):
         return src.search("q", 1.0)
 
 
-def _wiki(tmp_path, summary, stream, sleeps=None):
+def _wiki(tmp_path, summary, stream, sleeps=None, title="Lionel Messi"):
     def fake_get(url, **kw):
         action = (kw.get("params") or {}).get("action")
         if action == "opensearch":
-            return _json_resp(["Lionel Messi", ["Lionel Messi"], [], []])
+            return _json_resp([title, [title], [], []])
         if action == "query":
             return _json_resp({"query": {"pages": {"1": {"imageinfo": [{"extmetadata": {}}]}}}})
         if url.startswith(WikipediaImageSource._SUMMARY):

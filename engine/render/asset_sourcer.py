@@ -129,6 +129,33 @@ def _iter_capped(r, limit: int):
         yield chunk
 
 
+# ── ids that become local file names ─────────────────────────────────────────
+# `pexels_{id}.mp4` / `wiki_{id}.{ext}` are built from remote JSON, so an id is validated against a
+# strict, bounded pattern before it is interpolated (a `/`, `..` or a very long title must never
+# reach the filesystem, not even just to be rejected by a failing `Path.exists()`/write).
+
+_NUMERIC_ID_RE = re.compile(r"[0-9]{1,20}")
+_SAFE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def _numeric_id(raw) -> "str | None":
+    """`str(raw)` for a non-negative int or a string of at most 20 ASCII digits, else None."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        raw = str(raw) if raw >= 0 else ""
+    if isinstance(raw, str) and _NUMERIC_ID_RE.fullmatch(raw):
+        return raw
+    return None
+
+
+def _title_id(title: str) -> str:
+    """File-name-safe id for a page title: itself if already `[A-Za-z0-9_-]{1,64}`, else a digest."""
+    if _SAFE_ID_RE.fullmatch(title):
+        return title
+    return "t" + hashlib.sha256(title.encode()).hexdigest()[:16]
+
+
 _FHD = 1920   # Pexels returns 4K by default; cap downloads at <= FHD height
 _IMAGE_EXTS = ("jpg", "jpeg", "png", "webp")
 
@@ -250,7 +277,7 @@ class WikipediaImageSource:
         if not candidate_urls:
             return None
 
-        page_id = str(data.get("pageid", page_title.replace(" ", "_")))
+        page_id = _numeric_id(data.get("pageid")) or _title_id(page_title.replace(" ", "_"))
 
         # Fetch license metadata for rights tracking (needed at publish time)
         image_filename = original.rsplit("/", 1)[-1].rsplit("?", 1)[0] if original else ""
@@ -334,7 +361,10 @@ class PexelsVideoSource:
             link = _choose_video_file(files).get("link")
             if not link or not isinstance(link, str):
                 return None
-            return str(video["id"]), float(duration), link
+            vid_id = _numeric_id(video["id"])
+            if vid_id is None:
+                return None
+            return vid_id, float(duration), link
         except (KeyError, TypeError, ValueError, AttributeError):
             _log.warning("Skipping a malformed Pexels search result", exc_info=True)
             return None
