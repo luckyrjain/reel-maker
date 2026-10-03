@@ -82,7 +82,7 @@ fingerprints/filenames/headers/logging, every license-set member, ranking by hei
 width, the landscape FHD boundary, and a search-level test that a literal `+` in a filename reaches
 the license lookup unchanged (replacing a pre-existing test that only exercised `urllib.parse`).
 
-`tests/test_sourcer_contracts.py` (89), from a second independent mutation review (216 mutants,
+`tests/test_sourcer_contracts.py` (89 at 7z, 122 now), from a second independent mutation review (216 mutants,
 92 survivors): the fail-closed license set pinned exactly (additions are as dangerous as removals),
 `SourcedAsset`'s fail-closed default, `_atomic_write`, the four factories, `mkdir(parents)`,
 `raise_for_status`/malformed-body handling on every HTTP call, Pexels method/stale-tmp/failure paths,
@@ -151,7 +151,8 @@ list are now read inside the request `try` (a non-JSON body, or a body that is n
 `videos` list, gives `None`). Each hit is validated by `PexelsVideoSource._pick()`, which returns
 `(id, duration_s, link)` or `None`: a missing/`null`/non-numeric `duration`, a missing `id`, a
 `video_files` entry with a `null` or non-numeric width/height, a non-string `link`, or a hit that is
-not an object skips just that hit (logged at WARNING) and the loop moves on to the next. A missing
+not an object skips just that hit and the loop moves on to the next (a hit that raises while being
+read is logged at WARNING; the plain-validation skips are silent). A missing
 `duration` is now "skip" even with `min_duration_s <= 0` (it used to `KeyError` at the end). Successful
 searches are unchanged; the one test that pinned `ValueError` propagation now pins `None`.
 
@@ -159,8 +160,9 @@ searches are unchanged; the one test that pinned `ValueError` propagation now pi
 expected host: `*.pexels.com` (`_pexels_url_ok`; the apex and look-alikes such as `evilpexels.com`,
 `videos.pexels.com.evil.com`, `videos.pexels.com@evil.com` are rejected) and `upload.wikimedia.org`
 (`_wikimedia_url_ok`; both `originalimage.source` and `thumbnail.source` point at it, as the
-existing fakes' URLs already did). `_https_host()` additionally rejects userinfo, any port but 443,
-a trailing-dot host and a non-ASCII netloc (`str.lower()` maps U+212A "K" to ASCII `k`). The Pexels
+existing fakes' URLs already did). `_https_host()` additionally rejects userinfo, any port but 443
+and a non-ASCII netloc (`str.lower()` maps U+212A "K" to ASCII `k`); a trailing-dot host is rejected by
+the predicates' exact/suffix match, not by `_https_host` itself. The Pexels
 `link` shape is `https://videos.pexels.com/video-files/<id>/<id>-hd_1080_1920_25fps.mp4`; the
 test fakes used `https://cdn/...` and were moved to that shape.
 
@@ -180,13 +182,14 @@ that pinned `follow_redirects=True` now pin `False`; fake image hosts (`https://
 became `upload.wikimedia.org`; and the legacy Wikipedia fakes, which describe a download as a
 response returned from a patched `httpx.get`, are adapted to `httpx.stream` by one autouse fixture
 (`_wikipedia_downloads_via_get_fakes` in `test_sourcer_selection.py`, re-exported to the other
-sourcer test files) instead of rewriting ~60 call sites. Mutation-checked: dropping the host check,
+sourcer test files) instead of rewriting ~60 call sites. Mutation-checked (12 targeted mutants, all now failing a test; the post-second-429 sleep needed an added
+assertion): dropping the host check,
 either size check, the redirect bound, relative-`Location` resolution, the scheme, userinfo, port,
 `wikimedia` exactness and apex checks, or `follow_redirects=False` each fails a test.
 
 **3. Ids that become file names are validated.** `pexels_{id}.mp4` and `wiki_{id}.{ext}` are built
 from remote JSON. A Pexels id must now be a non-negative integer (not a bool) or a string of at most
-20 ASCII digits (`_numeric_id`; `fullmatch` on `[0-9]`, so a trailing newline or Arabic-Indic digits
+20 ASCII digits (`_numeric_id`; an int of more than 20 digits is rejected too; `fullmatch` on `[0-9]`, so a trailing newline or Arabic-Indic digits
 do not pass); a hit with any other id is skipped like any other malformed hit, before the cache is
 consulted. A Wikipedia page id uses the same numeric rule; when `pageid` is missing or unusable the
 id comes from the underscored title (`_title_id`): the title itself if it is `[A-Za-z0-9_-]{1,64}`
@@ -198,3 +201,44 @@ accented or dotted title without a `pageid` used to be cached as `wiki_<that tit
 `wiki_t<digest>.jpg` (one re-download; the Wikipedia summary endpoint returns `pageid` for real
 pages, so this is a defensive path). A title with a lone surrogate was already unreachable: the
 summary URL cannot encode it, so `search()` returns `None`.
+
+`tests/test_sourcer_ids.py` (77) holds the follow-up 3 tests: Pexels id accept/skip tables (bool,
+float, negative, traversal, Arabic-Indic digits, trailing newline, 21 digits, a 5000-character id),
+Wikipedia page-id fallback, plain-title identity, digest ids for unsafe titles, the 5000-character
+title (no `ENAMETOOLONG`), digest determinism and cache reuse. Follow-up 1 replaced one test in
+`test_sourcer_contracts.py` (the `ValueError` characterization) and added 32 more (89 -> 122).
+
+### Review round 1 (deep 4-persona review of PR #43)
+
+No exploitable allowlist or redirect bypass was found. Fixed afterwards, tests first:
+
+- **`_pick` could still raise** on a 400-digit `duration` (`OverflowError` from `float()`), and JSON
+  `NaN`/`Infinity` passed as durations. Now `math.isfinite` first, and `ArithmeticError` joins the
+  caught set.
+- **`WikipediaImageSource.search` had the same bug class**: `originalimage: null`, a non-string
+  `source` or a non-object body raised out of `search()`. It now degrades to no photo.
+- **Host check vs httpx.** `urlsplit` strips tab/CR/LF and accepts hosts httpx rejects or reads
+  differently. `_https_host` now refuses a URL containing any whitespace, control character or
+  backslash and requires the host to be plain `[a-z0-9.-]` (percent-encoded paths are unaffected).
+- **Decompression amplification.** The byte cap counts decoded bytes, but httpx inflates a gzip read
+  whole (~270 MB peak from a 3 MB body before the cap tripped). `Accept-Encoding: identity` is now
+  always sent and `_iter_capped` rejects a non-identity `Content-Encoding`.
+- **No total deadline.** httpx timeouts are per read, so a 1 byte/0.2 s trickle ran for 9 s past a
+  1 s timeout. `_iter_capped` now enforces a wall-clock budget (`_VIDEO_DEADLINE_S` 600,
+  `_IMAGE_DEADLINE_S` 120), checked per chunk.
+- **Silent rejections.** A disallowed URL (first or redirected) is logged at WARNING by host only;
+  a CDN host change would otherwise silently push every render to the paid HF tiers.
+- **Test gaps** (mutation audit, ~174 mutants): the redirect-status test asserted only `is not None`
+  (dropping 301/303/307/308 survived), `_MAX_REDIRECTS`'s value, the single request for a
+  Location-less redirect, a cached file vs an unusable link, bool durations, a relative redirect on
+  a non-`videos` host, `_iter_capped` yielding a chunk past the cap, and no test used real httpx
+  objects (header-name case, gzip) -- all closed; the `_wiki` fake's "must go through httpx.stream"
+  assertion was swallowed by `search()`'s `except Exception` and now fails the test.
+
+Known and left open: downloaded bytes are not content-sniffed (a 200 `text/html` from an allowlisted
+host would be cached as `.mp4`/`.jpg`; HF video accepts any 200 body), HF/search/summary responses
+are read without a cap, `_title_id` is case-sensitive (collides on case-insensitive filesystems, only
+when `pageid` is missing), and a Wikipedia page with no `pageid` and a non-plain title is re-downloaded
+once under its new digest name. Operational note: the allowlist assumes Pexels serves `link` from
+`*.pexels.com` (`videos.pexels.com` today); if it moves to another CDN host every Pexels hit is
+skipped (now visible as a WARNING) and the render falls through to HF or a black frame.
