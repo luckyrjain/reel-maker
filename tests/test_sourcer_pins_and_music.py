@@ -20,7 +20,6 @@ import pytest
 from sqlalchemy.orm import Query
 
 from api import models
-from engine.render import asset_sourcer as AS
 from engine.render.asset_sourcer import (
     EMPTY_PINS_FINGERPRINT,
     LocalMusicSource,
