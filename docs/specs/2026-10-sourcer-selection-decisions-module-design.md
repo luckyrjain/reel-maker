@@ -82,7 +82,7 @@ fingerprints/filenames/headers/logging, every license-set member, ranking by hei
 width, the landscape FHD boundary, and a search-level test that a literal `+` in a filename reaches
 the license lookup unchanged (replacing a pre-existing test that only exercised `urllib.parse`).
 
-`tests/test_sourcer_contracts.py` (89 at 7z, 122 now), from a second independent mutation review (216 mutants,
+`tests/test_sourcer_contracts.py` (89 at 7z, 124 now), from a second independent mutation review (216 mutants,
 92 survivors): the fail-closed license set pinned exactly (additions are as dangerous as removals),
 `SourcedAsset`'s fail-closed default, `_atomic_write`, the four factories, `mkdir(parents)`,
 `raise_for_status`/malformed-body handling on every HTTP call, Pexels method/stale-tmp/failure paths,
@@ -177,7 +177,7 @@ cap the body, Wikipedia image downloads moved from `httpx.get` to `httpx.stream`
 once after 2 s is unchanged). The check guards the download only: a file already cached on disk is
 served without a request, as before.
 
-Test changes beyond the new `tests/test_sourcer_download_guards.py` (100 tests): the three tests
+Test changes beyond the new `tests/test_sourcer_download_guards.py` (191 tests; 100 before review rounds 1-2): the three tests
 that pinned `follow_redirects=True` now pin `False`; fake image hosts (`https://x/...`, `https://u/...`)
 became `upload.wikimedia.org`; and the legacy Wikipedia fakes, which describe a download as a
 response returned from a patched `httpx.get`, are adapted to `httpx.stream` by one autouse fixture
@@ -206,7 +206,7 @@ summary URL cannot encode it, so `search()` returns `None`.
 float, negative, traversal, Arabic-Indic digits, trailing newline, 21 digits, a 5000-character id),
 Wikipedia page-id fallback, plain-title identity, digest ids for unsafe titles, the 5000-character
 title (no `ENAMETOOLONG`), digest determinism and cache reuse. Follow-up 1 replaced one test in
-`test_sourcer_contracts.py` (the `ValueError` characterization) and added 32 more (89 -> 122).
+`test_sourcer_contracts.py` (the `ValueError` characterization) and added 35 more (89 -> 124).
 
 ### Review round 1 (deep 4-persona review of PR #43)
 
@@ -242,3 +242,35 @@ when `pageid` is missing), and a Wikipedia page with no `pageid` and a non-plain
 once under its new digest name. Operational note: the allowlist assumes Pexels serves `link` from
 `*.pexels.com` (`videos.pexels.com` today); if it moves to another CDN host every Pexels hit is
 skipped (now visible as a WARNING) and the render falls through to HF or a black frame.
+
+### Review round 2
+
+Round 2 of the same 4-persona review confirmed round 1's host-differential (300k fuzzed URL mutations,
+0 mismatches against `httpx.URL`), gzip, NaN/overflow and malformed-summary fixes closed, a 95-scenario
+old-vs-new differential showed only the intended divergences, and a live fetch of a real
+`upload.wikimedia.org` image passed the stricter guard. It found, and this round fixed (tests first):
+
+- **The deadline still did not fire for a slow body.** `iter_bytes(chunk_size=65536)` makes httpx buffer
+  64 KB before yielding anything, so the per-chunk check ran only per 64 KB (1 byte every 0.1 s: still
+  running after 6 s). `iter_bytes()` without a size yields on every network read; a real-httpx test
+  (`MockTransport` with a chunked body) pins it.
+- **The budget was per call.** One `deadline_at` is now computed per download and shared by its redirect
+  hops (`_open_download` checks it before each hop) and the Wikipedia 429 retry. Still not bounded: a
+  server dripping response *headers* inside the read timeout (h11 caps that at ~16 KB) and the up-to-15
+  Pexels hits / 2 Wikipedia candidates each getting their own budget; the render task's
+  `soft_time_limit` is the outer bound.
+- **Log hygiene.** `urlsplit().hostname` strips only tab/CR/LF, so ESC/BEL/NEL and a 100 KB host could
+  reach the log. `_host_for_log` returns a short (<=253) plain `[a-z0-9.-]` host or `?`.
+- **Test gaps** (158 mutants, 120 killed at HEAD of round 1; the rest equivalent or the gaps below): the
+  bool-duration test was vacuous (it searched with a 5 s minimum, so `True` == 1 was skipped by value; now a
+  0.5 s minimum), both deadline constants were unpinned to their caller, `>` vs `>=` at the deadline, the
+  real-httpx Content-Length test passed on byte counting alone (now only the declared length can reject
+  it), userinfo in a logged URL, the `_pick` WARNING, and a literal non-ASCII path character.
+- **Docs**: "logged by host" overclaimed (only a disallowed URL is logged); a missing `id` is logged, not
+  silent; stale test counts in this spec; "int or <=20 digits" omitted that the cap and the sign rule apply
+  to ints too.
+
+Known and left open (unchanged): no content sniffing, uncapped JSON/HF responses, case-sensitive
+`_title_id` on case-insensitive filesystems, empty (0-byte) 200 bodies are cached by the existing
+`exists()` caches, and the JSON API calls (`opensearch`, summary, `imageinfo`, Pexels search) still send
+the default `Accept-Encoding: gzip`.

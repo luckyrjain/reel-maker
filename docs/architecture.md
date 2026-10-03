@@ -191,7 +191,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 ### `tests/`
 
-60 test files + `conftest.py`, **1577 tests run by default / 1578 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
+60 test files + `conftest.py`, **1598 tests run by default / 1599 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
 
 | File | Tests | File | Tests |
 |---|---|---|---|
@@ -221,8 +221,8 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_asset_sourcer_names.py` | 7 | `test_enqueue.py` | 13 |
 | `test_pricing.py` | 4 | `test_config.py` | 2 |
 | `test_proportional_timing.py` | 28 | `test_sourcer_selection.py` | 96 |
-| `test_sourcer_contracts.py` | 122 | `test_sourcer_cache_and_chain.py` | 56 |
-| `test_sourcer_download_guards.py` | 172 | `test_sourcer_ids.py` | 77 |
+| `test_sourcer_contracts.py` | 124 | `test_sourcer_cache_and_chain.py` | 56 |
+| `test_sourcer_download_guards.py` | 191 | `test_sourcer_ids.py` | 77 |
 | `test_llm_judge.py` | 3 | `test_main.py` | 3 |
 | `test_observability.py` | 3 | `test_golden_reel.py` | 1 (deselected) |
 
@@ -517,9 +517,9 @@ Every drawtext clause carries `:expansion=none` — disables ffmpeg's own `%`-ex
 ### Stock footage (`PexelsVideoSource`)
 
 - Portraits at ≤ FHD (1920 px) preferred; falls back gracefully to landscape or 4K
-- Cached by `(source="pexels", source_ref=video_id)` in `assets` table; `video_id` must be an integer or at most 20 ASCII digits, otherwise that search hit is skipped
+- Cached by `(source="pexels", source_ref=video_id)` in `assets` table; `video_id` must be a non-negative integer or a string of at most 20 ASCII digits, otherwise that search hit is skipped
 - A malformed search hit (missing/non-numeric duration or id, null width/height, non-string link) or a non-JSON body is skipped / gives no result — it never raises into the render task
-- Downloads (Pexels and Wikipedia alike): https only, to `*.pexels.com` / `upload.wikimedia.org` (no userinfo, port 443, plain `[a-z0-9.-]` host); redirects are followed by hand with every hop re-checked (max 3), never by httpx; `Accept-Encoding: identity` is sent and an encoded response is rejected; the body is capped (250 MB video / 50 MB image) and bounded in wall-clock time (600 s / 120 s). A rejected download is logged by host and the search moves on to the next hit/candidate
+- Downloads (Pexels and Wikipedia alike): https only, to `*.pexels.com` / `upload.wikimedia.org` (no userinfo, port 443, plain `[a-z0-9.-]` host); redirects are followed by hand with every hop re-checked (max 3), never by httpx; `Accept-Encoding: identity` is sent and an encoded response is rejected; the body is capped (250 MB video / 50 MB image) and bounded in wall-clock time (600 s / 120 s, one budget shared by the redirect hops and the 429 retry, checked on every network read). A download to a disallowed URL (first request or redirect target) is logged at WARNING by host; an oversized, encoded, too-slow or over-redirected one is rejected silently. Either way the search moves on to the next hit/candidate. Not bounded here: a server dripping response headers, and the per-hit budgets adding up (the render task's `soft_time_limit` is the outer bound)
 - `safe_to_publish=True` (Pexels license is permissive)
 
 ### Player photos (`WikipediaImageSource`)
