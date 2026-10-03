@@ -11,6 +11,7 @@ make the worker request an arbitrary URL (blind SSRF) or fill the disk. A downlo
 
 HTTP is faked at `engine.render.asset_sourcer.httpx`; nothing touches the network.
 """
+import time
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
@@ -576,7 +577,12 @@ def test_real_httpx_the_deadline_is_checked_on_every_network_read():
 # ── a wall-clock deadline (httpx timeouts are per read, so a trickle never trips them) ────────
 
 def _fake_clock(*ticks, after=999.0):
-    """A clock returning `ticks` in order, then `after` forever (no zero-slack StopIteration)."""
+    """A clock returning `ticks` in order, then `after` forever (no zero-slack StopIteration).
+
+    The tick lists in the tests below count every `_monotonic()` call the code makes (one per
+    download for `deadline_at`, one per hop, one per body read): adding a call in the module means
+    re-counting them, on purpose -- that is what pins the budget to be shared, not per call.
+    """
     it = iter(ticks)
     return lambda: next(it, after)
 
@@ -602,6 +608,10 @@ def test_reaching_the_deadline_exactly_is_still_allowed(monkeypatch):
         for c in AS._iter_capped(_Resp(chunks=(b"a", b"b")), 100, deadline_at=100.0):
             got.append(c)
     assert got == [b"a"]                                        # `>` not `>=`: the 100.0 tick passes
+
+
+def test_the_budget_uses_a_monotonic_clock():
+    assert AS._monotonic is time.monotonic          # a wall clock can jump; the budget must not
 
 
 def test_the_deadlines_are_sane_numbers():
@@ -750,7 +760,8 @@ def test_wikipedia_a_malformed_original_does_not_stop_a_valid_thumbnail(tmp_path
 def test_userinfo_in_a_rejected_url_is_never_logged(tmp_path, caplog):
     caplog.set_level("WARNING", logger=AS.__name__)
     _pexels(tmp_path, [_video(1, [_vf(1080, 1920, link="https://user:secret@evil.example/a.mp4")])], _Stream({}))
-    assert "evil.example" in caplog.text and "secret" not in caplog.text and "user" not in caplog.text.replace("Refusing", "")
+    assert "(host evil.example)" in caplog.text
+    assert "secret" not in caplog.text and "user:" not in caplog.text and "@" not in caplog.text
 
 
 @pytest.mark.parametrize("url,expected", [
@@ -780,11 +791,47 @@ def test_a_literal_non_ascii_path_character_is_accepted():
     assert AS._wikimedia_url_ok("https://upload.wikimedia.org/wikipedia/commons/a/ab/\u00c9.jpg") is True
 
 
-def test_real_httpx_a_declared_content_length_over_the_cap_is_rejected_on_its_own(tmp_path, monkeypatch):
+def test_a_declared_content_length_over_the_cap_is_rejected_on_its_own():
     """The body is within the cap, so only the Content-Length check can reject this one."""
-    monkeypatch.setattr(AS, "_MAX_VIDEO_BYTES", 10)
-    def handler(request):
-        return httpx.Response(200, content=b"x" * 10, headers={"content-length": "11"})
     r = httpx.Response(200, content=b"x" * 10, headers={"Content-Length": "11"})
     with pytest.raises(ValueError, match="Content-Length"):
         list(AS._iter_capped(r, 10))
+
+
+# ── round 3 gaps ──────────────────────────────────────────────────────────────────────────────
+
+def test_a_hostile_host_never_reaches_the_log_raw_through_the_download_path(tmp_path, caplog):
+    caplog.set_level("WARNING", logger=AS.__name__)
+    link = "https://evil\x1b[31m.example/a.mp4"
+    _pexels(tmp_path, [_video(1, [_vf(1080, 1920, link=link)])], _Stream({}))
+    assert "\x1b" not in caplog.text and "(host ?)" in caplog.text
+
+
+def test_pexels_the_body_shares_the_budget_started_before_the_connection(tmp_path, monkeypatch):
+    """Past the shared budget (10 s from t=0) but inside a fresh one started when the body begins."""
+    monkeypatch.setattr(AS, "_VIDEO_DEADLINE_S", 10.0)
+    # caller deadline_at = 0 + 10; hop check at 0 (ok); then every body read happens at 11
+    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, after=11.0))
+    stream = _Stream({PEXELS_OK: _Resp(chunks=(b"a", b"b"))})
+    assert _pexels(tmp_path, [_video(1, [_vf(1080, 1920, link=PEXELS_OK)])], stream) is None
+
+
+def test_the_pre_hop_check_allows_exactly_the_deadline(tmp_path, monkeypatch):
+    other = "https://videos.pexels.com/video-files/2/b.mp4"
+    monkeypatch.setattr(AS, "_VIDEO_DEADLINE_S", 10.0)
+    # deadline_at 10; hop 1 at 0; hop 2 at exactly 10 (allowed); body reads at 0
+    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 10.0, after=0.0))
+    stream = _Stream({PEXELS_OK: _redirect(other), other: _Resp(chunks=(b"ok",))})
+    result = _pexels(tmp_path, [_video(1, [_vf(1080, 1920, link=PEXELS_OK)])], stream)
+    assert stream.urls == [PEXELS_OK, other] and result is not None
+
+
+def test_host_for_log_length_bound_is_the_dns_maximum():
+    ok = ".".join(["a" * 63] * 3 + ["a" * 61])           # 63+1+63+1+63+1+61 = 253
+    assert len(ok) == 253 and AS._host_for_log(f"https://{ok}/x") == ok
+    assert AS._host_for_log(f"https://{ok}a/x") == "?"   # 254
+
+
+@pytest.mark.parametrize("bad", [b"https://x.com", bytearray(b"x"), ("https://x.com",)])
+def test_host_for_log_never_raises_on_non_str_input(bad):
+    assert AS._host_for_log(bad) == "?"
