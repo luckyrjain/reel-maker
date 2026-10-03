@@ -20,7 +20,9 @@ from engine.render import asset_sourcer as AS
 from engine.render.asset_sourcer import (
     HuggingFaceImageSource,
     HuggingFaceVideoSource,
+    PexelsVideoSource,
     SourcedAsset,
+    WikipediaImageSource,
     _cache_asset,
     _choose_video_file,
     _generate_gated_hf_asset,
@@ -28,7 +30,7 @@ from engine.render.asset_sourcer import (
     resolve_beat_assets,
 )
 from tests.test_sourcer_selection import (
-    _MOD, _bytes_resp, _hf_resp, _pexels, _summary, _vf, _video, _wiki,
+    _MOD, _bytes_resp, _hf_resp, _json_resp, _pexels, _stream_factory, _summary, _vf, _video, _wiki,
 )
 from tests.test_asset_sourcer_cost import _FakeHFSource, _asset_result
 
@@ -373,6 +375,9 @@ def _hit(source, ref):
 
 
 class _Rec:
+    """Duck-types every tier: records the calls it receives. api_key / last_call_was_generated mirror
+    the real HF sources so a keyed source is handled the way render_cut's would be."""
+
     def __init__(self, result=None, gen=True, key="k"):
         self.result, self.gen, self.api_key, self.calls = result, gen, key, []
         self.last_call_was_generated = False
@@ -427,3 +432,119 @@ def test_wiki_rate_limit_pause_sits_between_the_two_searches(db_session):
     with patch(f"{_MOD}.time.sleep", side_effect=lambda s: events.append(("sleep", s))):
         resolve_beat_assets(db_session, "Lionel Messi and Cristian Romero", 5.0, _Rec(), wiki=W())
     assert events == [("search", "Lionel Messi"), ("sleep", 0.5), ("search", "Cristian Romero")]
+
+
+# ── eighth pass: contracts a future edit could plausibly break ──────────────
+# _choose_video_file: "tallest", not "largest area" (a plausible 'highest resolution' refactor)
+def test_choose_is_by_height_not_by_area():
+    files = [_vf(1000, 1000), _vf(400, 1200)]
+    assert _choose_video_file(files)["height"] == 1200
+    files = [_vf(1000, 1000), _vf(400, 1200)]
+    assert _choose_video_file(list(reversed(files)))["height"] == 1200
+
+
+# Wikipedia: a %3F ("?") in the original image filename is decoded AFTER the query split
+def test_wikipedia_filename_with_encoded_question_mark_keeps_its_name_for_the_license_lookup(tmp_path):
+    titles = []
+
+    def fake_get(url, **kw):
+        p = kw.get("params") or {}
+        if url == WikipediaImageSource._SEARCH and p.get("action") == "opensearch":
+            return _json_resp(["x", ["Who"], [], []])
+        if url == WikipediaImageSource._SEARCH and p.get("action") == "query":
+            titles.append(p["titles"])
+            return _json_resp({"query": {"pages": {"1": {"imageinfo": [{"extmetadata": {}}]}}}})
+        if url.startswith(WikipediaImageSource._SUMMARY):
+            return _json_resp(_summary(original="https://upload.wikimedia.org/a/ab/Who%3F_Photo.jpg", thumbnail=None))
+        return _bytes_resp(b"img")
+
+    with patch(f"{_MOD}.httpx.get", side_effect=fake_get), patch(f"{_MOD}.time.sleep"):
+        assert WikipediaImageSource(tmp_path).search("Who") is not None
+    assert titles == ["File:Who?_Photo.jpg"]
+
+
+# resolve_beat_assets: wiki is optional (documented) -- a named person with wiki=None goes to Pexels
+def test_wiki_none_with_a_named_person_falls_to_pexels(db_session):
+    p = _Pex()
+    out = resolve_beat_assets(db_session, "Lionel Messi scores", 2.0, p, wiki=None)
+    assert [a.source for a, _ in out] == ["pexels"] and p.calls == [("Lionel Messi scores", 2.0)]
+
+
+# reel_id omitted (default) must never enter record_stage, even with an api-keyed HF source
+def test_reel_id_omitted_never_enters_record_stage(db_session):
+    hv, hi = _HF("huggingface_video"), _HF("huggingface")
+    with patch(f"{_LOG}.record_stage") as rs:
+        resolve_beat_assets(db_session, "q", 1.0, _NoneSrc(), hf_video=hv)
+        resolve_beat_assets(db_session, "q", 1.0, _NoneSrc(), hf=hi)
+    rs.assert_not_called()
+
+
+# positional order wiki, hf_video, hf (resolve_or_reuse calls it positionally)
+def test_positional_order_is_wiki_then_hf_video_then_hf(db_session):
+    wiki, vid, img = _Rec(), _Rec(_hit("huggingface_video", "v")), _Rec(_hit("huggingface", "i"))
+    out = resolve_beat_assets(db_session, "stadium", 1.0, _Rec(), wiki, vid, img)
+    assert [a.source for a, _ in out] == ["huggingface_video"] and img.calls == []
+
+
+# resolve_beat_assets must not commit: the caller (resolve_or_reuse) owns the transaction
+@pytest.mark.parametrize("tier", ["wiki", "pexels", "hf_video", "hf"])
+def test_resolve_does_not_commit_new_assets(db_session, tier):
+    t = dict(wiki=_Rec(), sourcer=_Rec(), hf_video=_Rec(), hf=_Rec())
+    key = {"wiki": "wiki", "pexels": "sourcer"}.get(tier, tier)
+    t[key] = _Rec(_hit(tier, "ref"))
+    resolve_beat_assets(db_session, "Lionel Messi scores", 1.0, t["sourcer"], wiki=t["wiki"],
+                        hf_video=t["hf_video"], hf=t["hf"])
+    assert db_session.query(models.Asset).count() == 1
+    db_session.rollback()
+    assert db_session.query(models.Asset).count() == 0
+
+
+# each source instance writes under ITS OWN store_dir (no class-level / module-level dir)
+def test_pexels_instances_use_their_own_store_dir(tmp_path):
+    outs = []
+    srcs = [PexelsVideoSource(api_key="k", store_dir=tmp_path / sub) for sub in ("a", "b")]   # both built first
+    for src in srcs:
+        with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(7, [_vf(1080, 1920)])]})), \
+                patch(f"{_MOD}.httpx.stream", _stream_factory([])):
+            outs.append(src.search("q", 1.0).local_path)
+    assert outs[0].parent == tmp_path / "a" and outs[1].parent == tmp_path / "b"
+
+
+# gated helper: provider is the literal "huggingface" (paid_call_count counts provider == "nvidia")
+def test_gated_stage_event_provider_is_huggingface_even_when_the_source_has_a_model(db_session):
+    reel = models.Reel(context="x", status=models.ReelStatus.generating)
+    db_session.add(reel); db_session.commit()
+    src = _Rec(_hit("huggingface", "i"))
+    src.model = "org/flux"
+    _generate_gated_hf_asset(db_session, reel.id, "asset_hf_image", src, "q", lambda r: 0.01)
+    ev = db_session.query(models.StageEvent).one()
+    assert ev.provider == "huggingface"
+
+
+# factories build from CURRENT settings on every call (no lru_cache / import-time snapshot)
+def test_factories_reflect_current_settings_each_call(tmp_path, monkeypatch):
+    monkeypatch.setattr(AS.settings, "pexels_api_key", "k1")
+    monkeypatch.setattr(AS.settings, "huggingface_api_key", "h1")
+    a1, h1, v1 = AS.get_asset_sourcer(tmp_path), AS.get_hf_sourcer(tmp_path), AS.get_hf_video_sourcer(tmp_path)
+    monkeypatch.setattr(AS.settings, "pexels_api_key", "k2")
+    monkeypatch.setattr(AS.settings, "huggingface_api_key", "h2")
+    a2, h2, v2 = AS.get_asset_sourcer(tmp_path), AS.get_hf_sourcer(tmp_path), AS.get_hf_video_sourcer(tmp_path)
+    assert (a1.api_key, a2.api_key, h1.api_key, h2.api_key, v1.api_key, v2.api_key) == ("k1", "k2", "h1", "h2", "h1", "h2")
+    assert AS.get_wiki_sourcer(tmp_path / "x").store_dir == tmp_path / "x" / "wiki"
+    assert AS.get_wiki_sourcer(tmp_path / "y").store_dir == tmp_path / "y" / "wiki"
+
+
+# Wikipedia summary URL: a literal % or ? in a page title is escaped (low priority)
+def test_wikipedia_summary_url_escapes_percent_and_question_mark(tmp_path):
+    urls = []
+
+    def fake_get(url, **kw):
+        p = kw.get("params") or {}
+        urls.append(url)
+        if url == WikipediaImageSource._SEARCH and p.get("action") == "opensearch":
+            return _json_resp(["x", ["100% Wolf?"], [], []])
+        return _json_resp(_summary(original=None, thumbnail=None))
+
+    with patch(f"{_MOD}.httpx.get", side_effect=fake_get):
+        WikipediaImageSource(tmp_path).search("x")
+    assert urls[-1] == f"{WikipediaImageSource._SUMMARY}/100%25_Wolf%3F"

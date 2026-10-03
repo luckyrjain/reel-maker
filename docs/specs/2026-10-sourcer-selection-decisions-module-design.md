@@ -99,7 +99,7 @@ lookup title decoded exactly once, no lookup for an empty filename, the 429 retr
 candidate and only on 429, near-miss and fractional duration boundaries, multi-digit video ids, any
 `image/*` content type, the gated StageEvent's `cut_id` and exact `detail`, all-whitespace HTML stripping.
 
-Mutation testing, nine batches. The author's ~28 targeted mutants found one vacuous fixture
+Mutation testing, ten batches. The author's ~28 targeted mutants found one vacuous fixture
 (square-as-portrait: a height tie let both branches pick the same file). An independent reviewer's
 ~160 mutants then found 24 gaps (above). A final ~65-mutant battery over the whole file —
 ladder comparators/min/max/keys/defaults, license set members/case/strip/default, HTML strip,
@@ -115,9 +115,11 @@ kills, 0 survivors); an eighth, from a sixth review (489 mutants, 7 meaningful s
 to `test_sourcer_cache_and_chain.py` (7 claimed kills, 0 survivors); a ninth, from a seventh review
 (1,112 mutants, 20 meaningful survivors in 7 groups), added 14 tests to `test_sourcer_contracts.py`
 and 4 to `test_sourcer_cache_and_chain.py` (15 representative mutants covering every group
-re-verified killed, 0 survivors).
+re-verified killed, 0 survivors); a tenth, from an eighth review (~830 mutants, mostly
+lower-confidence contracts), added 13 tests to `test_sourcer_cache_and_chain.py` (11 claimed kills,
+0 survivors).
 
-`tests/test_sourcer_cache_and_chain.py` (43), from a third through seventh review: `_cache_asset` lookup
+`tests/test_sourcer_cache_and_chain.py` (56), from a third through eighth review: `_cache_asset` lookup
 and heal rules,
 `resolve_beat_assets` ordering/argument forwarding and the `reel_id=None` gate (the pre-existing
 "no StageEvent" assertions were vacuous because `record_stage` swallows the NOT NULL failure), and
@@ -134,6 +136,11 @@ tiers unchanged. The seventh review added: `safe_to_publish` wired from the lice
 not from license-URL presence, wrong-shape (valid JSON) bodies failing closed, a cached Wikipedia
 thumbnail reused after the original fails, Pexels taking the first qualifying video in API order,
 a failed final rename skipped, and `resolve_beat_assets` with every tier supplied at once, as
-`render_cut` does (a skipped tier would silently trigger paid HF calls). Deliberately out of scope and
+`render_cut` does (a skipped tier would silently trigger paid HF calls). The eighth review added
+lower-confidence contracts: `wiki=None` with a named person, `reel_id` omitted never entering
+`record_stage`, the positional order `wiki, hf_video, hf` that `resolve_or_reuse` relies on, no commit
+inside `resolve_beat_assets`, tallest-by-height rather than by area, a `%3F` in a filename decoded
+after the query split, per-instance `store_dir`, the gated provider literal, the factories reading
+settings on every call, and `%`/`?` escaped in the summary URL. Deliberately out of scope and
 left as separate test debt: the `resolve_or_reuse` pin ledger, `compute_pins_fingerprint`, and
 `LocalMusicSource` — the same file, but not the sourcers' selection logic this candidate is about.
