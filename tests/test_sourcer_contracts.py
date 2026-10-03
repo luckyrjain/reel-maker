@@ -27,7 +27,6 @@ from engine.render.asset_sourcer import (
     _atomic_write,
     _strip_html,
     _cache_asset,
-    _choose_video_file,
     get_asset_sourcer,
     get_hf_sourcer,
     get_hf_video_sourcer,
