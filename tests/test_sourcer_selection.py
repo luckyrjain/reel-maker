@@ -79,7 +79,7 @@ def _pexels(tmp_path, videos, *, fail_urls=()):
     streamed: list[str] = []
     source = PexelsVideoSource(api_key="k", store_dir=tmp_path)
     with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": videos})) as get, \
-            patch(f"{_MOD}.httpx.stream", _stream_factory(streamed, fail_urls)):
+            patch(f"{_MOD}._http_stream", _stream_factory(streamed, fail_urls)):
         result = source.search("messi", min_duration_s=5.0)
     return result, streamed, get
 
@@ -103,7 +103,7 @@ def _wikipedia_downloads_via_get_fakes():
         resp.iter_bytes = lambda chunk_size=None: iter([content])
         yield resp
 
-    with patch(f"{_MOD}.httpx.stream", stream_from_get):
+    with patch(f"{_MOD}._http_stream", stream_from_get):
         yield
 
 
@@ -649,10 +649,12 @@ def test_pexels_endpoint_timeouts_and_redirect_options(tmp_path):
 
     source = PexelsVideoSource(api_key="k", store_dir=tmp_path)
     with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]})) as get, \
-            patch(f"{_MOD}.httpx.stream", fake_stream):
+            patch(f"{_MOD}._http_stream", fake_stream):
         source.search("q", 1.0)
     assert get.call_args.args[0] == "https://api.pexels.com/videos/search"
     assert get.call_args.kwargs["timeout"] == 30.0
+    trace = seen.pop("extensions")["trace"]            # the watchdog's connect-time hook
+    assert callable(trace)
     assert seen == {"follow_redirects": False, "timeout": 120.0,   # redirects are followed by hand, hop-checked
                     "headers": {"Accept-Encoding": "identity"}}
 
@@ -667,7 +669,7 @@ def test_pexels_partial_download_leaves_no_tmp_file(tmp_path):
         r.iter_bytes.return_value = gen(); yield r
     source = PexelsVideoSource(api_key="k", store_dir=tmp_path)
     with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]})), \
-            patch(f"{_MOD}.httpx.stream", fake_stream):
+            patch(f"{_MOD}._http_stream", fake_stream):
         assert source.search("q", 1.0) is None
     assert list(tmp_path.iterdir()) == []
 
@@ -814,7 +816,7 @@ def test_pexels_download_goes_through_a_tmp_file_and_reads_per_network_chunk(tmp
         r.iter_bytes.side_effect = it
         yield r
     with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]})), \
-            patch(f"{_MOD}.httpx.stream", fake_stream):
+            patch(f"{_MOD}._http_stream", fake_stream):
         assert PexelsVideoSource("k", tmp_path).search("q", 1.0) is not None
     # chunk_size is deliberately NOT passed (httpx would buffer 64 KB before the deadline check runs)
     assert state == {"chunk": None, "final_exists_mid_write": False}
@@ -826,7 +828,7 @@ def test_pexels_http_error_status_on_the_download_is_a_failure(tmp_path):
         r = MagicMock(); r.raise_for_status.side_effect = httpx.HTTPStatusError("404", request=MagicMock(), response=MagicMock())
         yield r
     with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]})), \
-            patch(f"{_MOD}.httpx.stream", fake_stream):
+            patch(f"{_MOD}._http_stream", fake_stream):
         assert PexelsVideoSource("k", tmp_path).search("q", 1.0) is None
     assert list(tmp_path.iterdir()) == []
 
