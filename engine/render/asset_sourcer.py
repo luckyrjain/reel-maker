@@ -3,6 +3,8 @@ import logging
 import math
 import os
 import re
+import socket
+import threading
 import time
 import urllib.parse
 from contextlib import contextmanager
@@ -10,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
+from celery.exceptions import SoftTimeLimitExceeded
 
 from api import models
 from api.config import settings
@@ -57,13 +60,13 @@ _MAX_IMAGE_BYTES = 50 * 1024 * 1024    # Wikipedia originals are rarely over ~20
 _MAX_REDIRECTS = 3
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 # httpx timeouts are per read, so a server that trickles never trips them: each download also gets a
-# wall-clock budget, shared by its redirect hops / 429 retry and checked before every hop and after
-# every network read. Not covered (a hostile *allowlisted* host only): a server dripping response
-# headers or a chunked-encoding size line / extension (h11 caps these at ~80 KB, but each byte may take
-# up to the read timeout), and a read that overruns the budget by up to its httpx timeout (120 s Pexels,
-# 30 s Wikipedia). The per-hit budgets also add up (up to 15 Pexels hits). The outer bound is the render
-# task's hard time limit (soft + 120 s, then the reaper) -- NOT its soft limit: the broad
-# `except Exception` in the search loops (pre-existing) swallows SoftTimeLimitExceeded.
+# wall-clock budget, shared by its redirect hops / 429 retry. It is enforced in three places: before
+# every hop (`_open_download`), after every network read (`_iter_capped`), and by a `_Watchdog` that
+# shuts the socket down when the budget runs out -- the only thing that can interrupt a read blocked
+# on a server dripping response headers or a chunked-encoding size line, where httpx yields nothing for
+# the other two to check. Still not bounded: the per-hit budgets add up (up to 15 Pexels hits). A
+# SoftTimeLimitExceeded raised inside a download is re-raised by the search loops (it ends the task),
+# not swallowed with the ordinary download failures.
 _VIDEO_DEADLINE_S = 600.0
 _IMAGE_DEADLINE_S = 120.0
 _monotonic = time.monotonic     # indirection so tests can drive a fake clock
@@ -124,14 +127,70 @@ def _host_for_log(url) -> str:
 
 
 @contextmanager
+def _http_stream(method, url, *, extensions=None, **kwargs):
+    """`httpx.stream()` plus the `extensions` parameter it lacks (needed for the connect-time trace).
+
+    A module-level seam so tests can substitute the transport; same call shape as `httpx.stream`.
+    """
+    with httpx.Client() as client:
+        with client.stream(method, url, extensions=extensions, **kwargs) as response:
+            yield response
+
+
+class _Watchdog:
+    """Shuts a download's socket down once its wall-clock budget is spent.
+
+    httpx timeouts are per read, and the deadline checks in `_open_download`/`_iter_capped` only run
+    when httpx hands back a response or a body chunk; a server dripping response headers, or a chunked
+    size line / extension, produces neither, so nothing else can interrupt that blocked read. Arm it
+    from httpcore's `connect_tcp.complete` trace event (`trace`, passed as the request's `trace`
+    extension: the raw socket exists before any response does), `cancel()` it when the hop ends. When
+    it fires the blocked read fails at once (`fired` is True and the caller reports a deadline error).
+    """
+
+    def __init__(self, deadline_at: "float | None"):
+        self._deadline_at = deadline_at
+        self._timer: "threading.Timer | None" = None
+        self.fired = False
+
+    def trace(self, event_name: str, info: dict) -> None:
+        if self._deadline_at is None or self._timer is not None:
+            return
+        if event_name != "connection.connect_tcp.complete":
+            return
+        sock = None
+        try:
+            sock = info["return_value"].get_extra_info("socket")
+        except Exception:                                   # noqa: BLE001 - never break the request
+            return
+        if not isinstance(sock, socket.socket):
+            return
+        timer = threading.Timer(max(self._deadline_at - _monotonic(), 0.0), self._fire, args=(sock,))
+        timer.daemon = True
+        self._timer = timer
+        timer.start()
+
+    def _fire(self, sock: socket.socket) -> None:
+        self.fired = True
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass                                            # already closed: the read is ending anyway
+
+    def cancel(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+
+
+@contextmanager
 def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = None,
                    deadline_at: "float | None" = None):
     """Stream a GET of `url`, following redirects by hand so every hop is checked by `url_ok`.
 
     Raises ValueError for a disallowed URL (first or redirected), a redirect with no Location, or
-    more than `_MAX_REDIRECTS` hops, or if the wall-clock `deadline_at` has passed before a hop.
-    Yields the final (non-redirect) response; the caller still
-    owns `raise_for_status()` and the status handling. `Accept-Encoding: identity` is always sent
+    more than `_MAX_REDIRECTS` hops, if the wall-clock `deadline_at` has passed before a hop, or if a
+    `_Watchdog` had to close the connection at the deadline. Yields the final (non-redirect) response;
+    the caller still owns `raise_for_status()` and the status handling. `Accept-Encoding: identity` is always sent
     (media is not worth compressing, and a gzip body would inflate far past its Content-Length
     before the size cap could see it); `_iter_capped` rejects a response that is encoded anyway.
     """
@@ -146,11 +205,22 @@ def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = N
         if not url_ok(url):
             _log.warning("Refusing download from a disallowed URL (host %s)", _host_for_log(url))
             raise ValueError(f"download URL not allowed: {url!r}")
-        with httpx.stream("GET", url, **kwargs) as r:
-            if r.status_code not in _REDIRECT_STATUSES:
-                yield r
-                return
-            location = r.headers.get("location")
+        guard = _Watchdog(deadline_at)
+        try:
+            with _http_stream("GET", url, extensions={"trace": guard.trace}, **kwargs) as r:
+                if r.status_code not in _REDIRECT_STATUSES:
+                    yield r
+                    return
+                location = r.headers.get("location")
+        except SoftTimeLimitExceeded:
+            raise
+        except Exception as exc:
+            if guard.fired:
+                _log.warning("Download from %s exceeded its deadline; connection closed", _host_for_log(url))
+                raise ValueError("download too slow: deadline exceeded (connection closed)") from exc
+            raise
+        finally:
+            guard.cancel()
         if not location or not isinstance(location, str):
             raise ValueError(f"redirect without a Location from {url!r}")
         url = urllib.parse.urljoin(url, location)
@@ -369,6 +439,8 @@ class WikipediaImageSource:
                 _atomic_write(lp, content)
                 local_path = lp
                 break
+            except SoftTimeLimitExceeded:
+                raise                               # the task is out of time: do not try the next candidate
             except Exception:
                 continue
 
@@ -477,6 +549,9 @@ class PexelsVideoSource:
                             for chunk in _iter_capped(r, _MAX_VIDEO_BYTES, deadline_at):
                                 fh.write(chunk)
                     os.replace(tmp_path, local_path)
+                except SoftTimeLimitExceeded:
+                    tmp_path.unlink(missing_ok=True)
+                    raise                           # the task is out of time: do not start the next hit
                 except Exception:
                     tmp_path.unlink(missing_ok=True)
                     continue
