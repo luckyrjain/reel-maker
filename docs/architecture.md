@@ -191,7 +191,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 ### `tests/`
 
-60 test files + `conftest.py`, **1606 tests run by default / 1607 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
+61 test files + `conftest.py`, **1637 tests run by default / 1638 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
 
 | File | Tests | File | Tests |
 |---|---|---|---|
@@ -223,6 +223,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_proportional_timing.py` | 28 | `test_sourcer_selection.py` | 96 |
 | `test_sourcer_contracts.py` | 124 | `test_sourcer_cache_and_chain.py` | 56 |
 | `test_sourcer_download_guards.py` | 199 | `test_sourcer_ids.py` | 77 |
+| `test_sourcer_watchdog.py` | 31 | | |
 | `test_llm_judge.py` | 3 | `test_main.py` | 3 |
 | `test_observability.py` | 3 | `test_golden_reel.py` | 1 (deselected) |
 
@@ -519,7 +520,7 @@ Every drawtext clause carries `:expansion=none` — disables ffmpeg's own `%`-ex
 - Portraits at ≤ FHD (1920 px) preferred; falls back gracefully to landscape or 4K
 - Cached by `(source="pexels", source_ref=video_id)` in `assets` table; `video_id` must be a non-negative integer or an ASCII digit string whose decimal form is 1-20 digits, otherwise that search hit is skipped
 - A malformed search hit (missing/non-numeric duration or id, null width/height, non-string link) or a non-JSON body is skipped / gives no result — it never raises into the render task
-- Downloads (Pexels and Wikipedia alike): https only, to `*.pexels.com` / `upload.wikimedia.org` (no userinfo, port 443, plain `[a-z0-9.-]` host); redirects are followed by hand with every hop re-checked (max 3), never by httpx; `Accept-Encoding: identity` is sent and an encoded response is rejected; the body is capped (250 MB video / 50 MB image) and bounded in wall-clock time (600 s / 120 s, one budget shared by the redirect hops and the 429 retry, checked on every network read). A download to a disallowed URL (first request or redirect target) is logged at WARNING by host; an oversized, encoded, too-slow or over-redirected one is rejected silently. Either way the search moves on to the next hit/candidate. Not bounded here: a server dripping response headers, and the per-hit budgets adding up (the outer bound is the render task's hard time limit, not its soft one: the search loops' broad `except Exception` swallows `SoftTimeLimitExceeded`); a read can also overrun the budget by up to its httpx timeout, and a dripped chunked-encoding size line is not covered
+- Downloads (Pexels and Wikipedia alike): https only, to `*.pexels.com` / `upload.wikimedia.org` (no userinfo, port 443, plain `[a-z0-9.-]` host); redirects are followed by hand with every hop re-checked (max 3), never by httpx; `Accept-Encoding: identity` is sent and an encoded response is rejected; the body is capped (250 MB video / 50 MB image) and bounded in wall-clock time (600 s / 120 s, one budget shared by the redirect hops and the 429 retry, checked on every network read). A download to a disallowed URL (first request or redirect target) is logged at WARNING by host; an oversized, encoded, too-slow or over-redirected one is rejected silently. Either way the search moves on to the next hit/candidate. A `_Watchdog` (armed from httpcore's connect-time trace event) shuts the socket down when the budget runs out, which is the only thing that can interrupt a read blocked on dripped response headers or a chunked-encoding size line. A `SoftTimeLimitExceeded` raised mid-download is re-raised by the search loops (it ends the task), not swallowed as an ordinary download failure. Not bounded: the per-hit budgets adding up (up to 15 Pexels hits), and a single read can overrun by up to its httpx timeout before the next check
 - `safe_to_publish=True` (Pexels license is permissive)
 
 ### Player photos (`WikipediaImageSource`)
