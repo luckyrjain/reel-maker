@@ -283,17 +283,38 @@ budget; a 20 MB body downloads in ~0.02 s with `iter_bytes()`; 200k tiny chunks 
 defect of medium severity or higher. Fixed (tests first): `_host_for_log` raised on bytes input and had a
 dead `.lower()`; four test gaps from a 104-mutant audit (the Pexels body sharing the connect-phase budget,
 the pre-hop deadline boundary, the exact 253-character host bound, a hostile host reaching the log raw
-through the download path); dead test code and a stale test name. Documented instead of changed, as
-deliberate scope decisions:
+through the download path); dead test code and a stale test name. The two hardening gaps round 3 raised were first documented and then closed in a follow-up (below);
+the two that remain documented are a read overrunning the budget by up to its httpx timeout (the
+timeout is not clamped to the time remaining) and a deterministic shared `.tmp` name (two concurrent
+renders downloading the same asset could truncate each other; render concurrency is 1; pre-existing).
 
-- **A dripped chunked-encoding size line / chunk extension, or response headers**, produce no body event,
-  so the deadline never runs (h11 caps the line at ~80 KB; a byte per read-timeout is ~110 days). A
-  socket-shutdown watchdog (`threading.Timer` on the connection's socket) fixed it in a prototype, but it
-  reaches into httpx's `network_stream` extension; left as a follow-up.
-- **A read can overrun the budget by up to its httpx timeout** (the timeout is not clamped to the time
-  remaining).
-- **`SoftTimeLimitExceeded` is swallowed** by the pre-existing broad `except Exception` in the Pexels and
-  Wikipedia loops (same on `main`), so the real outer bound is the hard limit (soft + 120 s, then the
-  reaper), not the soft one. Re-raising it in both loops is a follow-up.
-- A deterministic shared `.tmp` name means two concurrent renders downloading the same asset could truncate
-  each other (render concurrency is 1; pre-existing).
+### Follow-up: the watchdog and the soft-limit pass-through
+
+- **Watchdog.** The deadline checks in `_open_download` (before each hop) and `_iter_capped` (after each
+  network read) only run when httpx yields a response or a body chunk. A host dripping response headers,
+  or a chunked-encoding size line / extension, yields neither, and h11 only caps those at ~80 KB with
+  each byte allowed up to the read timeout (about 110 days at a 119 s drip). `_Watchdog` arms a daemon
+  `threading.Timer` for the remaining budget from httpcore's `connection.connect_tcp.complete` trace
+  event, which fires with the raw socket before any response exists, and `socket.shutdown(SHUT_RDWR)`s it
+  when the budget runs out; the blocked read then fails at once and `_open_download` raises
+  `ValueError("download too slow: deadline exceeded (connection closed)")` (logged by host). It is
+  cancelled when each hop ends and is never armed without a budget. The trace hook needs
+  `httpx.Client.stream`: module-level `httpx.stream()` has no `extensions` parameter, so downloads now go
+  through a small `_http_stream(method, url, *, extensions=None, **kwargs)` seam (same call shape as
+  `httpx.stream`); tests patch `_http_stream`, not `httpx.stream` (a mechanical rename of 28 patch
+  targets, plus the three tests that pin the request kwargs now also assert the `extensions` trace hook).
+  Verified with real raw-socket servers (header drip, chunk-size-line drip, one-byte-per-read body,
+  silent server: each cut off near a 0.6 s budget, not the 30 s read timeout), through `_open_download`
+  and through the real Pexels and Wikipedia `search()` paths, with no partial file and no Timer thread
+  left behind. `tests/test_sourcer_watchdog.py`: 31 tests; 13 targeted mutants, 12 killed by the suite and
+  the 13th (the double-arm guard) pinned by a direct trace-hook test.
+- **`SoftTimeLimitExceeded`.** It is an `Exception` subclass (billiard), so the search loops' broad
+  `except Exception: continue` swallowed it and started the next hit on a fresh budget (the same
+  pattern is on `main`). Both loops now catch `celery.exceptions.SoftTimeLimitExceeded` first and
+  re-raise (the Pexels loop after removing its partial `.tmp`; Wikipedia's `_atomic_write` already
+  cleans up), and `_open_download` never converts it into a deadline error. Every other download
+  failure is still swallowed. `engine/` now imports this one exception class from Celery (the
+  `worker/` modules already do), preferred over matching on the class name.
+- Corrected claims: the earlier "the soft limit is the outer bound" wording was wrong while the swallow
+  existed; with the re-raise the task's time limits are again the outer bound for the per-hit budgets
+  adding up.
