@@ -283,71 +283,63 @@ budget; a 20 MB body downloads in ~0.02 s with `iter_bytes()`; 200k tiny chunks 
 defect of medium severity or higher. Fixed (tests first): `_host_for_log` raised on bytes input and had a
 dead `.lower()`; four test gaps from a 104-mutant audit (the Pexels body sharing the connect-phase budget,
 the pre-hop deadline boundary, the exact 253-character host bound, a hostile host reaching the log raw
-through the download path); dead test code and a stale test name. Documented instead of changed, as
-deliberate scope decisions:
+through the download path); dead test code and a stale test name. The two hardening gaps round 3 raised were first documented and then closed in a follow-up (below);
+the two that remain documented are a read overrunning the budget by up to its httpx timeout (the
+timeout is not clamped to the time remaining) and a deterministic shared `.tmp` name (two concurrent
+renders downloading the same asset could truncate each other; render concurrency is 1; pre-existing).
 
-- **A dripped chunked-encoding size line / chunk extension, or response headers**, produce no body event,
-  so the deadline never runs (h11 caps the line at ~80 KB; a byte per read-timeout is ~110 days). A
-  socket-shutdown watchdog (`threading.Timer` on the connection's socket) fixed it in a prototype, but it
-  reaches into httpx's `network_stream` extension; left as a follow-up.
-- **A read can overrun the budget by up to its httpx timeout** (the timeout is not clamped to the time
-  remaining).
-- **`SoftTimeLimitExceeded` is swallowed** by the pre-existing broad `except Exception` in the Pexels and
-  Wikipedia loops (same on `main`), so the real outer bound is the hard limit (soft + 120 s, then the
-  reaper), not the soft one. Re-raising it in both loops is a follow-up.
-- A deterministic shared `.tmp` name means two concurrent renders downloading the same asset could truncate
-  each other (render concurrency is 1; pre-existing).
+### Follow-up: the watchdog and the soft-limit pass-through
 
-### Follow-up: socket watchdog, soft time limit, unique scratch files
+- **Watchdog.** The deadline checks in `_open_download` (before each hop) and `_iter_capped` (after each
+  network read) only run when httpx yields a response or a body chunk. A host dripping response headers,
+  or a chunked-encoding size line / extension, yields neither, and h11 only caps those at ~80 KB with
+  each byte allowed up to the read timeout (about 110 days at a 119 s drip). `_Watchdog` arms a daemon
+  `threading.Timer` for the remaining budget from httpcore's `connection.connect_tcp.complete` trace
+  event, which fires with the raw socket before any response exists, and `socket.shutdown(SHUT_RDWR)`s it
+  when the budget runs out; the blocked read then fails at once and `_open_download` raises
+  `ValueError("download too slow: deadline exceeded (connection closed)")` (logged by host). It is
+  cancelled when each hop ends and is never armed without a budget. The trace hook needs
+  `httpx.Client.stream`: module-level `httpx.stream()` has no `extensions` parameter, so downloads now go
+  through a small `_http_stream(method, url, *, extensions=None, **kwargs)` seam (same call shape as
+  `httpx.stream`); tests patch `_http_stream`, not `httpx.stream` (a mechanical rename of 28 patch
+  targets, plus the three tests that pin the request kwargs now also assert the `extensions` trace hook).
+  Verified with real raw-socket servers (header drip, chunk-size-line drip, one-byte-per-read body,
+  silent server: each cut off near a 0.6 s budget, not the 30 s read timeout), through `_open_download`
+  and through the real Pexels and Wikipedia `search()` paths, with no partial file and no Timer thread
+  left behind. `tests/test_sourcer_watchdog.py`: 31 tests; 13 targeted mutants, 12 killed by the suite and
+  the 13th (the double-arm guard) pinned by a direct trace-hook test.
+- **`SoftTimeLimitExceeded`.** It is an `Exception` subclass (billiard), so the search loops' broad
+  `except Exception: continue` swallowed it and started the next hit on a fresh budget (the same
+  pattern is on `main`). Both loops now catch `celery.exceptions.SoftTimeLimitExceeded` first and
+  re-raise (the Pexels loop after removing its partial `.tmp`; Wikipedia's `_atomic_write` already
+  cleans up), and `_open_download` never converts it into a deadline error. Every other download
+  failure is still swallowed. `engine/` now imports this one exception class from Celery (the
+  `worker/` modules already do), preferred over matching on the class name.
+- Corrected claims: the earlier "the soft limit is the outer bound" wording was wrong while the swallow
+  existed; with the re-raise the task's time limits are again the outer bound for the per-hit budgets
+  adding up.
 
-Closes the three items round 3 left documented. Built test-first (the real-socket tests were run against the
-unchanged code and failed after the full read timeout, 30 s each, before any production line was written).
+### Follow-up: the watchdog over TLS, unique scratch files
 
-**1. The wall-clock budget now also runs while httpx yields no event.** `_open_download` creates one
-`_DeadlineWatchdog` per download (shared by its redirect hops; the 429 retry builds a second one over the
-same `deadline_at`): a daemon `threading.Timer` that, when the budget is spent, calls
-`socket.shutdown(SHUT_RDWR)` on the connection currently in use. The blocked read returns at once and httpx
-raises a transport error (`RemoteProtocolError` / `ReadError`); `_open_download` turns it into the usual
-`ValueError("download too slow: deadline exceeded")` when the watchdog fired, and re-raises it untouched
-otherwise. Decisions worth knowing:
-
-- *How the socket is found.* The prototype read `r.extensions["network_stream"]` after the response opened.
-  That covers a dripped chunk-size line / extension and a stalled body, but **not dripped response headers**:
-  the response does not exist yet, and `httpx.stream()` is blocked inside `__enter__`. So the watchdog is
-  httpcore's documented `trace` request extension instead: `connection.connect_tcp.complete` and
-  `connection.start_tls.complete` hand over the stream the moment the connection exists (TLS replaces the TCP
-  socket — `wrap_socket` detaches the old object — so the later event wins). A socket registered after the
-  timer fired is shut down immediately.
-- *`httpx.stream()` takes no `extensions`*, so downloads now go through `_httpx_stream()`: a one-shot
-  `httpx.Client` + `client.stream(...)`, which is what `httpx.stream()` does. It is also the single seam the
-  tests patch (the ~30 `patch("…httpx.stream")` sites became `patch("…_httpx_stream")`; the two tests that
-  compared the stream kwargs exactly now pop `extensions` first).
-- *`disarm()` before the response closes and between hops*, so a timer that fires late never calls
-  `shutdown` on a file descriptor the OS has already recycled. `cancel()` (in `finally`) ends the thread, on
-  every exit path including a refused hop and an exception in the caller's body.
-- *The httpx timeout is clamped to the time left* (`min(timeout, max(remaining, 1.0))` per hop): defence in
-  depth for the case where no socket could be obtained, and it bounds the connect phase, which the watchdog
-  cannot interrupt (no socket yet). The clamp reuses the `_monotonic()` value the hop check already took, so
-  the fake-clock tests' tick lists did not change.
-- *Not covered:* the connect phase is bounded by the clamped timeout, not the deadline; budgets of
-  successive hits still add up (up to 15 Pexels hits).
-- *Verified* against real sockets on 127.0.0.1, plain TCP and TLS (a throwaway self-signed certificate,
-  trusted through `SSL_CERT_FILE`; the shutdown of an `SSLSocket` works): dripped headers, a dripped chunk
-  extension, a stalled body, a trickled body and a header drip behind a redirect all stop within ~1 s of a
-  0.6-0.8 s budget; a fast download, and a finished download whose timer would have fired later, are
-  untouched.
-
-**2. `SoftTimeLimitExceeded` is no longer swallowed by the two download loops.** `_is_soft_time_limit(exc)`
-matches any class named `SoftTimeLimitExceeded` in the exception's MRO (so `engine/` does not import
-Celery; billiard's real class and a subclass are both tested). Both loops re-raise it, after the scratch file
-is removed. Not changed (same flaw, much smaller window — 10-30 s metadata calls): the other
-`except Exception` handlers in these classes (`opensearch`, summary, `_fetch_license`, the Pexels search
-call); a soft limit landing there is still eaten once. They are a candidate for the same helper.
-
-**3. Scratch files have unique names.** `_tmp_for(path)` returns `<name>.<12 hex>.tmp` next to the target;
-`_atomic_write` (also used by the HuggingFace sources) and the Pexels loop use it. A unique name stops two
-processes from truncating each other's file (a test runs two overlapping downloads of one asset and checks
-the final bytes are one complete download, not a mix). Because a killed process no longer has its scratch
-file overwritten by the next attempt, `_tmp_for` also removes that target's `*.tmp` siblings untouched for
-`_STALE_TMP_S` (1 h, well above the 10 min video budget; best-effort, never blocks a download). Legacy
-fixed-name leftovers (`pexels_1.tmp`) are not swept.
+- **The watchdog did not work over https — i.e. for every real download.** `_Watchdog` armed on
+  `connection.connect_tcp.complete` and kept that raw socket. For https, httpcore then calls
+  `start_tls`, whose `ssl.wrap_socket` creates a NEW `SSLSocket` and detaches the original, so the timer
+  called `shutdown` on a dead object (swallowed as `OSError`) and the blocked read was never interrupted.
+  Reproduced with real TLS servers (throwaway self-signed cert, trusted through `SSL_CERT_FILE`): dripped
+  headers, a dripped chunk extension and a stalled body ran 5-13 s against a 0.8 s budget (read timeout 5 s,
+  server drip 8 s; with the 30 s default the pre-fix run took 30-38 s). The first pass tested plain TCP only,
+  which is why this was missed. `_Watchdog` now keeps the current socket under a lock and
+  `connection.start_tls.complete` re-targets it; a TLS socket that appears after the deadline is shut down
+  at once. `tests/test_sourcer_watchdog_tls.py`: 7 tests, 5 mutants killed (the sixth, an extra
+  "timer already armed" guard, was equivalent and removed).
+- **Scratch files have unique names.** The Pexels loop used `pexels_<id>.tmp` and `_atomic_write` used
+  `<final>.tmp`, so two processes fetching one asset truncated each other's file and one `os.replace`d a
+  mix. `_tmp_for(path)` returns `<name>.<12 hex>.tmp`. Because a killed process no longer has its scratch
+  file overwritten by the next attempt, it also removes that target's `*.tmp` siblings untouched for
+  `_STALE_TMP_S` (1 h, well above the 10 min video budget; best-effort, never blocks a download). Legacy
+  fixed-name leftovers are not swept. `tests/test_sourcer_tmp_files.py`: 10 tests, 7 mutants killed.
+- Not changed: the watchdog is still not disarmed between a response's last byte and its close (a timer
+  firing in that window calls `shutdown` on a socket about to be closed — harmless in practice since the
+  hop is cancelled in `finally`, but not a fd-recycling guarantee), the connect phase is bounded only by the
+  httpx connect timeout, and the other `except Exception` handlers in these classes (opensearch, summary,
+  `_fetch_license`, the Pexels search call) still swallow `SoftTimeLimitExceeded` once.

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
+from celery.exceptions import SoftTimeLimitExceeded
 
 from api import models
 from api.config import settings
@@ -58,15 +59,6 @@ def _tmp_for(path: Path) -> Path:
     return path.with_name(f"{path.name}.{uuid.uuid4().hex[:12]}.tmp")
 
 
-def _is_soft_time_limit(exc: BaseException) -> bool:
-    """True for Celery's (billiard's) `SoftTimeLimitExceeded` or a subclass.
-
-    Matched by class name so `engine/` does not import Celery. It is an `Exception` subclass, so an
-    `except Exception: continue` swallows it unless the handler re-raises it first.
-    """
-    return any(c.__name__ == "SoftTimeLimitExceeded" for c in type(exc).__mro__)
-
-
 def _atomic_write(path: Path, data: bytes) -> None:
     """Write bytes via a temp file + os.replace.
 
@@ -94,78 +86,16 @@ _MAX_IMAGE_BYTES = 50 * 1024 * 1024    # Wikipedia originals are rarely over ~20
 _MAX_REDIRECTS = 3
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 # httpx timeouts are per read, so a server that trickles never trips them: each download also gets a
-# wall-clock budget, shared by its redirect hops / 429 retry. It is enforced three ways: checked before
-# every hop and after every network read (cheap, deterministic, covers a trickling body), clamped into the
-# httpx timeout of each hop (so one read cannot overrun it by a whole 120 s), and -- the part that covers
-# what httpx surfaces no event for, i.e. a server dripping response headers or a chunked-encoding size
-# line / extension (h11 caps these at ~80 KB, but each byte may take up to the read timeout) -- a
-# `_DeadlineWatchdog` that shuts the connection's socket down when the budget runs out. Still not
-# covered: a connect that never completes (bounded by the httpx connect timeout, so by the clamped
-# per-hop timeout, but not by the watchdog) and any hit's budget beyond the first: they add up (up to 15
-# Pexels hits). The outer bound for those is the render task's soft limit, which the search loops now let
-# through (`_is_soft_time_limit`), then its hard limit (+120 s) and the reaper.
+# wall-clock budget, shared by its redirect hops / 429 retry. It is enforced in three places: before
+# every hop (`_open_download`), after every network read (`_iter_capped`), and by a `_Watchdog` that
+# shuts the socket down when the budget runs out -- the only thing that can interrupt a read blocked
+# on a server dripping response headers or a chunked-encoding size line, where httpx yields nothing for
+# the other two to check. Still not bounded: the per-hit budgets add up (up to 15 Pexels hits). A
+# SoftTimeLimitExceeded raised inside a download is re-raised by the search loops (it ends the task),
+# not swallowed with the ordinary download failures.
 _VIDEO_DEADLINE_S = 600.0
 _IMAGE_DEADLINE_S = 120.0
 _monotonic = time.monotonic     # indirection so tests can drive a fake clock
-_MIN_HOP_TIMEOUT_S = 1.0        # floor of the per-hop httpx timeout once the budget is nearly spent
-
-
-class _DeadlineWatchdog:
-    """Shuts a download's socket down when its wall-clock budget runs out.
-
-    Used as httpcore's `trace` hook (a documented request extension) to learn the socket of each
-    connection the moment it is made, so it also covers the time before httpx has a response to
-    hand out. `threading.Timer` fires `_fire` after `remaining_s`; `shutdown(SHUT_RDWR)` makes the
-    blocked read return at once, which httpx reports as a transport error (`_open_download` turns
-    that into the usual "too slow" ValueError, see `fired`). `disarm()` is called before a response
-    is closed and between hops so a late timer never touches a socket the download has finished with
-    (the fd may be recycled); `cancel()` ends the timer thread.
-    """
-
-    _SOCKET_EVENTS = ("connection.connect_tcp.complete", "connection.start_tls.complete")
-
-    def __init__(self, remaining_s: float):
-        self._lock = threading.Lock()
-        self._sock = None
-        self.fired = False
-        self._timer = threading.Timer(remaining_s, self._fire)     # a negative interval fires at once
-        self._timer.daemon = True
-        self._timer.start()
-
-    def trace(self, event: str, info: dict) -> None:
-        if event not in self._SOCKET_EVENTS:
-            return
-        try:
-            sock = info["return_value"].get_extra_info("socket")
-        except Exception:       # a hook must never break the request it observes
-            return
-        if sock is None:
-            return
-        with self._lock:
-            self._sock = sock
-            if self.fired:
-                self._shutdown_locked()
-
-    def _fire(self) -> None:
-        with self._lock:
-            self.fired = True
-            self._shutdown_locked()
-
-    def _shutdown_locked(self) -> None:
-        if self._sock is None:
-            return
-        try:
-            self._sock.shutdown(socket.SHUT_RDWR)
-        except Exception:       # already closed / not connected: nothing left to interrupt
-            pass
-
-    def disarm(self) -> None:
-        with self._lock:
-            self._sock = None
-
-    def cancel(self) -> None:
-        self._timer.cancel()
-        self.disarm()
 
 
 _HOST_RE = re.compile(r"[a-z0-9.-]+")
@@ -223,15 +153,82 @@ def _host_for_log(url) -> str:
 
 
 @contextmanager
-def _httpx_stream(method: str, url: str, **kwargs):
-    """`httpx.stream()` plus the `extensions` argument the module-level helper has no room for.
+def _http_stream(method, url, *, extensions=None, **kwargs):
+    """`httpx.stream()` plus the `extensions` parameter it lacks (needed for the connect-time trace).
 
-    `_open_download` needs it to hand httpcore a `trace` hook (see `_DeadlineWatchdog`); everything
-    else is what `httpx.stream()` does: a one-shot Client, closed with the response.
+    A module-level seam so tests can substitute the transport; same call shape as `httpx.stream`.
     """
-    with httpx.Client(follow_redirects=kwargs.pop("follow_redirects", False)) as client:
-        with client.stream(method, url, **kwargs) as response:
+    with httpx.Client() as client:
+        with client.stream(method, url, extensions=extensions, **kwargs) as response:
             yield response
+
+
+class _Watchdog:
+    """Shuts a download's socket down once its wall-clock budget is spent.
+
+    httpx timeouts are per read, and the deadline checks in `_open_download`/`_iter_capped` only run
+    when httpx hands back a response or a body chunk; a server dripping response headers, or a chunked
+    size line / extension, produces neither, so nothing else can interrupt that blocked read. Arm it
+    from httpcore's `connect_tcp.complete` trace event (`trace`, passed as the request's `trace`
+    extension: the raw socket exists before any response does), `cancel()` it when the hop ends. When
+    it fires the blocked read fails at once (`fired` is True and the caller reports a deadline error).
+
+    Over https `start_tls` wraps the TCP socket in a NEW `SSLSocket` and detaches the original (its
+    `shutdown` then raises and nothing is interrupted), so `connection.start_tls.complete` re-targets
+    the timer at the TLS socket -- and shuts it down at once if the deadline already passed.
+    """
+
+    def __init__(self, deadline_at: "float | None"):
+        self._deadline_at = deadline_at
+        self._timer: "threading.Timer | None" = None
+        self._sock: "socket.socket | None" = None
+        self._lock = threading.Lock()
+        self.fired = False
+
+    @staticmethod
+    def _socket_of(info: dict) -> "socket.socket | None":
+        try:
+            sock = info["return_value"].get_extra_info("socket")
+        except Exception:                                   # noqa: BLE001 - never break the request
+            return None
+        return sock if isinstance(sock, socket.socket) else None
+
+    def trace(self, event_name: str, info: dict) -> None:
+        if self._deadline_at is None:
+            return
+        if event_name == "connection.start_tls.complete":
+            sock = self._socket_of(info)
+            if sock is not None:
+                with self._lock:
+                    self._sock = sock
+                    if self.fired:
+                        self._shutdown_locked()
+            return
+        if event_name != "connection.connect_tcp.complete" or self._timer is not None:
+            return
+        sock = self._socket_of(info)
+        if sock is None:
+            return
+        self._sock = sock
+        timer = threading.Timer(max(self._deadline_at - _monotonic(), 0.0), self._fire)
+        timer.daemon = True
+        self._timer = timer
+        timer.start()
+
+    def _fire(self) -> None:
+        with self._lock:
+            self.fired = True
+            self._shutdown_locked()
+
+    def _shutdown_locked(self) -> None:
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except (OSError, AttributeError):
+            pass                                            # already closed: the read is ending anyway
+
+    def cancel(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
 
 
 @contextmanager
@@ -240,9 +237,9 @@ def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = N
     """Stream a GET of `url`, following redirects by hand so every hop is checked by `url_ok`.
 
     Raises ValueError for a disallowed URL (first or redirected), a redirect with no Location, or
-    more than `_MAX_REDIRECTS` hops, or if the wall-clock `deadline_at` has passed before a hop.
-    Yields the final (non-redirect) response; the caller still
-    owns `raise_for_status()` and the status handling. `Accept-Encoding: identity` is always sent
+    more than `_MAX_REDIRECTS` hops, if the wall-clock `deadline_at` has passed before a hop, or if a
+    `_Watchdog` had to close the connection at the deadline. Yields the final (non-redirect) response;
+    the caller still owns `raise_for_status()` and the status handling. `Accept-Encoding: identity` is always sent
     (media is not worth compressing, and a gzip body would inflate far past its Content-Length
     before the size cap could see it); `_iter_capped` rejects a response that is encoded anyway.
     """
@@ -251,42 +248,32 @@ def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = N
         "timeout": timeout,
         "headers": {**(headers or {}), "Accept-Encoding": "identity"},
     }
-    watchdog = None
-    try:
-        for _ in range(_MAX_REDIRECTS + 1):
-            if deadline_at is not None:
-                now = _monotonic()
-                if now > deadline_at:
-                    raise ValueError("download too slow: deadline exceeded before the request")
-                if watchdog is None:
-                    watchdog = _DeadlineWatchdog(deadline_at - now)
-                    kwargs["extensions"] = {"trace": watchdog.trace}
-                kwargs["timeout"] = min(timeout, max(deadline_at - now, _MIN_HOP_TIMEOUT_S))
-            if not url_ok(url):
-                _log.warning("Refusing download from a disallowed URL (host %s)", _host_for_log(url))
-                raise ValueError(f"download URL not allowed: {url!r}")
-            with _httpx_stream("GET", url, **kwargs) as r:
+    for _ in range(_MAX_REDIRECTS + 1):
+        if deadline_at is not None and _monotonic() > deadline_at:
+            raise ValueError("download too slow: deadline exceeded before the request")
+        if not url_ok(url):
+            _log.warning("Refusing download from a disallowed URL (host %s)", _host_for_log(url))
+            raise ValueError(f"download URL not allowed: {url!r}")
+        guard = _Watchdog(deadline_at)
+        try:
+            with _http_stream("GET", url, extensions={"trace": guard.trace}, **kwargs) as r:
                 if r.status_code not in _REDIRECT_STATUSES:
-                    try:
-                        yield r
-                    finally:
-                        if watchdog is not None:
-                            watchdog.disarm()
+                    yield r
                     return
                 location = r.headers.get("location")
-                if watchdog is not None:
-                    watchdog.disarm()
-            if not location or not isinstance(location, str):
-                raise ValueError(f"redirect without a Location from {url!r}")
-            url = urllib.parse.urljoin(url, location)
-        raise ValueError("too many redirects")
-    except httpx.HTTPError as exc:
-        if watchdog is not None and watchdog.fired:
-            raise ValueError("download too slow: deadline exceeded") from exc
-        raise
-    finally:
-        if watchdog is not None:
-            watchdog.cancel()
+        except SoftTimeLimitExceeded:
+            raise
+        except Exception as exc:
+            if guard.fired:
+                _log.warning("Download from %s exceeded its deadline; connection closed", _host_for_log(url))
+                raise ValueError("download too slow: deadline exceeded (connection closed)") from exc
+            raise
+        finally:
+            guard.cancel()
+        if not location or not isinstance(location, str):
+            raise ValueError(f"redirect without a Location from {url!r}")
+        url = urllib.parse.urljoin(url, location)
+    raise ValueError("too many redirects")
 
 
 def _iter_capped(r, limit: int, deadline_at: "float | None" = None):
@@ -501,9 +488,9 @@ class WikipediaImageSource:
                 _atomic_write(lp, content)
                 local_path = lp
                 break
-            except Exception as exc:
-                if _is_soft_time_limit(exc):
-                    raise
+            except SoftTimeLimitExceeded:
+                raise                               # the task is out of time: do not try the next candidate
+            except Exception:
                 continue
 
         if local_path is None:
@@ -611,10 +598,11 @@ class PexelsVideoSource:
                             for chunk in _iter_capped(r, _MAX_VIDEO_BYTES, deadline_at):
                                 fh.write(chunk)
                     os.replace(tmp_path, local_path)
-                except Exception as exc:
+                except SoftTimeLimitExceeded:
                     tmp_path.unlink(missing_ok=True)
-                    if _is_soft_time_limit(exc):
-                        raise
+                    raise                           # the task is out of time: do not start the next hit
+                except Exception:
+                    tmp_path.unlink(missing_ok=True)
                     continue
 
             return SourcedAsset(

@@ -226,7 +226,7 @@ def test_pexels_http_error_with_a_valid_body_is_none(tmp_path):
     src = PexelsVideoSource("k", tmp_path)
     streamed = []
     with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]}, status=500)), \
-            patch(f"{_MOD}._httpx_stream", _stream_factory(streamed)):
+            patch(f"{_MOD}._http_stream", _stream_factory(streamed)):
         assert src.search("q", 1.0) is None
     assert streamed == []        # a 5xx search response must never lead to a download
 
@@ -251,7 +251,7 @@ def test_pexels_malformed_search_json_is_none(tmp_path):
 def test_pexels_wrong_shape_search_body_is_none(tmp_path, body):
     streamed = []
     with patch(f"{_MOD}.httpx.get", return_value=_json_resp(body)), \
-            patch(f"{_MOD}._httpx_stream", _stream_factory(streamed)):
+            patch(f"{_MOD}._http_stream", _stream_factory(streamed)):
         assert PexelsVideoSource("k", tmp_path).search("q", 1.0) is None
     assert streamed == []
 
@@ -291,7 +291,7 @@ def test_pexels_a_cached_file_is_not_served_for_a_hit_with_an_unusable_link(tmp_
     (tmp_path / "pexels_1.mp4").write_bytes(b"cached")
     vid = {"id": 1, "duration": 10, "video_files": [{"width": 1080, "height": 1920, "link": bad_link}]}
     with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [vid]})), \
-            patch(f"{_MOD}._httpx_stream", _stream_factory([])):
+            patch(f"{_MOD}._http_stream", _stream_factory([])):
         assert PexelsVideoSource("k", tmp_path).search("q", 1.0) is None
 
 
@@ -300,7 +300,7 @@ def test_pexels_a_bool_duration_is_not_a_number_even_when_it_would_pass_the_mini
     """`True` == 1, so with a 0.5 s minimum only the bool guard can reject it."""
     vids = [{"id": 1, "duration": dur, "video_files": [_vf(1080, 1920)]}]
     with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": vids})), \
-            patch(f"{_MOD}._httpx_stream", _stream_factory([])):
+            patch(f"{_MOD}._http_stream", _stream_factory([])):
         assert PexelsVideoSource("k", tmp_path).search("q", 0.0 if dur is False else 0.5) is None
 
 
@@ -309,7 +309,7 @@ def test_pexels_missing_duration_is_skipped_even_with_no_minimum(tmp_path):
     src = PexelsVideoSource(api_key="k", store_dir=tmp_path)
     vids = [{"id": 1, "video_files": [_vf(1080, 1920)]}]
     with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": vids})), \
-            patch(f"{_MOD}._httpx_stream", _stream_factory([])):
+            patch(f"{_MOD}._http_stream", _stream_factory([])):
         assert src.search("q", 0.0) is None
 
 
@@ -324,7 +324,7 @@ def test_pexels_download_uses_a_get_stream(tmp_path):
     def fake_stream(method, url, **kw):
         methods.append(method); r = MagicMock(); r.iter_bytes.return_value = iter([b"v"]); yield r
     with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]})), \
-            patch(f"{_MOD}._httpx_stream", fake_stream):
+            patch(f"{_MOD}._http_stream", fake_stream):
         PexelsVideoSource("k", tmp_path).search("q", 1.0)
     assert methods == ["GET"]
 
@@ -341,7 +341,7 @@ def test_pexels_non_http_download_errors_still_skip_to_next(tmp_path):
         if "bad" in url: raise OSError("disk full")
         r = MagicMock(); r.iter_bytes.return_value = iter([b"v"]); yield r
     vids = [_video(1, [_vf(1080, 1920, link="https://videos.pexels.com/video-files/bad.mp4")]), _video(2, [_vf(1080, 1920)])]
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": vids})), patch(f"{_MOD}._httpx_stream", fake_stream):
+    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": vids})), patch(f"{_MOD}._http_stream", fake_stream):
         assert PexelsVideoSource("k", tmp_path).search("q", 1.0).source_ref == "2"
 
 
@@ -596,7 +596,7 @@ def test_pexels_query_is_sent_verbatim_case_preserved(tmp_path):
 def _pexels_min(tmp_path, videos, min_d):
     src = PexelsVideoSource("k", tmp_path)
     with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": videos})), \
-            patch(f"{_MOD}._httpx_stream", _stream_factory([])):
+            patch(f"{_MOD}._http_stream", _stream_factory([])):
         return src.search("q", min_d)
 
 
@@ -715,7 +715,7 @@ def test_pexels_first_qualifying_video_wins_not_sorted_by_duration(tmp_path, dur
 def test_pexels_fractional_minimum_is_not_truncated(tmp_path):
     src = PexelsVideoSource("k", tmp_path)
     with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)], duration=5.2)]})), \
-            patch(f"{_MOD}._httpx_stream", _stream_factory([])):
+            patch(f"{_MOD}._http_stream", _stream_factory([])):
         assert src.search("q", 5.5) is None
 
 
@@ -725,7 +725,7 @@ def test_pexels_long_query_verbatim_and_filename_uses_video_id(tmp_path):
     vid = _video(7, [{"id": 999, "width": 1080, "height": 1920, "link": "https://videos.pexels.com/video-files/a.mp4"}])
     src = PexelsVideoSource("k", tmp_path)
     with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [vid]})) as get, \
-            patch(f"{_MOD}._httpx_stream", _stream_factory([])):
+            patch(f"{_MOD}._http_stream", _stream_factory([])):
         r = src.search(q, 5.0)
     assert get.call_args.kwargs["params"]["query"] == q
     assert r.local_path.name == "pexels_7.mp4"
@@ -735,7 +735,7 @@ def test_pexels_long_query_verbatim_and_filename_uses_video_id(tmp_path):
 def test_pexels_failed_rename_is_a_skip_not_a_crash_and_leaves_no_tmp(tmp_path):
     src = PexelsVideoSource("k", tmp_path)
     with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]})), \
-            patch(f"{_MOD}._httpx_stream", _stream_factory([])), \
+            patch(f"{_MOD}._http_stream", _stream_factory([])), \
             patch(f"{_MOD}.os.replace", side_effect=OSError("exdev")):
         assert src.search("q", 5.0) is None
     assert list(tmp_path.iterdir()) == []
