@@ -1,10 +1,14 @@
+import glob
 import hashlib
 import logging
 import math
 import os
 import re
+import socket
+import threading
 import time
 import urllib.parse
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,13 +34,46 @@ def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text).strip()
 
 
+_STALE_TMP_S = 3600.0   # a scratch file untouched this long belongs to a dead process (a download <= 10 min)
+
+
+def _tmp_for(path: Path) -> Path:
+    """A unique scratch path next to `path`, for a write that ends in `os.replace(tmp, path)`.
+
+    The name is unique per call: with a fixed name, two processes fetching the same asset truncated
+    each other's file and one then `os.replace`d a mix of both. A process killed mid-download no longer
+    has its scratch file overwritten by the next attempt, so this also removes `path`'s scratch files
+    older than `_STALE_TMP_S` (best-effort; a live download keeps its file's mtime fresh).
+    """
+    try:
+        cutoff = time.time() - _STALE_TMP_S
+        for old in path.parent.glob(glob.escape(path.name) + ".*.tmp"):
+            try:
+                if old.stat().st_mtime < cutoff:
+                    old.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return path.with_name(f"{path.name}.{uuid.uuid4().hex[:12]}.tmp")
+
+
+def _is_soft_time_limit(exc: BaseException) -> bool:
+    """True for Celery's (billiard's) `SoftTimeLimitExceeded` or a subclass.
+
+    Matched by class name so `engine/` does not import Celery. It is an `Exception` subclass, so an
+    `except Exception: continue` swallows it unless the handler re-raises it first.
+    """
+    return any(c.__name__ == "SoftTimeLimitExceeded" for c in type(exc).__mro__)
+
+
 def _atomic_write(path: Path, data: bytes) -> None:
     """Write bytes via a temp file + os.replace.
 
     Every sourcer caches by `if path.exists()`, so a process killed mid-write
     would otherwise leave a truncated file that is reused on every later render.
     """
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = _tmp_for(path)
     try:
         tmp.write_bytes(data)
         os.replace(tmp, path)
@@ -57,16 +94,78 @@ _MAX_IMAGE_BYTES = 50 * 1024 * 1024    # Wikipedia originals are rarely over ~20
 _MAX_REDIRECTS = 3
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 # httpx timeouts are per read, so a server that trickles never trips them: each download also gets a
-# wall-clock budget, shared by its redirect hops / 429 retry and checked before every hop and after
-# every network read. Not covered (a hostile *allowlisted* host only): a server dripping response
-# headers or a chunked-encoding size line / extension (h11 caps these at ~80 KB, but each byte may take
-# up to the read timeout), and a read that overruns the budget by up to its httpx timeout (120 s Pexels,
-# 30 s Wikipedia). The per-hit budgets also add up (up to 15 Pexels hits). The outer bound is the render
-# task's hard time limit (soft + 120 s, then the reaper) -- NOT its soft limit: the broad
-# `except Exception` in the search loops (pre-existing) swallows SoftTimeLimitExceeded.
+# wall-clock budget, shared by its redirect hops / 429 retry. It is enforced three ways: checked before
+# every hop and after every network read (cheap, deterministic, covers a trickling body), clamped into the
+# httpx timeout of each hop (so one read cannot overrun it by a whole 120 s), and -- the part that covers
+# what httpx surfaces no event for, i.e. a server dripping response headers or a chunked-encoding size
+# line / extension (h11 caps these at ~80 KB, but each byte may take up to the read timeout) -- a
+# `_DeadlineWatchdog` that shuts the connection's socket down when the budget runs out. Still not
+# covered: a connect that never completes (bounded by the httpx connect timeout, so by the clamped
+# per-hop timeout, but not by the watchdog) and any hit's budget beyond the first: they add up (up to 15
+# Pexels hits). The outer bound for those is the render task's soft limit, which the search loops now let
+# through (`_is_soft_time_limit`), then its hard limit (+120 s) and the reaper.
 _VIDEO_DEADLINE_S = 600.0
 _IMAGE_DEADLINE_S = 120.0
 _monotonic = time.monotonic     # indirection so tests can drive a fake clock
+_MIN_HOP_TIMEOUT_S = 1.0        # floor of the per-hop httpx timeout once the budget is nearly spent
+
+
+class _DeadlineWatchdog:
+    """Shuts a download's socket down when its wall-clock budget runs out.
+
+    Used as httpcore's `trace` hook (a documented request extension) to learn the socket of each
+    connection the moment it is made, so it also covers the time before httpx has a response to
+    hand out. `threading.Timer` fires `_fire` after `remaining_s`; `shutdown(SHUT_RDWR)` makes the
+    blocked read return at once, which httpx reports as a transport error (`_open_download` turns
+    that into the usual "too slow" ValueError, see `fired`). `disarm()` is called before a response
+    is closed and between hops so a late timer never touches a socket the download has finished with
+    (the fd may be recycled); `cancel()` ends the timer thread.
+    """
+
+    _SOCKET_EVENTS = ("connection.connect_tcp.complete", "connection.start_tls.complete")
+
+    def __init__(self, remaining_s: float):
+        self._lock = threading.Lock()
+        self._sock = None
+        self.fired = False
+        self._timer = threading.Timer(remaining_s, self._fire)     # a negative interval fires at once
+        self._timer.daemon = True
+        self._timer.start()
+
+    def trace(self, event: str, info: dict) -> None:
+        if event not in self._SOCKET_EVENTS:
+            return
+        try:
+            sock = info["return_value"].get_extra_info("socket")
+        except Exception:       # a hook must never break the request it observes
+            return
+        if sock is None:
+            return
+        with self._lock:
+            self._sock = sock
+            if self.fired:
+                self._shutdown_locked()
+
+    def _fire(self) -> None:
+        with self._lock:
+            self.fired = True
+            self._shutdown_locked()
+
+    def _shutdown_locked(self) -> None:
+        if self._sock is None:
+            return
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except Exception:       # already closed / not connected: nothing left to interrupt
+            pass
+
+    def disarm(self) -> None:
+        with self._lock:
+            self._sock = None
+
+    def cancel(self) -> None:
+        self._timer.cancel()
+        self.disarm()
 
 
 _HOST_RE = re.compile(r"[a-z0-9.-]+")
@@ -124,6 +223,18 @@ def _host_for_log(url) -> str:
 
 
 @contextmanager
+def _httpx_stream(method: str, url: str, **kwargs):
+    """`httpx.stream()` plus the `extensions` argument the module-level helper has no room for.
+
+    `_open_download` needs it to hand httpcore a `trace` hook (see `_DeadlineWatchdog`); everything
+    else is what `httpx.stream()` does: a one-shot Client, closed with the response.
+    """
+    with httpx.Client(follow_redirects=kwargs.pop("follow_redirects", False)) as client:
+        with client.stream(method, url, **kwargs) as response:
+            yield response
+
+
+@contextmanager
 def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = None,
                    deadline_at: "float | None" = None):
     """Stream a GET of `url`, following redirects by hand so every hop is checked by `url_ok`.
@@ -140,21 +251,42 @@ def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = N
         "timeout": timeout,
         "headers": {**(headers or {}), "Accept-Encoding": "identity"},
     }
-    for _ in range(_MAX_REDIRECTS + 1):
-        if deadline_at is not None and _monotonic() > deadline_at:
-            raise ValueError("download too slow: deadline exceeded before the request")
-        if not url_ok(url):
-            _log.warning("Refusing download from a disallowed URL (host %s)", _host_for_log(url))
-            raise ValueError(f"download URL not allowed: {url!r}")
-        with httpx.stream("GET", url, **kwargs) as r:
-            if r.status_code not in _REDIRECT_STATUSES:
-                yield r
-                return
-            location = r.headers.get("location")
-        if not location or not isinstance(location, str):
-            raise ValueError(f"redirect without a Location from {url!r}")
-        url = urllib.parse.urljoin(url, location)
-    raise ValueError("too many redirects")
+    watchdog = None
+    try:
+        for _ in range(_MAX_REDIRECTS + 1):
+            if deadline_at is not None:
+                now = _monotonic()
+                if now > deadline_at:
+                    raise ValueError("download too slow: deadline exceeded before the request")
+                if watchdog is None:
+                    watchdog = _DeadlineWatchdog(deadline_at - now)
+                    kwargs["extensions"] = {"trace": watchdog.trace}
+                kwargs["timeout"] = min(timeout, max(deadline_at - now, _MIN_HOP_TIMEOUT_S))
+            if not url_ok(url):
+                _log.warning("Refusing download from a disallowed URL (host %s)", _host_for_log(url))
+                raise ValueError(f"download URL not allowed: {url!r}")
+            with _httpx_stream("GET", url, **kwargs) as r:
+                if r.status_code not in _REDIRECT_STATUSES:
+                    try:
+                        yield r
+                    finally:
+                        if watchdog is not None:
+                            watchdog.disarm()
+                    return
+                location = r.headers.get("location")
+                if watchdog is not None:
+                    watchdog.disarm()
+            if not location or not isinstance(location, str):
+                raise ValueError(f"redirect without a Location from {url!r}")
+            url = urllib.parse.urljoin(url, location)
+        raise ValueError("too many redirects")
+    except httpx.HTTPError as exc:
+        if watchdog is not None and watchdog.fired:
+            raise ValueError("download too slow: deadline exceeded") from exc
+        raise
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
 
 
 def _iter_capped(r, limit: int, deadline_at: "float | None" = None):
@@ -369,7 +501,9 @@ class WikipediaImageSource:
                 _atomic_write(lp, content)
                 local_path = lp
                 break
-            except Exception:
+            except Exception as exc:
+                if _is_soft_time_limit(exc):
+                    raise
                 continue
 
         if local_path is None:
@@ -467,7 +601,7 @@ class PexelsVideoSource:
             local_path = self.store_dir / f"pexels_{vid_id}.mp4"
 
             if not local_path.exists():
-                tmp_path = local_path.with_suffix(".tmp")
+                tmp_path = _tmp_for(local_path)
                 try:
                     deadline_at = _monotonic() + _VIDEO_DEADLINE_S
                     with _open_download(link, _pexels_url_ok, timeout=120.0,
@@ -477,8 +611,10 @@ class PexelsVideoSource:
                             for chunk in _iter_capped(r, _MAX_VIDEO_BYTES, deadline_at):
                                 fh.write(chunk)
                     os.replace(tmp_path, local_path)
-                except Exception:
+                except Exception as exc:
                     tmp_path.unlink(missing_ok=True)
+                    if _is_soft_time_limit(exc):
+                        raise
                     continue
 
             return SourcedAsset(

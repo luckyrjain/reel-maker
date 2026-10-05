@@ -152,7 +152,7 @@ class _Stream:
 def _pexels(tmp_path, videos, stream):
     src = PexelsVideoSource(api_key="k", store_dir=tmp_path)
     with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": videos})), \
-            patch(f"{_MOD}.httpx.stream", stream):
+            patch(f"{_MOD}._httpx_stream", stream):
         return src.search("q", 1.0)
 
 
@@ -169,7 +169,7 @@ def _wiki(tmp_path, summary, stream, sleeps=None, title="Lionel Messi"):
         misrouted.append(url)       # search() swallows exceptions, so record instead of raising
         return _json_resp({})
 
-    with patch(f"{_MOD}.httpx.get", side_effect=fake_get), patch(f"{_MOD}.httpx.stream", stream), \
+    with patch(f"{_MOD}.httpx.get", side_effect=fake_get), patch(f"{_MOD}._httpx_stream", stream), \
             patch(f"{_MOD}.time.sleep") as sleep:
         result = WikipediaImageSource(tmp_path).search("Lionel Messi")
     if sleeps is not None:
@@ -363,6 +363,7 @@ def test_wikipedia_downloads_from_upload_wikimedia_via_stream_without_following_
     assert result.local_path.read_bytes() == b"orig"
     (url, kw), = stream.requests
     assert url == WIKI_OK
+    assert callable(kw.pop("extensions")["trace"])              # the deadline watchdog's socket hook
     assert kw == {
         "headers": {"User-Agent": "reel-maker/1.0", "Accept-Encoding": "identity"},
         "timeout": 30.0, "follow_redirects": False,
@@ -712,7 +713,7 @@ def test_real_httpx_redirect_header_name_is_case_insensitive_and_relative_urls_r
     seen = []
     src = PexelsVideoSource(api_key="k", store_dir=tmp_path)
     with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920, link="https://videos.pexels.com/video-files/1/a.mp4")])]})), \
-            patch(f"{_MOD}.httpx.stream", _real_stream(handler, seen)):
+            patch(f"{_MOD}._httpx_stream", _real_stream(handler, seen)):
         result = src.search("q", 1.0)
     assert result.local_path.read_bytes() == b"final-bytes"
     assert [u for u, _ in seen] == ["https://videos.pexels.com/video-files/1/a.mp4",
@@ -727,7 +728,7 @@ def test_real_httpx_a_gzip_response_is_rejected_and_identity_was_requested(tmp_p
         return httpx.Response(200, content=gzip.compress(b"\0" * 100000), headers={"content-encoding": "gzip"})
     src = PexelsVideoSource(api_key="k", store_dir=tmp_path)
     with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920, link=PEXELS_OK)])]})), \
-            patch(f"{_MOD}.httpx.stream", _real_stream(handler)):
+            patch(f"{_MOD}._httpx_stream", _real_stream(handler)):
         assert src.search("q", 1.0) is None
     assert requested == ["identity"] and list(tmp_path.iterdir()) == []
 

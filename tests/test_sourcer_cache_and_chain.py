@@ -506,7 +506,7 @@ def test_pexels_instances_use_their_own_store_dir(tmp_path):
     srcs = [PexelsVideoSource(api_key="k", store_dir=tmp_path / sub) for sub in ("a", "b")]   # both built first
     for src in srcs:
         with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(7, [_vf(1080, 1920)])]})), \
-                patch(f"{_MOD}.httpx.stream", _stream_factory([])):
+                patch(f"{_MOD}._httpx_stream", _stream_factory([])):
             outs.append(src.search("q", 1.0).local_path)
     assert outs[0].parent == tmp_path / "a" and outs[1].parent == tmp_path / "b"
 
