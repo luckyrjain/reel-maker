@@ -192,7 +192,7 @@ from remote JSON. A Pexels id must now be a non-negative integer (not a bool) or
 20 ASCII digits (`_numeric_id`; an int of more than 20 digits is rejected too; `fullmatch` on `[0-9]`, so a trailing newline or Arabic-Indic digits
 do not pass); a hit with any other id is skipped like any other malformed hit, before the cache is
 consulted. A Wikipedia page id uses the same numeric rule; when `pageid` is missing or unusable the
-id comes from the underscored title (`_title_id`): the title itself if it is `[A-Za-z0-9_-]{1,64}`
+id comes from the underscored title (`_title_id`): the title itself if it is `[A-Za-z0-9_-]{1,64}` (lowercase-only since the later "Follow-up: the last open limits")
 (so `Lionel_Messi` still gives `wiki_Lionel_Messi.jpg`, byte-identical to before), otherwise `t` plus
 the first 16 hex of its SHA-256 (deterministic, so the cache still hits). That removes the
 `ENAMETOOLONG` from `lp.exists()` (a 5000-character title now works) and means `/`, `..`, `.`,
@@ -400,8 +400,9 @@ one commit each (`6bd81c8`, `b3bc584`, `cabf5b3`, `fd7a732`).
   18 mutants, all killed but one equivalent (the `isinstance` guard, which a non-bytes head also fails
   downstream). One real survivor (WebP accepted without the `RIFF` prefix) got its own case.
 
-Still open: DNS resolution time, HuggingFace/JSON API response size, `_title_id` case-sensitivity on a
-case-insensitive filesystem, the deterministic shared `.tmp` name, and the per-beat total across a render.
+Still open at that point (closed later, see "Follow-up: the last open limits"): DNS resolution time,
+HuggingFace/JSON API response size, `_title_id` case-sensitivity on a case-insensitive filesystem, the
+deterministic shared `.tmp` name, and the per-beat total across a render.
 
 ### Review round 5 (the four follow-ups above)
 
@@ -441,6 +442,54 @@ not follow them), `httpx.Timeout(0.0)` (never "no timeout"), timing thresholds u
 Decisions: a sniff-rejected HuggingFace body is **not billed** (consistent with the existing content-type
 rejection of a JSON 200; no `asset_hf_*` cost StageEvent is written). Not done, pre-existing and optional: an image
 pixel-count cap (a 140 KB PNG declaring 12000x12000 px decodes to ~430 MB in the compositor; needs PIL parsing in the
-sourcer). `record_stage`'s `finally` commit (`except Exception: db.rollback()`) could still swallow a soft limit
-delivered in that window; it lives in `engine/observability.py`, outside this module.
+sourcer). `record_stage`'s `finally` commit could still swallow a soft limit delivered in that window at that
+point (closed afterwards in `engine/observability.py`, see "Follow-up: the last open limits").
+
+### Follow-up: the last open limits
+
+After round 5 the open list was: DNS resolution time, the size of the HuggingFace / JSON API responses,
+`_title_id` case-sensitivity, the shared `.tmp` name and `record_stage`'s final commit. All five were taken,
+tests first, one commit each (`4a6af13`, `cc1d10a`, `f65aac2`, `e098d4b`, `cdc8eda`); one is only partly
+closed, as flagged below.
+
+- **`record_stage` swallowed a soft limit in its `finally` commit** (`engine/observability.py`). The
+  `except Exception: db.rollback()` ate Celery's `SoftTimeLimitExceeded` if it landed during the StageEvent
+  commit, so the task carried on past its limit. It now rolls the session back and re-raises (replacing any
+  error already propagating: the time limit is the more important signal); ordinary commit failures are still
+  swallowed so observability never fails the work it observes. `tests/test_observability.py` (3 -> 7).
+- **The shared `.tmp` name.** Temp files were fixed per target (`pexels_1.tmp`, `wiki_5.jpg.tmp`), so two
+  workers fetching the same asset wrote into one file and the loser's failure or deadline could leave holes
+  at the final path. Now `<name>.<8 hex>.tmp` beside the target (same directory, so `os.replace` stays
+  atomic), and creating any of the four sources deletes `*.tmp` files older than an hour (`_STALE_TMP_AGE_S`;
+  younger ones may be another worker's write in progress; directories and real assets are never touched).
+  The simultaneous-write test asserts that no writer raised: a first version passed on the old code only
+  because a worker thread died silently, and a Pexels uniqueness test compared names across different
+  directories (vacuous until mutation-testing caught it). `tests/test_sourcer_tmp_files.py` (11).
+- **`_title_id` and case-insensitive filesystems.** `wiki_Ab.jpg` and `wiki_aB.jpg` are one file on macOS /
+  Windows default filesystems, so one page's cached image could be served for another. Only an already
+  lowercase `[a-z0-9_-]{1,64}` title is its own id now; any title with a capital goes through the digest
+  (computed on the exact title, so `Ab` and `aB` still differ; the digest is itself lowercase hex). A
+  capitalised title such as `Lionel_Messi` therefore changes name (one more re-download, new `Asset` row),
+  only reachable when `pageid` is missing. `test_sourcer_ids.py` (77 -> 87).
+- **DNS resolution time.** `getaddrinfo` takes no timeout, so neither the per-hop httpx timeout nor the
+  watchdog (which needs a connection) bounded a stalled resolver. Before each hop with a budget,
+  `_dns_in_time` resolves the host on a daemon thread and waits at most the hop's timeout; a lookup still
+  pending fails the hop before any request. A lookup that fails passes (httpx reports it), IP literals are
+  skipped, and so is any environment-proxy setup (the proxy resolves). **A gate, not a guarantee**: httpx
+  resolves again on connect (normally an OS-cache hit), so a resolver that answers once and then stalls is
+  not covered; an abandoned hung lookup leaves a daemon thread. A conftest autouse no-op keeps real lookups
+  out of the suite; `@pytest.mark.real_dns` opts in. `tests/test_sourcer_dns.py` (25); 14 mutants, all
+  killed but a dead `strip("[]")` (removed) and one equivalent.
+- **API response size (partly closed).** The six API calls (Pexels search, Wikipedia opensearch / summary /
+  imageinfo, both HuggingFace generations) use `httpx.get` / `post`, which read the whole body. Streaming
+  them would route six more calls through the `_http_stream` seam and rewrite ~120 test patches whose fakes
+  only provide `.json()`, so the transient read buffer is **still unbounded**. What is bounded is what is
+  done with the body: `_body_too_large` (declared Content-Length, or decoded length, which also catches a
+  gzip header that understates) keeps an oversized body from reaching `.json()` (`_MAX_API_JSON_BYTES`, 8 MB)
+  or the HuggingFace asset cache (the image / video limits); a rejected HuggingFace body is not billed.
+  `tests/test_sourcer_api_limits.py` (22); one survivor (the HF image source using the video limit) got its
+  own test.
+
+Open after this: the transient read buffer of the non-streamed API calls, an image pixel-count cap, and the
+per-beat total across a render (the render task's own time limits are the bound).
 
