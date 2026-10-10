@@ -375,6 +375,8 @@ class WikipediaImageSource:
             page = next(iter(pages.values()), {})
             meta = (page.get("imageinfo") or [{}])[0].get("extmetadata", {})
             return _license_from_extmetadata(meta)
+        except SoftTimeLimitExceeded:
+            raise                                   # out of time: not "unknown license"
         except Exception:
             return {"license": "unknown", "license_url": None, "attribution": None, "safe_to_publish": False}
 
@@ -408,6 +410,8 @@ class WikipediaImageSource:
             if not results[1]:
                 return None
             page_title = results[1][0]
+        except SoftTimeLimitExceeded:
+            raise
         except Exception:
             return None
 
@@ -417,6 +421,8 @@ class WikipediaImageSource:
             resp = httpx.get(f"{self._SUMMARY}/{safe}", headers=self._HEADERS, timeout=10.0)
             resp.raise_for_status()
             data = resp.json()
+        except SoftTimeLimitExceeded:
+            raise
         except Exception:
             return None
 
@@ -550,6 +556,8 @@ class PexelsVideoSource:
             videos = resp.json().get("videos", [])
             if not isinstance(videos, list):
                 return None
+        except SoftTimeLimitExceeded:
+            raise
         except Exception:
             return None
 
@@ -635,6 +643,8 @@ class HuggingFaceImageSource:
                     return None
                 _atomic_write(local_path, resp.content)
                 self.last_call_was_generated = True
+            except SoftTimeLimitExceeded:
+                raise                               # out of time: do not log it as a model failure
             except Exception:
                 _log.exception("HuggingFace image generation failed for model %s", self.model)
                 return None
@@ -697,6 +707,8 @@ class HuggingFaceVideoSource:
                 local_path = self.store_dir / f"hfvid_{fp}.{ext}"
                 _atomic_write(local_path, resp.content)
                 self.last_call_was_generated = True
+            except SoftTimeLimitExceeded:
+                raise                               # out of time: do not log it as a model failure
             except Exception:
                 _log.exception("HuggingFace video generation failed for model %s", self.model)
                 return None
