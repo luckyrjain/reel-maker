@@ -27,3 +27,18 @@ def db_session():
         yield db
     finally:
         db.close()
+
+
+@pytest.fixture(autouse=True)
+def _permissive_media_sniffing(request, monkeypatch):
+    """Make the sourcers' downloaded-bytes check accept anything, except in tests that opt in.
+
+    `engine.render.asset_sourcer._sniff_ok` rejects a download whose first bytes are not a real
+    JPEG/PNG/GIF/WebP/TIFF image or MP4/WebM/GIF video. The hundreds of sourcer fakes elsewhere in
+    the suite serve placeholder bytes (b"orig", b"video", ...), so they would all fail it for a
+    reason that has nothing to do with what they test. Tests that exercise the check itself carry
+    `@pytest.mark.real_media_sniffing` (see tests/test_sourcer_sniffing.py) and get the real one.
+    """
+    if request.node.get_closest_marker("real_media_sniffing"):
+        return
+    monkeypatch.setattr("engine.render.asset_sourcer._sniff_ok", lambda kind, head: True, raising=False)

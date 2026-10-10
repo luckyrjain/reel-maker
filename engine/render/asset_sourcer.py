@@ -291,6 +291,40 @@ def _iter_capped(r, limit: int, deadline_at: "float | None" = None):
         yield chunk
 
 
+# ── downloaded bytes must look like what they claim to be ─────────────────────────────────────
+# The download guards bound where bytes come from, how many and how long; a 200 text/html or JSON body
+# (a CDN error page, a captive portal, a compromised allowlisted host) or an empty one would otherwise
+# be written as pexels_N.mp4 / wiki_N.jpg / hf_*.png and then reused forever by the `exists()` caches.
+# The first bytes are checked against the formats the pipeline actually decodes (MoviePy/PIL/ffmpeg).
+
+_IMAGE_MAGIC = (b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF87a", b"GIF89a", b"II*\x00", b"MM\x00*")
+_VIDEO_MAGIC = (b"\x1a\x45\xdf\xa3", b"GIF87a", b"GIF89a")             # WebM/EBML, GIF
+_MP4_BOXES = (b"ftyp", b"moov", b"mdat", b"free", b"wide", b"skip")       # first ISO-BMFF box type, offset 4
+
+
+def _sniff_ok(kind: str, head) -> bool:
+    """True if `head` (the first <=16 bytes) is a JPEG/PNG/GIF/WebP/TIFF image or an MP4/WebM/GIF video.
+
+    `kind` is "image" or "video"; anything else, or a non-bytes `head`, is not ok. SVG, BMP, HTML,
+    JSON, PDF and an empty body are all refused.
+    """
+    if not isinstance(head, (bytes, bytearray)):
+        return False
+    head = bytes(head)
+    if kind == "image":
+        return head.startswith(_IMAGE_MAGIC) or (head[:4] == b"RIFF" and head[8:12] == b"WEBP")
+    if kind == "video":
+        return head[4:8] in _MP4_BOXES or head.startswith(_VIDEO_MAGIC)
+    return False
+
+
+def _require_media(kind: str, head) -> None:
+    """Raise ValueError (after a WARNING) if `head` is not a `kind` per `_sniff_ok`."""
+    if not _sniff_ok(kind, head):
+        _log.warning("Discarding a download that is not a valid %s", kind)
+        raise ValueError(f"downloaded bytes are not a valid {kind}")
+
+
 # ── ids that become local file names ─────────────────────────────────────────
 # `pexels_{id}.mp4` / `wiki_{id}.{ext}` are built from remote JSON, so an id is validated against a
 # strict, bounded pattern before it is interpolated (a `/`, `..` or a very long title must never
@@ -484,6 +518,7 @@ class WikipediaImageSource:
                 content = self._download(img_url, search_deadline)
                 if content is None:
                     continue
+                _require_media("image", content[:16])
                 _atomic_write(lp, content)
                 local_path = lp
                 break
@@ -602,6 +637,8 @@ class PexelsVideoSource:
                         with open(tmp_path, "wb") as fh:
                             for chunk in _iter_capped(r, _MAX_VIDEO_BYTES, deadline_at):
                                 fh.write(chunk)
+                    with open(tmp_path, "rb") as fh:
+                        _require_media("video", fh.read(16))
                     os.replace(tmp_path, local_path)
                 except SoftTimeLimitExceeded:
                     tmp_path.unlink(missing_ok=True)
@@ -664,6 +701,9 @@ class HuggingFaceImageSource:
                 resp.raise_for_status()
                 content_type = resp.headers.get("content-type", "")
                 if not content_type.startswith("image/"):
+                    return None
+                if not _sniff_ok("image", resp.content[:16]):
+                    _log.warning("Discarding a HuggingFace download that is not a valid image")
                     return None
                 _atomic_write(local_path, resp.content)
                 self.last_call_was_generated = True
@@ -729,6 +769,9 @@ class HuggingFaceVideoSource:
                 content_type = resp.headers.get("content-type", "video/mp4")
                 ext = "gif" if "gif" in content_type else "mp4"
                 local_path = self.store_dir / f"hfvid_{fp}.{ext}"
+                if not _sniff_ok("video", resp.content[:16]):
+                    _log.warning("Discarding a HuggingFace download that is not a valid video")
+                    return None
                 _atomic_write(local_path, resp.content)
                 self.last_call_was_generated = True
             except SoftTimeLimitExceeded:
