@@ -1,4 +1,5 @@
 import hashlib
+import ipaddress
 import logging
 import math
 import os
@@ -7,6 +8,7 @@ import socket
 import threading
 import time
 import urllib.parse
+import urllib.request
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -246,6 +248,39 @@ class _Watchdog:
                 pass
 
 
+def _dns_in_time(host: str, port: int, timeout: float) -> bool:
+    """False only if resolving `host` is still pending after `timeout` seconds.
+
+    `socket.getaddrinfo` takes no timeout, so neither httpx's connect/read timeouts nor the watchdog
+    (which needs a connection) bound a stalled resolver. The lookup runs on a daemon thread (a hung
+    getaddrinfo cannot be cancelled, so it is simply abandoned and must not block interpreter exit)
+    and is waited on for at most `timeout`. A resolution that FAILS counts as in time: reporting it is
+    httpx's job. Skipped (True) for IP literals and when an environment proxy is configured, because
+    the proxy then resolves the name. This is a gate, not a guarantee: httpx resolves again when it
+    connects (normally an OS-cache hit); a resolver that answers once and then stalls is not covered.
+    """
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    env = urllib.request.getproxies_environment()
+    if any(env.get(k) for k in ("all", "https", "http")):
+        return True
+    done = threading.Event()
+
+    def resolve():
+        try:
+            socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except Exception:                                   # noqa: BLE001 - httpx reports a failed lookup
+            pass
+        finally:
+            done.set()
+
+    threading.Thread(target=resolve, daemon=True, name="sourcer-dns").start()
+    return done.wait(timeout)
+
+
 @contextmanager
 def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = None,
                    deadline_at: "float | None" = None):
@@ -255,7 +290,8 @@ def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = N
     more than `_MAX_REDIRECTS` hops, if the wall-clock `deadline_at` has passed before a hop, or if a
     `_Watchdog` had to close the connection at the deadline. Yields the final (non-redirect) response;
     the caller still owns `raise_for_status()` and the status handling. With a `deadline_at`, each hop's
-    httpx timeout is clamped to the time left (+ `_HOP_TIMEOUT_GRACE_S`). `Accept-Encoding: identity` is always sent
+    httpx timeout is clamped to the time left (+ `_HOP_TIMEOUT_GRACE_S`) and its host's DNS lookup is
+    given at most that long (`_dns_in_time`). `Accept-Encoding: identity` is always sent
     (media is not worth compressing, and a gzip body would inflate far past its Content-Length
     before the size cap could see it); `_iter_capped` rejects a response that is encoded anyway.
     """
@@ -274,6 +310,11 @@ def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = N
         if not url_ok(url):
             _log.warning("Refusing download from a disallowed URL (host %s)", _host_for_log(url))
             raise ValueError(f"download URL not allowed: {url!r}")
+        if deadline_at is not None and not _dns_in_time(
+                urllib.parse.urlsplit(url).hostname or "", 443, hop_kwargs["timeout"]):
+            _log.warning("DNS resolution for %s did not finish in time; giving up on the download",
+                         _host_for_log(url))
+            raise ValueError("download too slow: DNS resolution did not finish in time")
         guard = _Watchdog(deadline_at)
         try:
             with _http_stream("GET", url, extensions={"trace": guard.trace}, **hop_kwargs) as r:

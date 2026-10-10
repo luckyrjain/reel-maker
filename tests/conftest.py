@@ -42,3 +42,18 @@ def _permissive_media_sniffing(request, monkeypatch):
     if request.node.get_closest_marker("real_media_sniffing"):
         return
     monkeypatch.setattr("engine.render.asset_sourcer._sniff_ok", lambda kind, head: True, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_dns_lookups(request, monkeypatch):
+    """Make the sourcers' bounded DNS pre-resolution a no-op that always answers "in time".
+
+    `engine.render.asset_sourcer._dns_in_time` resolves the host of every download hop. Real lookups
+    in the suite would need the network (and fail offline) for no reason: the fakes never connect.
+    Tests of the gate itself carry `@pytest.mark.real_dns` (tests/test_sourcer_dns.py) and get the
+    real one, with `socket.getaddrinfo` stubbed.
+    """
+    if request.node.get_closest_marker("real_dns"):
+        return
+    monkeypatch.setattr("engine.render.asset_sourcer._dns_in_time", lambda host, port, timeout: True, raising=False)
+
