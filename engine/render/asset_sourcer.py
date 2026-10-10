@@ -7,6 +7,7 @@ import socket
 import threading
 import time
 import urllib.parse
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,13 +34,44 @@ def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text).strip()
 
 
+_STALE_TMP_AGE_S = 3600     # a *.tmp older than this is a crashed process's leftover, not a write in progress
+
+
+def _tmp_path_for(path: Path) -> Path:
+    """A unique temp file beside `path` (same directory, so `os.replace` is atomic): `<name>.<8 hex>.tmp`.
+
+    It used to be one fixed name per target (`pexels_1.tmp`, `wiki_5.jpg.tmp`), so two workers
+    fetching the same asset wrote into the same file and the loser's failure could leave holes.
+    """
+    return path.with_name(f"{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+
+
+def _sweep_stale_tmp(store_dir: Path) -> None:
+    """Delete `*.tmp` files in `store_dir` older than `_STALE_TMP_AGE_S` (best effort, never raises).
+
+    Unique temp names mean a crashed download's leftover is never overwritten, so it is swept when a
+    source is created. Younger files are left alone: they may be another worker's write in progress.
+    """
+    cutoff = time.time() - _STALE_TMP_AGE_S
+    try:
+        for f in store_dir.glob("*.tmp"):
+            try:
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    f.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def _atomic_write(path: Path, data: bytes) -> None:
     """Write bytes via a temp file + os.replace.
 
     Every sourcer caches by `if path.exists()`, so a process killed mid-write
-    would otherwise leave a truncated file that is reused on every later render.
+    would otherwise leave a truncated file that is reused on every later render. The temp name
+    is unique per call (see `_tmp_path_for`), so two workers writing the same asset never share it.
     """
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = _tmp_path_for(path)
     try:
         tmp.write_bytes(data)
         os.replace(tmp, path)
@@ -433,6 +465,7 @@ class WikipediaImageSource:
     def __init__(self, store_dir: Path):
         self.store_dir = store_dir
         store_dir.mkdir(parents=True, exist_ok=True)
+        _sweep_stale_tmp(store_dir)
 
     def _fetch_license(self, page_title: str) -> dict:
         """Return license metadata for a Wikimedia file via the imageinfo API."""
@@ -591,6 +624,7 @@ class PexelsVideoSource:
         self.api_key = api_key
         self.store_dir = store_dir
         store_dir.mkdir(parents=True, exist_ok=True)
+        _sweep_stale_tmp(store_dir)
 
     @staticmethod
     def _pick(video, min_duration_s: float) -> "tuple[str, float, str] | None":
@@ -655,7 +689,7 @@ class PexelsVideoSource:
             local_path = self.store_dir / f"pexels_{vid_id}.mp4"
 
             if not (local_path.exists() and _cached_media_ok(local_path, "video")):
-                tmp_path = local_path.with_suffix(".tmp")
+                tmp_path = _tmp_path_for(local_path)
                 now = _monotonic()
                 if now >= search_deadline:
                     continue                        # budget spent: no more downloads, but a later hit may be cached
@@ -705,6 +739,7 @@ class HuggingFaceImageSource:
         self.model = model
         self.store_dir = store_dir
         store_dir.mkdir(parents=True, exist_ok=True)
+        _sweep_stale_tmp(store_dir)
         # Set by generate() on every call — False on a cache hit (no real API
         # call, no cost) or a failed/skipped call. Callers check this before
         # charging StageEvent.cost_usd, so a cached re-render isn't billed twice.
@@ -769,6 +804,7 @@ class HuggingFaceVideoSource:
         self.model = model
         self.store_dir = store_dir
         store_dir.mkdir(parents=True, exist_ok=True)
+        _sweep_stale_tmp(store_dir)
         # Set by generate() on every call — False on a cache hit (no real API
         # call, no cost) or a failed/skipped call. Callers check this before
         # charging StageEvent.cost_usd, so a cached re-render isn't billed twice.
