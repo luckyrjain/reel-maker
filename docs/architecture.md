@@ -191,7 +191,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 ### `tests/`
 
-64 test files + `conftest.py`, **1773 tests run by default / 1774 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
+64 test files + `conftest.py`, **1810 tests run by default / 1811 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
 
 | File | Tests | File | Tests |
 |---|---|---|---|
@@ -223,8 +223,8 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_proportional_timing.py` | 28 | `test_sourcer_selection.py` | 96 |
 | `test_sourcer_contracts.py` | 124 | `test_sourcer_cache_and_chain.py` | 56 |
 | `test_sourcer_download_guards.py` | 199 | `test_sourcer_ids.py` | 77 |
-| `test_sourcer_watchdog.py` | 52 | `test_sourcer_soft_limit.py` | 16 |
-| `test_sourcer_budgets.py` | 20 | `test_sourcer_sniffing.py` | 79 |
+| `test_sourcer_watchdog.py` | 53 | `test_sourcer_soft_limit.py` | 18 |
+| `test_sourcer_budgets.py` | 23 | `test_sourcer_sniffing.py` | 110 |
 | `test_llm_judge.py` | 3 | `test_main.py` | 3 |
 | `test_observability.py` | 3 | `test_golden_reel.py` | 1 (deselected) |
 
@@ -521,7 +521,7 @@ Every drawtext clause carries `:expansion=none` — disables ffmpeg's own `%`-ex
 - Portraits at ≤ FHD (1920 px) preferred; falls back gracefully to landscape or 4K
 - Cached by `(source="pexels", source_ref=video_id)` in `assets` table; `video_id` must be a non-negative integer or an ASCII digit string whose decimal form is 1-20 digits, otherwise that search hit is skipped
 - A malformed search hit (missing/non-numeric duration or id, null width/height, non-string link) or a non-JSON body is skipped / gives no result — it never raises into the render task
-- Downloads (Pexels and Wikipedia alike): https only, to `*.pexels.com` / `upload.wikimedia.org` (no userinfo, port 443, plain `[a-z0-9.-]` host); redirects are followed by hand with every hop re-checked (max 3), never by httpx; `Accept-Encoding: identity` is sent and an encoded response is rejected; the body is capped (250 MB video / 50 MB image) and bounded in wall-clock time (600 s / 120 s, one budget shared by the redirect hops and the 429 retry, checked on every network read). A download to a disallowed URL (first request or redirect target) is logged at WARNING by host; an oversized, encoded, over-redirected or per-hop/per-chunk-too-slow one is rejected silently (a deadline the watchdog had to enforce by closing the connection is logged by host). Either way the search moves on to the next hit/candidate. A `_Watchdog` (armed from httpcore's connect-time trace event; it holds a `dup()` of the socket so it still works after the TLS wrap, i.e. for every real host) shuts the connection down when the budget runs out, which is the only thing that can interrupt a read blocked on dripped response headers, a chunked-encoding size line or a TLS handshake; a fired watchdog fails the download even if the read ended cleanly (a close-delimited body reads the shutdown as EOF). A `SoftTimeLimitExceeded` raised mid-download is re-raised by the search loops (it ends the task), not swallowed as an ordinary download failure. Not bounded: the per-hit budgets adding up (up to 15 Pexels hits) and the DNS/TCP connect phase before the watchdog arms (up to the httpx connect timeout)
+- Downloads (Pexels and Wikipedia alike): https only, to `*.pexels.com` / `upload.wikimedia.org` (no userinfo, port 443, plain `[a-z0-9.-]` host); redirects are followed by hand with every hop re-checked (max 3), never by httpx; `Accept-Encoding: identity` is sent and an encoded response is rejected; the body is capped (250 MB video / 50 MB image) and bounded in wall-clock time (600 s / 120 s, one budget shared by the redirect hops and the 429 retry, checked on every network read). A download to a disallowed URL (first request or redirect target) is logged at WARNING by host; an oversized, encoded, over-redirected or per-hop/per-chunk-too-slow one is rejected silently (a deadline the watchdog had to enforce by closing the connection is logged by host). Either way the search moves on to the next hit/candidate. A `_Watchdog` (armed from httpcore's connect-time trace event; it holds a `dup()` of the socket so it still works after the TLS wrap, i.e. for every real host) shuts the connection down when the budget runs out, which is the only thing that can interrupt a read blocked on dripped response headers, a chunked-encoding size line or a TLS handshake; a fired watchdog fails the download even if the read ended cleanly (a close-delimited body reads the shutdown as EOF). A `SoftTimeLimitExceeded` raised in ANY sourcer network call (downloads, the Pexels search, the Wikipedia lookups, HuggingFace) is re-raised and ends the task, never swallowed as an ordinary failure. Each hop's httpx timeout is clamped to `min(configured, time left + 1 s)`, which bounds the connect/TLS phase before the watchdog can arm, and each `search()` has one overall budget (Pexels 900 s, Wikipedia 240 s) so the per-hit budgets cannot add up; once it is spent no further download starts, but cached hits are still served. Every download's first bytes must be a real JPEG/PNG/GIF/WebP/TIFF (images) or MP4/WebM/GIF (videos) before it is cached, and a file already on disk is checked the same way on a cache hit (a poisoned or empty one is deleted and re-downloaded); an HTML/JSON/empty body is discarded and the search moves on. Not bounded: DNS resolution (`getaddrinfo` takes no timeout; the OS resolver bounds it), the render task's own limits across beats, and image pixel count
 - `safe_to_publish=True` (Pexels license is permissive)
 
 ### Player photos (`WikipediaImageSource`)
@@ -536,6 +536,7 @@ Every drawtext clause carries `:expansion=none` — disables ffmpeg's own `%`-ex
 ### Generated fallback (HuggingFace)
 
 - `HuggingFaceVideoSource` (LTX-Video) and `HuggingFaceImageSource` (FLUX.1-schnell) — last resorts in the chain, before a black frame
+- A response body that is not a real image/video (and a cached file that is not) is discarded: neither cached nor billed, the same as the existing content-type rejection
 - Both cache by prompt fingerprint; cost (`asset_hf_video`/`asset_hf_image` StageEvents) is charged only on an actual generation call, never a cache hit
 - Always `safe_to_publish=True`
 
