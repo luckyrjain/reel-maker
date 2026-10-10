@@ -108,10 +108,10 @@ _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 # the other two to check. Each hop's httpx timeout is also clamped to the time left (see
 # `_HOP_TIMEOUT_GRACE_S`), which bounds the TCP connect / TLS handshake before the watchdog exists, and
 # each search() has one overall budget (below), and the host's DNS lookup is given at most that long
-# (`_dns_in_time`; getaddrinfo takes no timeout). Not bounded: the transient read buffer of the API
-# calls (httpx.get/post read the whole body; see `_body_too_large`) and the render task's own time
-# limits across beats. SoftTimeLimitExceeded raised in ANY network call of this module is re-raised
-# (it ends the task), never swallowed as a failed download.
+# (`_dns_in_time`; getaddrinfo takes no timeout). The API calls are streamed and capped while they are
+# read (`_api_call`), and a render's total is bounded by `asset_budget()` (below). SoftTimeLimitExceeded
+# raised in ANY network call of this module is re-raised (it ends the task), never swallowed as a failed
+# download.
 _VIDEO_DEADLINE_S = 600.0
 _IMAGE_DEADLINE_S = 120.0
 # One budget per search() call, so the per-download budgets of its hits/candidates cannot add up (a
@@ -410,10 +410,10 @@ def _api_post(url: str, *, limit: int | None = None, **kw):
 def _body_too_large(resp, limit: int) -> bool:
     """True if `resp` declares (Content-Length) or actually holds (decoded) more than `limit` bytes.
 
-    For the `httpx.get`/`httpx.post` API calls, which read the whole body before returning: this does
-    NOT bound that read, it keeps an oversized body from being handed to `.json()` (parse time/memory
-    amplification) or written to the asset cache (disk). A header that understates (gzip) is caught by
-    the decoded length; a missing or unparsable header falls back to it.
+    Defense in depth behind `_api_call`, which already stops reading at the limit: this keeps an
+    oversized body from being handed to `.json()` (parse time/memory amplification) or written to the
+    asset cache (disk) if a response reaches the caller some other way. A header that understates
+    (gzip) is caught by the decoded length; a missing or unparsable header falls back to it.
     """
     try:
         declared = int(resp.headers.get("content-length"))
