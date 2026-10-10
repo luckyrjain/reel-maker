@@ -4,7 +4,7 @@
 falls back to the page title. Unvalidated, an over-long title raised ENAMETOOLONG from
 `Path.exists()` (outside the try), and a `/` or `..` in an id relied on the write failing rather
 than on the name being safe. Now: a Pexels id is an integer (or a string of ASCII digits, at most
-20); a Wikipedia id is such a page id, else the underscored title when that is `[A-Za-z0-9_-]{1,64}`,
+20); a Wikipedia id is such a page id, else the underscored title when that is `[a-z0-9_-]{1,64}`,
 else `t` + a 16-hex digest of the title. Anything else is skipped (Pexels) or replaced (Wikipedia),
 never interpolated.
 """
@@ -75,13 +75,13 @@ def test_wikipedia_numeric_page_ids_name_the_file(tmp_path, pageid, expected):
 def test_wikipedia_an_unsafe_page_id_falls_back_to_the_title_not_the_junk(tmp_path, bad):
     summary = {"pageid": bad, "originalimage": {"source": WIKI_OK}}
     result = _wiki(tmp_path, summary, _Stream({WIKI_OK: _Resp()}))
-    assert result.source_ref == "Lionel_Messi"
-    assert [p.name for p in tmp_path.iterdir()] == ["wiki_Lionel_Messi.jpg"]
+    assert result.source_ref == _digest_id("Lionel_Messi")           # capitalised: hashed (case-insensitive FS)
+    assert [p.name for p in tmp_path.iterdir()] == [f"wiki_{_digest_id('Lionel_Messi')}.jpg"]
 
 
 def test_wikipedia_a_null_page_id_falls_back_to_the_title(tmp_path):
     summary = {"pageid": None, "originalimage": {"source": WIKI_OK}}
-    assert _wiki(tmp_path, summary, _Stream({WIKI_OK: _Resp()})).source_ref == "Lionel_Messi"
+    assert _wiki(tmp_path, summary, _Stream({WIKI_OK: _Resp()})).source_ref == _digest_id("Lionel_Messi")
 
 
 # ── Wikipedia: the title fallback ────────────────────────────────────────────
@@ -91,18 +91,20 @@ def _digest_id(title):
 
 
 @pytest.mark.parametrize("title,expected", [
-    ("Lionel Messi", "Lionel_Messi"),
-    ("Kylian Mbappe-Lottin", "Kylian_Mbappe-Lottin"),
-    ("A" * 64, "A" * 64),                                      # exactly the bound
-    ("Already_Underscored_1", "Already_Underscored_1"),
+    ("lionel messi", "lionel_messi"),
+    ("kylian mbappe-lottin", "kylian_mbappe-lottin"),
+    ("a" * 64, "a" * 64),                                      # exactly the bound
+    ("already_underscored_1", "already_underscored_1"),
+    ("1984", "1984"),
 ])
-def test_wikipedia_a_plain_title_is_used_unchanged_as_the_id(tmp_path, title, expected):
+def test_wikipedia_a_lowercase_title_is_used_unchanged_as_the_id(tmp_path, title, expected):
     summary = {"originalimage": {"source": WIKI_OK}}
     result = _wiki(tmp_path, summary, _Stream({WIKI_OK: _Resp()}), title=title)
     assert result.source_ref == expected and result.local_path.name == f"wiki_{expected}.jpg"
 
 
 @pytest.mark.parametrize("title", [
+    "Lionel Messi", "Kylian Mbappe-Lottin", "A" * 64, "Already_Underscored_1", "aB", "Ab",      # any capital
     "AC/DC", "Mesé Fernández", "St. Louis", "..", "a/../b", "Lionel Messi?x=1", "A" * 65,
     "x" * 5000, "name\x00null", "back\\slash", "tab\tname", "emoji \U0001f600", "C++", "100%",
 ])
@@ -148,6 +150,25 @@ def test_wikipedia_a_digest_id_file_is_reused_on_the_next_search(tmp_path):
 
 
 def test_safe_id_constants_are_what_the_docs_say():
-    assert AS._SAFE_ID_RE.fullmatch("A" * 64) and not AS._SAFE_ID_RE.fullmatch("A" * 65)
+    assert AS._SAFE_ID_RE.fullmatch("a" * 64) and not AS._SAFE_ID_RE.fullmatch("a" * 65)
+    assert not AS._SAFE_ID_RE.fullmatch("A") and not AS._SAFE_ID_RE.fullmatch("aB")      # lowercase only
     assert not AS._SAFE_ID_RE.fullmatch("") and not AS._SAFE_ID_RE.fullmatch("a.b")
     assert not AS._SAFE_ID_RE.fullmatch("ab\n")
+
+
+# ── case-insensitive filesystems (macOS/Windows default) ────────────────────────────────────
+
+def test_titles_that_differ_only_in_case_never_share_a_file_name():
+    """Ab / aB / AB would have been three ids that are ONE file on a case-insensitive filesystem,
+    so one page's cached image could be served for another."""
+    titles = ["Ab", "aB", "AB", "ab", "Lionel_Messi", "lionel_messi", "LIONEL_MESSI"]
+    ids = [AS._title_id(t) for t in titles]
+    assert len({i.lower() for i in ids}) == len(titles)            # distinct even after case-folding
+
+
+def test_a_lowercase_title_and_its_capitalised_twin_get_different_ids():
+    assert AS._title_id("ab") == "ab" and AS._title_id("Ab") == _digest_id("Ab") != "ab"
+
+
+def test_a_digest_id_is_itself_lowercase_so_it_folds_to_itself():
+    assert AS._title_id("Lionel_Messi") == AS._title_id("Lionel_Messi").lower()
