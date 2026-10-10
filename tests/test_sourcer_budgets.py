@@ -100,3 +100,140 @@ def test_the_real_connect_timeout_is_untouched_without_a_budget(monkeypatch):
         with AS._open_download("https://videos.pexels.com/x.mp4", AS._pexels_url_ok, timeout=7.0):
             pass
     assert seen["timeout"] == 7.0
+
+
+# ── one budget per search (earlier hits' time counts against later ones) ─────────────────────
+
+class _Ticking:
+    """Wraps a _Stream so every request advances a shared fake clock by `step` seconds."""
+
+    def __init__(self, stream, clock, step):
+        self.stream, self.clock, self.step = stream, clock, step
+
+    def __call__(self, method, url, **kw):
+        self.clock["t"] += self.step
+        return self.stream(method, url, **kw)
+
+    @property
+    def requests(self):
+        return self.stream.requests
+
+    @property
+    def urls(self):
+        return self.stream.urls
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    state = {"t": 0.0}
+    monkeypatch.setattr(AS, "_monotonic", lambda: state["t"])
+    return state
+
+
+def _failing(*urls):
+    return _Stream({u: _Resp(status=500) for u in urls})
+
+
+def test_the_search_budgets_are_sane_numbers():
+    assert AS._VIDEO_DEADLINE_S < AS._PEXELS_SEARCH_BUDGET_S <= 3600
+    assert AS._IMAGE_DEADLINE_S < AS._WIKI_SEARCH_BUDGET_S <= 3600
+
+
+def _links(n):
+    return [f"https://videos.pexels.com/video-files/{i}/a.mp4" for i in range(n)]
+
+
+def _pexels_hits(links):
+    return [_video(i + 1, [_vf(1080, 1920, link=link)]) for i, link in enumerate(links)]
+
+
+def test_pexels_stops_trying_hits_once_the_search_budget_is_spent(tmp_path, clock, monkeypatch):
+    monkeypatch.setattr(AS, "_PEXELS_SEARCH_BUDGET_S", 25.0)
+    links = _links(5)
+    stream = _Ticking(_failing(*links), clock, step=10.0)
+    assert _pexels(tmp_path, _pexels_hits(links), stream) is None
+    assert stream.urls == links[:3]                 # requests at t=0, 10, 20; at t=30 the budget (25) is gone
+
+
+def test_pexels_a_hit_that_would_start_exactly_when_the_budget_ends_is_not_started(tmp_path, clock, monkeypatch):
+    """Without the explicit check the pre-hop test (`now > deadline_at`) would let it through, with a 1 s timeout."""
+    monkeypatch.setattr(AS, "_PEXELS_SEARCH_BUDGET_S", 25.0)
+    links = _links(5)
+    stream = _Ticking(_failing(*links), clock, step=12.5)
+    assert _pexels(tmp_path, _pexels_hits(links), stream) is None
+    assert stream.urls == links[:2]                 # t=0 and t=12.5; the third would start at t=25 == the end
+
+
+def test_pexels_without_a_tight_budget_tries_every_hit(tmp_path, clock):
+    links = _links(5)
+    stream = _Ticking(_failing(*links), clock, step=10.0)
+    assert _pexels(tmp_path, _pexels_hits(links), stream) is None
+    assert stream.urls == links
+
+
+def test_pexels_the_last_hit_is_clipped_to_what_is_left_of_the_search_budget(tmp_path, clock, monkeypatch):
+    monkeypatch.setattr(AS, "_PEXELS_SEARCH_BUDGET_S", 25.0)
+    links = _links(5)
+    stream = _Ticking(_failing(*links), clock, step=10.0)
+    _pexels(tmp_path, _pexels_hits(links), stream)
+    # a request at now=t gets deadline_at=min(t+600, 25), hence a hop timeout of min(120, 25-t+1):
+    # the search budget clips even the first hit
+    timeouts = [kw["timeout"] for _, kw in stream.requests]
+    assert timeouts == [pytest.approx(26.0), pytest.approx(16.0), pytest.approx(6.0)]
+
+
+def test_pexels_a_cached_hit_is_still_served_after_the_budget_is_spent(tmp_path, clock, monkeypatch):
+    monkeypatch.setattr(AS, "_PEXELS_SEARCH_BUDGET_S", 5.0)
+    (tmp_path / "pexels_2.mp4").write_bytes(b"cached")
+    links = _links(2)
+    stream = _Ticking(_failing(links[0]), clock, step=100.0)
+    result = _pexels(tmp_path, _pexels_hits(links), stream)
+    assert result.local_path.read_bytes() == b"cached" and stream.urls == [links[0]]
+
+
+def test_pexels_each_search_gets_its_own_budget(tmp_path, clock, monkeypatch):
+    monkeypatch.setattr(AS, "_PEXELS_SEARCH_BUDGET_S", 25.0)
+    links = _links(3)
+    first = _Ticking(_failing(*links), clock, step=10.0)
+    _pexels(tmp_path, _pexels_hits(links), first)
+    clock["t"] += 1000.0                            # a later search, long after the first one's budget
+    second = _Ticking(_failing(*links), clock, step=10.0)
+    _pexels(tmp_path, _pexels_hits(links), second)
+    assert second.urls == links[:3]
+
+
+def test_wikipedia_the_second_candidate_is_skipped_once_the_search_budget_is_spent(tmp_path, clock, monkeypatch):
+    monkeypatch.setattr(AS, "_WIKI_SEARCH_BUDGET_S", 150.0)
+    stream = _Ticking(_failing(WIKI_OK, WIKI_THUMB), clock, step=160.0)
+    assert _wiki(tmp_path, _summary(), stream) is None
+    assert stream.urls == [WIKI_OK]                 # t=160 after the original: 150 s budget gone
+
+
+def test_wikipedia_a_candidate_that_would_start_exactly_when_the_budget_ends_is_not_started(tmp_path, clock, monkeypatch):
+    monkeypatch.setattr(AS, "_WIKI_SEARCH_BUDGET_S", 150.0)
+    stream = _Ticking(_failing(WIKI_OK, WIKI_THUMB), clock, step=150.0)
+    assert _wiki(tmp_path, _summary(), stream) is None
+    assert stream.urls == [WIKI_OK]                 # the thumbnail would start at t=150 == the end
+
+
+def test_wikipedia_the_second_candidate_is_clipped_to_what_is_left(tmp_path, clock, monkeypatch):
+    monkeypatch.setattr(AS, "_WIKI_SEARCH_BUDGET_S", 150.0)
+    stream = _Ticking(_failing(WIKI_OK, WIKI_THUMB), clock, step=100.0)
+    assert _wiki(tmp_path, _summary(), stream) is None
+    assert stream.urls == [WIKI_OK, WIKI_THUMB]
+    # thumbnail request: now=100 (before the fake advances), deadline_at=min(100+120, 150)=150
+    assert stream.requests[1][1]["timeout"] == pytest.approx(30.0)      # min(30, 150-100+1=51)
+    assert stream.requests[0][1]["timeout"] == pytest.approx(30.0)
+
+
+def test_wikipedia_a_tight_remaining_budget_shrinks_the_second_download_timeout(tmp_path, clock, monkeypatch):
+    monkeypatch.setattr(AS, "_WIKI_SEARCH_BUDGET_S", 150.0)
+    stream = _Ticking(_failing(WIKI_OK, WIKI_THUMB), clock, step=130.0)
+    _wiki(tmp_path, _summary(), stream)
+    assert stream.urls == [WIKI_OK, WIKI_THUMB]
+    assert stream.requests[1][1]["timeout"] == pytest.approx(21.0)      # min(30, 150-130+1)
+
+
+def test_wikipedia_a_fast_original_never_touches_the_budget(tmp_path, clock):
+    stream = _Ticking(_Stream({WIKI_OK: _Resp(chunks=(b"orig",))}), clock, step=1.0)
+    assert _wiki(tmp_path, _summary(thumbnail=None), stream).local_path.read_bytes() == b"orig"

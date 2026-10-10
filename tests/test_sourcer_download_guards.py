@@ -622,8 +622,8 @@ def test_the_deadlines_are_sane_numbers():
 def test_pexels_uses_the_video_deadline_and_not_the_image_one(tmp_path, monkeypatch):
     monkeypatch.setattr(AS, "_VIDEO_DEADLINE_S", 10.0)
     monkeypatch.setattr(AS, "_IMAGE_DEADLINE_S", 1e9)
-    # caller: deadline_at = 0 + 10; hop check at 0; chunk a at 1; chunk b at 999 (> 10)
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 1.0, 999.0))
+    # readings: search start 0; this hit's deadline_at = 0 + 10; hop check 0; chunk a 1; chunk b 999 (> 10)
+    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 0.0, 1.0, 999.0))
     stream = _Stream({PEXELS_OK: _Resp(chunks=(b"a", b"b"))})
     assert _pexels(tmp_path, [_video(1, [_vf(1080, 1920, link=PEXELS_OK)])], stream) is None
     assert list(tmp_path.iterdir()) == []
@@ -632,7 +632,8 @@ def test_pexels_uses_the_video_deadline_and_not_the_image_one(tmp_path, monkeypa
 def test_pexels_a_download_inside_the_video_deadline_is_kept_even_past_the_image_one(tmp_path, monkeypatch):
     monkeypatch.setattr(AS, "_VIDEO_DEADLINE_S", 1e9)
     monkeypatch.setattr(AS, "_IMAGE_DEADLINE_S", 10.0)
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 1.0, 999.0))
+    monkeypatch.setattr(AS, "_PEXELS_SEARCH_BUDGET_S", 1e9)         # the search budget must not clip it
+    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 0.0, 1.0, 999.0))
     stream = _Stream({PEXELS_OK: _Resp(chunks=(b"a", b"b"))})
     assert _pexels(tmp_path, [_video(1, [_vf(1080, 1920, link=PEXELS_OK)])], stream).local_path.read_bytes() == b"ab"
 
@@ -640,9 +641,9 @@ def test_pexels_a_download_inside_the_video_deadline_is_kept_even_past_the_image
 def test_wikipedia_uses_the_image_deadline_and_not_the_video_one(tmp_path, monkeypatch):
     monkeypatch.setattr(AS, "_IMAGE_DEADLINE_S", 10.0)
     monkeypatch.setattr(AS, "_VIDEO_DEADLINE_S", 1e9)
-    # original: deadline_at 10, hop at 0, chunk a at 1, chunk b at 999 -> cut off.
-    # thumbnail: deadline_at 0 + 10, hop at 0, chunk at 1 -> kept.
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 1.0, 999.0, 0.0, 0.0, 1.0))
+    # search start 0; original: _download reading 0 (deadline_at 10), hop 0, chunk a 1, chunk b 999 -> cut off.
+    # thumbnail: _download reading 0 (deadline_at 10), hop 0, chunk 1 -> kept.
+    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 0.0, 1.0, 999.0, 0.0, 0.0, 1.0))
     stream = _Stream({WIKI_OK: _Resp(chunks=(b"a", b"b")), WIKI_THUMB: _Resp(chunks=(b"t",))})
     result = _wiki(tmp_path, _summary(), stream)
     assert stream.urls == [WIKI_OK, WIKI_THUMB] and result.local_path.read_bytes() == b"t"
@@ -651,7 +652,8 @@ def test_wikipedia_uses_the_image_deadline_and_not_the_video_one(tmp_path, monke
 def test_wikipedia_a_download_inside_the_image_deadline_is_kept_even_past_the_video_one(tmp_path, monkeypatch):
     monkeypatch.setattr(AS, "_IMAGE_DEADLINE_S", 1e9)
     monkeypatch.setattr(AS, "_VIDEO_DEADLINE_S", 10.0)
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 1.0, 999.0))
+    monkeypatch.setattr(AS, "_WIKI_SEARCH_BUDGET_S", 1e9)           # the search budget must not clip it
+    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 0.0, 1.0, 999.0))
     stream = _Stream({WIKI_OK: _Resp(chunks=(b"a", b"b"))})
     assert _wiki(tmp_path, _summary(thumbnail=None), stream).local_path.read_bytes() == b"ab"
 
@@ -660,8 +662,8 @@ def test_the_budget_covers_the_redirect_hops_too(tmp_path, monkeypatch):
     """A chain of slow-to-answer hops cannot each get a fresh budget."""
     other = "https://videos.pexels.com/video-files/2/b.mp4"
     monkeypatch.setattr(AS, "_VIDEO_DEADLINE_S", 10.0)
-    # deadline_at 10; first hop at 0 (ok); second hop at 999 -> refused before it is requested
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 999.0))
+    # search start 0; deadline_at 10; first hop at 0 (ok); second hop at 999 -> refused before it is requested
+    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 0.0, 999.0))
     stream = _Stream({PEXELS_OK: _redirect(other), other: _Resp()})
     assert _pexels(tmp_path, [_video(1, [_vf(1080, 1920, link=PEXELS_OK)])], stream) is None
     assert stream.urls == [PEXELS_OK]
@@ -669,7 +671,8 @@ def test_the_budget_covers_the_redirect_hops_too(tmp_path, monkeypatch):
 
 def test_the_budget_covers_the_429_retry_too(tmp_path, monkeypatch):
     monkeypatch.setattr(AS, "_IMAGE_DEADLINE_S", 10.0)
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 999.0))
+    # search start 0; _download reading 0 (deadline_at 10); hop 1 at 0; hop 2 (after the 429) at 999
+    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 0.0, 999.0))
     stream = _Stream({WIKI_OK: [_Resp(status=429), _Resp(chunks=(b"ok",))]})
     assert _wiki(tmp_path, _summary(thumbnail=None), stream) is None
     assert stream.urls == [WIKI_OK]                             # the retry was refused: budget spent
@@ -811,8 +814,8 @@ def test_a_hostile_host_never_reaches_the_log_raw_through_the_download_path(tmp_
 def test_pexels_the_body_shares_the_budget_started_before_the_connection(tmp_path, monkeypatch):
     """Past the shared budget (10 s from t=0) but inside a fresh one started when the body begins."""
     monkeypatch.setattr(AS, "_VIDEO_DEADLINE_S", 10.0)
-    # caller deadline_at = 0 + 10; hop check at 0 (ok); then every body read happens at 11
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, after=11.0))
+    # search start 0; this hit's deadline_at = 0 + 10; hop check at 0 (ok); then every body read is at 11
+    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 0.0, after=11.0))
     stream = _Stream({PEXELS_OK: _Resp(chunks=(b"a", b"b"))})
     assert _pexels(tmp_path, [_video(1, [_vf(1080, 1920, link=PEXELS_OK)])], stream) is None
 
@@ -820,8 +823,8 @@ def test_pexels_the_body_shares_the_budget_started_before_the_connection(tmp_pat
 def test_the_pre_hop_check_allows_exactly_the_deadline(tmp_path, monkeypatch):
     other = "https://videos.pexels.com/video-files/2/b.mp4"
     monkeypatch.setattr(AS, "_VIDEO_DEADLINE_S", 10.0)
-    # deadline_at 10; hop 1 at 0; hop 2 at exactly 10 (allowed); body reads at 0
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 10.0, after=0.0))
+    # search start 0; deadline_at 10; hop 1 at 0; hop 2 at exactly 10 (allowed); body reads at 0
+    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 0.0, 10.0, after=0.0))
     stream = _Stream({PEXELS_OK: _redirect(other), other: _Resp(chunks=(b"ok",))})
     result = _pexels(tmp_path, [_video(1, [_vf(1080, 1920, link=PEXELS_OK)])], stream)
     assert stream.urls == [PEXELS_OK, other] and result is not None
