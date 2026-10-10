@@ -36,6 +36,7 @@ captions = [
 
 [tool.pytest.ini_options]
 markers = [
+    "real_media_sniffing: runs with the real engine.render.asset_sourcer._sniff_ok. Every other test gets a permissive one (tests/conftest.py), because their fakes serve placeholder bytes such as b\"orig\" rather than valid JPEG/PNG/MP4 headers.",
     "golden: end-to-end smoke test — real edge-tts synthesis + real ffmpeg render, no mocks. Slow (~20s, dominated by a real TTS network call) and needs network access, unlike the rest of the suite (which only needs ffmpeg on PATH, no network). Excluded from the default run by addopts below; see tests/test_golden_reel.py and .github/workflows/ci.yml's golden-reel job, which runs it explicitly.",
 ]
 # Default run skips `golden` tests — every other slow/environment-dependent test in this
@@ -43,7 +44,7 @@ markers = [
 # well under a second; this one makes a real network call and adds ~20s to every routine
 # `pytest -q` a developer runs locally. `pytest -m golden` (or CI's dedicated job) runs it
 # explicitly instead.
-addopts = "-m 'not golden'"
+addopts = "-m 'not golden' --strict-markers"
 
 [build-system]
 requires = ["hatchling"]

@@ -90,12 +90,24 @@ _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 # every hop (`_open_download`), after every network read (`_iter_capped`), and by a `_Watchdog` that
 # shuts the socket down when the budget runs out -- the only thing that can interrupt a read blocked
 # on a server dripping response headers or a chunked-encoding size line, where httpx yields nothing for
-# the other two to check. Still not bounded: the per-hit budgets add up (up to 15 Pexels hits). A
-# SoftTimeLimitExceeded raised inside a download is re-raised by the search loops (it ends the task),
-# not swallowed with the ordinary download failures.
+# the other two to check. Each hop's httpx timeout is also clamped to the time left (see
+# `_HOP_TIMEOUT_GRACE_S`), which bounds the TCP connect / TLS handshake before the watchdog exists, and
+# each search() has one overall budget (below). Not bounded: DNS resolution (getaddrinfo takes no
+# timeout) and the render task's own time limits across beats. SoftTimeLimitExceeded raised in ANY
+# network call of this module is re-raised (it ends the task), never swallowed as a failed download.
 _VIDEO_DEADLINE_S = 600.0
 _IMAGE_DEADLINE_S = 120.0
+# One budget per search() call, so the per-download budgets of its hits/candidates cannot add up (a
+# Pexels search tries up to 15 hits, a Wikipedia search 2 candidates). A download's own budget is
+# clipped to what is left of it, and no further download is started once it is spent.
+_PEXELS_SEARCH_BUDGET_S = 900.0
+_WIKI_SEARCH_BUDGET_S = 240.0
 _monotonic = time.monotonic     # indirection so tests can drive a fake clock
+# Per hop, httpx's own timeout is clamped to the budget that is left plus this grace: it bounds the TCP
+# connect and TLS handshake (before the watchdog exists) and one read that would outlive the budget,
+# while the watchdog -- exact, but only armed once connected -- still wins when the connection is up.
+# DNS resolution (getaddrinfo) takes no timeout and is bounded only by the OS resolver.
+_HOP_TIMEOUT_GRACE_S = 1.0
 
 
 _HOST_RE = re.compile(r"[a-z0-9.-]+")
@@ -196,6 +208,8 @@ class _Watchdog:
             if not isinstance(raw, socket.socket):
                 return
             dup = raw.dup()
+        except SoftTimeLimitExceeded:
+            raise                                   # a few microseconds wide, but the task is out of time
         except Exception:                                   # noqa: BLE001 - never break the request
             return
         timer = threading.Timer(max(self._deadline_at - _monotonic(), 0.0), self._fire)
@@ -234,7 +248,8 @@ def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = N
     Raises ValueError for a disallowed URL (first or redirected), a redirect with no Location, or
     more than `_MAX_REDIRECTS` hops, if the wall-clock `deadline_at` has passed before a hop, or if a
     `_Watchdog` had to close the connection at the deadline. Yields the final (non-redirect) response;
-    the caller still owns `raise_for_status()` and the status handling. `Accept-Encoding: identity` is always sent
+    the caller still owns `raise_for_status()` and the status handling. With a `deadline_at`, each hop's
+    httpx timeout is clamped to the time left (+ `_HOP_TIMEOUT_GRACE_S`). `Accept-Encoding: identity` is always sent
     (media is not worth compressing, and a gzip body would inflate far past its Content-Length
     before the size cap could see it); `_iter_capped` rejects a response that is encoded anyway.
     """
@@ -244,14 +259,18 @@ def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = N
         "headers": {**(headers or {}), "Accept-Encoding": "identity"},
     }
     for _ in range(_MAX_REDIRECTS + 1):
-        if deadline_at is not None and _monotonic() > deadline_at:
-            raise ValueError("download too slow: deadline exceeded before the request")
+        hop_kwargs = kwargs
+        if deadline_at is not None:
+            now = _monotonic()                              # one reading: the check and the clamp
+            if now > deadline_at:
+                raise ValueError("download too slow: deadline exceeded before the request")
+            hop_kwargs = {**kwargs, "timeout": min(timeout, deadline_at - now + _HOP_TIMEOUT_GRACE_S)}
         if not url_ok(url):
             _log.warning("Refusing download from a disallowed URL (host %s)", _host_for_log(url))
             raise ValueError(f"download URL not allowed: {url!r}")
         guard = _Watchdog(deadline_at)
         try:
-            with _http_stream("GET", url, extensions={"trace": guard.trace}, **kwargs) as r:
+            with _http_stream("GET", url, extensions={"trace": guard.trace}, **hop_kwargs) as r:
                 if r.status_code not in _REDIRECT_STATUSES:
                     yield r
                     if guard.fired:
@@ -300,6 +319,66 @@ def _iter_capped(r, limit: int, deadline_at: "float | None" = None):
         if deadline_at is not None and _monotonic() > deadline_at:
             raise ValueError("download too slow: deadline exceeded")
         yield chunk
+
+
+# ── downloaded bytes must look like what they claim to be ─────────────────────────────────────
+# The download guards bound where bytes come from, how many and how long; a 200 text/html or JSON body
+# (a CDN error page, a captive portal, a compromised allowlisted host) or an empty one would otherwise
+# be written as pexels_N.mp4 / wiki_N.jpg / hf_*.png and then reused forever by the `exists()` caches.
+# The first bytes are checked against the formats the pipeline actually decodes (MoviePy/PIL/ffmpeg).
+
+_IMAGE_MAGIC = (b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF87a", b"GIF89a", b"II*\x00", b"MM\x00*")
+_VIDEO_MAGIC = (b"\x1a\x45\xdf\xa3", b"GIF87a", b"GIF89a")             # WebM/EBML, GIF
+# First ISO-BMFF box type, at offset 4. `ftyp` is what progressive MP4 (Pexels) starts with; the rest are
+# first boxes of decodable QuickTime / fragmented / CMAF files. A false reject would silently drop a hit to
+# the paid HuggingFace tier, while this is only a sanity check (it cannot prove the rest of the file).
+_MP4_BOXES = (b"ftyp", b"moov", b"mdat", b"free", b"wide", b"skip",
+              b"styp", b"moof", b"sidx", b"junk", b"pnot", b"uuid")
+
+
+def _sniff_ok(kind: str, head) -> bool:
+    """True if `head` (the first <=16 bytes) is a JPEG/PNG/GIF/WebP/TIFF image or an MP4/WebM/GIF video.
+
+    `kind` is "image" or "video"; anything else, or a non-bytes `head`, is not ok. SVG, BMP, HTML,
+    JSON, PDF and an empty body are all refused.
+    """
+    if not isinstance(head, (bytes, bytearray)):
+        return False
+    head = bytes(head)
+    if kind == "image":
+        return head.startswith(_IMAGE_MAGIC) or (head[:4] == b"RIFF" and head[8:12] == b"WEBP")
+    if kind == "video":
+        return head[4:8] in _MP4_BOXES or head.startswith(_VIDEO_MAGIC)
+    return False
+
+
+def _require_media(kind: str, head) -> None:
+    """Raise ValueError (after a WARNING) if `head` is not a `kind` per `_sniff_ok`."""
+    if not _sniff_ok(kind, head):
+        _log.warning("Discarding a download that is not a valid %s", kind)
+        raise ValueError(f"downloaded bytes are not a valid {kind}")
+
+
+def _cached_media_ok(path: Path, kind: str) -> bool:
+    """True if the cached file at `path` starts like a real `kind`; otherwise delete it and say so.
+
+    A file cached before the content check existed (or by a process that died mid-write on a
+    pre-`os.replace` version) would otherwise be served by the `exists()` caches forever and fail
+    every later render in the compositor. The caller falls through to a fresh download.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(16)
+    except OSError:
+        head = b""
+    if _sniff_ok(kind, head):
+        return True
+    _log.warning("Discarding a cached file that is not a valid %s", kind)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return False
 
 
 # ── ids that become local file names ─────────────────────────────────────────
@@ -401,16 +480,22 @@ class WikipediaImageSource:
             page = next(iter(pages.values()), {})
             meta = (page.get("imageinfo") or [{}])[0].get("extmetadata", {})
             return _license_from_extmetadata(meta)
+        except SoftTimeLimitExceeded:
+            raise                                   # out of time: not "unknown license"
         except Exception:
             return {"license": "unknown", "license_url": None, "attribution": None, "safe_to_publish": False}
 
-    def _download(self, url: str) -> "bytes | None":
-        """Image bytes from a checked, size-capped GET; None if rate-limited twice.
+    def _download(self, url: str, search_deadline: float) -> "bytes | None":
+        """Image bytes from a checked, size-capped GET; None if rate-limited twice or out of budget.
 
         A 429 is retried once after a 2 s pause. Any other failure raises (the caller moves on
-        to the next candidate URL).
+        to the next candidate URL). `search_deadline` is the whole search's budget: this download
+        gets `_IMAGE_DEADLINE_S` or what is left of it, whichever is less.
         """
-        deadline_at = _monotonic() + _IMAGE_DEADLINE_S
+        now = _monotonic()
+        if now >= search_deadline:
+            return None
+        deadline_at = min(now + _IMAGE_DEADLINE_S, search_deadline)
         for attempt in (0, 1):
             with _open_download(url, _wikimedia_url_ok, timeout=30.0, headers=self._HEADERS,
                                 deadline_at=deadline_at) as r:
@@ -434,6 +519,8 @@ class WikipediaImageSource:
             if not results[1]:
                 return None
             page_title = results[1][0]
+        except SoftTimeLimitExceeded:
+            raise
         except Exception:
             return None
 
@@ -443,6 +530,8 @@ class WikipediaImageSource:
             resp = httpx.get(f"{self._SUMMARY}/{safe}", headers=self._HEADERS, timeout=10.0)
             resp.raise_for_status()
             data = resp.json()
+        except SoftTimeLimitExceeded:
+            raise
         except Exception:
             return None
 
@@ -475,15 +564,17 @@ class WikipediaImageSource:
         }
 
         local_path = None
+        search_deadline = _monotonic() + _WIKI_SEARCH_BUDGET_S
         for img_url in candidate_urls:
             lp = self.store_dir / f"wiki_{page_id}.{_image_extension(img_url)}"
-            if lp.exists():
+            if lp.exists() and _cached_media_ok(lp, "image"):
                 local_path = lp
                 break
             try:
-                content = self._download(img_url)
+                content = self._download(img_url, search_deadline)
                 if content is None:
                     continue
+                _require_media("image", content[:16])
                 _atomic_write(lp, content)
                 local_path = lp
                 break
@@ -576,9 +667,12 @@ class PexelsVideoSource:
             videos = resp.json().get("videos", [])
             if not isinstance(videos, list):
                 return None
+        except SoftTimeLimitExceeded:
+            raise
         except Exception:
             return None
 
+        search_deadline = _monotonic() + _PEXELS_SEARCH_BUDGET_S
         for video in videos:
             picked = self._pick(video, min_duration_s)
             if picked is None:
@@ -586,16 +680,21 @@ class PexelsVideoSource:
             vid_id, duration, link = picked
             local_path = self.store_dir / f"pexels_{vid_id}.mp4"
 
-            if not local_path.exists():
+            if not (local_path.exists() and _cached_media_ok(local_path, "video")):
                 tmp_path = _tmp_for(local_path)
+                now = _monotonic()
+                if now >= search_deadline:
+                    continue                        # budget spent: no more downloads, but a later hit may be cached
                 try:
-                    deadline_at = _monotonic() + _VIDEO_DEADLINE_S
+                    deadline_at = min(now + _VIDEO_DEADLINE_S, search_deadline)
                     with _open_download(link, _pexels_url_ok, timeout=120.0,
                                         deadline_at=deadline_at) as r:
                         r.raise_for_status()
                         with open(tmp_path, "wb") as fh:
                             for chunk in _iter_capped(r, _MAX_VIDEO_BYTES, deadline_at):
                                 fh.write(chunk)
+                    with open(tmp_path, "rb") as fh:
+                        _require_media("video", fh.read(16))
                     os.replace(tmp_path, local_path)
                 except SoftTimeLimitExceeded:
                     tmp_path.unlink(missing_ok=True)
@@ -647,7 +746,7 @@ class HuggingFaceImageSource:
         fp = hashlib.sha256(full_prompt.encode()).hexdigest()[:16]
         local_path = self.store_dir / f"hf_{fp}.png"
 
-        if not local_path.exists():
+        if not (local_path.exists() and _cached_media_ok(local_path, "image")):
             try:
                 resp = httpx.post(
                     f"{self._API}/{self.model}",
@@ -659,8 +758,13 @@ class HuggingFaceImageSource:
                 content_type = resp.headers.get("content-type", "")
                 if not content_type.startswith("image/"):
                     return None
+                if not _sniff_ok("image", resp.content[:16]):
+                    _log.warning("Discarding a HuggingFace download that is not a valid image")
+                    return None
                 _atomic_write(local_path, resp.content)
                 self.last_call_was_generated = True
+            except SoftTimeLimitExceeded:
+                raise                               # out of time: do not log it as a model failure
             except Exception:
                 _log.exception("HuggingFace image generation failed for model %s", self.model)
                 return None
@@ -706,7 +810,7 @@ class HuggingFaceVideoSource:
 
         # Check both possible cached extensions before making an API call
         for cached in (self.store_dir / f"hfvid_{fp}.mp4", self.store_dir / f"hfvid_{fp}.gif"):
-            if cached.exists():
+            if cached.exists() and _cached_media_ok(cached, "video"):
                 local_path = cached
                 break
         else:
@@ -721,8 +825,13 @@ class HuggingFaceVideoSource:
                 content_type = resp.headers.get("content-type", "video/mp4")
                 ext = "gif" if "gif" in content_type else "mp4"
                 local_path = self.store_dir / f"hfvid_{fp}.{ext}"
+                if not _sniff_ok("video", resp.content[:16]):
+                    _log.warning("Discarding a HuggingFace download that is not a valid video")
+                    return None
                 _atomic_write(local_path, resp.content)
                 self.last_call_was_generated = True
+            except SoftTimeLimitExceeded:
+                raise                               # out of time: do not log it as a model failure
             except Exception:
                 _log.exception("HuggingFace video generation failed for model %s", self.model)
                 return None
