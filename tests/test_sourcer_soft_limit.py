@@ -46,9 +46,10 @@ def test_wikipedia_a_soft_time_limit_propagates_from_every_lookup(tmp_path, stag
     assert list(tmp_path.iterdir()) == []
 
 
-@pytest.mark.parametrize("stage,expect_none", [("opensearch", True), ("summary", True), ("license", False)])
-def test_wikipedia_an_ordinary_error_at_each_lookup_still_degrades(tmp_path, stage, expect_none):
-    """opensearch / summary failing means no result; a failing license lookup means 'unknown, unsafe'."""
+@pytest.mark.parametrize("stage", ["opensearch", "summary", "license"])
+def test_wikipedia_an_ordinary_error_at_each_lookup_still_degrades(tmp_path, stage):
+    """No lookup failure raises; the download fails here too, so every variant ends in None (the
+    license-only degrade to 'unknown, unsafe' is the standalone test below)."""
     fake = _wiki_get(raise_at=stage, exc=httpx.ConnectError("down"))
     with patch(f"{_MOD}.httpx.get", side_effect=fake), patch(f"{_MOD}.time.sleep"), \
             patch(f"{_MOD}._http_stream", side_effect=httpx.ConnectError("down")):
@@ -100,3 +101,25 @@ def test_huggingface_a_soft_limit_does_not_leave_the_generated_flag_set(tmp_path
         with pytest.raises(SoftTimeLimitExceeded):
             src.generate("p")
     assert src.last_call_was_generated is False
+
+
+def test_the_watchdog_trace_hook_does_not_swallow_a_soft_limit():
+    """The hook swallows ordinary errors (it must never break the request) but not the task's time limit."""
+    from engine.render import asset_sourcer as AS
+
+    class Boom:
+        def get_extra_info(self, name):
+            raise SoftTimeLimitExceeded()
+
+    with pytest.raises(SoftTimeLimitExceeded):
+        AS._Watchdog(AS._monotonic() + 30.0).trace("connection.connect_tcp.complete", {"return_value": Boom()})
+
+
+def test_the_watchdog_trace_hook_still_swallows_an_ordinary_error():
+    from engine.render import asset_sourcer as AS
+
+    class Boom:
+        def get_extra_info(self, name):
+            raise RuntimeError("odd stream")
+
+    AS._Watchdog(AS._monotonic() + 30.0).trace("connection.connect_tcp.complete", {"return_value": Boom()})

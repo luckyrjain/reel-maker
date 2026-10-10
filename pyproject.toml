@@ -44,7 +44,7 @@ markers = [
 # well under a second; this one makes a real network call and adds ~20s to every routine
 # `pytest -q` a developer runs locally. `pytest -m golden` (or CI's dedicated job) runs it
 # explicitly instead.
-addopts = "-m 'not golden'"
+addopts = "-m 'not golden' --strict-markers"
 
 [build-system]
 requires = ["hatchling"]

@@ -28,7 +28,7 @@ def test_the_grace_is_one_second():
     assert AS._HOP_TIMEOUT_GRACE_S == 1.0
 
 
-def _open(stream, *, timeout, deadline_at, clock=None):
+def _open(stream, *, timeout, deadline_at):
     with patch.object(AS, "_http_stream", stream):
         with AS._open_download(PEXELS_OK, AS._pexels_url_ok, timeout=timeout, deadline_at=deadline_at):
             pass
@@ -191,6 +191,16 @@ def test_pexels_a_cached_hit_is_still_served_after_the_budget_is_spent(tmp_path,
     assert result.local_path.read_bytes() == b"cached" and stream.urls == [links[0]]
 
 
+def test_pexels_a_cached_hit_later_in_the_list_is_served_after_the_budget_is_spent(tmp_path, clock, monkeypatch):
+    """The cached hit is free; `break` on the first over-budget hit would never reach it."""
+    monkeypatch.setattr(AS, "_PEXELS_SEARCH_BUDGET_S", 5.0)
+    (tmp_path / "pexels_3.mp4").write_bytes(b"cached")
+    links = _links(3)
+    stream = _Ticking(_failing(links[0]), clock, step=100.0)
+    result = _pexels(tmp_path, _pexels_hits(links), stream)
+    assert result.source_ref == "3" and stream.urls == [links[0]]     # hit 2 skipped (no budget), hit 3 served
+
+
 def test_pexels_each_search_gets_its_own_budget(tmp_path, clock, monkeypatch):
     monkeypatch.setattr(AS, "_PEXELS_SEARCH_BUDGET_S", 25.0)
     links = _links(3)
@@ -216,14 +226,22 @@ def test_wikipedia_a_candidate_that_would_start_exactly_when_the_budget_ends_is_
     assert stream.urls == [WIKI_OK]                 # the thumbnail would start at t=150 == the end
 
 
-def test_wikipedia_the_second_candidate_is_clipped_to_what_is_left(tmp_path, clock, monkeypatch):
+def test_wikipedia_the_second_candidate_is_still_tried_while_there_is_budget(tmp_path, clock, monkeypatch):
     monkeypatch.setattr(AS, "_WIKI_SEARCH_BUDGET_S", 150.0)
     stream = _Ticking(_failing(WIKI_OK, WIKI_THUMB), clock, step=100.0)
     assert _wiki(tmp_path, _summary(), stream) is None
-    assert stream.urls == [WIKI_OK, WIKI_THUMB]
-    # thumbnail request: now=100 (before the fake advances), deadline_at=min(100+120, 150)=150
-    assert stream.requests[1][1]["timeout"] == pytest.approx(30.0)      # min(30, 150-100+1=51)
-    assert stream.requests[0][1]["timeout"] == pytest.approx(30.0)
+    assert stream.urls == [WIKI_OK, WIKI_THUMB]                         # t=100 < 150: the thumbnail is tried
+    assert [kw["timeout"] for _, kw in stream.requests] == [pytest.approx(30.0), pytest.approx(30.0)]
+
+
+def test_wikipedia_a_cached_candidate_is_served_after_the_budget_is_spent(tmp_path, clock, monkeypatch):
+    """The thumbnail has its own file name (.png): cached, so free even though the budget is gone."""
+    monkeypatch.setattr(AS, "_WIKI_SEARCH_BUDGET_S", 150.0)
+    thumb_png = "https://upload.wikimedia.org/wikipedia/commons/thumb/a/ab/Messi.jpg/320px-Messi.png"
+    (tmp_path / "wiki_123.png").write_bytes(b"cached")
+    stream = _Ticking(_failing(WIKI_OK), clock, step=200.0)
+    result = _wiki(tmp_path, _summary(thumbnail=thumb_png), stream)
+    assert result.local_path.read_bytes() == b"cached" and stream.urls == [WIKI_OK]
 
 
 def test_wikipedia_a_tight_remaining_budget_shrinks_the_second_download_timeout(tmp_path, clock, monkeypatch):
@@ -237,3 +255,8 @@ def test_wikipedia_a_tight_remaining_budget_shrinks_the_second_download_timeout(
 def test_wikipedia_a_fast_original_never_touches_the_budget(tmp_path, clock):
     stream = _Ticking(_Stream({WIKI_OK: _Resp(chunks=(b"orig",))}), clock, step=1.0)
     assert _wiki(tmp_path, _summary(thumbnail=None), stream).local_path.read_bytes() == b"orig"
+
+
+def test_media_sniffing_is_permissive_in_unmarked_tests():
+    """tests/conftest.py's autouse fixture: only tests marked real_media_sniffing get the real check."""
+    assert AS._sniff_ok("image", b"placeholder") is True and AS._sniff_ok("video", b"") is True

@@ -76,8 +76,11 @@ BEHAVIORS = {
     "close_delimited_drip": lambda c, s: _drip(
         c, s, b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n", b"x"),
     "close_delimited_ok": lambda c, s: c.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello"),
-    "redirect_then_drip": _redirect_then_drip(),
 }
+
+# behaviors with per-server state: called once per `_serve`, never shared between tests (a counter built at
+# import time made the second redirect test in a run drip on its FIRST connection -- order-dependent failure)
+FACTORIES = {"redirect_then_drip": _redirect_then_drip}
 
 
 class _Server:
@@ -139,7 +142,13 @@ def HANDSHAKE_HANG(conn, stop):                        # sentinel behavior: see 
 
 @contextmanager
 def _serve(name, tls_ctx=None):
-    server = _Server(HANDSHAKE_HANG if name == "handshake_hang" else BEHAVIORS[name], tls_ctx)
+    if name == "handshake_hang":
+        behavior = HANDSHAKE_HANG
+    elif name in FACTORIES:
+        behavior = FACTORIES[name]()
+    else:
+        behavior = BEHAVIORS[name]
+    server = _Server(behavior, tls_ctx)
     try:
         yield server
     finally:
@@ -629,3 +638,19 @@ def test_http_stream_sends_the_request_headers_and_does_not_follow_a_redirect():
         assert len(server.requests) == 1                # the 302 was not followed
     finally:
         server.close()
+
+
+def test_each_redirect_server_starts_with_a_fresh_counter():
+    """Regression: the redirect-then-drip state was shared, so test order decided whether hop 1 redirected."""
+    for _ in range(2):
+        armed = []
+        real = threading.Timer
+
+        class Spy(real):
+            def __init__(self, interval, *a, **kw):
+                super().__init__(interval, *a, **kw)
+                armed.append(interval)
+
+        with patch.object(AS.threading, "Timer", Spy), _serve("redirect_then_drip") as server:
+            result, _ = _fetch(server.url, 0.8)
+        assert isinstance(result, ValueError) and len(armed) == 2, (result, armed)
