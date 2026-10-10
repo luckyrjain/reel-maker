@@ -393,7 +393,7 @@ def _cached_media_ok(path: Path, kind: str) -> bool:
 # reach the filesystem, not even just to be rejected by a failing `Path.exists()`/write).
 
 _NUMERIC_ID_RE = re.compile(r"[0-9]{1,20}")
-_SAFE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_SAFE_ID_RE = re.compile(r"[a-z0-9_-]{1,64}")      # lowercase only: see _title_id
 
 
 def _numeric_id(raw) -> "str | None":
@@ -408,7 +408,13 @@ def _numeric_id(raw) -> "str | None":
 
 
 def _title_id(title: str) -> str:
-    """File-name-safe id for a page title: itself if already `[A-Za-z0-9_-]{1,64}`, else a digest."""
+    """File-name-safe id for a page title: itself if already `[a-z0-9_-]{1,64}`, else a digest.
+
+    Lowercase only, on purpose: on a case-insensitive filesystem (macOS / Windows default) `wiki_Ab.jpg`
+    and `wiki_aB.jpg` are ONE file, so one page's cached image would be served for another. Any title
+    with a capital goes through the digest (computed on the exact title, so `Ab` and `aB` still differ,
+    and the digest is itself lowercase hex). Only reachable when `pageid` is missing.
+    """
     if _SAFE_ID_RE.fullmatch(title):
         return title
     return "t" + hashlib.sha256(title.encode()).hexdigest()[:16]

@@ -394,7 +394,8 @@ def test_wikipedia_missing_pageid_falls_back_to_the_underscored_title(tmp_path):
     summary = _summary()
     del summary["pageid"]
     result, _ = _wiki(tmp_path, summary=summary, downloads={_ORIG: _bytes_resp()})
-    assert result.source_ref == "Lionel_Messi"
+    # the underscored title, hashed because it has capitals (see engine/render/asset_sourcer.py::_title_id)
+    assert result.source_ref == "t" + hashlib.sha256(b"Lionel_Messi").hexdigest()[:16]
 
 
 def test_wikipedia_license_metadata_travels_with_the_asset(tmp_path):

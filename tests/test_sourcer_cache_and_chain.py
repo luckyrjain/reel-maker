@@ -159,7 +159,8 @@ def test_wikipedia_missing_pageid_falls_back_to_the_underscored_page_title_not_t
     result, _ = _wiki(tmp_path, summary={"originalimage": {"source": url}},
                       opensearch=["Lionel Messi", ["Lionel Andres Messi"], [], []],
                       downloads={url: _bytes_resp(b"i")})
-    assert result.source_ref == "Lionel_Andres_Messi"
+    import hashlib
+    assert result.source_ref == "t" + hashlib.sha256(b"Lionel_Andres_Messi").hexdigest()[:16]
 
 
 def test_wikipedia_each_candidate_gets_its_own_extension_and_success_stops_the_loop(tmp_path):
