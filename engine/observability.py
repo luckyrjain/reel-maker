@@ -12,6 +12,8 @@ Usage:
 import time
 from contextlib import contextmanager
 
+from celery.exceptions import SoftTimeLimitExceeded
+
 from api import models
 
 
@@ -55,6 +57,12 @@ def record_stage(
         db.add(ev)
         try:
             db.commit()
+        except SoftTimeLimitExceeded:
+            # Celery's soft time limit is an Exception subclass: swallowing it here (the line below) would
+            # let the task carry on past its limit. Leave the session clean for the failure stamp and
+            # re-raise (it also replaces any error already propagating: it is the more important signal).
+            db.rollback()
+            raise
         except Exception:
             db.rollback()
 
