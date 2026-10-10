@@ -235,7 +235,7 @@ No exploitable allowlist or redirect bypass was found. Fixed afterwards (tests w
   objects (header-name case, gzip) -- all closed; the `_wiki` fake's "must go through httpx.stream"
   assertion was swallowed by `search()`'s `except Exception` and now fails the test.
 
-Known and left open: downloaded bytes are not content-sniffed (a 200 `text/html` from an allowlisted
+Known and left open at that time (content sniffing was added later, see "Follow-up: the four limits"): downloaded bytes are not content-sniffed (a 200 `text/html` from an allowlisted
 host would be cached as `.mp4`/`.jpg`; HF video accepts any 200 body), HF/search/summary responses
 are read without a cap, `_title_id` is case-sensitive (collides on case-insensitive filesystems, only
 when `pageid` is missing), and a Wikipedia page with no `pageid` and a non-plain title is re-downloaded
@@ -270,7 +270,7 @@ old-vs-new differential showed only the intended divergences, and a live fetch o
   silent; stale test counts in this spec; "int or <=20 digits" omitted that the cap and the sign rule apply
   to ints too.
 
-Known and left open (unchanged): no content sniffing, uncapped JSON/HF responses, case-sensitive
+Known and left open (unchanged; no content sniffing and the empty-body caching were closed later, see "Follow-up: the four limits"): no content sniffing, uncapped JSON/HF responses, case-sensitive
 `_title_id` on case-insensitive filesystems, empty (0-byte) 200 bodies are cached by the existing
 `exists()` caches, and the JSON API calls (`opensearch`, summary, `imageinfo`, Pexels search) still send
 the default `Accept-Encoding: gzip`.
@@ -355,3 +355,47 @@ real defects in the watchdog itself, found independently by two reviewers, were 
 
 The soft-limit pass-through covers the two download loops only; the other `except Exception` blocks in the
 module (Pexels search, Wikipedia opensearch/summary/license, HuggingFace) still swallow it.
+
+### Follow-up: the four limits left after review round 4
+
+Four limits had been documented as open at the end of round 4. All four are closed except DNS; tests first,
+one commit each (`6bd81c8`, `b3bc584`, `cabf5b3`, `fd7a732`).
+
+- **`SoftTimeLimitExceeded` swallowed by the other `except Exception` blocks.** The two download loops
+  re-raised it; the Pexels search call, the Wikipedia opensearch / summary / license lookups and both
+  HuggingFace sources still reported it as "no result" / "unknown license" / a logged model failure and let
+  the render carry on past an exhausted soft limit. Each now re-raises it first. Every re-raise clause in the
+  module (8) was removed in turn: each removal fails a test. `tests/test_sourcer_soft_limit.py` (16).
+- **The connect/TLS phase before the watchdog arms.** It ran on httpx's full timeout (120 s Pexels / 30 s
+  Wikipedia), and one read could outlive the budget by its whole read timeout. Each hop's timeout is now
+  `min(configured, time left + 1 s)`, from the same single `_monotonic()` reading as the pre-hop deadline
+  check (no extra clock call); the 1 s grace (`_HOP_TIMEOUT_GRACE_S`) lets the exact watchdog win once the
+  connection exists instead of a racing `ReadTimeout`. Verified through the real httpx/httpcore stack (the
+  timeout that reaches `socket.create_connection`). **DNS stays unbounded by us**: `getaddrinfo` takes no
+  timeout, only the OS resolver bounds it.
+- **Per-hit budgets adding up.** A Pexels search tries up to 15 hits (600 s each: 2.5 h worst case), a
+  Wikipedia search 2 candidates. Each `search()` now has one budget (`_PEXELS_SEARCH_BUDGET_S` 900,
+  `_WIKI_SEARCH_BUDGET_S` 240, computed once per call); a download's budget is clipped to what is left, and no
+  further download starts once it is spent (`now >= search_deadline`; a cached hit is still served). The
+  exact-boundary case (a download that would start exactly when the budget ends) is pinned, because the
+  pre-hop check alone would let it through with a 1 s timeout. The four fake-clock tests were re-counted for
+  the one extra clock reading per search. `tests/test_sourcer_budgets.py` (20). Across beats, the render
+  task's own time limits remain the outer bound.
+- **No content sniffing.** A 200 `text/html`/JSON body (CDN error page, captive portal, compromised allowlisted
+  host) or an empty one was cached as `pexels_N.mp4` / `wiki_N.jpg` / `hf_*.png` and reused forever by the
+  `exists()` caches (it also closes the "empty body cached forever" note from the security reviews). The first
+  16 bytes are checked (`_sniff_ok`, `_require_media`) against what the pipeline decodes: JPEG, PNG, GIF,
+  `RIFF…WEBP`, TIFF for images; an MP4 box (`ftyp`/`moov`/`mdat`/`free`/`wide`/`skip` at offset 4), WebM or GIF
+  for videos. SVG and BMP are refused on purpose (PIL/MoviePy cannot use an SVG, and Wikimedia's thumbnail of
+  an SVG is a PNG, which the fallback then takes). Pexels checks the finished `.tmp` before `os.replace`;
+  Wikipedia checks the bytes before `_atomic_write`; HuggingFace checks before writing, so a lying
+  `Content-Type` is neither cached nor billed. Files cached before this check existed are served as before.
+  **Test seam**: the suite's fakes serve placeholder bytes (`b"orig"`), so `tests/conftest.py` has an autouse
+  fixture that makes `_sniff_ok` permissive for every test, and tests that exercise the check carry
+  `@pytest.mark.real_media_sniffing` (registered in `pyproject.toml`). `tests/test_sourcer_sniffing.py` (79);
+  18 mutants, all killed but one equivalent (the `isinstance` guard, which a non-bytes head also fails
+  downstream). One real survivor (WebP accepted without the `RIFF` prefix) got its own case.
+
+Still open: DNS resolution time, HuggingFace/JSON API response size, `_title_id` case-sensitivity on a
+case-insensitive filesystem, the deterministic shared `.tmp` name, and the per-beat total across a render.
+
