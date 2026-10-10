@@ -101,9 +101,11 @@ _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 # on a server dripping response headers or a chunked-encoding size line, where httpx yields nothing for
 # the other two to check. Each hop's httpx timeout is also clamped to the time left (see
 # `_HOP_TIMEOUT_GRACE_S`), which bounds the TCP connect / TLS handshake before the watchdog exists, and
-# each search() has one overall budget (below). Not bounded: DNS resolution (getaddrinfo takes no
-# timeout) and the render task's own time limits across beats. SoftTimeLimitExceeded raised in ANY
-# network call of this module is re-raised (it ends the task), never swallowed as a failed download.
+# each search() has one overall budget (below), and the host's DNS lookup is given at most that long
+# (`_dns_in_time`; getaddrinfo takes no timeout). Not bounded: the transient read buffer of the API
+# calls (httpx.get/post read the whole body; see `_body_too_large`) and the render task's own time
+# limits across beats. SoftTimeLimitExceeded raised in ANY network call of this module is re-raised
+# (it ends the task), never swallowed as a failed download.
 _VIDEO_DEADLINE_S = 600.0
 _IMAGE_DEADLINE_S = 120.0
 # One budget per search() call, so the per-download budgets of its hits/candidates cannot add up (a
@@ -115,7 +117,7 @@ _monotonic = time.monotonic     # indirection so tests can drive a fake clock
 # Per hop, httpx's own timeout is clamped to the budget that is left plus this grace: it bounds the TCP
 # connect and TLS handshake (before the watchdog exists) and one read that would outlive the budget,
 # while the watchdog -- exact, but only armed once connected -- still wins when the connection is up.
-# DNS resolution (getaddrinfo) takes no timeout and is bounded only by the OS resolver.
+# DNS is gated separately (`_dns_in_time`), with this same hop timeout.
 _HOP_TIMEOUT_GRACE_S = 1.0
 
 
