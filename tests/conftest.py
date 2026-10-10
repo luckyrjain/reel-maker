@@ -79,3 +79,17 @@ def _api_calls_via_httpx(request, monkeypatch):
     monkeypatch.setattr("engine.render.asset_sourcer._api_post",
                         lambda url, *, limit=None, **kw: httpx.post(url, **kw), raising=False)
 
+
+@pytest.fixture(autouse=True)
+def _permissive_image_check(request, monkeypatch):
+    """Make the sourcers' "Pillow can read it and it is not enormous" check accept anything.
+
+    `engine.render.asset_sourcer._image_ok` opens an image's header with Pillow; the suite's fakes
+    serve placeholder bytes (even the "valid-looking" JPEG/PNG heads of test_sourcer_sniffing.py are not
+    decodable images). Tests of the check itself carry `@pytest.mark.real_image_check`
+    (tests/test_sourcer_image_check.py) and use real images.
+    """
+    if request.node.get_closest_marker("real_image_check"):
+        return
+    monkeypatch.setattr("engine.render.asset_sourcer._image_ok", lambda source: True, raising=False)
+
