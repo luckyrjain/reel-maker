@@ -173,14 +173,14 @@ cannot bounce the worker to an arbitrary one. Size: `_iter_capped()` rejects a d
 `Content-Length` over the cap before reading and otherwise counts bytes, raising as soon as the
 cap is exceeded (`_MAX_VIDEO_BYTES` 250 MB, `_MAX_IMAGE_BYTES` 50 MB); a Pexels partial `.tmp` is
 removed and the next hit tried, an oversized Wikipedia original falls back to the thumbnail. To
-cap the body, Wikipedia image downloads moved from `httpx.get` to `httpx.stream` (the 429 retry
+cap the body, Wikipedia image downloads moved from `httpx.get` to `httpx.stream` (since renamed `_http_stream`, see the Follow-up; the 429 retry
 once after 2 s is unchanged). The check guards the download only: a file already cached on disk is
 served without a request, as before.
 
 Test changes beyond the new `tests/test_sourcer_download_guards.py` (199 tests; 100 before the review rounds): the three tests
 that pinned `follow_redirects=True` now pin `False`; fake image hosts (`https://x/...`, `https://u/...`)
 became `upload.wikimedia.org`; and the legacy Wikipedia fakes, which describe a download as a
-response returned from a patched `httpx.get`, are adapted to `httpx.stream` by one autouse fixture
+response returned from a patched `httpx.get`, are adapted to `httpx.stream` (now `_http_stream`) by one autouse fixture
 (`_wikipedia_downloads_via_get_fakes` in `test_sourcer_selection.py`, re-exported to the other
 sourcer test files) instead of rewriting ~60 call sites. Mutation-checked (12 targeted mutants, all now failing a test; the post-second-429 sleep needed an added
 assertion): dropping the host check,
@@ -256,7 +256,7 @@ old-vs-new differential showed only the intended divergences, and a live fetch o
   (`MockTransport` with a chunked body) pins it.
 - **The budget was per call.** One `deadline_at` is now computed per download and shared by its redirect
   hops (`_open_download` checks it before each hop) and the Wikipedia 429 retry. Still not bounded: a
-  server dripping response *headers* inside the read timeout (h11 caps that at ~16 KB) and the up-to-15
+  server dripping response *headers* inside the read timeout (h11 caps an incomplete event at ~100 KiB) and the up-to-15
   Pexels hits / 2 Wikipedia candidates each getting their own budget; the render task's
   `soft_time_limit` is the outer bound.
 - **Log hygiene.** `urlsplit().hostname` strips only tab/CR/LF, so ESC/BEL/NEL and a 100 KB host could
@@ -284,30 +284,34 @@ defect of medium severity or higher. Fixed (tests first): `_host_for_log` raised
 dead `.lower()`; four test gaps from a 104-mutant audit (the Pexels body sharing the connect-phase budget,
 the pre-hop deadline boundary, the exact 253-character host bound, a hostile host reaching the log raw
 through the download path); dead test code and a stale test name. The two hardening gaps round 3 raised were first documented and then closed in a follow-up (below);
-the two that remain documented are a read overrunning the budget by up to its httpx timeout (the
-timeout is not clamped to the time remaining) and a deterministic shared `.tmp` name (two concurrent
-renders downloading the same asset could truncate each other; render concurrency is 1; pre-existing).
+the remaining documented one is a deterministic shared `.tmp` name (two concurrent renders downloading
+the same asset could truncate each other; render concurrency is 1; pre-existing). A read overrunning the
+budget by up to its httpx timeout, listed here at the time, is bounded by the watchdog (only the DNS/TCP
+connect phase before it arms is not).
 
 ### Follow-up: the watchdog and the soft-limit pass-through
 
 - **Watchdog.** The deadline checks in `_open_download` (before each hop) and `_iter_capped` (after each
   network read) only run when httpx yields a response or a body chunk. A host dripping response headers,
-  or a chunked-encoding size line / extension, yields neither, and h11 only caps those at ~80 KB with
-  each byte allowed up to the read timeout (about 110 days at a 119 s drip). `_Watchdog` arms a daemon
-  `threading.Timer` for the remaining budget from httpcore's `connection.connect_tcp.complete` trace
-  event, which fires with the raw socket before any response exists, and `socket.shutdown(SHUT_RDWR)`s it
-  when the budget runs out; the blocked read then fails at once and `_open_download` raises
+  or a chunked-encoding size line / extension, yields neither, and h11 only caps those at ~100 KiB
+  (`MAX_INCOMPLETE_EVENT_SIZE`) with each byte allowed up to the read timeout (about 140 days at a 119 s
+  drip). `_Watchdog` arms a daemon `threading.Timer` for the remaining budget from httpcore's
+  `connection.connect_tcp.complete` trace event, which fires with the raw socket before any response
+  exists, and `shutdown(SHUT_RDWR)`s a `dup()` of it when the budget runs out (see Review round 4 for why a
+  dup); the blocked read then fails at once and `_open_download` raises
   `ValueError("download too slow: deadline exceeded (connection closed)")` (logged by host). It is
   cancelled when each hop ends and is never armed without a budget. The trace hook needs
   `httpx.Client.stream`: module-level `httpx.stream()` has no `extensions` parameter, so downloads now go
   through a small `_http_stream(method, url, *, extensions=None, **kwargs)` seam (same call shape as
-  `httpx.stream`); tests patch `_http_stream`, not `httpx.stream` (a mechanical rename of 28 patch
-  targets, plus the three tests that pin the request kwargs now also assert the `extensions` trace hook).
+  `httpx.stream`); tests patch `_http_stream`, not `httpx.stream` (a mechanical rename of 22 patch
+  targets, plus the two tests that pin the full request kwargs — one per source — now also assert the
+  `extensions` trace hook).
   Verified with real raw-socket servers (header drip, chunk-size-line drip, one-byte-per-read body,
   silent server: each cut off near a 0.6 s budget, not the 30 s read timeout), through `_open_download`
   and through the real Pexels and Wikipedia `search()` paths, with no partial file and no Timer thread
-  left behind. `tests/test_sourcer_watchdog.py`: 31 tests; 13 targeted mutants, 12 killed by the suite and
-  the 13th (the double-arm guard) pinned by a direct trace-hook test.
+  left behind. `tests/test_sourcer_watchdog.py`: 52 tests after review round 4 (31 when first written); 13 targeted
+  mutants, 12 killed by the suite and the 13th (the double-arm guard) pinned by a direct trace-hook test;
+  7 more after round 4, 5 killed and 2 equivalent.
 - **`SoftTimeLimitExceeded`.** It is an `Exception` subclass (billiard), so the search loops' broad
   `except Exception: continue` swallowed it and started the next hit on a fresh budget (the same
   pattern is on `main`). Both loops now catch `celery.exceptions.SoftTimeLimitExceeded` first and
@@ -318,3 +322,36 @@ renders downloading the same asset could truncate each other; render concurrency
 - Corrected claims: the earlier "the soft limit is the outer bound" wording was wrong while the swallow
   existed; with the re-raise the task's time limits are again the outer bound for the per-hit budgets
   adding up.
+
+### Review round 4 (the watchdog and soft-limit change)
+
+Four reviewers ran on c2085ca. The soft-limit re-raise, the `_http_stream` seam (a 95-scenario old-vs-new
+differential: 0 divergences; no test silently reaches the real network) and the timer lifecycle held. Two
+real defects in the watchdog itself, found independently by two reviewers, were fixed (tests first):
+
+- **It did nothing over HTTPS — i.e. for every allowlisted host.** The watchdog kept the raw `socket.socket`
+  from `connect_tcp.complete`; httpcore's TLS wrap then *detaches* that object (fileno -1), so at the deadline
+  `shutdown()` raised `EBADF`, which was swallowed, while `fired` was already set and the log/error said
+  "connection closed". A header drip over TLS ran 21 s against a 1 s budget. All 31 tests used plain
+  `http://127.0.0.1`, so none could see it. Now it keeps a `dup()` taken at connect time (`shutdown()` acts
+  on the connection, not the descriptor, so the dup works after the wrap and also during a TLS handshake
+  drip, which arming at `start_tls.complete` would miss), closed in `cancel()` under a lock shared with
+  `_fire`. `fired` is set before the shutdown and reverted if it raised.
+- **A shutdown could read as a successful, truncated download.** For a close-delimited body (no
+  Content-Length, no chunking) the shutdown looks like a valid EOF, so `_iter_capped` ended normally and the
+  partial file was `os.replace`d / `_atomic_write`n into an `exists()` cache that serves it forever
+  (chunked and Content-Length bodies raised correctly). `_open_download` now raises after the `yield` when
+  `fired`.
+- **Test gaps** (~90 mutants): a hostile redirect target having its own watchdog (a shared guard survived),
+  the real `_http_stream` (the `MockTransport` helper replaces it: kwargs forwarded, Client closed, 302 not
+  followed), `_fire`'s error handling, a non-socket stream, and the `body_trickle` cases never needing the
+  watchdog (the per-chunk check covers them; the other drips fail without it). New tests use a self-signed
+  cert for 127.0.0.1 (`SSL_CERT_FILE`), a handshake-hang server, close-delimited servers and a
+  redirect-then-drip server.
+- **Docs**: 22 (not 28) renamed patch targets, two (not three) kwargs-pin tests, a stale
+  `httpx.stream` test-suite note, "a read can overrun by its httpx timeout" (now only the connect phase
+  before the watchdog arms), "deadline rejections are silent" (a watchdog-enforced one is logged), the h11
+  cap (~100 KiB, not ~16/~80 KB), and the `.tmp` wording on soft-limit cleanup (Pexels only).
+
+The soft-limit pass-through covers the two download loops only; the other `except Exception` blocks in the
+module (Pexels search, Wikipedia opensearch/summary/license, HuggingFace) still swallow it.
