@@ -121,7 +121,7 @@ def _slow_download(url, *, budget_s, read_timeout=5.0, consume=True):
 # ── TLS: the socket handed out by httpcore is an SSLSocket ───────────────────
 
 def _self_signed_cert(tmp_path):
-    cryptography = pytest.importorskip("cryptography")
+    pytest.importorskip("cryptography")
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import rsa

@@ -17,7 +17,6 @@ import time
 from contextlib import contextmanager
 from unittest.mock import patch
 
-import httpx
 import pytest
 from celery.exceptions import SoftTimeLimitExceeded
 
