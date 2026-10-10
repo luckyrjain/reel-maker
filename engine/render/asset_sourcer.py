@@ -164,71 +164,66 @@ def _http_stream(method, url, *, extensions=None, **kwargs):
 
 
 class _Watchdog:
-    """Shuts a download's socket down once its wall-clock budget is spent.
+    """Shuts a download's connection down once its wall-clock budget is spent.
 
     httpx timeouts are per read, and the deadline checks in `_open_download`/`_iter_capped` only run
-    when httpx hands back a response or a body chunk; a server dripping response headers, or a chunked
-    size line / extension, produces neither, so nothing else can interrupt that blocked read. Arm it
-    from httpcore's `connect_tcp.complete` trace event (`trace`, passed as the request's `trace`
-    extension: the raw socket exists before any response does), `cancel()` it when the hop ends. When
-    it fires the blocked read fails at once (`fired` is True and the caller reports a deadline error).
-
-    Over https `start_tls` wraps the TCP socket in a NEW `SSLSocket` and detaches the original (its
-    `shutdown` then raises and nothing is interrupted), so `connection.start_tls.complete` re-targets
-    the timer at the TLS socket -- and shuts it down at once if the deadline already passed.
+    when httpx hands back a response or a body chunk; a server dripping response headers, a chunked
+    size line / extension, or a TLS handshake produces none of those, so nothing else can interrupt
+    that blocked read. `trace` (the request's `trace` extension) arms it on httpcore's
+    `connection.connect_tcp.complete` event: the raw socket exists before any response does, and
+    a `dup()` of it is kept, not the socket itself -- for HTTPS (every allowlisted host) httpcore
+    next wraps the socket in TLS, which *detaches* the original object (fileno -1), so shutting that
+    down would silently do nothing. `shutdown()` acts on the connection, not the descriptor, so the
+    dup still breaks a blocked read in any phase. `cancel()` it when the hop ends. When it fires,
+    `fired` is True: the caller must treat the download as failed even if the read ended *cleanly*
+    (a close-delimited body reads a shutdown as a valid EOF).
     """
 
     def __init__(self, deadline_at: "float | None"):
         self._deadline_at = deadline_at
+        self._lock = threading.Lock()
         self._timer: "threading.Timer | None" = None
         self._sock: "socket.socket | None" = None
-        self._lock = threading.Lock()
         self.fired = False
 
-    @staticmethod
-    def _socket_of(info: dict) -> "socket.socket | None":
-        try:
-            sock = info["return_value"].get_extra_info("socket")
-        except Exception:                                   # noqa: BLE001 - never break the request
-            return None
-        return sock if isinstance(sock, socket.socket) else None
-
     def trace(self, event_name: str, info: dict) -> None:
-        if self._deadline_at is None:
+        if self._deadline_at is None or self._timer is not None:
             return
-        if event_name == "connection.start_tls.complete":
-            sock = self._socket_of(info)
-            if sock is not None:
-                with self._lock:
-                    self._sock = sock
-                    if self.fired:
-                        self._shutdown_locked()
+        if event_name != "connection.connect_tcp.complete":
             return
-        if event_name != "connection.connect_tcp.complete" or self._timer is not None:
+        try:
+            raw = info["return_value"].get_extra_info("socket")
+            if not isinstance(raw, socket.socket):
+                return
+            dup = raw.dup()
+        except Exception:                                   # noqa: BLE001 - never break the request
             return
-        sock = self._socket_of(info)
-        if sock is None:
-            return
-        self._sock = sock
         timer = threading.Timer(max(self._deadline_at - _monotonic(), 0.0), self._fire)
         timer.daemon = True
-        self._timer = timer
+        with self._lock:
+            self._sock, self._timer = dup, timer
         timer.start()
 
     def _fire(self) -> None:
-        with self._lock:
-            self.fired = True
-            self._shutdown_locked()
-
-    def _shutdown_locked(self) -> None:
-        try:
-            self._sock.shutdown(socket.SHUT_RDWR)
-        except (OSError, AttributeError):
-            pass                                            # already closed: the read is ending anyway
+        with self._lock:                                    # cancel() closes the dup under this lock
+            if self._sock is None:
+                return
+            self.fired = True                               # before the shutdown: the read thread may
+            try:                                            # see the error the instant it returns
+                self._sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                self.fired = False                          # nothing was closed; do not claim it was
 
     def cancel(self) -> None:
-        if self._timer is not None:
-            self._timer.cancel()
+        with self._lock:
+            timer, sock, self._sock = self._timer, self._sock, None
+        if timer is not None:
+            timer.cancel()
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
 @contextmanager
@@ -259,6 +254,10 @@ def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = N
             with _http_stream("GET", url, extensions={"trace": guard.trace}, **kwargs) as r:
                 if r.status_code not in _REDIRECT_STATUSES:
                     yield r
+                    if guard.fired:
+                        # the body ended "cleanly" only because we shut the connection down (a
+                        # close-delimited body reads that as EOF): it is truncated, never a success
+                        raise ValueError("download too slow: deadline exceeded (connection closed)")
                     return
                 location = r.headers.get("location")
         except SoftTimeLimitExceeded:
