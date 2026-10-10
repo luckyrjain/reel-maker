@@ -64,9 +64,11 @@ _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 # every hop (`_open_download`), after every network read (`_iter_capped`), and by a `_Watchdog` that
 # shuts the socket down when the budget runs out -- the only thing that can interrupt a read blocked
 # on a server dripping response headers or a chunked-encoding size line, where httpx yields nothing for
-# the other two to check. Still not bounded: the per-hit budgets add up (up to 15 Pexels hits). A
-# SoftTimeLimitExceeded raised inside a download is re-raised by the search loops (it ends the task),
-# not swallowed with the ordinary download failures.
+# the other two to check. Each hop's httpx timeout is also clamped to the time left (see
+# `_HOP_TIMEOUT_GRACE_S`), which bounds the TCP connect / TLS handshake before the watchdog exists, and
+# each search() has one overall budget (below). Not bounded: DNS resolution (getaddrinfo takes no
+# timeout) and the render task's own time limits across beats. SoftTimeLimitExceeded raised in ANY
+# network call of this module is re-raised (it ends the task), never swallowed as a failed download.
 _VIDEO_DEADLINE_S = 600.0
 _IMAGE_DEADLINE_S = 120.0
 # One budget per search() call, so the per-download budgets of its hits/candidates cannot add up (a
