@@ -69,6 +69,11 @@ _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 # not swallowed with the ordinary download failures.
 _VIDEO_DEADLINE_S = 600.0
 _IMAGE_DEADLINE_S = 120.0
+# One budget per search() call, so the per-download budgets of its hits/candidates cannot add up (a
+# Pexels search tries up to 15 hits, a Wikipedia search 2 candidates). A download's own budget is
+# clipped to what is left of it, and no further download is started once it is spent.
+_PEXELS_SEARCH_BUDGET_S = 900.0
+_WIKI_SEARCH_BUDGET_S = 240.0
 _monotonic = time.monotonic     # indirection so tests can drive a fake clock
 # Per hop, httpx's own timeout is clamped to the budget that is left plus this grace: it bounds the TCP
 # connect and TLS handshake (before the watchdog exists) and one read that would outlive the budget,
@@ -390,13 +395,17 @@ class WikipediaImageSource:
         except Exception:
             return {"license": "unknown", "license_url": None, "attribution": None, "safe_to_publish": False}
 
-    def _download(self, url: str) -> "bytes | None":
-        """Image bytes from a checked, size-capped GET; None if rate-limited twice.
+    def _download(self, url: str, search_deadline: float) -> "bytes | None":
+        """Image bytes from a checked, size-capped GET; None if rate-limited twice or out of budget.
 
         A 429 is retried once after a 2 s pause. Any other failure raises (the caller moves on
-        to the next candidate URL).
+        to the next candidate URL). `search_deadline` is the whole search's budget: this download
+        gets `_IMAGE_DEADLINE_S` or what is left of it, whichever is less.
         """
-        deadline_at = _monotonic() + _IMAGE_DEADLINE_S
+        now = _monotonic()
+        if now >= search_deadline:
+            return None
+        deadline_at = min(now + _IMAGE_DEADLINE_S, search_deadline)
         for attempt in (0, 1):
             with _open_download(url, _wikimedia_url_ok, timeout=30.0, headers=self._HEADERS,
                                 deadline_at=deadline_at) as r:
@@ -465,13 +474,14 @@ class WikipediaImageSource:
         }
 
         local_path = None
+        search_deadline = _monotonic() + _WIKI_SEARCH_BUDGET_S
         for img_url in candidate_urls:
             lp = self.store_dir / f"wiki_{page_id}.{_image_extension(img_url)}"
             if lp.exists():
                 local_path = lp
                 break
             try:
-                content = self._download(img_url)
+                content = self._download(img_url, search_deadline)
                 if content is None:
                     continue
                 _atomic_write(lp, content)
@@ -571,6 +581,7 @@ class PexelsVideoSource:
         except Exception:
             return None
 
+        search_deadline = _monotonic() + _PEXELS_SEARCH_BUDGET_S
         for video in videos:
             picked = self._pick(video, min_duration_s)
             if picked is None:
@@ -580,8 +591,11 @@ class PexelsVideoSource:
 
             if not local_path.exists():
                 tmp_path = local_path.with_suffix(".tmp")
+                now = _monotonic()
+                if now >= search_deadline:
+                    break                           # the search's budget is spent: no more downloads
                 try:
-                    deadline_at = _monotonic() + _VIDEO_DEADLINE_S
+                    deadline_at = min(now + _VIDEO_DEADLINE_S, search_deadline)
                     with _open_download(link, _pexels_url_ok, timeout=120.0,
                                         deadline_at=deadline_at) as r:
                         r.raise_for_status()
