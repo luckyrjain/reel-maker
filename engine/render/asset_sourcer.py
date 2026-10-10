@@ -70,6 +70,11 @@ _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 _VIDEO_DEADLINE_S = 600.0
 _IMAGE_DEADLINE_S = 120.0
 _monotonic = time.monotonic     # indirection so tests can drive a fake clock
+# Per hop, httpx's own timeout is clamped to the budget that is left plus this grace: it bounds the TCP
+# connect and TLS handshake (before the watchdog exists) and one read that would outlive the budget,
+# while the watchdog -- exact, but only armed once connected -- still wins when the connection is up.
+# DNS resolution (getaddrinfo) takes no timeout and is bounded only by the OS resolver.
+_HOP_TIMEOUT_GRACE_S = 1.0
 
 
 _HOST_RE = re.compile(r"[a-z0-9.-]+")
@@ -208,7 +213,8 @@ def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = N
     Raises ValueError for a disallowed URL (first or redirected), a redirect with no Location, or
     more than `_MAX_REDIRECTS` hops, if the wall-clock `deadline_at` has passed before a hop, or if a
     `_Watchdog` had to close the connection at the deadline. Yields the final (non-redirect) response;
-    the caller still owns `raise_for_status()` and the status handling. `Accept-Encoding: identity` is always sent
+    the caller still owns `raise_for_status()` and the status handling. With a `deadline_at`, each hop's
+    httpx timeout is clamped to the time left (+ `_HOP_TIMEOUT_GRACE_S`). `Accept-Encoding: identity` is always sent
     (media is not worth compressing, and a gzip body would inflate far past its Content-Length
     before the size cap could see it); `_iter_capped` rejects a response that is encoded anyway.
     """
@@ -218,14 +224,18 @@ def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = N
         "headers": {**(headers or {}), "Accept-Encoding": "identity"},
     }
     for _ in range(_MAX_REDIRECTS + 1):
-        if deadline_at is not None and _monotonic() > deadline_at:
-            raise ValueError("download too slow: deadline exceeded before the request")
+        hop_kwargs = kwargs
+        if deadline_at is not None:
+            now = _monotonic()                              # one reading: the check and the clamp
+            if now > deadline_at:
+                raise ValueError("download too slow: deadline exceeded before the request")
+            hop_kwargs = {**kwargs, "timeout": min(timeout, deadline_at - now + _HOP_TIMEOUT_GRACE_S)}
         if not url_ok(url):
             _log.warning("Refusing download from a disallowed URL (host %s)", _host_for_log(url))
             raise ValueError(f"download URL not allowed: {url!r}")
         guard = _Watchdog(deadline_at)
         try:
-            with _http_stream("GET", url, extensions={"trace": guard.trace}, **kwargs) as r:
+            with _http_stream("GET", url, extensions={"trace": guard.trace}, **hop_kwargs) as r:
                 if r.status_code not in _REDIRECT_STATUSES:
                     yield r
                     if guard.fired:
