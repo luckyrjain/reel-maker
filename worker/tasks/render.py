@@ -5,7 +5,7 @@ from api.config import settings
 from api.state import CUT_TRANSITIONS, transition
 from engine.generation.guide_schema import PlatformGuide, compute_guide_fingerprint
 from engine.observability import record_stage
-from engine.render.asset_sourcer import compute_pins_fingerprint_for_render, get_asset_sourcer, get_hf_sourcer, get_hf_video_sourcer, get_music_sourcer, get_wiki_sourcer, resolve_or_reuse
+from engine.render.asset_sourcer import RENDER_ASSET_BUDGET_S, asset_budget, compute_pins_fingerprint_for_render, get_asset_sourcer, get_hf_sourcer, get_hf_video_sourcer, get_music_sourcer, get_wiki_sourcer, resolve_or_reuse
 from engine.render.compositor import DEFAULT_TEXT_COLOR, composite_cut
 from engine.render.tts import SilentProvider, _audio_duration, get_tts_provider
 from worker.celery_app import celery_app
@@ -56,37 +56,39 @@ def render_cut(self, db, job, ctx):
     # see docs/roadmap.md's Phase 7 asset_sourcer visibility item.
     black_frame_beats: list[int] = []
 
-    for i, beat in enumerate(beats):
-        # resolve_or_reuse: reuses pinned assets when visual_direction hasn't
-        # changed; re-resolves (and re-pins) only when the direction changed.
-        pairs = resolve_or_reuse(
-            db,
-            cut=cut,
-            beat_index=beat.index,
-            visual_direction=beat.visual_direction,
-            min_duration_s=beat.duration_s,
-            sourcer=sourcer,
-            wiki=wiki,
-            hf_video=hf_video,
-            hf=hf,
-        )
-        beat_asset_pairs.append(pairs)
-        paths = [p for _, p in pairs]
-        beat_video_paths.append(paths)
-        if not any(p is not None for p in paths):
-            black_frame_beats.append(beat.index)
+    # Per-search budgets in asset_sourcer add up across beats; this bounds their sum.
+    with asset_budget(RENDER_ASSET_BUDGET_S):
+        for i, beat in enumerate(beats):
+            # resolve_or_reuse: reuses pinned assets when visual_direction hasn't
+            # changed; re-resolves (and re-pins) only when the direction changed.
+            pairs = resolve_or_reuse(
+                db,
+                cut=cut,
+                beat_index=beat.index,
+                visual_direction=beat.visual_direction,
+                min_duration_s=beat.duration_s,
+                sourcer=sourcer,
+                wiki=wiki,
+                hf_video=hf_video,
+                hf=hf,
+            )
+            beat_asset_pairs.append(pairs)
+            paths = [p for _, p in pairs]
+            beat_video_paths.append(paths)
+            if not any(p is not None for p in paths):
+                black_frame_beats.append(beat.index)
 
-        # Synthesize VO and nudge speaking rate toward beat target duration
-        if reel.voiceover_mode == "voiceover" and beat.vo_script.strip():
-            if hasattr(tts, "synth_to_budget"):
-                vo_path = tts.synth_to_budget(beat.vo_script, target_s=beat.duration_s)
+            # Synthesize VO and nudge speaking rate toward beat target duration
+            if reel.voiceover_mode == "voiceover" and beat.vo_script.strip():
+                if hasattr(tts, "synth_to_budget"):
+                    vo_path = tts.synth_to_budget(beat.vo_script, target_s=beat.duration_s)
+                else:
+                    vo_path = tts.synthesize(beat.vo_script)
             else:
-                vo_path = tts.synthesize(beat.vo_script)
-        else:
-            vo_path = None
-        beat_vo_paths.append(vo_path)
+                vo_path = None
+            beat_vo_paths.append(vo_path)
 
-        heartbeat(db, job, 10 + int(55 * (i + 1) / n))
+            heartbeat(db, job, 10 + int(55 * (i + 1) / n))
 
     heartbeat(db, job, 70)
 

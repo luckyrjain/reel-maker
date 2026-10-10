@@ -13,6 +13,7 @@ import urllib.request
 import uuid
 import warnings
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -119,6 +120,36 @@ _IMAGE_DEADLINE_S = 120.0
 _PEXELS_SEARCH_BUDGET_S = 900.0
 _WIKI_SEARCH_BUDGET_S = 240.0
 _monotonic = time.monotonic     # indirection so tests can drive a fake clock
+
+# One budget for a whole render's asset sourcing. The per-search budgets above cannot add up across a
+# render's beats only if something bounds the sum: `asset_budget()` sets a deadline that every search()
+# inside it is clipped to, after which no download starts and the paid HuggingFace tiers are skipped (a
+# cached file is still served). `render_cut` wraps its beat loop in it. Unset (the default) changes nothing.
+RENDER_ASSET_BUDGET_S = 1200.0
+_asset_deadline_at: ContextVar["float | None"] = ContextVar("asset_deadline_at", default=None)
+
+
+@contextmanager
+def asset_budget(seconds: float):
+    """Bound the asset sourcing done inside this block to `seconds` of wall clock (nesting only tightens)."""
+    deadline = _monotonic() + seconds
+    outer = _asset_deadline_at.get()
+    token = _asset_deadline_at.set(deadline if outer is None else min(deadline, outer))
+    try:
+        yield
+    finally:
+        _asset_deadline_at.reset(token)
+
+
+def _clip_to_asset_budget(deadline_at: float) -> float:
+    """`deadline_at`, or the active asset budget's deadline if that is sooner (no clock reading either way)."""
+    budget = _asset_deadline_at.get()
+    return deadline_at if budget is None else min(deadline_at, budget)
+
+
+def _asset_budget_spent() -> bool:
+    budget = _asset_deadline_at.get()
+    return budget is not None and _monotonic() >= budget
 # Per hop, httpx's own timeout is clamped to the budget that is left plus this grace: it bounds the TCP
 # connect and TLS handshake (before the watchdog exists) and one read that would outlive the budget,
 # while the watchdog -- exact, but only armed once connected -- still wins when the connection is up.
@@ -710,7 +741,7 @@ class WikipediaImageSource:
         }
 
         local_path = None
-        search_deadline = _monotonic() + _WIKI_SEARCH_BUDGET_S
+        search_deadline = _clip_to_asset_budget(_monotonic() + _WIKI_SEARCH_BUDGET_S)
         for img_url in candidate_urls:
             lp = self.store_dir / f"wiki_{page_id}.{_image_extension(img_url)}"
             if lp.exists() and _cached_media_ok(lp, "image"):
@@ -822,7 +853,7 @@ class PexelsVideoSource:
         except Exception:
             return None
 
-        search_deadline = _monotonic() + _PEXELS_SEARCH_BUDGET_S
+        search_deadline = _clip_to_asset_budget(_monotonic() + _PEXELS_SEARCH_BUDGET_S)
         for video in videos:
             picked = self._pick(video, min_duration_s)
             if picked is None:
@@ -1142,6 +1173,9 @@ def _generate_gated_hf_asset(db, reel_id, stage, source, query, cost_fn):
     convention (pre-existing behavior, unchanged by this extraction — the inline cost
     calculations this helper replaced had the identical propagation).
     """
+    if _asset_budget_spent():
+        _log.warning("Skipping %s: the render's asset budget is spent", stage)
+        return None
     if reel_id is not None and source.api_key:
         with record_stage(db, reel_id, stage, provider="huggingface") as ev:
             result = source.generate(query)
