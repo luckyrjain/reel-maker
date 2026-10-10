@@ -61,7 +61,7 @@ def _video(vid_id, files, duration=10):
 
 
 def _stream_factory(streamed_urls, fail_urls=()):
-    """Stand-in for httpx.stream: records the URL, optionally fails on __enter__."""
+    """Stand-in for `_http_stream` (httpx.stream's call shape): records the URL, optionally fails on __enter__."""
     @contextmanager
     def fake_stream(method, url, **kwargs):
         streamed_urls.append(url)
@@ -86,14 +86,14 @@ def _pexels(tmp_path, videos, *, fail_urls=()):
 
 @pytest.fixture(autouse=True)
 def _wikipedia_downloads_via_get_fakes():
-    """Serve `httpx.stream` from whatever `httpx.get` is patched to in these legacy fakes.
+    """Serve `_http_stream` from whatever `httpx.get` is patched to in these legacy fakes.
 
-    Wikipedia image downloads used to be `httpx.get(...)`; they are `httpx.stream(...)` now (so
+    Wikipedia image downloads used to be `httpx.get(...)`; they go through `_http_stream(...)` now (so
     the body can be size-capped), but these tests' URL-dispatching fakes still describe a download
     as a `_bytes_resp` returned from `httpx.get`. This adapts one to the other so the fakes keep
     pinning the same selection/caching/429 behavior; the streaming-specific guards (host check,
     redirects, size cap) are tested in test_sourcer_download_guards.py with real stream fakes.
-    Pexels tests patch `httpx.stream` themselves, which takes precedence over this.
+    Pexels tests patch `_http_stream` themselves, which takes precedence over this.
     """
     @contextmanager
     def stream_from_get(method, url, **kwargs):

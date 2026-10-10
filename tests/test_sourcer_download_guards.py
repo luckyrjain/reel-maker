@@ -129,7 +129,7 @@ def _redirect(to, status=302):
 
 
 class _Stream:
-    """httpx.stream stand-in: `script` maps URL -> a _Resp, an Exception, or a list of them."""
+    """`_http_stream` stand-in (same call shape as httpx.stream): `script` maps URL -> a _Resp, an Exception, or a list of them."""
 
     def __init__(self, script):
         self.script = {u: (list(v) if isinstance(v, list) else [v]) for u, v in script.items()}
@@ -174,7 +174,7 @@ def _wiki(tmp_path, summary, stream, sleeps=None, title="Lionel Messi"):
         result = WikipediaImageSource(tmp_path).search("Lionel Messi")
     if sleeps is not None:
         sleeps.extend(c.args[0] for c in sleep.call_args_list)
-    assert misrouted == [], f"image downloads must go through httpx.stream, not httpx.get: {misrouted}"
+    assert misrouted == [], f"image downloads must go through _http_stream, not httpx.get: {misrouted}"
     return result
 
 
