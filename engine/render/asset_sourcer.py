@@ -1,4 +1,5 @@
 import hashlib
+import io
 import ipaddress
 import logging
 import math
@@ -10,6 +11,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -91,6 +93,9 @@ def _atomic_write(path: Path, data: bytes) -> None:
 
 _MAX_VIDEO_BYTES = 250 * 1024 * 1024   # FHD portrait Pexels clips are tens of MB
 _MAX_IMAGE_BYTES = 50 * 1024 * 1024    # Wikipedia originals are rarely over ~20 MB
+# The byte cap says nothing about declared PIXELS: a 140 KB PNG can declare 12000x12000, and the compositor's
+# `Image.open(...).convert("RGB")` then allocates ~430 MB. 50 Mpx is ~7000x7000, far past any photo used here.
+_MAX_IMAGE_PIXELS = 50_000_000
 _MAX_API_JSON_BYTES = 8 * 1024 * 1024   # Pexels search / Wikipedia lookups are a few KB; refuse to parse more
 _MAX_REDIRECTS = 3
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
@@ -451,6 +456,35 @@ def _sniff_ok(kind: str, head) -> bool:
     return False
 
 
+def _image_ok(source) -> bool:
+    """True if Pillow can identify `source` (image bytes or a Path) and it declares <= _MAX_IMAGE_PIXELS.
+
+    Reads the HEADER only (`Image.open` is lazy; pixels are never decoded). An unidentifiable or
+    truncated file, a file Pillow itself calls a decompression bomb (> 2x its own limit raises at open)
+    and an unreadable path are all "not ok" -- a refusal, never an exception. Pillow's own
+    `DecompressionBombWarning` (a soft warning between 1x and 2x its limit) is silenced: the cap here is
+    the one that decides. `SoftTimeLimitExceeded` is re-raised.
+    """
+    try:
+        from PIL import Image
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with Image.open(io.BytesIO(source) if isinstance(source, (bytes, bytearray)) else source) as im:
+                width, height = im.size
+        return width * height <= _MAX_IMAGE_PIXELS
+    except SoftTimeLimitExceeded:
+        raise
+    except Exception:
+        return False
+
+
+def _require_image(content: bytes) -> None:
+    """Raise ValueError (after a WARNING) if `content` is not `_image_ok`."""
+    if not _image_ok(content):
+        _log.warning("Discarding a download that is not a readable image of a reasonable size")
+        raise ValueError("downloaded bytes are not a readable image")
+
+
 def _require_media(kind: str, head) -> None:
     """Raise ValueError (after a WARNING) if `head` is not a `kind` per `_sniff_ok`."""
     if not _sniff_ok(kind, head):
@@ -470,7 +504,7 @@ def _cached_media_ok(path: Path, kind: str) -> bool:
             head = fh.read(16)
     except OSError:
         head = b""
-    if _sniff_ok(kind, head):
+    if _sniff_ok(kind, head) and (kind != "image" or _image_ok(path)):
         return True
     _log.warning("Discarding a cached file that is not a valid %s", kind)
     try:
@@ -687,6 +721,7 @@ class WikipediaImageSource:
                 if content is None:
                     continue
                 _require_media("image", content[:16])
+                _require_image(content)
                 _atomic_write(lp, content)
                 local_path = lp
                 break
@@ -880,6 +915,9 @@ class HuggingFaceImageSource:
                     return None
                 if not _sniff_ok("image", resp.content[:16]):
                     _log.warning("Discarding a HuggingFace download that is not a valid image")
+                    return None
+                if not _image_ok(resp.content):
+                    _log.warning("Discarding a HuggingFace download that is not a readable image of a reasonable size")
                     return None
                 _atomic_write(local_path, resp.content)
                 self.last_call_was_generated = True
