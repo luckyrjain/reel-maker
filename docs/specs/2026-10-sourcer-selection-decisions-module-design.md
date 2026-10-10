@@ -286,8 +286,8 @@ the pre-hop deadline boundary, the exact 253-character host bound, a hostile hos
 through the download path); dead test code and a stale test name. The two hardening gaps round 3 raised were first documented and then closed in a follow-up (below);
 the remaining documented one is a deterministic shared `.tmp` name (two concurrent renders downloading
 the same asset could truncate each other; render concurrency is 1; pre-existing). A read overrunning the
-budget by up to its httpx timeout, listed here at the time, is bounded by the watchdog (only the DNS/TCP
-connect phase before it arms is not).
+budget by up to its httpx timeout, listed here at the time, is bounded by the watchdog (the connect phase before
+it arms was bounded later by the hop-timeout clamp; only DNS is left, see the final Follow-up).
 
 ### Follow-up: the watchdog and the soft-limit pass-through
 
@@ -353,8 +353,9 @@ real defects in the watchdog itself, found independently by two reviewers, were 
   before the watchdog arms), "deadline rejections are silent" (a watchdog-enforced one is logged), the h11
   cap (~100 KiB, not ~16/~80 KB), and the `.tmp` wording on soft-limit cleanup (Pexels only).
 
-The soft-limit pass-through covers the two download loops only; the other `except Exception` blocks in the
-module (Pexels search, Wikipedia opensearch/summary/license, HuggingFace) still swallow it.
+At that point the soft-limit pass-through covered the two download loops only; the other `except Exception`
+blocks (Pexels search, Wikipedia opensearch/summary/license, HuggingFace) were closed afterwards, see
+"Follow-up: the four limits".
 
 ### Follow-up: the four limits left after review round 4
 
@@ -364,8 +365,10 @@ one commit each (`6bd81c8`, `b3bc584`, `cabf5b3`, `fd7a732`).
 - **`SoftTimeLimitExceeded` swallowed by the other `except Exception` blocks.** The two download loops
   re-raised it; the Pexels search call, the Wikipedia opensearch / summary / license lookups and both
   HuggingFace sources still reported it as "no result" / "unknown license" / a logged model failure and let
-  the render carry on past an exhausted soft limit. Each now re-raises it first. Every re-raise clause in the
-  module (8) was removed in turn: each removal fails a test. `tests/test_sourcer_soft_limit.py` (16).
+  the render carry on past an exhausted soft limit. Each now re-raises it first. Every
+  `except SoftTimeLimitExceeded` clause in the module (10 now: these 6, the 2 download loops, `_open_download`'s
+  pass-through and, after review round 5, `_Watchdog.trace`'s) was removed in turn: each removal fails a test.
+  `tests/test_sourcer_soft_limit.py` (18).
 - **The connect/TLS phase before the watchdog arms.** It ran on httpx's full timeout (120 s Pexels / 30 s
   Wikipedia), and one read could outlive the budget by its whole read timeout. Each hop's timeout is now
   `min(configured, time left + 1 s)`, from the same single `_monotonic()` reading as the pre-hop deadline
@@ -376,10 +379,11 @@ one commit each (`6bd81c8`, `b3bc584`, `cabf5b3`, `fd7a732`).
 - **Per-hit budgets adding up.** A Pexels search tries up to 15 hits (600 s each: 2.5 h worst case), a
   Wikipedia search 2 candidates. Each `search()` now has one budget (`_PEXELS_SEARCH_BUDGET_S` 900,
   `_WIKI_SEARCH_BUDGET_S` 240, computed once per call); a download's budget is clipped to what is left, and no
-  further download starts once it is spent (`now >= search_deadline`; a cached hit is still served). The
+  further download starts once it is spent (`now >= search_deadline`; a cached hit is still served — see round 5 for the `break` that first broke that). The
   exact-boundary case (a download that would start exactly when the budget ends) is pinned, because the
-  pre-hop check alone would let it through with a 1 s timeout. The four fake-clock tests were re-counted for
-  the one extra clock reading per search. `tests/test_sourcer_budgets.py` (20). Across beats, the render
+  pre-hop check alone would let it through with a 1 s timeout. The eight fake-clock tests in
+  `test_sourcer_download_guards.py` were re-counted for the one extra clock reading per search.
+  `tests/test_sourcer_budgets.py` (23). Across beats, the render
   task's own time limits remain the outer bound.
 - **No content sniffing.** A 200 `text/html`/JSON body (CDN error page, captive portal, compromised allowlisted
   host) or an empty one was cached as `pexels_N.mp4` / `wiki_N.jpg` / `hf_*.png` and reused forever by the
@@ -398,4 +402,45 @@ one commit each (`6bd81c8`, `b3bc584`, `cabf5b3`, `fd7a732`).
 
 Still open: DNS resolution time, HuggingFace/JSON API response size, `_title_id` case-sensitivity on a
 case-insensitive filesystem, the deterministic shared `.tmp` name, and the per-beat total across a render.
+
+### Review round 5 (the four follow-ups above)
+
+The four reviewers (security, correctness, test quality, docs) found no exploitable issue and no
+regression of the earlier guards: a real-file differential (JPEG, MPO, PNG, WebP, GIF, TIFF, MP4 in every layout
+ffmpeg can produce, M4V, MOV, WebM, MKV; 44 cases, only the 10 intended rejections differ), polyglot files
+(`free`/GIF/EBML heads followed by `#EXTM3U`/`ffconcat` payloads pointing at `file:///etc/passwd`: ffprobe does
+not follow them), `httpx.Timeout(0.0)` (never "no timeout"), timing thresholds under 30 busy-loop processes,
+~150 mutants. Fixed (tests first):
+
+- **A cache poisoned before the check existed was served forever.** The four `exists()` cache hits were not
+  validated, so an old `<html>429…</html>` at `pexels_1.mp4` was returned as a valid asset and failed every render
+  in the compositor until someone deleted it by hand. `_cached_media_ok(path, kind)` now reads the first 16
+  bytes of a cached file; an invalid or unreadable one is deleted (WARNING) and the code falls through to a
+  fresh download. Pexels, Wikipedia and both HuggingFace sources; an empty file counts as invalid.
+- **The Pexels budget `break` skipped later cached hits.** After a slow failing hit spent the budget, a LATER hit
+  that was already on disk was never served and the render fell through to paid HuggingFace. It is now
+  `continue` (later uncached hits cost one clock reading each and start nothing; Wikipedia already behaved
+  this way, and now has its own test for a cached second candidate).
+- **MP4 first-box list widened** (`styp`, `moof`, `sidx`, `junk`, `pnot`, `uuid` added): decodable CMAF /
+  fragmented / QuickTime files starting with those boxes were rejected, and a false reject silently drops a hit
+  to the paid tier. A reviewer asked for the opposite (tighten to `ftyp` only, because `\0\0\0\x08free` + MPEG-TS
+  passes); declined: ffprobe treats those polyglots as ordinary media, and `_sniff_ok` is documented as a
+  sanity check, not a format guarantee.
+- **`_Watchdog.trace` could swallow a soft limit** landing in its `dup()` window; it re-raises it.
+- **A shared counter made the watchdog redirect tests order-dependent** (`_redirect_then_drip` built its counter
+  once at import, so whichever redirect test ran second dripped on its first connection; 5 of 7 shuffled orders
+  failed one). It is now a per-server factory, with a regression test that starts two servers in one test.
+- **Test hygiene**: `--strict-markers` (a typo'd `real_media_sniffing` silently got the permissive check), an
+  unmarked test that pins the permissive seam, near-miss rejects (magic not at offset 0, `II*\x01`, `MMxx`,
+  `RIFF…WEBQ`, `\x1a\x45\xdf\x00`), HF image WebP/JPEG (a 12-byte head), `bytearray`, no ERROR-level record on an
+  expected HF rejection, a vacuous Wikipedia timeout test renamed to what it checks, unused parameters removed.
+- **Docs**: the architecture.md download bullet still listed the closed limits; the re-raise count (9, now 10)
+  forgot `_open_download`'s pass-through; "four" fake-clock tests were eight; two spec paragraphs said "still
+  swallow"/"only DNS/TCP connect" in the present tense.
+
+Decisions: a sniff-rejected HuggingFace body is **not billed** (consistent with the existing content-type
+rejection of a JSON 200; no `asset_hf_*` cost StageEvent is written). Not done, pre-existing and optional: an image
+pixel-count cap (a 140 KB PNG declaring 12000x12000 px decodes to ~430 MB in the compositor; needs PIL parsing in the
+sourcer). `record_stage`'s `finally` commit (`except Exception: db.rollback()`) could still swallow a soft limit
+delivered in that window; it lives in `engine/observability.py`, outside this module.
 
