@@ -141,7 +141,7 @@ class _Stream:
 
     @contextmanager
     def __call__(self, method, url, **kw):
-        assert method == "GET"
+        assert method in ("GET", "POST")          # downloads are GETs; the HuggingFace API calls are POSTs
         self.requests.append((url, kw))
         outcome = self.script[url].pop(0) if len(self.script[url]) > 1 else self.script[url][0]
         if isinstance(outcome, Exception):

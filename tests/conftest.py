@@ -57,3 +57,25 @@ def _no_real_dns_lookups(request, monkeypatch):
         return
     monkeypatch.setattr("engine.render.asset_sourcer._dns_in_time", lambda host, port, timeout: True, raising=False)
 
+
+@pytest.fixture(autouse=True)
+def _api_calls_via_httpx(request, monkeypatch):
+    """Wire the sourcers' streamed API calls back to `httpx.get` / `httpx.post`, except in `real_api` tests.
+
+    `engine.render.asset_sourcer._api_get` / `_api_post` stream and size-cap the Pexels / Wikipedia /
+    HuggingFace API calls through the `_http_stream` seam. They keep `httpx.get`'s / `httpx.post`'s
+    call signature, and ~130 older tests fake those two functions (a fake returns a response-like
+    object with `.json()`, which the streaming path could not build a body from). This hands every
+    such call to whatever `httpx.get` / `httpx.post` currently is (looked up at call time, so the old
+    patches keep working untouched), dropping the one extra keyword, `limit`. Tests of the streaming
+    path itself carry `@pytest.mark.real_api` (tests/test_sourcer_api_streaming.py).
+    """
+    if request.node.get_closest_marker("real_api"):
+        return
+    import httpx
+
+    monkeypatch.setattr("engine.render.asset_sourcer._api_get",
+                        lambda url, *, limit=None, **kw: httpx.get(url, **kw), raising=False)
+    monkeypatch.setattr("engine.render.asset_sourcer._api_post",
+                        lambda url, *, limit=None, **kw: httpx.post(url, **kw), raising=False)
+

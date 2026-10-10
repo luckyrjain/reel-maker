@@ -344,6 +344,33 @@ def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = N
     raise ValueError("too many redirects")
 
 
+def _api_call(method: str, url: str, limit: int, *, headers=None, timeout: float, params=None, json=None):
+    """One API request, streamed through `_http_stream` and read at most `limit` bytes.
+
+    `httpx.get` / `httpx.post` read the WHOLE body before returning, so a hostile or broken upstream
+    could make the worker buffer gigabytes before any size check ran. Here `Accept-Encoding: identity`
+    is sent (an encoded body is refused: its decoded size is not what the network read says), no
+    redirect is followed (same as the httpx functions), reading stops with `_TooLarge` as soon as
+    `limit` is crossed, and what was read is returned as a real `httpx.Response` (`.json()`,
+    `.content`, `.headers`, `.raise_for_status()` work as call sites expect).
+    """
+    with _http_stream(method, url, headers={**(headers or {}), "Accept-Encoding": "identity"},
+                      timeout=timeout, follow_redirects=False, params=params, json=json) as r:
+        body = b"".join(_iter_capped(r, limit))
+        return httpx.Response(r.status_code, headers=r.headers, content=body,
+                              request=httpx.Request(method, url))
+
+
+def _api_get(url: str, *, limit: int | None = None, **kw):
+    """`httpx.get(url, **kw)` (params/headers/timeout), streamed and capped at `limit` (default 8 MB)."""
+    return _api_call("GET", url, _MAX_API_JSON_BYTES if limit is None else limit, **kw)
+
+
+def _api_post(url: str, *, limit: int | None = None, **kw):
+    """`httpx.post(url, **kw)` (headers/json/timeout), streamed and capped at `limit` (default 8 MB)."""
+    return _api_call("POST", url, _MAX_API_JSON_BYTES if limit is None else limit, **kw)
+
+
 def _body_too_large(resp, limit: int) -> bool:
     """True if `resp` declares (Content-Length) or actually holds (decoded) more than `limit` bytes.
 
@@ -362,6 +389,10 @@ def _body_too_large(resp, limit: int) -> bool:
     return isinstance(content, (bytes, bytearray)) and len(content) > limit
 
 
+class _TooLarge(ValueError):
+    """A response body exceeded its size limit (declared Content-Length, or bytes actually read)."""
+
+
 def _iter_capped(r, limit: int, deadline_at: "float | None" = None):
     """Yield `r`'s body in chunks; ValueError once it exceeds `limit` bytes or passes `deadline_at`.
 
@@ -378,12 +409,12 @@ def _iter_capped(r, limit: int, deadline_at: "float | None" = None):
     except (TypeError, ValueError):
         declared = None
     if declared is not None and declared > limit:
-        raise ValueError(f"download too large: Content-Length {declared} > {limit}")
+        raise _TooLarge(f"download too large: Content-Length {declared} > {limit}")
     total = 0
     for chunk in r.iter_bytes():
         total += len(chunk)
         if total > limit:
-            raise ValueError(f"download too large: more than {limit} bytes")
+            raise _TooLarge(f"download too large: more than {limit} bytes")
         if deadline_at is not None and _monotonic() > deadline_at:
             raise ValueError("download too slow: deadline exceeded")
         yield chunk
@@ -538,7 +569,7 @@ class WikipediaImageSource:
     def _fetch_license(self, page_title: str) -> dict:
         """Return license metadata for a Wikimedia file via the imageinfo API."""
         try:
-            resp = httpx.get(
+            resp = _api_get(
                 self._SEARCH,
                 params={
                     "action": "query",
@@ -585,7 +616,7 @@ class WikipediaImageSource:
 
     def search(self, person_name: str) -> "SourcedAsset | None":
         try:
-            resp = httpx.get(
+            resp = _api_get(
                 self._SEARCH,
                 params={"action": "opensearch", "search": person_name, "limit": 1, "format": "json"},
                 headers=self._HEADERS,
@@ -606,7 +637,7 @@ class WikipediaImageSource:
         try:
             # safe="": the title is ONE path segment, so a "/" in it ("AC/DC") must become %2F
             safe = urllib.parse.quote(page_title.replace(" ", "_"), safe="")
-            resp = httpx.get(f"{self._SUMMARY}/{safe}", headers=self._HEADERS, timeout=10.0)
+            resp = _api_get(f"{self._SUMMARY}/{safe}", headers=self._HEADERS, timeout=10.0)
             resp.raise_for_status()
             if _body_too_large(resp, _MAX_API_JSON_BYTES):
                 raise ValueError("summary response too large")
@@ -734,7 +765,7 @@ class PexelsVideoSource:
             return None
 
         try:
-            resp = httpx.get(
+            resp = _api_get(
                 f"{self._API}/search",
                 headers={"Authorization": self.api_key},
                 params={
@@ -833,11 +864,12 @@ class HuggingFaceImageSource:
 
         if not (local_path.exists() and _cached_media_ok(local_path, "image")):
             try:
-                resp = httpx.post(
+                resp = _api_post(
                     f"{self._API}/{self.model}",
                     headers={"Authorization": f"Bearer {self.api_key}"},
                     json={"inputs": full_prompt},
                     timeout=60.0,
+                    limit=_MAX_IMAGE_BYTES,
                 )
                 resp.raise_for_status()
                 content_type = resp.headers.get("content-type", "")
@@ -853,6 +885,9 @@ class HuggingFaceImageSource:
                 self.last_call_was_generated = True
             except SoftTimeLimitExceeded:
                 raise                               # out of time: do not log it as a model failure
+            except _TooLarge:
+                _log.warning("Discarding a HuggingFace download that is too large for an image")
+                return None
             except Exception:
                 _log.exception("HuggingFace image generation failed for model %s", self.model)
                 return None
@@ -904,11 +939,12 @@ class HuggingFaceVideoSource:
                 break
         else:
             try:
-                resp = httpx.post(
+                resp = _api_post(
                     f"{self._API}/{self.model}",
                     headers={"Authorization": f"Bearer {self.api_key}"},
                     json={"inputs": full_prompt},
                     timeout=180.0,  # video generation is slow
+                    limit=_MAX_VIDEO_BYTES,
                 )
                 resp.raise_for_status()
                 content_type = resp.headers.get("content-type", "video/mp4")
@@ -924,6 +960,9 @@ class HuggingFaceVideoSource:
                 self.last_call_was_generated = True
             except SoftTimeLimitExceeded:
                 raise                               # out of time: do not log it as a model failure
+            except _TooLarge:
+                _log.warning("Discarding a HuggingFace download that is too large for a video")
+                return None
             except Exception:
                 _log.exception("HuggingFace video generation failed for model %s", self.model)
                 return None
