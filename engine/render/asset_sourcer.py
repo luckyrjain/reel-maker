@@ -1,3 +1,4 @@
+import glob
 import hashlib
 import logging
 import math
@@ -7,6 +8,7 @@ import socket
 import threading
 import time
 import urllib.parse
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,13 +35,37 @@ def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text).strip()
 
 
+_STALE_TMP_S = 3600.0   # a scratch file untouched this long belongs to a dead process (a download <= 10 min)
+
+
+def _tmp_for(path: Path) -> Path:
+    """A unique scratch path next to `path`, for a write that ends in `os.replace(tmp, path)`.
+
+    The name is unique per call: with a fixed name, two processes fetching the same asset truncated
+    each other's file and one then `os.replace`d a mix of both. A process killed mid-download no longer
+    has its scratch file overwritten by the next attempt, so this also removes `path`'s scratch files
+    older than `_STALE_TMP_S` (best-effort; a live download keeps its file's mtime fresh).
+    """
+    try:
+        cutoff = time.time() - _STALE_TMP_S
+        for old in path.parent.glob(glob.escape(path.name) + ".*.tmp"):
+            try:
+                if old.stat().st_mtime < cutoff:
+                    old.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return path.with_name(f"{path.name}.{uuid.uuid4().hex[:12]}.tmp")
+
+
 def _atomic_write(path: Path, data: bytes) -> None:
     """Write bytes via a temp file + os.replace.
 
     Every sourcer caches by `if path.exists()`, so a process killed mid-write
     would otherwise leave a truncated file that is reused on every later render.
     """
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = _tmp_for(path)
     try:
         tmp.write_bytes(data)
         os.replace(tmp, path)
@@ -655,7 +681,7 @@ class PexelsVideoSource:
             local_path = self.store_dir / f"pexels_{vid_id}.mp4"
 
             if not (local_path.exists() and _cached_media_ok(local_path, "video")):
-                tmp_path = local_path.with_suffix(".tmp")
+                tmp_path = _tmp_for(local_path)
                 now = _monotonic()
                 if now >= search_deadline:
                     continue                        # budget spent: no more downloads, but a later hit may be cached

@@ -444,3 +444,15 @@ pixel-count cap (a 140 KB PNG declaring 12000x12000 px decodes to ~430 MB in the
 sourcer). `record_stage`'s `finally` commit (`except Exception: db.rollback()`) could still swallow a soft limit
 delivered in that window; it lives in `engine/observability.py`, outside this module.
 
+### Follow-up: unique scratch files
+
+- The Pexels loop used `pexels_<id>.tmp` and `_atomic_write` used `<final>.tmp`, so two processes fetching
+  one asset truncated each other's file and one `os.replace`d a mix. `_tmp_for(path)` returns
+  `<name>.<12 hex>.tmp`. Because a killed process no longer has its scratch file overwritten by the next
+  attempt, it also removes that target's `*.tmp` siblings untouched for `_STALE_TMP_S` (1 h, well above the
+  10 min video budget; best-effort, never blocks a download). Legacy fixed-name leftovers
+  (`pexels_1.tmp`) are not swept. `tests/test_sourcer_tmp_files.py`: 10 tests, 7 mutants killed
+  (fixed name in either caller, sweep disabled / too eager / too broad / raising).
+- (An earlier revision of this PR also fixed the watchdog not working over https; the base branch's round 4
+  fixed the same bug first, with a `dup()` of the socket, and that version was kept. The real-TLS drip
+  tests written for this PR pass against it.)
