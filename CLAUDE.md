@@ -47,7 +47,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 1295 tests across 30+ files, default run (11 test_compositor tests need ffmpeg
+.venv/bin/pytest                            # 1333 tests across 30+ files, default run (11 test_compositor tests need ffmpeg
                                              # on PATH; 1 kokoro voice test skips without the kokoro package; 1 golden-reel
                                              # test is deselected by default — see below)
 .venv/bin/pytest -m golden                  # the golden-reel smoke test (real edge-tts + real ffmpeg, ~20s, needs network)
@@ -811,6 +811,30 @@ tests/
                               clubs/tournaments no longer looked up, a leading opener never reaching the
                               Wikipedia query, and the 0.5 s rate-limit pause happening between names
                               only (once for two names, never for one)
+  test_sourcer_pins_and_music.py 38 tests (new) — asset_sourcer.py test debt from an independent mutation
+                              review; each test names the mutant it kills (60 hand-made mutants of
+                              asset_sourcer.py, 59 killed, the one survivor — dropping `.strip()` from
+                              LocalMusicSource.find()'s blank-cue guard — is equivalent: a whitespace-only
+                              cue yields no keywords and returns None anyway). resolve_or_reuse()'s
+                              per-cut/per-beat pin ledger (another cut's or beat's pin is never reused or
+                              deleted, any stale pin forces a re-resolve, reuse returns Paths in
+                              order_in_beat order for both insertion orders, a pin whose Asset row is gone
+                              is re-resolved, resolve-before-delete crash safety, a nothing-found re-resolve still
+                              dropping the beat's stale pins, the read transaction ended before any source call,
+                              reuse never rewriting pin rows, written pin fields, the fingerprint is not
+                              whitespace-normalised, a two-item beat
+                              pins from order 0, min_duration_s/wiki/hf_video/hf/reel_id=cut.reel_id are all
+                              forwarded — the cuts fixture makes cut.id != cut.reel_id); the persisted
+                              formats pinned literally rather than via _fp() as its own oracle (_fp = sha256
+                              first 16 hex, compute_pins_fingerprint = full 64-hex sha256 of sorted
+                              "beat:order:asset" joined by "|", EMPTY_PINS_FINGERPRINT == "no-pins-bound");
+                              the old "order independent" fingerprint test was vacuous on sqlite (the unique
+                              index returns rows in index order, so removing sorted() still passed), so the
+                              sorted() test forces a reversed result set via a Query.all patch;
+                              LocalMusicSource (a library path that is a file, no descent into subdirectories, .ogg too, alphabetical tie-break
+                              regardless of iterdir order, directories skipped, extension set
+                              case-insensitive incl. m4a/flac/wav, keywords split on digits/case with a
+                              3-letter minimum). Uses the shared db_session fixture. No production change.
   test_enqueue.py             13 tests (new, Phase 7x) — api/enqueue.py::enqueue_job() on real sessions with
                               the routers' default expire_on_commit=True: success commits the job, calls
                               task.delay(job.id) and leaves it refreshed (expiry state read before touching
