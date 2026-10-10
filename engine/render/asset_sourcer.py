@@ -91,6 +91,7 @@ def _atomic_write(path: Path, data: bytes) -> None:
 
 _MAX_VIDEO_BYTES = 250 * 1024 * 1024   # FHD portrait Pexels clips are tens of MB
 _MAX_IMAGE_BYTES = 50 * 1024 * 1024    # Wikipedia originals are rarely over ~20 MB
+_MAX_API_JSON_BYTES = 8 * 1024 * 1024   # Pexels search / Wikipedia lookups are a few KB; refuse to parse more
 _MAX_REDIRECTS = 3
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 # httpx timeouts are per read, so a server that trickles never trips them: each download also gets a
@@ -341,6 +342,24 @@ def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = N
     raise ValueError("too many redirects")
 
 
+def _body_too_large(resp, limit: int) -> bool:
+    """True if `resp` declares (Content-Length) or actually holds (decoded) more than `limit` bytes.
+
+    For the `httpx.get`/`httpx.post` API calls, which read the whole body before returning: this does
+    NOT bound that read, it keeps an oversized body from being handed to `.json()` (parse time/memory
+    amplification) or written to the asset cache (disk). A header that understates (gzip) is caught by
+    the decoded length; a missing or unparsable header falls back to it.
+    """
+    try:
+        declared = int(resp.headers.get("content-length"))
+    except (TypeError, ValueError, AttributeError):
+        declared = None
+    if declared is not None and declared > limit:
+        return True
+    content = getattr(resp, "content", None)
+    return isinstance(content, (bytes, bytearray)) and len(content) > limit
+
+
 def _iter_capped(r, limit: int, deadline_at: "float | None" = None):
     """Yield `r`'s body in chunks; ValueError once it exceeds `limit` bytes or passes `deadline_at`.
 
@@ -530,6 +549,8 @@ class WikipediaImageSource:
                 timeout=10.0,
             )
             resp.raise_for_status()
+            if _body_too_large(resp, _MAX_API_JSON_BYTES):
+                raise ValueError("license lookup response too large")
             pages = resp.json().get("query", {}).get("pages", {})
             page = next(iter(pages.values()), {})
             meta = (page.get("imageinfo") or [{}])[0].get("extmetadata", {})
@@ -569,6 +590,8 @@ class WikipediaImageSource:
                 timeout=10.0,
             )
             resp.raise_for_status()
+            if _body_too_large(resp, _MAX_API_JSON_BYTES):
+                raise ValueError("opensearch response too large")
             results = resp.json()
             if not results[1]:
                 return None
@@ -583,6 +606,8 @@ class WikipediaImageSource:
             safe = urllib.parse.quote(page_title.replace(" ", "_"), safe="")
             resp = httpx.get(f"{self._SUMMARY}/{safe}", headers=self._HEADERS, timeout=10.0)
             resp.raise_for_status()
+            if _body_too_large(resp, _MAX_API_JSON_BYTES):
+                raise ValueError("summary response too large")
             data = resp.json()
         except SoftTimeLimitExceeded:
             raise
@@ -719,6 +744,8 @@ class PexelsVideoSource:
                 timeout=30.0,
             )
             resp.raise_for_status()
+            if _body_too_large(resp, _MAX_API_JSON_BYTES):
+                raise ValueError("search response too large")
             videos = resp.json().get("videos", [])
             if not isinstance(videos, list):
                 return None
@@ -814,6 +841,9 @@ class HuggingFaceImageSource:
                 content_type = resp.headers.get("content-type", "")
                 if not content_type.startswith("image/"):
                     return None
+                if _body_too_large(resp, _MAX_IMAGE_BYTES):
+                    _log.warning("Discarding a HuggingFace download that is too large for an image")
+                    return None
                 if not _sniff_ok("image", resp.content[:16]):
                     _log.warning("Discarding a HuggingFace download that is not a valid image")
                     return None
@@ -882,6 +912,9 @@ class HuggingFaceVideoSource:
                 content_type = resp.headers.get("content-type", "video/mp4")
                 ext = "gif" if "gif" in content_type else "mp4"
                 local_path = self.store_dir / f"hfvid_{fp}.{ext}"
+                if _body_too_large(resp, _MAX_VIDEO_BYTES):
+                    _log.warning("Discarding a HuggingFace download that is too large for a video")
+                    return None
                 if not _sniff_ok("video", resp.content[:16]):
                     _log.warning("Discarding a HuggingFace download that is not a valid video")
                     return None
