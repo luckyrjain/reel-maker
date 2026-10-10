@@ -440,7 +440,7 @@ not follow them), `httpx.Timeout(0.0)` (never "no timeout"), timing thresholds u
   swallow"/"only DNS/TCP connect" in the present tense.
 
 Decisions: a sniff-rejected HuggingFace body is **not billed** (consistent with the existing content-type
-rejection of a JSON 200; no `asset_hf_*` cost StageEvent is written). Not done, pre-existing and optional: an image
+rejection of a JSON 200; no `asset_hf_*` cost StageEvent is written). Closed afterwards (see "Follow-up: the last three limits"): an image
 pixel-count cap (a 140 KB PNG declaring 12000x12000 px decodes to ~430 MB in the compositor; needs PIL parsing in the
 sourcer). `record_stage`'s `finally` commit could still swallow a soft limit delivered in that window at that
 point (closed afterwards in `engine/observability.py`, see "Follow-up: the last open limits").
@@ -483,13 +483,34 @@ closed, as flagged below.
 - **API response size (partly closed).** The six API calls (Pexels search, Wikipedia opensearch / summary /
   imageinfo, both HuggingFace generations) use `httpx.get` / `post`, which read the whole body. Streaming
   them would route six more calls through the `_http_stream` seam and rewrite ~120 test patches whose fakes
-  only provide `.json()`, so the transient read buffer is **still unbounded**. What is bounded is what is
+  only provide `.json()`, so the transient read buffer was **still unbounded** at this point (closed in "Follow-up: the last three limits"). What is bounded is what is
   done with the body: `_body_too_large` (declared Content-Length, or decoded length, which also catches a
   gzip header that understates) keeps an oversized body from reaching `.json()` (`_MAX_API_JSON_BYTES`, 8 MB)
   or the HuggingFace asset cache (the image / video limits); a rejected HuggingFace body is not billed.
   `tests/test_sourcer_api_limits.py` (22); one survivor (the HF image source using the video limit) got its
   own test.
 
-Open after this: the transient read buffer of the non-streamed API calls, an image pixel-count cap, and the
-per-beat total across a render (the render task's own time limits are the bound).
+## Follow-up: the last three limits
+
+* **API read buffer.** The six `httpx.get/post` calls (Pexels search, Wikipedia opensearch / summary / imageinfo,
+  both HuggingFace generations) now go through `_api_call`: streamed via `_http_stream`, read with `_iter_capped`
+  against the call's limit (`_MAX_API_JSON_BYTES`, or the HF image / video limit), identity encoding, no redirects,
+  returned as an ordinary `httpx.Response` built from the capped body. Reading stops at the limit, so the buffer
+  is bounded; `_TooLarge` is caught per caller (HF: WARNING, not billed). `_body_too_large` stays as defense in
+  depth. To avoid rewriting ~130 test patches, a conftest fixture points `_api_get/_api_post` back at `httpx.get/post`
+  unless a test carries `real_api` (`tests/test_sourcer_api_streaming.py`, 30).
+* **Image pixel cap.** `_image_ok()` opens only the header with Pillow and refuses an unidentifiable image or one over
+  `_MAX_IMAGE_PIXELS` (50 Mpx). Applied to Wikipedia downloads (refused original -> thumbnail), HuggingFace images
+  and cached images. Pillow's own bomb warning is silenced so the cap here decides; a test with a lowered Pillow
+  limit pins that (the first mutation run found that survivor). `tests/test_sourcer_image_check.py` (36, marker
+  `real_image_check`; other tests get a permissive check because their fakes serve placeholder bytes).
+* **Per-render total.** `asset_budget(seconds)` (a `ContextVar` deadline, nested budgets only tighten) wraps
+  `render_cut`'s beat loop with `RENDER_ASSET_BUDGET_S` = 1200. Each Pexels / Wikipedia search budget is clipped
+  to it; once spent no download starts and `_generate_gated_hf_asset` skips the paid tiers (cached files are
+  still served by the search paths; a skipped HF tier cannot serve its cache, which is accepted because a
+  pinned beat never reaches `resolve_beat_assets()`). TTS time inside the loop counts against the budget.
+  `tests/test_sourcer_render_budget.py` (20) plus 2 in `test_render_task.py`.
+
+Mutation checks: 9 + 9 mutants over the image check and the budget, all killed (one survivor, the warning filter,
+got its own test). Nothing from the original follow-up lists is open.
 
