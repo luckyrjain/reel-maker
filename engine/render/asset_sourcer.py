@@ -182,6 +182,8 @@ class _Watchdog:
             if not isinstance(raw, socket.socket):
                 return
             dup = raw.dup()
+        except SoftTimeLimitExceeded:
+            raise                                   # a few microseconds wide, but the task is out of time
         except Exception:                                   # noqa: BLE001 - never break the request
             return
         timer = threading.Timer(max(self._deadline_at - _monotonic(), 0.0), self._fire)
@@ -301,7 +303,11 @@ def _iter_capped(r, limit: int, deadline_at: "float | None" = None):
 
 _IMAGE_MAGIC = (b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF87a", b"GIF89a", b"II*\x00", b"MM\x00*")
 _VIDEO_MAGIC = (b"\x1a\x45\xdf\xa3", b"GIF87a", b"GIF89a")             # WebM/EBML, GIF
-_MP4_BOXES = (b"ftyp", b"moov", b"mdat", b"free", b"wide", b"skip")       # first ISO-BMFF box type, offset 4
+# First ISO-BMFF box type, at offset 4. `ftyp` is what progressive MP4 (Pexels) starts with; the rest are
+# first boxes of decodable QuickTime / fragmented / CMAF files. A false reject would silently drop a hit to
+# the paid HuggingFace tier, while this is only a sanity check (it cannot prove the rest of the file).
+_MP4_BOXES = (b"ftyp", b"moov", b"mdat", b"free", b"wide", b"skip",
+              b"styp", b"moof", b"sidx", b"junk", b"pnot", b"uuid")
 
 
 def _sniff_ok(kind: str, head) -> bool:
@@ -325,6 +331,28 @@ def _require_media(kind: str, head) -> None:
     if not _sniff_ok(kind, head):
         _log.warning("Discarding a download that is not a valid %s", kind)
         raise ValueError(f"downloaded bytes are not a valid {kind}")
+
+
+def _cached_media_ok(path: Path, kind: str) -> bool:
+    """True if the cached file at `path` starts like a real `kind`; otherwise delete it and say so.
+
+    A file cached before the content check existed (or by a process that died mid-write on a
+    pre-`os.replace` version) would otherwise be served by the `exists()` caches forever and fail
+    every later render in the compositor. The caller falls through to a fresh download.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(16)
+    except OSError:
+        head = b""
+    if _sniff_ok(kind, head):
+        return True
+    _log.warning("Discarding a cached file that is not a valid %s", kind)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return False
 
 
 # ── ids that become local file names ─────────────────────────────────────────
@@ -513,7 +541,7 @@ class WikipediaImageSource:
         search_deadline = _monotonic() + _WIKI_SEARCH_BUDGET_S
         for img_url in candidate_urls:
             lp = self.store_dir / f"wiki_{page_id}.{_image_extension(img_url)}"
-            if lp.exists():
+            if lp.exists() and _cached_media_ok(lp, "image"):
                 local_path = lp
                 break
             try:
@@ -626,11 +654,11 @@ class PexelsVideoSource:
             vid_id, duration, link = picked
             local_path = self.store_dir / f"pexels_{vid_id}.mp4"
 
-            if not local_path.exists():
+            if not (local_path.exists() and _cached_media_ok(local_path, "video")):
                 tmp_path = local_path.with_suffix(".tmp")
                 now = _monotonic()
                 if now >= search_deadline:
-                    break                           # the search's budget is spent: no more downloads
+                    continue                        # budget spent: no more downloads, but a later hit may be cached
                 try:
                     deadline_at = min(now + _VIDEO_DEADLINE_S, search_deadline)
                     with _open_download(link, _pexels_url_ok, timeout=120.0,
@@ -692,7 +720,7 @@ class HuggingFaceImageSource:
         fp = hashlib.sha256(full_prompt.encode()).hexdigest()[:16]
         local_path = self.store_dir / f"hf_{fp}.png"
 
-        if not local_path.exists():
+        if not (local_path.exists() and _cached_media_ok(local_path, "image")):
             try:
                 resp = httpx.post(
                     f"{self._API}/{self.model}",
@@ -756,7 +784,7 @@ class HuggingFaceVideoSource:
 
         # Check both possible cached extensions before making an API call
         for cached in (self.store_dir / f"hfvid_{fp}.mp4", self.store_dir / f"hfvid_{fp}.gif"):
-            if cached.exists():
+            if cached.exists() and _cached_media_ok(cached, "video"):
                 local_path = cached
                 break
         else:
