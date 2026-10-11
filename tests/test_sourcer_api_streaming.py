@@ -20,7 +20,7 @@ from engine.render import asset_sourcer as AS
 from engine.render.asset_sourcer import (
     HuggingFaceImageSource, HuggingFaceVideoSource, PexelsVideoSource, WikipediaImageSource,
 )
-from tests.test_sourcer_download_guards import PEXELS_OK, WIKI_OK, _Resp, _Stream, _fake_clock, _wiki
+from tests.test_sourcer_download_guards import PEXELS_OK, WIKI_OK, _Resp, _Stream
 from tests.test_sourcer_selection import _summary, _video, _vf
 
 pytestmark = pytest.mark.real_api
@@ -69,8 +69,6 @@ def test_the_request_is_get_with_identity_encoding_no_redirects_and_the_callers_
 
 def test_a_post_carries_its_json_body(monkeypatch):
     stream = _with(_Stream({URL: _Resp(chunks=(b"{}",))}), monkeypatch)
-    seen = {}
-    real = stream.__call__
     AS._api_post(URL, json={"inputs": "a prompt"}, headers={"Authorization": "Bearer k"}, timeout=60.0)
     (url, kw), = stream.requests
     assert kw["json"] == {"inputs": "a prompt"} and kw["headers"]["Authorization"] == "Bearer k"
@@ -276,3 +274,16 @@ def test_a_soft_time_limit_in_an_api_call_still_propagates(tmp_path, monkeypatch
     _with(_Stream({"https://api.pexels.com/videos/search": SoftTimeLimitExceeded()}), monkeypatch)
     with pytest.raises(SoftTimeLimitExceeded):
         PexelsVideoSource("k", tmp_path).search("q", 1.0)
+
+
+def test_a_post_never_follows_redirects_either(monkeypatch):
+    """The HuggingFace POSTs carry a Bearer token: following a redirect would send it elsewhere."""
+    stream = _with(_Stream({URL: _Resp(chunks=(b"{}",))}), monkeypatch)
+    AS._api_post(URL, json={"inputs": "p"}, headers={"Authorization": "Bearer k"}, timeout=1.0)
+    assert stream.requests[0][1]["follow_redirects"] is False
+
+
+def test_a_caller_cannot_override_identity_encoding(monkeypatch):
+    stream = _with(_Stream({URL: _Resp(chunks=(b"{}",))}), monkeypatch)
+    AS._api_get(URL, headers={"Accept-Encoding": "gzip"}, timeout=1.0)
+    assert stream.requests[0][1]["headers"]["Accept-Encoding"] == "identity"

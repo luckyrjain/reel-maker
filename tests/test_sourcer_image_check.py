@@ -91,10 +91,13 @@ def test_the_cap_boundary_is_inclusive(monkeypatch):
     assert AS._image_ok(_img("PNG", (65, 64))) is False
 
 
-def test_pillows_bomb_warning_does_not_escape_as_an_error():
+def test_pillows_bomb_warning_does_not_escape_as_an_error(monkeypatch):
+    """Pillow warns between 1x and 2x its own limit; with warnings as errors that must not become a refusal
+    of an image that is within OUR cap."""
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1000)
     with warnings.catch_warnings():
-        warnings.simplefilter("error")                  # a leaked DecompressionBombWarning would raise here
-        assert AS._image_ok(_png_declaring(10000, 10000)) is False       # 100 Mpx: over our cap, over Pillow's warn level
+        warnings.simplefilter("error")
+        assert AS._image_ok(_img("PNG", (45, 30))) is True            # 1350 px: Pillow's warning band, under our cap
 
 
 def test_only_the_header_is_read_pixels_are_never_decoded():
@@ -242,3 +245,19 @@ def test_a_transient_failure_while_checking_a_download_fails_that_candidate_only
     with patch.object(AS, "_image_ok", flaky):
         result = _wiki(tmp_path, _summary(), stream)
     assert result is not None and stream.urls == [WIKI_OK, WIKI_THUMB]
+
+
+# ── the check is for images only, and thumbnails are checked like originals ─────────────────────
+
+@pytest.mark.real_media_sniffing
+def test_a_cached_video_is_never_opened_with_pillow(tmp_path):
+    p = tmp_path / "pexels_1.mp4"
+    p.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 8)
+    assert AS._cached_media_ok(p, "video") is True and p.exists()
+
+
+def test_wikipedia_a_huge_thumbnail_is_refused_too(tmp_path):
+    huge = _png_declaring(12000, 12000)
+    stream = _Stream({WIKI_OK: _Resp(chunks=(huge,)), WIKI_THUMB: _Resp(chunks=(huge,))})
+    assert _wiki(tmp_path, _summary(), stream) is None
+    assert stream.urls == [WIKI_OK, WIKI_THUMB] and list(tmp_path.iterdir()) == []

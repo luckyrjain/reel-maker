@@ -47,7 +47,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 2017 tests across 71 files, default run (11 test_compositor tests need ffmpeg
+.venv/bin/pytest                            # 2021 tests across 71 files, default run (11 test_compositor tests need ffmpeg
                                              # on PATH; 3 tests skip without optional packages — kokoro voice, two whisper
                                              # caption tests; 1 golden-reel test is deselected by default — see below)
 .venv/bin/pytest -m golden                  # the golden-reel smoke test (real edge-tts + real ffmpeg, ~20s, needs network)
@@ -908,7 +908,7 @@ tests/
                               oversized HuggingFace image/video body (declared or actual) is not cached, not billed,
                               logged at WARNING without a traceback; each HF source uses ITS OWN limit (swapping them
                               was a surviving mutant, now killed).
-  test_sourcer_api_streaming.py  30 tests (new, `real_api` marker) — the API calls go through `_api_call`: streamed via `_http_stream`
+  test_sourcer_api_streaming.py  32 tests (new, `real_api` marker) — the API calls go through `_api_call`: streamed via `_http_stream`
                               and read through `_iter_capped`, so reading STOPS at the limit (a body over `_MAX_API_JSON_BYTES` /
                               the HF image or video limit raises `_TooLarge` before more than the limit is buffered, by
                               Content-Length and by bytes read); `Accept-Encoding: identity` always sent and an encoded response
@@ -916,7 +916,7 @@ tests/
                               `httpx.Response` keeps status, headers and `.json()`; `SoftTimeLimitExceeded` passes through.
                               Every other test gets `_api_get/_api_post` wired to `httpx.get/post` by a conftest fixture, so the
                               ~130 legacy patches of `httpx.get` keep working.
-  test_sourcer_image_check.py  42 tests (new, `real_image_check` marker, real Pillow images) — `_image_ok`: JPEG/PNG/GIF/WebP/TIFF ok;
+  test_sourcer_image_check.py  44 tests (new, `real_image_check` marker, real Pillow images) — `_image_ok`: JPEG/PNG/GIF/WebP/TIFF ok;
                               garbage behind a valid signature, truncated, empty, HTML, a missing file refused; 50 Mpx cap pinned
                               exactly (7071x7071 ok, 7072x7072 not, 50000x1 ok) on the pixel COUNT not the file size; Pillow's own
                               bomb error / warning never escapes (refusal, not exception) and a lowered Pillow limit does not

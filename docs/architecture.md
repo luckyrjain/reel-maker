@@ -191,7 +191,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 ### `tests/`
 
-71 test files + `conftest.py`, **2017 tests run by default / 2018 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
+71 test files + `conftest.py`, **2021 tests run by default / 2022 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
 
 | File | Tests | File | Tests |
 |---|---|---|---|
@@ -226,8 +226,8 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_sourcer_watchdog.py` | 53 | `test_sourcer_soft_limit.py` | 18 |
 | `test_sourcer_budgets.py` | 23 | `test_sourcer_sniffing.py` | 110 |
 | `test_sourcer_dns.py` | 25 | `test_sourcer_tmp_files.py` | 11 |
-| `test_sourcer_api_limits.py` | 22 | `test_sourcer_api_streaming.py` | 30 |
-| `test_sourcer_image_check.py` | 42 | `test_sourcer_render_budget.py` | 22 |
+| `test_sourcer_api_limits.py` | 22 | `test_sourcer_api_streaming.py` | 32 |
+| `test_sourcer_image_check.py` | 44 | `test_sourcer_render_budget.py` | 22 |
 | `test_sourcer_pins_and_music.py` | 38 | | |
 | `test_llm_judge.py` | 3 | `test_main.py` | 3 |
 | `test_observability.py` | 7 | `test_golden_reel.py` | 1 (deselected) |
