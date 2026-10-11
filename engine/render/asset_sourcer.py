@@ -12,6 +12,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import warnings
+import zlib
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -392,6 +393,46 @@ def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = N
 
 
 _API_MIN_DEADLINE_S = 30.0
+_API_DECODABLE_ENCODINGS = ("gzip", "x-gzip", "deflate")
+_API_DROPPED_HEADERS = ("content-encoding", "content-length", "transfer-encoding")
+
+
+def _content_encoding(headers) -> str:
+    """The lower-cased Content-Encoding header, or "" (a list like "gzip, gzip" stays as written)."""
+    value = headers.get("content-encoding")
+    return value.strip().lower() if isinstance(value, str) else ""
+
+
+def _decode_bounded(raw: bytes, encoding: str, limit: int) -> bytes:
+    """Inflate a gzip / deflate body, refusing (`_TooLarge`) as soon as the OUTPUT passes `limit`.
+
+    httpx's own decoder would inflate the whole thing before any cap could look at it (a few KB of gzip
+    is gigabytes of zeros), so the body is read raw and inflated here in bounded steps. `deflate` is
+    zlib-wrapped in practice but raw deflate exists in the wild, so both are tried. A corrupt or
+    truncated stream raises ValueError.
+    """
+    wbits_options = (47,) if encoding in ("gzip", "x-gzip") else (zlib.MAX_WBITS, -zlib.MAX_WBITS)
+    last: Exception | None = None
+    for wbits in wbits_options:
+        d = zlib.decompressobj(wbits)
+        out: list[bytes] = []
+        total = 0
+        data = raw
+        try:
+            while data:
+                chunk = d.decompress(data, 1 << 20)
+                total += len(chunk)
+                if total > limit:
+                    raise _TooLarge(f"download too large: more than {limit} bytes once decoded")
+                out.append(chunk)
+                data = d.unconsumed_tail
+            if not d.eof:
+                raise ValueError("compressed response body is truncated")
+        except zlib.error as exc:
+            last = exc
+            continue
+        return b"".join(out)
+    raise ValueError(f"compressed response body is corrupt: {last}")
 
 
 def _any_https_host(url) -> bool:
@@ -406,8 +447,9 @@ def _api_call(method: str, url: str, limit: int, *, headers=None, timeout: float
 
     `httpx.get` / `httpx.post` read the WHOLE body before returning, so a hostile or broken upstream
     could make the worker buffer gigabytes before any size check ran. Here `Accept-Encoding: identity`
-    is sent (an encoded body is refused: its decoded size is not what the network read says), no
-    redirect is followed (same as the httpx functions), reading stops with `_TooLarge` as soon as
+    is sent; a host that ignores it and answers gzip / deflate anyway is still served -- the body is
+    read raw (capped as sent) and inflated under the same cap (`_decode_bounded`) -- while any other
+    encoding (br, zstd, a stack of them) is refused. No redirect is followed (same as the httpx functions), reading stops with `_TooLarge` as soon as
     `limit` is crossed, and what was read is returned as a real `httpx.Response` (`.json()`,
     `.content`, `.headers`, `.raise_for_status()` work as call sites expect).
 
@@ -424,8 +466,13 @@ def _api_call(method: str, url: str, limit: int, *, headers=None, timeout: float
     deadline_at = _monotonic() + deadline_s
     with _open_download(url, url_ok, timeout=timeout, headers=headers, deadline_at=deadline_at,
                         method=method, params=params, json=json, follow_redirects=False) as r:
-        body = b"".join(_iter_capped(r, limit, deadline_at))
-        return httpx.Response(r.status_code, headers=r.headers, content=body,
+        if _content_encoding(r.headers) in _API_DECODABLE_ENCODINGS:
+            body = _decode_bounded(b"".join(_iter_capped(r, limit, deadline_at, raw=True)),
+                                   _content_encoding(r.headers), limit)
+        else:
+            body = b"".join(_iter_capped(r, limit, deadline_at))
+        headers = {k: v for k, v in r.headers.items() if k.lower() not in _API_DROPPED_HEADERS}
+        return httpx.Response(r.status_code, headers=headers, content=body,
                               request=httpx.Request(method, url))
 
 
@@ -461,16 +508,18 @@ class _TooLarge(ValueError):
     """A response body exceeded its size limit (declared Content-Length, or bytes actually read)."""
 
 
-def _iter_capped(r, limit: int, deadline_at: "float | None" = None):
+def _iter_capped(r, limit: int, deadline_at: "float | None" = None, *, raw: bool = False):
     """Yield `r`'s body in chunks; `_TooLarge` (a ValueError) once it exceeds `limit` bytes, plain ValueError past `deadline_at` or for an encoded body.
 
     Also refuses a response with a non-identity Content-Encoding, whose decoded size is not what
-    Content-Length (or the network read) says. `iter_bytes()` is called without a chunk size on
+    Content-Length (or the network read) says -- unless `raw=True`, which reads the UNDECODED stream
+    (`iter_raw()`) so the limit and the deadline apply to the bytes on the wire and the caller decodes
+    them itself under its own cap (`_decode_bounded`). `iter_bytes()` is called without a chunk size on
     purpose: with one, httpx buffers that many bytes before yielding anything, so a slow body would
     never reach the deadline check; without it, every network read does.
     """
     encoding = r.headers.get("content-encoding")
-    if isinstance(encoding, str) and encoding.strip().lower() not in ("", "identity"):
+    if not raw and isinstance(encoding, str) and encoding.strip().lower() not in ("", "identity"):
         raise ValueError(f"download is Content-Encoding {encoding!r}, expected identity")
     try:
         declared = int(r.headers.get("content-length"))
@@ -479,7 +528,7 @@ def _iter_capped(r, limit: int, deadline_at: "float | None" = None):
     if declared is not None and declared > limit:
         raise _TooLarge(f"download too large: Content-Length {declared} > {limit}")
     total = 0
-    for chunk in r.iter_bytes():
+    for chunk in (r.iter_raw() if raw else r.iter_bytes()):
         total += len(chunk)
         if total > limit:
             raise _TooLarge(f"download too large: more than {limit} bytes")
@@ -598,8 +647,34 @@ def _downscale_jpeg(content: bytes) -> "bytes | None":
         return None
 
 
+class _OversizedImage(ValueError):
+    """A readable image whose declared size is over `_MAX_IMAGE_PIXELS` and that could not be downscaled."""
+
+
+def _is_oversized(content: bytes) -> bool:
+    """True if `content` declares more than `_MAX_IMAGE_PIXELS` (or trips Pillow's own bomb limit).
+
+    False for anything else, including a corrupt file: only a definitely-too-big image is worth
+    remembering (a bad download may be transient)."""
+    from PIL import Image
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with Image.open(io.BytesIO(content)) as im:
+                return im.size[0] * im.size[1] > _MAX_IMAGE_PIXELS
+    except SoftTimeLimitExceeded:
+        raise
+    except Image.DecompressionBombError:
+        return True
+    except Exception:
+        return False
+
+
 def _fit_image(content: bytes) -> bytes:
-    """`content` if `_image_ok`; else a downscaled copy of an oversized JPEG; else ValueError (after a WARNING)."""
+    """`content` if `_image_ok`; else a downscaled copy of an oversized JPEG; else ValueError (after a WARNING).
+
+    The ValueError is `_OversizedImage` when the image is readable but too big and cannot be downscaled
+    (PNG/WebP/TIFF/GIF, or a JPEG past Pillow's bomb limit), so the caller can remember it."""
     if _image_ok(content):
         return content
     smaller = _downscale_jpeg(content)
@@ -607,7 +682,30 @@ def _fit_image(content: bytes) -> bytes:
         _log.info("Downscaled an oversized JPEG (%d -> %d bytes)", len(content), len(smaller))
         return smaller
     _log.warning("Discarding a download that is not a readable image of a reasonable size")
+    if _is_oversized(content):
+        raise _OversizedImage("downloaded bytes are not a readable image: over the pixel cap and cannot be downscaled")
     raise ValueError("downloaded bytes are not a readable image")
+
+
+def _refusal_marker(path: Path, url: str) -> Path:
+    """Where a refused-as-oversized image is remembered: next to the file it would have been, keyed by URL.
+
+    The URL is part of the name because an original and its thumbnail often share one target path
+    (same extension): remembering the original must not block the thumbnail."""
+    return path.with_name(f"{path.name}.{hashlib.sha256(url.encode()).hexdigest()[:12]}.refused")
+
+
+def _refusal_recorded(path: Path, url: str) -> bool:
+    """True if `url` (which would be cached at `path`) was already refused as oversized under the CURRENT cap.
+
+    Without this a non-JPEG original over the cap is downloaded in full (up to 50 MB), refused and
+    forgotten on every `search()` -- the thumbnail that replaced it is cached under a different
+    extension, so the `exists()` check never fires for the original's own path. The marker holds the cap
+    it was recorded under; raising the cap forgets it."""
+    try:
+        return _refusal_marker(path, url).read_text() == str(_MAX_IMAGE_PIXELS)
+    except OSError:
+        return False
 
 
 def _require_media(kind: str, head) -> None:
@@ -850,6 +948,8 @@ class WikipediaImageSource:
             if lp.exists() and _cached_media_ok(lp, "image"):
                 local_path = lp
                 break
+            if _refusal_recorded(lp, img_url):
+                continue                            # known too big: don't download it again
             try:
                 content = self._download(img_url, search_deadline)
                 if content is None:
@@ -861,6 +961,12 @@ class WikipediaImageSource:
                 break
             except SoftTimeLimitExceeded:
                 raise                               # the task is out of time: do not try the next candidate
+            except _OversizedImage:
+                try:
+                    _atomic_write(_refusal_marker(lp, img_url), str(_MAX_IMAGE_PIXELS).encode())
+                except OSError:
+                    pass                            # best effort: the cost is one more download next time
+                continue
             except Exception:
                 continue
 

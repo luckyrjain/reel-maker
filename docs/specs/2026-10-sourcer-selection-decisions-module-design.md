@@ -531,8 +531,25 @@ closed, as flagged below.
 * **Review fixes to the above.** `_image_ok` re-raises `MemoryError` and errno-bearing `OSError`s (EMFILE, EIO) so a
   transient failure no longer deletes a cached (possibly paid-for) image; `_cached_media_ok` keeps the file and
   logs. Known, accepted limits: a non-JPEG original over 50 Mpx (or a JPEG past Pillow's bomb limit) still falls
-  back to the small thumbnail, and a Wikipedia original refused for that reason with a thumbnail of another
-  extension is re-downloaded on every search; `_api_call` refuses a non-identity `Content-Encoding`.
+  back to the small thumbnail (but see below: it is no longer re-downloaded on every search).
+* **Oversized originals are remembered.** The thumbnail that replaces a refused original is cached under its
+  own extension, so the `exists()` check never fired for the original's path and a non-JPEG original (up to
+  50 MB) was downloaded and refused on every search. `_fit_image` now raises `_OversizedImage` for a readable,
+  definitely-too-big image (`_is_oversized`: declared size over the cap, or Pillow's own bomb error; never a
+  corrupt file, which may be a transient bad download), and `WikipediaImageSource.search` writes a marker
+  `wiki_<id>.<ext>.<sha256(url)[:12]>.refused` holding the cap it was refused under, which later searches
+  check before downloading. Keyed by URL because an original and its thumbnail often share one target path
+  (the first version keyed by path and blocked the thumbnail -- caught by its own tests). A different cap
+  forgets the marker; a failed marker write only costs one more download.
+* **gzip / deflate API responses are decoded, not refused.** A host that ignores `Accept-Encoding: identity`
+  used to make the call fail. `_api_call` now reads such a body RAW (`_iter_capped(raw=True)`, so the cap and the
+  deadline apply to the bytes on the wire) and inflates it with `_decode_bounded` (a `zlib.decompressobj` driven
+  in 1 MB steps, `_TooLarge` the moment the OUTPUT passes the limit; zlib and raw deflate both tried; truncated
+  or corrupt bodies refused). The rebuilt response drops `content-encoding` / `content-length` /
+  `transfer-encoding` (it is decoded now, and a stale `content-encoding` would make httpx try to decode it
+  again). br, zstd, compress and stacked encodings are still refused. A test-fake gotcha: a
+  `httpx.MockTransport` response built with `content=` is already consumed and `iter_raw()` raises
+  `StreamConsumed`; use `stream=httpx.ByteStream(...)`.
 
 Mutation checks: the image check, the budget and the review fixes were mutation-tested (one survivor, the warning
 filter, got its own test); all other mutants were killed. The original follow-up lists are closed; the limits above are the

@@ -160,7 +160,7 @@ def test_wikipedia_a_huge_original_falls_back_to_a_small_thumbnail(tmp_path, cap
     stream = _Stream({WIKI_OK: _Resp(chunks=(_png_declaring(12000, 12000),)), WIKI_THUMB: _Resp(chunks=(thumb,))})
     result = _wiki(tmp_path, _summary(), stream)
     assert stream.urls == [WIKI_OK, WIKI_THUMB] and result.local_path.read_bytes() == thumb
-    assert [p.name for p in tmp_path.iterdir()] == ["wiki_123.jpg"]
+    assert [p.name for p in tmp_path.iterdir() if not p.name.endswith(".refused")] == ["wiki_123.jpg"]
     assert "not a readable image" in caplog.text
 
 
@@ -299,7 +299,8 @@ def test_wikipedia_a_huge_thumbnail_is_refused_too(tmp_path):
     huge = _png_declaring(12000, 12000)
     stream = _Stream({WIKI_OK: _Resp(chunks=(huge,)), WIKI_THUMB: _Resp(chunks=(huge,))})
     assert _wiki(tmp_path, _summary(), stream) is None
-    assert stream.urls == [WIKI_OK, WIKI_THUMB] and list(tmp_path.iterdir()) == []
+    assert stream.urls == [WIKI_OK, WIKI_THUMB]
+    assert [p for p in tmp_path.iterdir() if not p.name.endswith(".refused")] == []
 
 
 # ── an oversized JPEG is downscaled instead of dropped for the tiny thumbnail ────────────────────
@@ -428,3 +429,99 @@ def test_a_downscaled_result_that_is_still_unusable_is_refused(monkeypatch):
     monkeypatch.setattr(AS, "_downscale_jpeg", lambda content: _jpeg((256, 192)))      # still over the cap
     with pytest.raises(ValueError, match="not a readable image"):
         AS._fit_image(_jpeg((256, 192)))
+
+
+# ── a non-JPEG original that is over the cap is not downloaded again on every search ────────────────
+
+PNG_ORIG = "https://upload.wikimedia.org/wikipedia/commons/a/ab/Messi.png"
+
+
+def _png_noise(size):
+    buf = io.BytesIO()
+    Image.effect_noise(size, 60).convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _two_searches(tmp_path, monkeypatch, original, thumb, original_url=PNG_ORIG):
+    """Two searches of one page whose original is a .png (or `original_url`) and whose thumbnail is a .jpg."""
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    summary = _summary(original=original_url)
+    first = _Stream({original_url: _Resp(chunks=(original,)), WIKI_THUMB: _Resp(chunks=(thumb,))})
+    r1 = _wiki(tmp_path, summary, first)
+    second = _Stream({original_url: _Resp(chunks=(original,)), WIKI_THUMB: _Resp(chunks=(thumb,))})
+    r2 = _wiki(tmp_path, summary, second)
+    return first, r1, second, r2
+
+
+def _refused(tmp_path):
+    return [p.name for p in tmp_path.iterdir() if p.name.endswith(".refused")]
+
+
+def test_an_oversized_original_is_not_fetched_again_on_the_next_search(tmp_path, monkeypatch):
+    thumb = _jpeg((16, 12))
+    first, r1, second, r2 = _two_searches(tmp_path, monkeypatch, _png_noise((256, 192)), thumb)
+    assert first.urls == [PNG_ORIG, WIKI_THUMB]
+    assert second.urls == []                                         # original skipped, thumbnail served from cache
+    assert r1.local_path == r2.local_path and r2.local_path.read_bytes() == thumb
+    assert r2.local_path.name == "wiki_123.jpg"                      # different extension from the original
+
+
+def test_the_refusal_is_recorded_next_to_the_would_be_file(tmp_path, monkeypatch):
+    _two_searches(tmp_path, monkeypatch, _png_noise((256, 192)), _jpeg((16, 12)))
+    refused = _refused(tmp_path)
+    assert len(refused) == 1 and refused[0].startswith("wiki_123.png.")
+    assert (tmp_path / refused[0]).read_text() == str(CAP)
+    assert not any(p.name.endswith(".tmp") for p in tmp_path.iterdir())
+
+
+def test_a_changed_cap_forgets_the_refusal(tmp_path, monkeypatch):
+    thumb = _jpeg((16, 12))
+    orig = _png_noise((256, 192))
+    _two_searches(tmp_path, monkeypatch, orig, thumb)
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", 20 * CAP)           # now it fits (256*192 < 81920)
+    third = _Stream({PNG_ORIG: _Resp(chunks=(orig,)), WIKI_THUMB: _Resp(chunks=(thumb,))})
+    result = _wiki(tmp_path, _summary(original=PNG_ORIG), third)
+    assert third.urls == [PNG_ORIG] and result.local_path.read_bytes() == orig
+
+
+def test_a_corrupt_original_is_not_recorded_as_oversized(tmp_path, monkeypatch):
+    """A bad download may be transient: only a definitely-too-big original is remembered."""
+    thumb = _jpeg((16, 12))
+    first, _, second, _ = _two_searches(tmp_path, monkeypatch, b"\x89PNG\r\n\x1a\n" + b"garbage" * 20, thumb)
+    assert _refused(tmp_path) == []
+    assert second.urls == [PNG_ORIG]                                 # tried again (the thumbnail is cached)
+
+
+def test_an_oversized_jpeg_past_pillows_limit_is_recorded_too(tmp_path, monkeypatch):
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1000)
+    first, _, second, _ = _two_searches(tmp_path, monkeypatch, _jpeg((256, 192)), _png_noise((16, 12)),
+                                        original_url="https://upload.wikimedia.org/wikipedia/commons/a/ab/Messi.jpeg")
+    assert second.urls == []
+
+
+def test_a_failed_marker_write_is_not_fatal(tmp_path, monkeypatch):
+    real = AS._atomic_write
+
+    def flaky(path, data):
+        if str(path).endswith(".refused"):
+            raise OSError("disk full")
+        return real(path, data)
+
+    monkeypatch.setattr(AS, "_atomic_write", flaky)
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    stream = _Stream({PNG_ORIG: _Resp(chunks=(_png_noise((256, 192)),)), WIKI_THUMB: _Resp(chunks=(_jpeg((16, 12)),))})
+    assert _wiki(tmp_path, _summary(original=PNG_ORIG), stream) is not None
+
+
+def test_a_different_pages_refusal_does_not_block_this_page(tmp_path, monkeypatch):
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    (tmp_path / "wiki_999.jpg.0123456789ab.refused").write_text(str(CAP))
+    stream = _Stream({WIKI_OK: _Resp(chunks=(_jpeg((16, 12)),))})
+    assert _wiki(tmp_path, _summary(thumbnail=None), stream) is not None and stream.urls == [WIKI_OK]
+
+
+def test_remembering_the_original_does_not_block_a_thumbnail_that_shares_its_path(tmp_path, monkeypatch):
+    """Both URLs map to wiki_<id>.jpg here (and often in real life): the marker is keyed by URL."""
+    thumb = _jpeg((16, 12))
+    first, r1, _, _ = _two_searches(tmp_path, monkeypatch, _png_noise((256, 192)), thumb, original_url=WIKI_OK)
+    assert r1.local_path.read_bytes() == thumb and first.urls == [WIKI_OK, WIKI_THUMB]

@@ -123,6 +123,11 @@ class _Resp:
             self.chunks_read += 1
             yield c
 
+    def iter_raw(self, chunk_size=None):
+        for c in self._chunks:
+            self.chunks_read += 1
+            yield c
+
 
 def _redirect(to, status=302):
     return _Resp(status=status, chunks=(), headers={"location": to})

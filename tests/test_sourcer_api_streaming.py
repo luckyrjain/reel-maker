@@ -117,8 +117,8 @@ def test_the_default_limit_is_the_json_one(monkeypatch):
         AS._api_get(URL, timeout=5.0)
 
 
-@pytest.mark.parametrize("enc", ["gzip", "br", "deflate"])
-def test_an_encoded_response_is_refused(monkeypatch, enc):
+@pytest.mark.parametrize("enc", ["br", "zstd", "compress", "gzip, gzip", "deflate, gzip", "bogus"])
+def test_an_unsupported_encoding_is_refused(monkeypatch, enc):
     _with(_Stream({URL: _Resp(chunks=(b"x",), headers={"content-encoding": enc})}), monkeypatch)
     with pytest.raises(ValueError, match="Content-Encoding"):
         AS._api_get(URL, timeout=5.0)
@@ -392,3 +392,127 @@ def test_the_body_read_is_checked_against_the_deadline_chunk_by_chunk(monkeypatc
     monkeypatch.setattr(AS, "_monotonic", _fake_clock(100.0, 100.0, after=999.0))
     with pytest.raises(ValueError, match="too slow"):
         AS._api_get(URL, timeout=5.0)
+
+
+# ── a host that ignores `Accept-Encoding: identity` and sends gzip / deflate anyway ───────────────
+
+import gzip
+import zlib
+
+
+def _gz(data):
+    return gzip.compress(data)
+
+
+def _zlib(data):
+    return zlib.compress(data)
+
+
+def _raw_deflate(data):
+    c = zlib.compressobj(wbits=-15)
+    return c.compress(data) + c.flush()
+
+
+@pytest.mark.parametrize("enc,pack", [("gzip", _gz), ("x-gzip", _gz), ("GZIP", _gz), ("deflate", _zlib),
+                                      ("deflate", _raw_deflate)], ids=["gzip", "x-gzip", "upper", "zlib", "raw-deflate"])
+def test_a_gzip_or_deflate_response_is_decoded(monkeypatch, enc, pack):
+    body = _json_bytes({"a": [1, 2, 3], "t": "x" * 500})
+    _with(_Stream({URL: _Resp(chunks=(pack(body)[:10], pack(body)[10:]), headers={"content-encoding": enc,
+                                                                                 "content-type": "application/json"})}), monkeypatch)
+    resp = AS._api_get(URL, timeout=5.0)
+    assert resp.json() == {"a": [1, 2, 3], "t": "x" * 500} and resp.content == body
+    assert resp.headers["content-type"] == "application/json"
+    assert "content-encoding" not in resp.headers                   # it is decoded now
+
+
+def test_the_decoded_size_is_capped_not_just_the_compressed_size(monkeypatch):
+    """A 100 KB-of-zeros gzip is ~100 bytes on the wire: the cap must apply after inflating."""
+    monkeypatch.setattr(AS, "_MAX_API_JSON_BYTES", 1000)
+    bomb = _gz(b"\0" * 100_000)
+    assert len(bomb) < 1000
+    _with(_Stream({URL: _Resp(chunks=(bomb,), headers={"content-encoding": "gzip"})}), monkeypatch)
+    with pytest.raises(AS._TooLarge):
+        AS._api_get(URL, timeout=5.0)
+
+
+def test_a_decoded_body_exactly_at_the_limit_is_accepted_and_one_over_is_not(monkeypatch):
+    for size, ok in ((1000, True), (1001, False)):
+        _with(_Stream({URL: _Resp(chunks=(_gz(b"x" * size),), headers={"content-encoding": "gzip"})}), monkeypatch)
+        if ok:
+            assert len(AS._api_get(URL, timeout=5.0, limit=1000).content) == 1000
+        else:
+            with pytest.raises(AS._TooLarge):
+                AS._api_get(URL, timeout=5.0, limit=1000)
+
+
+def test_the_compressed_size_is_capped_too(monkeypatch):
+    """Incompressible data: the gzip is LARGER than its content, so only the on-the-wire cap can refuse it."""
+    import random
+    content = random.Random(7).randbytes(500)
+    packed = _gz(content)
+    limit = 510
+    assert len(content) <= limit < len(packed)
+    _with(_Stream({URL: _Resp(chunks=(packed,), headers={"content-encoding": "gzip"})}), monkeypatch)
+    with pytest.raises(AS._TooLarge):
+        AS._api_get(URL, timeout=5.0, limit=limit)
+
+
+@pytest.mark.parametrize("data", [b"not gzip at all", _gz(b"hello world")[:-6], b""], ids=["garbage", "truncated", "empty"])
+def test_a_corrupt_or_truncated_encoded_body_is_refused(monkeypatch, data):
+    _with(_Stream({URL: _Resp(chunks=(data,), headers={"content-encoding": "gzip"})}), monkeypatch)
+    with pytest.raises(ValueError):
+        AS._api_get(URL, timeout=5.0)
+
+
+def test_an_encoded_body_is_read_raw_not_through_httpxs_decoder(monkeypatch):
+    """iter_bytes() would inflate before any cap could see it; the raw stream is what is bounded."""
+    resp = _Resp(chunks=(_gz(b"{}"),), headers={"content-encoding": "gzip"})
+    used = []
+    real_raw, real_bytes = resp.iter_raw, resp.iter_bytes
+    resp.iter_raw = lambda *a, **k: used.append("raw") or real_raw(*a, **k)
+    resp.iter_bytes = lambda *a, **k: used.append("bytes") or real_bytes(*a, **k)
+    _with(_Stream({URL: resp}), monkeypatch)
+    AS._api_get(URL, timeout=5.0)
+    assert used == ["raw"]
+
+
+def test_the_rebuilt_response_never_carries_stale_framing_headers(monkeypatch):
+    _with(_Stream({URL: _Resp(chunks=(b'{"a": 1}',), headers={
+        "content-length": "999", "transfer-encoding": "chunked", "content-type": "application/json"})}), monkeypatch)
+    resp = AS._api_get(URL, timeout=5.0)
+    assert resp.json() == {"a": 1}
+    assert "transfer-encoding" not in resp.headers and resp.headers.get("content-length") == str(len(resp.content))
+
+
+def test_real_httpx_a_gzip_api_response_works_end_to_end(monkeypatch):
+    from contextlib import contextmanager
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers.get("accept-encoding"))
+        return httpx.Response(200, stream=httpx.ByteStream(_gz(_json_bytes({"ok": True}))),
+                              headers={"content-encoding": "gzip"})        # unread, like a real network response
+
+    @contextmanager
+    def real(method, url, **kw):
+        kw.pop("extensions", None)
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            with client.stream(method, url, **kw) as r:
+                yield r
+
+    monkeypatch.setattr(AS, "_http_stream", real)
+    assert AS._api_get(URL, timeout=5.0).json() == {"ok": True}
+    assert seen == ["identity"]                                      # still asked for identity first
+
+
+def test_the_hf_image_call_takes_a_gzipped_response_through_to_its_cache_rules(tmp_path, monkeypatch):
+    """The encoding support is in _api_call, so every caller (here HF with its image limit) gets it."""
+    import io
+    from PIL import Image
+    b = io.BytesIO()
+    Image.new("RGB", (8, 8)).save(b, format="PNG")
+    png = b.getvalue()
+    _with(_Stream({f"{HuggingFaceImageSource._API}/org/m": _Resp(
+        chunks=(_gz(png),), headers={"content-encoding": "gzip", "content-type": "image/png"})}), monkeypatch)
+    result = HuggingFaceImageSource("k", "org/m", tmp_path).generate("p")
+    assert result is not None and result.local_path.read_bytes() == png
