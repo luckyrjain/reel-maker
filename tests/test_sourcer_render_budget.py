@@ -148,13 +148,12 @@ def test_wikipedia_the_download_budget_is_what_is_left_of_the_render_budget(tmp_
 
 
 # ── the paid HuggingFace tiers ─────────────────────────────────────────────────────────────────
+# The skip lives in generate(), AFTER the on-disk cache lookup: a cached (already paid for) asset is
+# still served once the budget is spent, only a call to the paid API is refused.
 
-def _hf(result=None):
-    src = MagicMock()
-    src.api_key = "k"
-    src.generate.return_value = result
-    src.last_call_was_generated = False
-    return src
+import hashlib
+
+_HF_SUFFIX = ", portrait orientation, vertical format, cinematic, high quality"
 
 
 def _no_result_sourcer():
@@ -163,43 +162,93 @@ def _no_result_sourcer():
     return s
 
 
-def test_hf_tiers_are_skipped_once_the_budget_is_spent(monkeypatch):
+def _hf_image_cache_file(tmp_path, query="q"):
+    return tmp_path / f"hf_{hashlib.sha256((query + _HF_SUFFIX).encode()).hexdigest()[:16]}.png"
+
+
+def _hf_video_cache_file(tmp_path, query="q"):
+    return tmp_path / f"hfvid_{hashlib.sha256((query + _HF_SUFFIX).encode()).hexdigest()[:16]}.mp4"
+
+
+def _post_resp(content_type, content):
+    r = MagicMock()
+    r.raise_for_status.return_value = None
+    r.headers = {"content-type": content_type}
+    r.content = content
+    return r
+
+
+def _png():
+    import io
+    from PIL import Image
+    b = io.BytesIO()
+    Image.new("RGB", (8, 8)).save(b, format="PNG")
+    return b.getvalue()
+
+
+def test_hf_image_not_generated_once_the_budget_is_spent(tmp_path, monkeypatch):
     _clock(monkeypatch, 0.0)
-    hf_video, hf = _hf(), _hf()
-    with AS.asset_budget(-1.0):
-        out = AS.resolve_beat_assets(MagicMock(), "q", 1.0, _no_result_sourcer(), None, hf_video, hf, reel_id=1)
-    assert out == [(None, None)]
-    hf_video.generate.assert_not_called()
-    hf.generate.assert_not_called()
+    src = AS.HuggingFaceImageSource("k", "org/m", tmp_path)
+    with patch(f"{AS.__name__}.httpx.post") as post, AS.asset_budget(-1.0):
+        assert src.generate("q") is None
+    post.assert_not_called()
+    assert src.last_call_was_generated is False and list(tmp_path.iterdir()) == []
 
 
-def test_hf_tiers_run_while_budget_remains(monkeypatch):
+def test_hf_video_not_generated_once_the_budget_is_spent(tmp_path, monkeypatch):
     _clock(monkeypatch, 0.0)
-    hf_video, hf = _hf(), _hf()
-    with AS.asset_budget(100.0):
-        AS.resolve_beat_assets(MagicMock(), "q", 1.0, _no_result_sourcer(), None, hf_video, hf, reel_id=1)
-    hf_video.generate.assert_called_once()
-    hf.generate.assert_called_once()
+    src = AS.HuggingFaceVideoSource("k", "org/m", tmp_path)
+    with patch(f"{AS.__name__}.httpx.post") as post, AS.asset_budget(-1.0):
+        assert src.generate("q") is None
+    post.assert_not_called()
 
 
-def test_hf_tiers_run_without_any_budget():
-    hf_video, hf = _hf(), _hf()
-    AS.resolve_beat_assets(MagicMock(), "q", 1.0, _no_result_sourcer(), None, hf_video, hf, reel_id=1)
-    hf_video.generate.assert_called_once()
-    hf.generate.assert_called_once()
-
-
-def test_a_spent_budget_writes_no_stage_event_for_a_skipped_hf_call(monkeypatch):
+def test_hf_image_cached_asset_still_served_once_the_budget_is_spent(tmp_path, monkeypatch):
     _clock(monkeypatch, 0.0)
-    with patch.object(AS, "record_stage") as rs, AS.asset_budget(-1.0):
-        AS.resolve_beat_assets(MagicMock(), "q", 1.0, _no_result_sourcer(), None, _hf(), _hf(), reel_id=1)
-    rs.assert_not_called()
+    _hf_image_cache_file(tmp_path).write_bytes(_png())
+    src = AS.HuggingFaceImageSource("k", "org/m", tmp_path)
+    with patch(f"{AS.__name__}.httpx.post") as post, AS.asset_budget(-1.0):
+        result = src.generate("q")
+    assert result is not None and result.local_path == _hf_image_cache_file(tmp_path)
+    post.assert_not_called()
+    assert src.last_call_was_generated is False                 # a cache hit is never billed
 
 
-def test_the_skip_is_logged(monkeypatch, caplog):
+def test_hf_video_cached_asset_still_served_once_the_budget_is_spent(tmp_path, monkeypatch):
+    _clock(monkeypatch, 0.0)
+    _hf_video_cache_file(tmp_path).write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 8)
+    src = AS.HuggingFaceVideoSource("k", "org/m", tmp_path)
+    with patch(f"{AS.__name__}.httpx.post") as post, AS.asset_budget(-1.0):
+        assert src.generate("q") is not None
+    post.assert_not_called()
+
+
+def test_hf_image_is_generated_while_budget_remains(tmp_path, monkeypatch):
+    _clock(monkeypatch, 0.0)
+    src = AS.HuggingFaceImageSource("k", "org/m", tmp_path)
+    with patch(f"{AS.__name__}.httpx.post", return_value=_post_resp("image/png", _png())) as post, \
+            AS.asset_budget(100.0):
+        assert src.generate("q") is not None
+    post.assert_called_once()
+
+
+def test_a_spent_budget_through_resolve_beat_assets_gives_a_black_frame_but_serves_a_cached_hf_image(tmp_path, monkeypatch):
+    _clock(monkeypatch, 0.0)
+    hf = AS.HuggingFaceImageSource("k", "org/m", tmp_path)
+    with patch(f"{AS.__name__}.httpx.post") as post, AS.asset_budget(-1.0), \
+            patch.object(AS, "_cache_asset", side_effect=lambda db, r, t: ("asset", r.local_path)):
+        out = AS.resolve_beat_assets(MagicMock(), "q", 1.0, _no_result_sourcer(), None, None, hf, reel_id=None)
+        assert out == [(None, None)]
+        _hf_image_cache_file(tmp_path).write_bytes(_png())
+        out2 = AS.resolve_beat_assets(MagicMock(), "q", 1.0, _no_result_sourcer(), None, None, hf, reel_id=None)
+    post.assert_not_called()
+    assert out2[0][1] == _hf_image_cache_file(tmp_path)
+
+
+def test_the_skip_is_logged(tmp_path, monkeypatch, caplog):
     import logging
     caplog.set_level(logging.WARNING, logger=AS.__name__)
     _clock(monkeypatch, 0.0)
     with AS.asset_budget(-1.0):
-        AS.resolve_beat_assets(MagicMock(), "q", 1.0, _no_result_sourcer(), None, _hf(), None, reel_id=1)
+        AS.HuggingFaceImageSource("k", "org/m", tmp_path).generate("q")
     assert "asset budget" in caplog.text

@@ -198,3 +198,47 @@ def test_a_lowered_pillow_limit_does_not_override_our_cap(monkeypatch):
     """Pillow warns (1x-2x its limit) / raises (>2x) on its own; the cap here is the one that decides."""
     monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1000)
     assert AS._image_ok(_img("PNG", (45, 30))) is True           # 1350 px: Pillow's warning band, under our cap
+
+
+# ── a transient failure is not a verdict (security review: it used to delete a paid cache file) ──
+
+import errno
+
+
+@pytest.mark.parametrize("exc", [OSError(errno.EMFILE, "Too many open files"), OSError(errno.EIO, "I/O error"),
+                                 MemoryError()], ids=["emfile", "eio", "memory"])
+def test_a_transient_failure_is_raised_not_reported_as_a_bad_image(exc):
+    with patch("PIL.Image.open", side_effect=exc):
+        with pytest.raises(type(exc)):
+            AS._image_ok(b"anything")
+
+
+def test_a_transient_failure_never_deletes_a_cached_image(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger=AS.__name__)
+    f = tmp_path / "hf_cache.png"
+    f.write_bytes(_img("PNG"))
+    with patch("PIL.Image.open", side_effect=OSError(errno.EMFILE, "Too many open files")):
+        assert AS._cached_media_ok(f, "image") is True
+    assert f.exists()
+    assert "Could not check" in caplog.text
+
+
+def test_a_definitely_bad_cached_image_is_still_deleted(tmp_path):
+    f = tmp_path / "hf_cache.png"
+    f.write_bytes(_png_declaring(12000, 12000))
+    assert AS._cached_media_ok(f, "image") is False and not f.exists()
+
+
+def test_a_transient_failure_while_checking_a_download_fails_that_candidate_only(tmp_path):
+    stream = _Stream({WIKI_OK: _Resp(chunks=(_img("JPEG"),)), WIKI_THUMB: _Resp(chunks=(_img("JPEG"),))})
+    calls = []
+
+    def flaky(source):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError(errno.EMFILE, "Too many open files")
+        return True
+
+    with patch.object(AS, "_image_ok", flaky):
+        result = _wiki(tmp_path, _summary(), stream)
+    assert result is not None and stream.urls == [WIKI_OK, WIKI_THUMB]

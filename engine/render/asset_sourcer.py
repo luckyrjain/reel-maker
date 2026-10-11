@@ -121,10 +121,13 @@ _PEXELS_SEARCH_BUDGET_S = 900.0
 _WIKI_SEARCH_BUDGET_S = 240.0
 _monotonic = time.monotonic     # indirection so tests can drive a fake clock
 
-# One budget for a whole render's asset sourcing. The per-search budgets above cannot add up across a
-# render's beats only if something bounds the sum: `asset_budget()` sets a deadline that every search()
-# inside it is clipped to, after which no download starts and the paid HuggingFace tiers are skipped (a
-# cached file is still served). `render_cut` wraps its beat loop in it. Unset (the default) changes nothing.
+# One budget for a whole render's asset sourcing. The per-search budgets above can still add up across a
+# render's beats unless something bounds the sum: `asset_budget()` sets a deadline that every search()
+# inside it is clipped to, after which no download starts and no HuggingFace generation is requested
+# (a cached file, Pexels / Wikipedia / HuggingFace alike, is still served). It gates the START of
+# downloads and paid calls only: the small API calls (search / summary / license lookups, the 429 retry
+# sleep) and anything already in flight are not interrupted. `render_cut` wraps each beat's asset
+# resolution in it, with the time left out of `RENDER_ASSET_BUDGET_S`. Unset (the default) changes nothing.
 RENDER_ASSET_BUDGET_S = 1200.0
 _asset_deadline_at: ContextVar["float | None"] = ContextVar("asset_deadline_at", default=None)
 
@@ -430,7 +433,7 @@ class _TooLarge(ValueError):
 
 
 def _iter_capped(r, limit: int, deadline_at: "float | None" = None):
-    """Yield `r`'s body in chunks; ValueError once it exceeds `limit` bytes or passes `deadline_at`.
+    """Yield `r`'s body in chunks; `_TooLarge` (a ValueError) once it exceeds `limit` bytes, plain ValueError past `deadline_at` or for an encoded body.
 
     Also refuses a response with a non-identity Content-Encoding, whose decoded size is not what
     Content-Length (or the network read) says. `iter_bytes()` is called without a chunk size on
@@ -492,12 +495,16 @@ def _image_ok(source) -> bool:
 
     Reads the HEADER only (`Image.open` is lazy; pixels are never decoded). An unidentifiable or
     truncated file, a file Pillow itself calls a decompression bomb (> 2x its own limit raises at open)
-    and an unreadable path are all "not ok" -- a refusal, never an exception. Pillow's own
+    and a missing path are all "not ok" -- a refusal, not an exception. Pillow's own
     `DecompressionBombWarning` (a soft warning between 1x and 2x its limit) is silenced: the cap here is
-    the one that decides. `SoftTimeLimitExceeded` is re-raised.
+    the one that decides. Only the HEADER is read, so a file truncated after its header still passes (the
+    byte cap and the transport already fail a truncated download). A TRANSIENT failure (`MemoryError`, or
+    an `OSError` carrying an errno other than "no such file": EMFILE, EIO, ...) says nothing about the
+    image and is re-raised, so a caller never deletes a good (possibly paid-for) cached file over it.
+    `SoftTimeLimitExceeded` is re-raised.
     """
+    from PIL import Image, UnidentifiedImageError
     try:
-        from PIL import Image
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             with Image.open(io.BytesIO(source) if isinstance(source, (bytes, bytearray)) else source) as im:
@@ -505,7 +512,14 @@ def _image_ok(source) -> bool:
         return width * height <= _MAX_IMAGE_PIXELS
     except SoftTimeLimitExceeded:
         raise
-    except Exception:
+    except MemoryError:
+        raise
+    except FileNotFoundError:
+        return False
+    except Exception as exc:
+        if isinstance(exc, OSError) and not isinstance(exc, UnidentifiedImageError) \
+                and exc.errno is not None:
+            raise
         return False
 
 
@@ -535,7 +549,16 @@ def _cached_media_ok(path: Path, kind: str) -> bool:
             head = fh.read(16)
     except OSError:
         head = b""
-    if _sniff_ok(kind, head) and (kind != "image" or _image_ok(path)):
+    ok = _sniff_ok(kind, head)
+    if ok and kind == "image":
+        try:
+            ok = _image_ok(path)
+        except SoftTimeLimitExceeded:
+            raise
+        except Exception:
+            _log.warning("Could not check a cached image (transient error); keeping it", exc_info=True)
+            return True
+    if ok:
         return True
     _log.warning("Discarding a cached file that is not a valid %s", kind)
     try:
@@ -929,6 +952,9 @@ class HuggingFaceImageSource:
         local_path = self.store_dir / f"hf_{fp}.png"
 
         if not (local_path.exists() and _cached_media_ok(local_path, "image")):
+            if _asset_budget_spent():                # after the cache lookup: a cached asset is free
+                _log.warning("Skipping HuggingFace image generation: the render's asset budget is spent")
+                return None
             try:
                 resp = _api_post(
                     f"{self._API}/{self.model}",
@@ -1007,6 +1033,9 @@ class HuggingFaceVideoSource:
                 local_path = cached
                 break
         else:
+            if _asset_budget_spent():                # after the cache lookup: a cached asset is free
+                _log.warning("Skipping HuggingFace video generation: the render's asset budget is spent")
+                return None
             try:
                 resp = _api_post(
                     f"{self._API}/{self.model}",
@@ -1173,9 +1202,6 @@ def _generate_gated_hf_asset(db, reel_id, stage, source, query, cost_fn):
     convention (pre-existing behavior, unchanged by this extraction — the inline cost
     calculations this helper replaced had the identical propagation).
     """
-    if _asset_budget_spent():
-        _log.warning("Skipping %s: the render's asset budget is spent", stage)
-        return None
     if reel_id is not None and source.api_key:
         with record_stage(db, reel_id, stage, provider="huggingface") as ev:
             result = source.generate(query)
