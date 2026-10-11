@@ -499,11 +499,26 @@ closed, as flagged below.
   is bounded; `_TooLarge` is caught per caller (HF: WARNING, not billed). `_body_too_large` stays as defense in
   depth. To avoid rewriting ~130 test patches, a conftest fixture points `_api_get/_api_post` back at `httpx.get/post`
   unless a test carries `real_api` (`tests/test_sourcer_api_streaming.py`, 30).
-* **Image pixel cap.** `_image_ok()` opens only the header with Pillow and refuses an unidentifiable image or one over
-  `_MAX_IMAGE_PIXELS` (50 Mpx). Applied to Wikipedia downloads (refused original -> thumbnail), HuggingFace images
-  and cached images. Pillow's own bomb warning is silenced so the cap here decides; a test with a lowered Pillow
-  limit pins that (the first mutation run found that survivor). `tests/test_sourcer_image_check.py` (36, marker
-  `real_image_check`; other tests get a permissive check because their fakes serve placeholder bytes).
+* **Image pixel cap.** `_image_ok()` reads the declared size with Pillow, refuses an unidentifiable image or one over
+  `_MAX_IMAGE_PIXELS` (50 Mpx), and only then decodes the pixels (`load()`, a JPEG at 1/8 scale through `draft`), so
+  a truncated or corrupt file is refused and an over-cap one is never decoded (first version: header only, which
+  passed a file truncated after its header -- found by review). Applied to Wikipedia downloads, HuggingFace
+  images and cached images. Pillow's own bomb warning is silenced so the cap here decides; a test with a lowered
+  Pillow limit pins that (the first mutation run found that survivor). `tests/test_sourcer_image_check.py`
+  (marker `real_image_check`; other tests get a permissive check because their fakes serve placeholder bytes).
+* **Oversized JPEG originals are downscaled.** A Wikimedia original over the cap (a 75 Mpx featured picture) used
+  to fall back to the ~320 px summary thumbnail, which looks soft upscaled to 1080x1920. `_downscale_jpeg()`
+  decodes a JPEG at the smallest DCT reduction (1/2, 1/4, 1/8) that fits the cap -- never allocating the full-size
+  buffer --, bakes the EXIF rotation in (the re-encode drops the tag) and saves a JPEG; `_fit_image()` returns the
+  input if `_image_ok`, else the downscaled copy if that is `_image_ok`, else raises. Only JPEG (PNG/WebP/TIFF/GIF have no cheap partial decode) and
+  only within Pillow's own bomb limit (2x `Image.MAX_IMAGE_PIXELS`, ~179 Mpx, where `Image.open` raises); anything else
+  still falls back to the thumbnail.
+* **API calls get a deadline.** `_api_call` now goes through `_open_download` (new `method`/`params`/`json`/
+  `follow_redirects` parameters; redirects are still never followed for an API call), so it has the per-hop timeout
+  clamp, the DNS gate and the connection `_Watchdog`, plus `_iter_capped`'s per-chunk deadline. The budget is
+  `deadline_s`, default `max(30 s, 2 x timeout)`. It is deliberately NOT clipped to `asset_budget()`: the searches
+  must still run once that is spent to find cached files. The URL check is `_any_https_host` (https, default port,
+  plain host) -- no allowlist, the API hosts are constants in the module.
 * **Per-render total.** `asset_budget(seconds)` (a `ContextVar` deadline, nested budgets only tighten) with
   `RENDER_ASSET_BUDGET_S` = 1200. `render_cut` wraps each beat's `resolve_or_reuse()` in it with what is left of the
   total after the earlier beats' ASSET time (the first version wrapped the whole loop, so slow TTS starved later
@@ -515,10 +530,9 @@ closed, as flagged below.
   `tests/test_sourcer_render_budget.py` (22) plus 3 in `test_render_task.py`.
 * **Review fixes to the above.** `_image_ok` re-raises `MemoryError` and errno-bearing `OSError`s (EMFILE, EIO) so a
   transient failure no longer deletes a cached (possibly paid-for) image; `_cached_media_ok` keeps the file and
-  logs. Known, accepted limits: the check reads only the header (a file truncated after it passes), a Wikipedia
-  original refused for pixels with a thumbnail of another extension is re-downloaded on every search, an original
-  over 50 Mpx falls back to the small thumbnail, `_api_call` refuses a non-identity `Content-Encoding` and has no
-  deadline of its own.
+  logs. Known, accepted limits: a non-JPEG original over 50 Mpx (or a JPEG past Pillow's bomb limit) still falls
+  back to the small thumbnail, and a Wikipedia original refused for that reason with a thumbnail of another
+  extension is re-downloaded on every search; `_api_call` refuses a non-identity `Content-Encoding`.
 
 Mutation checks: the image check, the budget and the review fixes were mutation-tested (one survivor, the warning
 filter, got its own test); all other mutants were killed. The original follow-up lists are closed; the limits above are the

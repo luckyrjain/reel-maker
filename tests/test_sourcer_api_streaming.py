@@ -20,7 +20,7 @@ from engine.render import asset_sourcer as AS
 from engine.render.asset_sourcer import (
     HuggingFaceImageSource, HuggingFaceVideoSource, PexelsVideoSource, WikipediaImageSource,
 )
-from tests.test_sourcer_download_guards import PEXELS_OK, WIKI_OK, _Resp, _Stream
+from tests.test_sourcer_download_guards import PEXELS_OK, WIKI_OK, _Resp, _Stream, _fake_clock
 from tests.test_sourcer_selection import _summary, _video, _vf
 
 pytestmark = pytest.mark.real_api
@@ -287,3 +287,108 @@ def test_a_caller_cannot_override_identity_encoding(monkeypatch):
     stream = _with(_Stream({URL: _Resp(chunks=(b"{}",))}), monkeypatch)
     AS._api_get(URL, headers={"Accept-Encoding": "gzip"}, timeout=1.0)
     assert stream.requests[0][1]["headers"]["Accept-Encoding"] == "identity"
+
+
+# ── a wall-clock budget, DNS gate and watchdog of their own ──────────────────────────────────────
+
+import time as _time
+
+from tests.test_sourcer_watchdog import _serve
+
+
+def _allow_any(u):
+    return True
+
+
+@pytest.mark.parametrize("behavior", ["header_drip", "chunk_line_drip", "body_trickle", "silent"])
+def test_a_hostile_api_host_is_cut_off_near_the_deadline(behavior):
+    started = _time.monotonic()
+    with _serve(behavior) as server:
+        with pytest.raises(ValueError, match="too slow"):
+            AS._api_get(server.url, timeout=30.0, deadline_s=0.6, url_ok=_allow_any)
+    assert 0.5 <= _time.monotonic() - started < 3.0                   # not the 30 s read timeout
+
+
+def test_a_fast_api_host_is_unaffected():
+    with _serve("fast_ok") as server:
+        resp = AS._api_get(server.url, timeout=5.0, url_ok=_allow_any)
+    assert resp.content == b"hello"
+
+
+def test_a_post_has_the_same_deadline():
+    with _serve("header_drip") as server:
+        with pytest.raises(ValueError, match="too slow"):
+            AS._api_post(server.url, json={"a": 1}, timeout=30.0, deadline_s=0.6, url_ok=_allow_any)
+
+
+def test_the_default_budget_is_twice_the_timeout_with_a_floor_of_thirty_seconds(monkeypatch):
+    monkeypatch.setattr(AS, "_monotonic", lambda: 100.0)
+    seen = []
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_open(url, url_ok, **kw):
+        seen.append(kw["deadline_at"])
+        yield _Resp(chunks=(b"{}",))
+
+    monkeypatch.setattr(AS, "_open_download", fake_open)
+    AS._api_get(URL, timeout=5.0)
+    AS._api_get(URL, timeout=20.0)
+    AS._api_get(URL, timeout=20.0, deadline_s=7.0)
+    assert seen == [130.0, 140.0, 107.0]
+
+
+def test_the_api_budget_is_not_clipped_to_the_render_asset_budget(monkeypatch):
+    """The searches must still run once the asset budget is spent, to find cached files."""
+    stream = _with(_Stream({URL: _Resp(chunks=(b'{"a": 1}',))}), monkeypatch)
+    with AS.asset_budget(-1.0):
+        assert AS._api_get(URL, timeout=5.0).json() == {"a": 1}
+    assert len(stream.requests) == 1
+
+
+def test_a_stalled_dns_lookup_fails_the_call_before_any_request(monkeypatch):
+    stream = _with(_Stream({URL: _Resp(chunks=(b"{}",))}), monkeypatch)
+    monkeypatch.setattr(AS, "_dns_in_time", lambda host, port, timeout: False)
+    with pytest.raises(ValueError, match="DNS"):
+        AS._api_get(URL, timeout=5.0)
+    assert stream.requests == []
+
+
+def test_a_plain_http_or_odd_api_url_is_refused_before_any_request(monkeypatch):
+    stream = _with(_Stream({}), monkeypatch)
+    for bad in ("http://api.example/x", "https://user:pw@api.example/x", "https://api.example:8443/x", "ftp://x/y"):
+        with pytest.raises(ValueError, match="not allowed"):
+            AS._api_get(bad, timeout=5.0)
+    assert stream.requests == []
+
+
+def test_a_redirect_is_still_returned_not_followed(monkeypatch):
+    from tests.test_sourcer_download_guards import _redirect
+    stream = _with(_Stream({URL: _redirect("https://api.example/elsewhere")}), monkeypatch)
+    resp = AS._api_get(URL, timeout=5.0)
+    assert resp.status_code in AS._REDIRECT_STATUSES and len(stream.requests) == 1
+    with pytest.raises(httpx.HTTPStatusError):
+        resp.raise_for_status()
+
+
+def test_a_soft_time_limit_in_an_api_call_passes_through(monkeypatch):
+    from celery.exceptions import SoftTimeLimitExceeded
+    from contextlib import contextmanager
+
+    @contextmanager
+    def boom(*a, **k):
+        raise SoftTimeLimitExceeded()
+        yield
+
+    monkeypatch.setattr(AS, "_http_stream", boom)
+    with pytest.raises(SoftTimeLimitExceeded):
+        AS._api_get(URL, timeout=5.0)
+
+
+def test_the_body_read_is_checked_against_the_deadline_chunk_by_chunk(monkeypatch):
+    """Ticks: the budget's start, the hop's pre-check, then the first chunk's check -- already past it."""
+    _with(_Stream({URL: _Resp(chunks=(b"{", b"}"))}), monkeypatch)
+    monkeypatch.setattr(AS, "_monotonic", _fake_clock(100.0, 100.0, after=999.0))
+    with pytest.raises(ValueError, match="too slow"):
+        AS._api_get(URL, timeout=5.0)

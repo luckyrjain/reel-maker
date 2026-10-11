@@ -325,8 +325,12 @@ def _dns_in_time(host: str, port: int, timeout: float) -> bool:
 
 @contextmanager
 def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = None,
-                   deadline_at: "float | None" = None):
-    """Stream a GET of `url`, following redirects by hand so every hop is checked by `url_ok`.
+                   deadline_at: "float | None" = None, method: str = "GET", params=None, json=None,
+                   follow_redirects: bool = True):
+    """Stream a request to `url` (GET by default), following redirects by hand so every hop is checked by `url_ok`.
+
+    `method`/`params`/`json` are for the API calls (`_api_call`); `follow_redirects=False` yields a
+    redirect response to the caller as it is (the API calls never follow one).
 
     Raises ValueError for a disallowed URL (first or redirected), a redirect with no Location, or
     more than `_MAX_REDIRECTS` hops, if the wall-clock `deadline_at` has passed before a hop, or if a
@@ -342,6 +346,10 @@ def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = N
         "timeout": timeout,
         "headers": {**(headers or {}), "Accept-Encoding": "identity"},
     }
+    if params is not None:
+        kwargs["params"] = params
+    if json is not None:
+        kwargs["json"] = json
     for _ in range(_MAX_REDIRECTS + 1):
         hop_kwargs = kwargs
         if deadline_at is not None:
@@ -359,8 +367,8 @@ def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = N
             raise ValueError("download too slow: DNS resolution did not finish in time")
         guard = _Watchdog(deadline_at)
         try:
-            with _http_stream("GET", url, extensions={"trace": guard.trace}, **hop_kwargs) as r:
-                if r.status_code not in _REDIRECT_STATUSES:
+            with _http_stream(method, url, extensions={"trace": guard.trace}, **hop_kwargs) as r:
+                if not follow_redirects or r.status_code not in _REDIRECT_STATUSES:
                     yield r
                     if guard.fired:
                         # the body ended "cleanly" only because we shut the connection down (a
@@ -383,8 +391,18 @@ def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = N
     raise ValueError("too many redirects")
 
 
-def _api_call(method: str, url: str, limit: int, *, headers=None, timeout: float, params=None, json=None):
-    """One API request, streamed through `_http_stream` and read at most `limit` bytes.
+_API_MIN_DEADLINE_S = 30.0
+
+
+def _any_https_host(url) -> bool:
+    """URL check for the API calls: https, default port, a plain host. The hosts are constants in this
+    module (not remote-controlled), so unlike the download hosts there is no allowlist to enforce."""
+    return _https_host(url) is not None
+
+
+def _api_call(method: str, url: str, limit: int, *, headers=None, timeout: float, params=None, json=None,
+              deadline_s: "float | None" = None, url_ok=_any_https_host):
+    """One API request, streamed through `_open_download` and read at most `limit` bytes.
 
     `httpx.get` / `httpx.post` read the WHOLE body before returning, so a hostile or broken upstream
     could make the worker buffer gigabytes before any size check ran. Here `Accept-Encoding: identity`
@@ -392,10 +410,21 @@ def _api_call(method: str, url: str, limit: int, *, headers=None, timeout: float
     redirect is followed (same as the httpx functions), reading stops with `_TooLarge` as soon as
     `limit` is crossed, and what was read is returned as a real `httpx.Response` (`.json()`,
     `.content`, `.headers`, `.raise_for_status()` work as call sites expect).
+
+    The call also has a wall-clock budget (`deadline_s`, default `max(30 s, 2 x timeout)`), because
+    httpx's timeout is per read: a host dripping headers, a chunked size line or the body would
+    otherwise hold the worker for as long as it likes. It gets the same guards as a download -- the
+    per-hop timeout clamp, the DNS gate and the connection `_Watchdog` -- and a spent budget raises
+    `ValueError("download too slow ...")`, which every caller treats like any other failed request.
+    It is NOT clipped to `asset_budget()`: the searches must still run after it is spent so that cached
+    files can be found and served.
     """
-    with _http_stream(method, url, headers={**(headers or {}), "Accept-Encoding": "identity"},
-                      timeout=timeout, follow_redirects=False, params=params, json=json) as r:
-        body = b"".join(_iter_capped(r, limit))
+    if deadline_s is None:
+        deadline_s = max(_API_MIN_DEADLINE_S, 2 * timeout)
+    deadline_at = _monotonic() + deadline_s
+    with _open_download(url, url_ok, timeout=timeout, headers=headers, deadline_at=deadline_at,
+                        method=method, params=params, json=json, follow_redirects=False) as r:
+        body = b"".join(_iter_capped(r, limit, deadline_at))
         return httpx.Response(r.status_code, headers=r.headers, content=body,
                               request=httpx.Request(method, url))
 
@@ -491,14 +520,16 @@ def _sniff_ok(kind: str, head) -> bool:
 
 
 def _image_ok(source) -> bool:
-    """True if Pillow can identify `source` (image bytes or a Path) and it declares <= _MAX_IMAGE_PIXELS.
+    """True if Pillow can decode `source` (image bytes or a Path) and it declares <= _MAX_IMAGE_PIXELS.
 
-    Reads the HEADER only (`Image.open` is lazy; pixels are never decoded). An unidentifiable or
-    truncated file, a file Pillow itself calls a decompression bomb (> 2x its own limit raises at open)
-    and a missing path are all "not ok" -- a refusal, not an exception. Pillow's own
-    `DecompressionBombWarning` (a soft warning between 1x and 2x its limit) is silenced: the cap here is
-    the one that decides. Only the HEADER is read, so a file truncated after its header still passes (the
-    byte cap and the transport already fail a truncated download). A TRANSIENT failure (`MemoryError`, or
+    The declared size is read from the header first, and the pixels are decoded (`load()`) only when it
+    is within the cap, so the decode is bounded (<= ~150 MB for 8-bit RGB; a JPEG is decoded at 1/8
+    scale via DCT scaling, which still reads the whole entropy-coded stream, so truncation is caught
+    without the full-size buffer). An unidentifiable or truncated/corrupt file, a file Pillow itself calls
+    a decompression bomb (> 2x its own limit raises at open) and a missing path are all "not ok" -- a
+    refusal, not an exception. Pillow's own `DecompressionBombWarning` (a soft warning between 1x and 2x
+    its limit) is silenced: the cap here is the one that decides. Only the first frame of an animated
+    file is decoded. A TRANSIENT failure (`MemoryError`, or
     an `OSError` carrying an errno other than "no such file": EMFILE, EIO, ...) says nothing about the
     image and is re-raised, so a caller never deletes a good (possibly paid-for) cached file over it.
     `SoftTimeLimitExceeded` is re-raised.
@@ -509,7 +540,11 @@ def _image_ok(source) -> bool:
             warnings.simplefilter("ignore")
             with Image.open(io.BytesIO(source) if isinstance(source, (bytes, bytearray)) else source) as im:
                 width, height = im.size
-        return width * height <= _MAX_IMAGE_PIXELS
+                if width * height > _MAX_IMAGE_PIXELS:
+                    return False
+                im.draft("RGB", (max(1, width // 8), max(1, height // 8)))   # JPEG only; a no-op otherwise
+                im.load()                                                    # raises on a truncated file
+        return True
     except SoftTimeLimitExceeded:
         raise
     except MemoryError:
@@ -523,11 +558,56 @@ def _image_ok(source) -> bool:
         return False
 
 
-def _require_image(content: bytes) -> None:
-    """Raise ValueError (after a WARNING) if `content` is not `_image_ok`."""
-    if not _image_ok(content):
-        _log.warning("Discarding a download that is not a readable image of a reasonable size")
-        raise ValueError("downloaded bytes are not a readable image")
+def _downscale_jpeg(content: bytes) -> "bytes | None":
+    """A JPEG over `_MAX_IMAGE_PIXELS`, re-encoded smaller; None for anything else or on any failure.
+
+    Wikimedia originals are often JPEG photos over the cap (a 75 Mpx featured picture) and the only
+    alternative, the summary thumbnail, is ~320 px wide: far too small for a 1080x1920 frame. A JPEG
+    can be decoded at 1/2, 1/4 or 1/8 scale (DCT scaling) without ever allocating the full-size
+    buffer, so such a picture is decoded at the smallest reduction that fits, its EXIF rotation is baked
+    in (the re-encode drops the tag) and it is saved as a JPEG. Only up to Pillow's own bomb limit
+    (2x `Image.MAX_IMAGE_PIXELS`, ~179 Mpx) -- beyond it `Image.open` raises and this returns None, as it
+    does for PNG/WebP/TIFF/GIF (no cheap partial decode), so the caller falls back to the thumbnail.
+    """
+    from PIL import Image, ImageOps
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with Image.open(io.BytesIO(content)) as im:
+                if im.format != "JPEG":
+                    return None
+                width, height = im.size
+                if width * height <= _MAX_IMAGE_PIXELS:
+                    return None
+                scale = 2
+                while scale < 8 and (width // scale) * (height // scale) > _MAX_IMAGE_PIXELS:
+                    scale *= 2
+                im.draft("RGB", (max(1, width // scale), max(1, height // scale)))
+                im.load()
+                out = ImageOps.exif_transpose(im).convert("RGB")
+        if out.width * out.height > _MAX_IMAGE_PIXELS:
+            out.thumbnail((out.width, out.height))          # unreachable in practice; keep the cap a guarantee
+            factor = (_MAX_IMAGE_PIXELS / (out.width * out.height)) ** 0.5
+            out = out.resize((max(1, int(out.width * factor)), max(1, int(out.height * factor))))
+        buf = io.BytesIO()
+        out.save(buf, format="JPEG", quality=92)
+        return buf.getvalue()
+    except SoftTimeLimitExceeded:
+        raise
+    except Exception:
+        return None
+
+
+def _fit_image(content: bytes) -> bytes:
+    """`content` if `_image_ok`; else a downscaled copy of an oversized JPEG; else ValueError (after a WARNING)."""
+    if _image_ok(content):
+        return content
+    smaller = _downscale_jpeg(content)
+    if smaller is not None and _image_ok(smaller):
+        _log.info("Downscaled an oversized JPEG (%d -> %d bytes)", len(content), len(smaller))
+        return smaller
+    _log.warning("Discarding a download that is not a readable image of a reasonable size")
+    raise ValueError("downloaded bytes are not a readable image")
 
 
 def _require_media(kind: str, head) -> None:
@@ -775,7 +855,7 @@ class WikipediaImageSource:
                 if content is None:
                     continue
                 _require_media("image", content[:16])
-                _require_image(content)
+                content = _fit_image(content)
                 _atomic_write(lp, content)
                 local_path = lp
                 break
