@@ -11,7 +11,6 @@ filling the disk). A rejected HuggingFace body is neither cached nor billed.
 import logging
 from unittest.mock import MagicMock, patch
 
-import httpx
 import pytest
 
 from engine.render import asset_sourcer as AS

@@ -42,7 +42,7 @@ def _with(stream, monkeypatch):
 # ── _api_get / _api_post themselves ──────────────────────────────────────────────────────────
 
 def test_a_response_is_a_real_httpx_response_built_from_what_was_read(monkeypatch):
-    stream = _with(_Stream({URL: _Resp(chunks=(b'{"a":', b' 1}'), headers={"content-type": "application/json"})}), monkeypatch)
+    _with(_Stream({URL: _Resp(chunks=(b'{"a":', b' 1}'), headers={"content-type": "application/json"})}), monkeypatch)
     resp = AS._api_get(URL, timeout=5.0)
     assert isinstance(resp, httpx.Response) and resp.status_code == 200
     assert resp.json() == {"a": 1} and resp.content == b'{"a": 1}'

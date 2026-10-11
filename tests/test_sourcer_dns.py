@@ -19,8 +19,7 @@ from unittest.mock import patch
 import pytest
 
 from engine.render import asset_sourcer as AS
-from engine.render.asset_sourcer import PexelsVideoSource, WikipediaImageSource
-from tests.test_sourcer_download_guards import PEXELS_OK, WIKI_OK, _Resp, _Stream, _pexels, _redirect, _wiki
+from tests.test_sourcer_download_guards import PEXELS_OK, _Resp, _Stream, _pexels, _redirect, _wiki
 from tests.test_sourcer_selection import _summary, _video, _vf
 
 pytestmark = pytest.mark.real_dns

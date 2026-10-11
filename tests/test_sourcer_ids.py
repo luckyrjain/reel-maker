@@ -16,7 +16,7 @@ from engine.render import asset_sourcer as AS
 from tests.test_sourcer_download_guards import (
     PEXELS_OK, WIKI_OK, WIKI_THUMB, _Resp, _Stream, _pexels, _wiki,
 )
-from tests.test_sourcer_selection import _video, _vf
+from tests.test_sourcer_selection import _vf
 
 
 def _hit(vid_id, link=PEXELS_OK):

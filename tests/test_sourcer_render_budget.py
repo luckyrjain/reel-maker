@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from engine.render import asset_sourcer as AS
-from tests.test_sourcer_download_guards import PEXELS_OK, WIKI_OK, _Resp, _Stream, _fake_clock, _pexels, _wiki
+from tests.test_sourcer_download_guards import PEXELS_OK, WIKI_OK, _Resp, _Stream, _pexels, _wiki
 from tests.test_sourcer_selection import _summary, _video, _vf
 
 

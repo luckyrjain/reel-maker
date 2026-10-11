@@ -15,11 +15,10 @@ import httpx
 import pytest
 
 from engine.render import asset_sourcer as AS
-from engine.render.asset_sourcer import PexelsVideoSource, WikipediaImageSource
 from tests.test_sourcer_download_guards import (
     PEXELS_OK, WIKI_OK, WIKI_THUMB, _Resp, _Stream, _fake_clock, _pexels, _wiki,
 )
-from tests.test_sourcer_selection import _json_resp, _summary, _video, _vf
+from tests.test_sourcer_selection import _summary, _video, _vf
 
 
 # ── per-hop timeout clamp ─────────────────────────────────────────────────────────────────────
