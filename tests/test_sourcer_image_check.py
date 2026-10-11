@@ -349,14 +349,108 @@ def test_exif_rotation_is_baked_into_the_downscaled_jpeg(monkeypatch):
     assert h > w                                                         # landscape + "rotate 90" -> portrait
 
 
-@pytest.mark.parametrize("fmt", ["PNG", "GIF", "TIFF", "WEBP"])
-def test_only_jpegs_are_downscaled(monkeypatch, fmt):
+def _encoded(fmt, size, **kw):
+    buf = io.BytesIO()
+    img = Image.effect_noise(size, 60).convert("RGBA" if kw.pop("alpha", False) else "RGB")
+    img.save(buf, format=fmt, **kw)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("fmt,expect", [("PNG", "PNG"), ("GIF", "JPEG"), ("TIFF", "JPEG"), ("WEBP", "JPEG")])
+def test_a_non_jpeg_over_the_cap_is_downscaled_too(monkeypatch, fmt, expect):
+    """PNG stays PNG (lossless); anything else becomes a JPEG. The size window is _MAX_FULL_DECODE_PIXELS."""
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    big = _encoded(fmt, (256, 192))
+    assert AS._image_ok(big) is False
+    fitted = AS._fit_image(big)
+    (w, h), out_fmt = _size_and_format(fitted)
+    assert out_fmt == expect and w * h <= CAP and w * h > CAP // 8
+    assert abs(w / h - 256 / 192) < 0.1 and AS._image_ok(fitted) is True
+
+
+def test_a_png_keeps_its_alpha_channel(monkeypatch):
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    with Image.open(io.BytesIO(AS._fit_image(_encoded("PNG", (256, 192), alpha=True)))) as im:
+        assert im.mode == "RGBA"
+
+
+def test_a_palette_png_is_handled(monkeypatch):
     monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
     buf = io.BytesIO()
-    Image.effect_noise((256, 192), 60).convert("RGB").save(buf, format=fmt)
-    assert AS._downscale_jpeg(buf.getvalue()) is None
-    with pytest.raises(ValueError, match="not a readable image"):
-        AS._fit_image(buf.getvalue())
+    Image.effect_noise((256, 192), 60).convert("P").save(buf, format="PNG")
+    (w, h), fmt = _size_and_format(AS._fit_image(buf.getvalue()))
+    assert fmt == "PNG" and w * h <= CAP
+
+
+def test_a_16_bit_tiff_is_handled(monkeypatch):
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    buf = io.BytesIO()
+    Image.effect_noise((256, 192), 60).convert("I;16").save(buf, format="TIFF")
+    (w, h), fmt = _size_and_format(AS._fit_image(buf.getvalue()))
+    assert fmt == "JPEG" and w * h <= CAP
+
+
+def test_a_non_jpeg_past_the_full_decode_window_is_refused_without_being_decoded(monkeypatch):
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    monkeypatch.setattr(AS, "_MAX_FULL_DECODE_PIXELS", 2 * CAP)
+    big = _encoded("PNG", (256, 192))
+    with patch.object(Image.Image, "load", side_effect=AssertionError("decoded an image past the window")):
+        assert AS._downscale_decoded(big) is None
+    with pytest.raises(AS._OversizedImage):
+        AS._fit_image(big)
+
+
+def test_the_full_decode_window_boundary(monkeypatch):
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    big = _encoded("PNG", (256, 192))
+    monkeypatch.setattr(AS, "_MAX_FULL_DECODE_PIXELS", 256 * 192)
+    assert AS._downscale_decoded(big) is not None                     # exactly at the window: decoded
+    monkeypatch.setattr(AS, "_MAX_FULL_DECODE_PIXELS", 256 * 192 - 1)
+    assert AS._downscale_decoded(big) is None
+
+
+def test_the_full_decode_window_is_eighty_megapixels():
+    assert AS._MAX_FULL_DECODE_PIXELS == 80_000_000
+
+
+def test_downscale_decoded_leaves_a_jpeg_and_an_in_cap_image_alone(monkeypatch):
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    assert AS._downscale_decoded(_jpeg((256, 192))) is None           # JPEG has its own path
+    assert AS._downscale_decoded(_encoded("PNG", (40, 40))) is None   # within the cap: nothing to do
+
+
+@pytest.mark.parametrize("orientation,landscape_in,portrait_out", [(6, True, True), (8, True, True), (1, True, False),
+                                                                    (3, True, False)])
+def test_exif_rotation_is_baked_into_a_downscaled_png(monkeypatch, orientation, landscape_in, portrait_out):
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    exif = Image.Exif()
+    exif[0x0112] = orientation
+    (w, h), _ = _size_and_format(AS._fit_image(_encoded("PNG", (256, 128), exif=exif)))
+    assert (h > w) is portrait_out
+
+
+def test_a_truncated_oversized_png_is_not_rescued(monkeypatch):
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    big = _encoded("PNG", (256, 192))
+    assert AS._downscale_decoded(big[: len(big) // 2]) is None
+    with pytest.raises(ValueError):
+        AS._fit_image(big[: len(big) // 2])
+
+
+def test_an_animated_gif_is_downscaled_from_its_first_frame(monkeypatch):
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    frames = [Image.effect_noise((256, 192), 60).convert("P") for _ in range(3)]
+    buf = io.BytesIO()
+    frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:])
+    (w, h), fmt = _size_and_format(AS._fit_image(buf.getvalue()))
+    assert fmt == "JPEG" and w * h <= CAP
+
+
+def test_a_soft_time_limit_is_not_swallowed_by_the_full_decode(monkeypatch):
+    from celery.exceptions import SoftTimeLimitExceeded
+    with patch("PIL.Image.open", side_effect=SoftTimeLimitExceeded()):
+        with pytest.raises(SoftTimeLimitExceeded):
+            AS._downscale_decoded(b"x")
 
 
 def test_a_truncated_oversized_jpeg_is_not_rescued(monkeypatch):
@@ -407,8 +501,9 @@ def test_wikipedia_an_oversized_jpeg_original_is_used_downscaled_not_replaced_by
     assert [p.name for p in tmp_path.iterdir()] == ["wiki_123.jpg"]
 
 
-def test_wikipedia_an_oversized_png_original_still_falls_back_to_the_thumbnail(tmp_path, monkeypatch):
+def test_wikipedia_an_oversized_png_original_past_the_decode_window_falls_back_to_the_thumbnail(tmp_path, monkeypatch):
     monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    monkeypatch.setattr(AS, "_MAX_FULL_DECODE_PIXELS", 2 * CAP)
     buf = io.BytesIO()
     Image.effect_noise((256, 192), 60).convert("RGB").save(buf, format="PNG")
     thumb = _jpeg((16, 12))
@@ -421,7 +516,7 @@ def test_wikipedia_a_downscale_is_logged(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
     caplog.set_level(logging.INFO, logger=AS.__name__)
     _wiki(tmp_path, _summary(thumbnail=None), _Stream({WIKI_OK: _Resp(chunks=(_jpeg((256, 192)),))}))
-    assert "Downscaled an oversized JPEG" in caplog.text
+    assert "Downscaled an oversized image" in caplog.text
 
 
 def test_a_downscaled_result_that_is_still_unusable_is_refused(monkeypatch):
@@ -445,6 +540,7 @@ def _png_noise(size):
 def _two_searches(tmp_path, monkeypatch, original, thumb, original_url=PNG_ORIG):
     """Two searches of one page whose original is a .png (or `original_url`) and whose thumbnail is a .jpg."""
     monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    monkeypatch.setattr(AS, "_MAX_FULL_DECODE_PIXELS", 2 * CAP)       # the original is too big to decode here
     summary = _summary(original=original_url)
     first = _Stream({original_url: _Resp(chunks=(original,)), WIKI_THUMB: _Resp(chunks=(thumb,))})
     r1 = _wiki(tmp_path, summary, first)
@@ -525,3 +621,35 @@ def test_remembering_the_original_does_not_block_a_thumbnail_that_shares_its_pat
     thumb = _jpeg((16, 12))
     first, r1, _, _ = _two_searches(tmp_path, monkeypatch, _png_noise((256, 192)), thumb, original_url=WIKI_OK)
     assert r1.local_path.read_bytes() == thumb and first.urls == [WIKI_OK, WIKI_THUMB]
+
+
+def test_wikipedia_an_oversized_png_original_within_the_window_is_used_downscaled(tmp_path, monkeypatch):
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    stream = _Stream({PNG_ORIG: _Resp(chunks=(_png_noise((256, 192)),)), WIKI_THUMB: _Resp(chunks=(_jpeg((16, 12)),))})
+    result = _wiki(tmp_path, _summary(original=PNG_ORIG), stream)
+    assert stream.urls == [PNG_ORIG] and result.local_path.name == "wiki_123.png"
+    (w, h), fmt = _size_and_format(result.local_path.read_bytes())
+    assert fmt == "PNG" and w * h <= CAP and w * h > 16 * 12
+    assert _refused(tmp_path) == []                                   # nothing to remember: it was used
+
+
+def test_the_big_image_is_shrunk_with_an_integer_reduce_not_a_full_size_resize(monkeypatch):
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    seen = []
+    real = Image.Image.reduce
+
+    def spy(self, factor, *a, **k):
+        seen.append(factor)
+        return real(self, factor, *a, **k)
+
+    with patch.object(Image.Image, "reduce", spy):
+        AS._downscale_decoded(_encoded("PNG", (256, 192)))
+    assert seen == [4]                                                # ceil(sqrt(49152 / 4096))
+
+
+def test_rounding_up_in_reduce_never_leaves_the_result_over_the_cap(monkeypatch):
+    """reduce() rounds dimensions UP: 11x67 at factor 2 is 6x34 = 204 px, over a cap of 200."""
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", 200)
+    monkeypatch.setattr(AS, "_MAX_FULL_DECODE_PIXELS", 10_000)
+    (w, h), _ = _size_and_format(AS._downscale_decoded(_encoded("PNG", (11, 67))))
+    assert w * h <= 200

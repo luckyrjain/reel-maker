@@ -98,6 +98,10 @@ _MAX_IMAGE_BYTES = 50 * 1024 * 1024    # Wikipedia originals are rarely over ~20
 # The byte cap says nothing about declared PIXELS: a 140 KB PNG can declare 12000x12000, and the compositor's
 # `Image.open(...).convert("RGB")` then allocates ~430 MB. 50 Mpx is ~7000x7000, far past any photo used here.
 _MAX_IMAGE_PIXELS = 50_000_000
+# A non-JPEG image has no cheap partial decode: shrinking one means decoding it at full size first. Up to
+# this many pixels that is done (<= ~320 MB transient even for RGBA); above it the image is refused. A JPEG
+# is decoded at 1/2-1/8 scale instead and has no such limit (only Pillow's own bomb limit).
+_MAX_FULL_DECODE_PIXELS = 80_000_000
 _MAX_API_JSON_BYTES = 8 * 1024 * 1024   # Pexels search / Wikipedia lookups are a few KB; refuse to parse more
 _MAX_REDIRECTS = 3
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
@@ -670,16 +674,67 @@ def _is_oversized(content: bytes) -> bool:
         return False
 
 
+_ORIENTATION_TRANSPOSE = {2: "FLIP_LEFT_RIGHT", 3: "ROTATE_180", 4: "FLIP_TOP_BOTTOM", 5: "TRANSPOSE",
+                          6: "ROTATE_270", 7: "TRANSVERSE", 8: "ROTATE_90"}
+
+
+def _downscale_decoded(content: bytes) -> "bytes | None":
+    """A non-JPEG image over `_MAX_IMAGE_PIXELS`, decoded in full and re-encoded smaller; None otherwise.
+
+    PNG / WebP / TIFF / GIF have no partial decode, so the whole image is decoded (only if it is within
+    `_MAX_FULL_DECODE_PIXELS`, which bounds the transient memory), shrunk with an integer box `reduce()`
+    (cheap, no resampling allocation of the big image), has its EXIF orientation baked in (the reduce drops
+    the metadata) and is re-encoded: PNG stays PNG (lossless, alpha kept), everything else becomes a
+    JPEG. Only the first frame of an animated file is used -- the compositor also opens just that
+    (`Image.open(...).convert("RGB")`). None for a JPEG (see `_downscale_jpeg`), for an image outside the
+    size window, or on any failure.
+    """
+    from PIL import Image
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with Image.open(io.BytesIO(content)) as im:
+                fmt = im.format
+                width, height = im.size
+                pixels = width * height
+                if fmt == "JPEG" or pixels <= _MAX_IMAGE_PIXELS or pixels > _MAX_FULL_DECODE_PIXELS:
+                    return None
+                orientation = im.getexif().get(0x0112)
+                im.load()
+                factor = max(2, math.ceil(math.sqrt(pixels / _MAX_IMAGE_PIXELS)))
+                try:
+                    small = im.reduce(factor)
+                except Exception:                       # modes reduce() does not support (e.g. palette)
+                    small = im.convert("RGBA" if "A" in im.getbands() or "transparency" in im.info else "RGB").reduce(factor)
+        name = _ORIENTATION_TRANSPOSE.get(orientation)
+        if name:
+            small = small.transpose(getattr(Image.Transpose, name))
+        if small.width * small.height > _MAX_IMAGE_PIXELS:
+            shrink = (_MAX_IMAGE_PIXELS / (small.width * small.height)) ** 0.5
+            small = small.resize((max(1, int(small.width * shrink)), max(1, int(small.height * shrink))))
+        buf = io.BytesIO()
+        if fmt == "PNG":
+            small.convert("RGBA" if "A" in small.getbands() else "RGB").save(buf, format="PNG")
+        else:
+            small.convert("RGB").save(buf, format="JPEG", quality=92)
+        return buf.getvalue()
+    except SoftTimeLimitExceeded:
+        raise
+    except Exception:
+        return None
+
+
 def _fit_image(content: bytes) -> bytes:
-    """`content` if `_image_ok`; else a downscaled copy of an oversized JPEG; else ValueError (after a WARNING).
+    """`content` if `_image_ok`; else a downscaled copy of an oversized image; else ValueError (after a WARNING).
 
     The ValueError is `_OversizedImage` when the image is readable but too big and cannot be downscaled
-    (PNG/WebP/TIFF/GIF, or a JPEG past Pillow's bomb limit), so the caller can remember it."""
+    (a non-JPEG over `_MAX_FULL_DECODE_PIXELS`, or a JPEG past Pillow's bomb limit), so the caller can
+    remember it."""
     if _image_ok(content):
         return content
-    smaller = _downscale_jpeg(content)
+    smaller = _downscale_jpeg(content) or _downscale_decoded(content)
     if smaller is not None and _image_ok(smaller):
-        _log.info("Downscaled an oversized JPEG (%d -> %d bytes)", len(content), len(smaller))
+        _log.info("Downscaled an oversized image (%d -> %d bytes)", len(content), len(smaller))
         return smaller
     _log.warning("Discarding a download that is not a readable image of a reasonable size")
     if _is_oversized(content):

@@ -530,8 +530,18 @@ closed, as flagged below.
   `tests/test_sourcer_render_budget.py` (22) plus 3 in `test_render_task.py`.
 * **Review fixes to the above.** `_image_ok` re-raises `MemoryError` and errno-bearing `OSError`s (EMFILE, EIO) so a
   transient failure no longer deletes a cached (possibly paid-for) image; `_cached_media_ok` keeps the file and
-  logs. Known, accepted limits: a non-JPEG original over 50 Mpx (or a JPEG past Pillow's bomb limit) still falls
+  logs. Known, accepted limits: a non-JPEG original over 80 Mpx (or a JPEG past Pillow's bomb limit) still falls
   back to the small thumbnail (but see below: it is no longer re-downloaded on every search).
+* **Non-JPEG originals are downscaled too.** A PNG / WebP / TIFF / GIF between the 50 Mpx cap and
+  `_MAX_FULL_DECODE_PIXELS` (80 Mpx, so <= ~320 MB transient even for RGBA) is decoded in full (`load()`), shrunk by
+  an integer box `reduce()` (factor `ceil(sqrt(pixels / cap))`, no resampling of the big image; palette images fall
+  back to a converted copy), re-oriented from the EXIF tag read BEFORE the reduce (it drops the metadata), and
+  re-encoded: PNG stays PNG (lossless, alpha kept), everything else becomes a JPEG. A final resize guards the
+  case where `reduce()` rounds dimensions UP past the cap (11x67 at factor 2 is 204 px against a cap of 200).
+  Beyond 80 Mpx a non-JPEG is not decoded at all (no partial decode exists, so that is the memory bound) and
+  still falls back to the thumbnail, remembered by the marker below. The image check and the downscale use only
+  the first frame of an animated file: the compositor opens just that frame, so a later one cannot matter (this
+  was listed as a limit before; it is not one).
 * **Oversized originals are remembered.** The thumbnail that replaces a refused original is cached under its
   own extension, so the `exists()` check never fired for the original's path and a non-JPEG original (up to
   50 MB) was downloaded and refused on every search. `_fit_image` now raises `_OversizedImage` for a readable,
