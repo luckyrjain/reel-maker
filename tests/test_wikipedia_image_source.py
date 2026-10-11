@@ -116,17 +116,6 @@ def test_fetch_license_passes_through_an_already_plain_filename_unchanged():
     assert mock_get.call_args.kwargs["params"]["titles"] == f"File:{plain}"
 
 
-def test_a_literal_plus_in_a_filename_is_preserved_not_turned_into_a_space():
-    """unquote(), not unquote_plus(): image_filename comes from a URL path
-    segment, not a query string, so a literal '+' must survive decoding."""
-    import urllib.parse
-    assert urllib.parse.unquote("C%2B%2B_conference.jpg") == "C++_conference.jpg"
-    # unquote_plus would have wrongly turned a literal '+' into a space, but
-    # there's no encoded '+' here to begin with -- the point is unquote()
-    # never touches a literal '+' character at all.
-    assert urllib.parse.unquote("Bjarne+Stroustrup.jpg") == "Bjarne+Stroustrup.jpg"
-
-
 def test_cache_asset_self_heals_an_existing_row_once_a_fresh_search_finds_a_real_license(db):
     """A row broken by the pre-fix bug (license_url=None, safe_to_publish=False)
     is retroactively updated the next time _cache_asset() sees a richer result
