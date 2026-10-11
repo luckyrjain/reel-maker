@@ -480,7 +480,7 @@ closed, as flagged below.
   not covered; an abandoned hung lookup leaves a daemon thread. A conftest autouse no-op keeps real lookups
   out of the suite; `@pytest.mark.real_dns` opts in. `tests/test_sourcer_dns.py` (25); 14 mutants, all
   killed but a dead `strip("[]")` (removed) and one equivalent.
-- **API response size (partly closed).** The six API calls (Pexels search, Wikipedia opensearch / summary /
+- **API response size (closed in "Follow-up: the last three limits").** The six API calls (Pexels search, Wikipedia opensearch / summary /
   imageinfo, both HuggingFace generations) use `httpx.get` / `post`, which read the whole body. Streaming
   them would route six more calls through the `_http_stream` seam and rewrite ~120 test patches whose fakes
   only provide `.json()`, so the transient read buffer was **still unbounded** at this point (closed in "Follow-up: the last three limits"). What is bounded is what is
@@ -504,13 +504,23 @@ closed, as flagged below.
   and cached images. Pillow's own bomb warning is silenced so the cap here decides; a test with a lowered Pillow
   limit pins that (the first mutation run found that survivor). `tests/test_sourcer_image_check.py` (36, marker
   `real_image_check`; other tests get a permissive check because their fakes serve placeholder bytes).
-* **Per-render total.** `asset_budget(seconds)` (a `ContextVar` deadline, nested budgets only tighten) wraps
-  `render_cut`'s beat loop with `RENDER_ASSET_BUDGET_S` = 1200. Each Pexels / Wikipedia search budget is clipped
-  to it; once spent no download starts and `_generate_gated_hf_asset` skips the paid tiers (cached files are
-  still served by the search paths; a skipped HF tier cannot serve its cache, which is accepted because a
-  pinned beat never reaches `resolve_beat_assets()`). TTS time inside the loop counts against the budget.
-  `tests/test_sourcer_render_budget.py` (20) plus 2 in `test_render_task.py`.
+* **Per-render total.** `asset_budget(seconds)` (a `ContextVar` deadline, nested budgets only tighten) with
+  `RENDER_ASSET_BUDGET_S` = 1200. `render_cut` wraps each beat's `resolve_or_reuse()` in it with what is left of the
+  total after the earlier beats' ASSET time (the first version wrapped the whole loop, so slow TTS starved later
+  beats of footage -- found by review). Each Pexels / Wikipedia search budget is clipped to it; once spent no
+  download starts and the HuggingFace `generate()` calls refuse the paid API. The refusal sits AFTER their cache
+  lookup (the first version put it in `_generate_gated_hf_asset`, before the lookup, so a cached, already-paid-for
+  asset became a black frame and its old pin was dropped -- found by review). It gates starts only: the small API
+  calls, the 429 sleep and anything in flight are not interrupted.
+  `tests/test_sourcer_render_budget.py` (22) plus 3 in `test_render_task.py`.
+* **Review fixes to the above.** `_image_ok` re-raises `MemoryError` and errno-bearing `OSError`s (EMFILE, EIO) so a
+  transient failure no longer deletes a cached (possibly paid-for) image; `_cached_media_ok` keeps the file and
+  logs. Known, accepted limits: the check reads only the header (a file truncated after it passes), a Wikipedia
+  original refused for pixels with a thumbnail of another extension is re-downloaded on every search, an original
+  over 50 Mpx falls back to the small thumbnail, `_api_call` refuses a non-identity `Content-Encoding` and has no
+  deadline of its own.
 
-Mutation checks: 9 + 9 mutants over the image check and the budget, all killed (one survivor, the warning filter,
-got its own test). Nothing from the original follow-up lists is open.
+Mutation checks: the image check, the budget and the review fixes were mutation-tested (one survivor, the warning
+filter, got its own test); all other mutants were killed. The original follow-up lists are closed; the limits above are the
+residue.
 
