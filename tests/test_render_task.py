@@ -551,3 +551,104 @@ def test_no_music_cue_passes_none_without_querying_sourcer():
 
     fake_sourcer.find.assert_not_called()
     assert mock_composite.call_args.kwargs["music_path"] is None
+
+
+def test_the_beat_loop_runs_inside_the_render_asset_budget():
+    """Per-search budgets add up across beats; render_cut bounds the whole asset-sourcing loop."""
+    from engine.render import asset_sourcer as AS
+    from worker.tasks.render import render_cut
+
+    job, cut, reel = _job(), _cut(), _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else (
+        cut if model is models.Cut else reel
+    )
+    seen = []
+
+    def resolve(*a, **kw):
+        seen.append(AS._asset_deadline_at.get())
+        return [(MagicMock(), None)]
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.render.get_asset_sourcer"),
+        patch("worker.tasks.render.get_wiki_sourcer"),
+        patch("worker.tasks.render.get_hf_sourcer"),
+        patch("worker.tasks.render.get_hf_video_sourcer"),
+        patch("worker.tasks.render.get_tts_provider"),
+        patch("worker.tasks.render.resolve_or_reuse", side_effect=resolve),
+        patch("worker.tasks.render.record_stage"),
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"], _FAKE_SRT_PATH)),
+        patch.object(AS, "_monotonic", return_value=1000.0),
+        patch("worker.tasks.render._asset_clock", return_value=1000.0),
+    ):
+        render_cut(1)
+
+    assert seen == [1000.0 + AS.RENDER_ASSET_BUDGET_S] * 3          # one deadline, every beat
+    assert AS._asset_deadline_at.get() is None                      # and gone after the loop
+
+
+def test_the_budget_is_released_when_a_beat_fails():
+    from engine.render import asset_sourcer as AS
+    from worker.tasks.render import render_cut
+
+    job, cut, reel = _job(), _cut(), _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else (
+        cut if model is models.Cut else reel
+    )
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.render.get_asset_sourcer"),
+        patch("worker.tasks.render.get_wiki_sourcer"),
+        patch("worker.tasks.render.get_hf_sourcer"),
+        patch("worker.tasks.render.get_hf_video_sourcer"),
+        patch("worker.tasks.render.get_tts_provider"),
+        patch("worker.tasks.render.resolve_or_reuse", side_effect=RuntimeError("boom")),
+        patch("worker.tasks.render.record_stage"),
+    ):
+        with pytest.raises(RuntimeError):
+            render_cut(1)
+    assert AS._asset_deadline_at.get() is None
+
+
+def test_only_asset_time_counts_against_the_render_budget_not_tts():
+    """TTS can be slow (60 s timeout + retry per beat); it must not starve later beats of footage."""
+    from engine.render import asset_sourcer as AS
+    from worker.tasks.render import render_cut
+
+    job, cut, reel = _job(), _cut(), _reel()
+    reel.voiceover_mode = "voiceover"
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else (
+        cut if model is models.Cut else reel
+    )
+    t = [1000.0]
+    seen = []
+
+    def resolve(*a, **kw):
+        seen.append(AS._asset_deadline_at.get())
+        t[0] += 100.0                                    # 100 s of asset work per beat
+        return [(MagicMock(), None)]
+
+    tts = MagicMock()
+    tts.synth_to_budget.side_effect = lambda *a, **kw: t.__setitem__(0, t[0] + 500.0)  # 500 s of TTS per beat
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.render.get_asset_sourcer"),
+        patch("worker.tasks.render.get_wiki_sourcer"),
+        patch("worker.tasks.render.get_hf_sourcer"),
+        patch("worker.tasks.render.get_hf_video_sourcer"),
+        patch("worker.tasks.render.get_tts_provider", return_value=tts),
+        patch("worker.tasks.render.resolve_or_reuse", side_effect=resolve),
+        patch("worker.tasks.render.record_stage"),
+        patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"], _FAKE_SRT_PATH)),
+        patch.object(AS, "_monotonic", lambda: t[0]),
+        patch("worker.tasks.render._asset_clock", lambda: t[0]),
+    ):
+        render_cut(1)
+
+    B = AS.RENDER_ASSET_BUDGET_S
+    # beat k starts at 1000 + 600*k; its deadline is that + (B - 100*k) -- the earlier beats' TTS is not charged
+    assert seen == [1000.0 + B, 1600.0 + (B - 100.0), 2200.0 + (B - 200.0)]
