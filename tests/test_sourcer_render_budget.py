@@ -2,7 +2,8 @@
 
 Each search() has its own budget (900 s Pexels / 240 s Wikipedia), but a render resolves assets for every
 beat, so those add up to hours. `asset_budget(seconds)` sets one deadline for everything inside it
-(`render_cut` wraps its beat loop in it): each search's budget is clipped to what is left, no further
+(`render_cut` wraps each beat's `resolve_or_reuse()` in `asset_budget(RENDER_ASSET_BUDGET_S - asset
+time spent so far)`, so TTS time is not charged): each search's budget is clipped to what is left, no further
 download starts once it is spent, and the paid HuggingFace tiers are not called. A cached file is still
 served. Outside the context nothing changes, and no extra clock reading is made.
 """
@@ -252,3 +253,61 @@ def test_the_skip_is_logged(tmp_path, monkeypatch, caplog):
     with AS.asset_budget(-1.0):
         AS.HuggingFaceImageSource("k", "org/m", tmp_path).generate("q")
     assert "asset budget" in caplog.text
+
+
+# ── round-2: a refused HF call is visible as such in its StageEvent and in the log ────────────────────
+
+def test_the_video_skip_is_logged_too(tmp_path, monkeypatch, caplog):
+    import logging
+    caplog.set_level(logging.WARNING, logger=AS.__name__)
+    _clock(monkeypatch, 0.0)
+    with AS.asset_budget(-1.0):
+        AS.HuggingFaceVideoSource("k", "org/m", tmp_path).generate("q")
+    assert "Skipping HuggingFace video generation" in caplog.text
+
+
+def test_last_call_skipped_is_set_only_by_a_refusal_and_reset_by_the_next_call(tmp_path, monkeypatch):
+    _clock(monkeypatch, 0.0)
+    for src in (AS.HuggingFaceImageSource("k", "org/m", tmp_path), AS.HuggingFaceVideoSource("k", "org/m", tmp_path)):
+        assert src.last_call_skipped is False
+        with AS.asset_budget(-1.0):
+            assert src.generate("q") is None
+        assert src.last_call_skipped is True and src.last_call_was_generated is False
+        with patch(f"{AS.__name__}.httpx.post", return_value=_post_resp("text/plain", b"")):
+            src.generate("q")                                                 # budget not spent: a real attempt
+        assert src.last_call_skipped is False
+
+
+def test_a_cached_asset_served_after_the_budget_is_spent_is_not_marked_skipped(tmp_path, monkeypatch):
+    _clock(monkeypatch, 0.0)
+    _hf_image_cache_file(tmp_path).write_bytes(_png())
+    src = AS.HuggingFaceImageSource("k", "org/m", tmp_path)
+    with AS.asset_budget(-1.0):
+        assert src.generate("q") is not None
+    assert src.last_call_skipped is False
+
+
+def test_a_skipped_gated_call_records_why_in_its_stage_event(db_session, tmp_path, monkeypatch):
+    from api import models
+    _clock(monkeypatch, 0.0)
+    reel = models.Reel(context="c", niche="n")
+    db_session.add(reel)
+    db_session.flush()
+    src = AS.HuggingFaceImageSource("k", "org/m", tmp_path)
+    with AS.asset_budget(-1.0):
+        assert AS._generate_gated_hf_asset(db_session, reel.id, "asset_hf_image", src, "q", lambda r: 1.0) is None
+    ev = db_session.query(models.StageEvent).filter_by(stage="asset_hf_image").one()
+    assert ev.detail == {"cache_hit": False, "skipped": "asset_budget_spent"} and not ev.cost_usd
+
+
+def test_a_normal_gated_call_has_no_skipped_marker(db_session, tmp_path, monkeypatch):
+    from api import models
+    _clock(monkeypatch, 0.0)
+    reel = models.Reel(context="c", niche="n")
+    db_session.add(reel)
+    db_session.flush()
+    _hf_image_cache_file(tmp_path).write_bytes(_png())
+    src = AS.HuggingFaceImageSource("k", "org/m", tmp_path)
+    AS._generate_gated_hf_asset(db_session, reel.id, "asset_hf_image", src, "q", lambda r: 1.0)
+    ev = db_session.query(models.StageEvent).filter_by(stage="asset_hf_image").one()
+    assert "skipped" not in ev.detail

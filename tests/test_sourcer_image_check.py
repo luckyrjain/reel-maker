@@ -2,10 +2,12 @@
 
 The byte cap (50 MB) says nothing about how many PIXELS a file declares: a 140 KB PNG declaring
 12000x12000 px is "small" and passes the magic-byte sniff, yet the compositor's
-`Image.open(...).convert("RGB")` allocates ~430 MB for it. `_image_ok` opens the image HEADER with
-Pillow (it does not decode pixels) and refuses a file Pillow cannot identify or one declaring more than
-`_MAX_IMAGE_PIXELS`. Applied to Wikipedia downloads, HuggingFace images and cached images; a refused
-Wikipedia original falls back to the (much smaller) thumbnail.
+`Image.open(...).convert("RGB")` allocates ~430 MB for it. `_image_ok` reads the declared size from the
+header first, refuses a file Pillow cannot identify or one declaring more than `_MAX_IMAGE_PIXELS`, and
+only then decodes the pixels (so a truncated file is refused and an over-cap one is never decoded).
+Applied to Wikipedia downloads, HuggingFace images and cached images. An oversized Wikipedia original is
+downscaled when it can be (`_fit_image`); past the downscale windows it falls back to the (much smaller)
+thumbnail and is remembered in a `.refused` marker.
 
 These tests carry `real_image_check` and use real images; every other test gets a permissive check.
 """
@@ -566,7 +568,8 @@ def test_the_refusal_is_recorded_next_to_the_would_be_file(tmp_path, monkeypatch
     _two_searches(tmp_path, monkeypatch, _png_noise((256, 192)), _jpeg((16, 12)))
     refused = _refused(tmp_path)
     assert len(refused) == 1 and refused[0].startswith("wiki_123.png.")
-    assert (tmp_path / refused[0]).read_text() == str(CAP)
+    assert (tmp_path / refused[0]).read_text() == AS._refusal_stamp()
+    assert AS._refusal_stamp().startswith(f"{CAP}:")
     assert not any(p.name.endswith(".tmp") for p in tmp_path.iterdir())
 
 
@@ -593,20 +596,6 @@ def test_an_oversized_jpeg_past_pillows_limit_is_recorded_too(tmp_path, monkeypa
     first, _, second, _ = _two_searches(tmp_path, monkeypatch, _jpeg((256, 192)), _png_noise((16, 12)),
                                         original_url="https://upload.wikimedia.org/wikipedia/commons/a/ab/Messi.jpeg")
     assert second.urls == []
-
-
-def test_a_failed_marker_write_is_not_fatal(tmp_path, monkeypatch):
-    real = AS._atomic_write
-
-    def flaky(path, data):
-        if str(path).endswith(".refused"):
-            raise OSError("disk full")
-        return real(path, data)
-
-    monkeypatch.setattr(AS, "_atomic_write", flaky)
-    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
-    stream = _Stream({PNG_ORIG: _Resp(chunks=(_png_noise((256, 192)),)), WIKI_THUMB: _Resp(chunks=(_jpeg((16, 12)),))})
-    assert _wiki(tmp_path, _summary(original=PNG_ORIG), stream) is not None
 
 
 def test_a_different_pages_refusal_does_not_block_this_page(tmp_path, monkeypatch):
@@ -653,3 +642,310 @@ def test_rounding_up_in_reduce_never_leaves_the_result_over_the_cap(monkeypatch)
     monkeypatch.setattr(AS, "_MAX_FULL_DECODE_PIXELS", 10_000)
     (w, h), _ = _size_and_format(AS._downscale_decoded(_encoded("PNG", (11, 67))))
     assert w * h <= 200
+
+
+# ── round-2 review: transient read errors, decode failures and bad markers ────────────────────────
+
+def test_a_transient_error_reading_the_cached_file_head_never_deletes_it(tmp_path, caplog):
+    import builtins
+    import errno
+    caplog.set_level(logging.WARNING, logger=AS.__name__)
+    f = tmp_path / "hf_cache.png"
+    f.write_bytes(_img("PNG"))
+    real_open = builtins.open
+
+    def flaky(file, *a, **k):
+        if str(file) == str(f):
+            raise OSError(errno.EMFILE, "Too many open files")
+        return real_open(file, *a, **k)
+
+    with patch("builtins.open", flaky):
+        assert AS._cached_media_ok(f, "image") is True
+    assert f.exists() and "Could not read a cached image" in caplog.text
+
+
+def test_a_cached_file_that_vanished_is_not_ok_and_not_an_error(tmp_path):
+    assert AS._cached_media_ok(tmp_path / "gone.png", "image") is False
+
+
+def test_a_truncated_oversized_png_inside_the_window_is_not_remembered(tmp_path, monkeypatch):
+    """Over the cap but decodable in principle: a truncated copy failed to DECODE, which may not repeat."""
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    monkeypatch.setattr(AS, "_MAX_FULL_DECODE_PIXELS", 20 * CAP)       # 256*192 = 12 CAP: inside the window
+    big = _png_noise((256, 192))
+    with pytest.raises(ValueError) as exc:
+        AS._fit_image(big[: len(big) // 2])
+    assert not isinstance(exc.value, AS._OversizedImage)
+
+
+def test_a_truncated_oversized_jpeg_is_not_remembered(monkeypatch):
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    big = _jpeg((256, 192))
+    with pytest.raises(ValueError) as exc:
+        AS._fit_image(big[: len(big) // 2])
+    assert not isinstance(exc.value, AS._OversizedImage)
+
+
+def test_a_transient_failure_while_downscaling_is_not_remembered(monkeypatch):
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    monkeypatch.setattr(AS, "_MAX_FULL_DECODE_PIXELS", 20 * CAP)
+    with patch.object(AS, "_downscale_decoded", return_value=None):          # e.g. a swallowed MemoryError
+        with pytest.raises(ValueError) as exc:
+            AS._fit_image(_png_noise((256, 192)))
+    assert not isinstance(exc.value, AS._OversizedImage)
+
+
+def test_only_an_image_beyond_the_window_is_remembered(monkeypatch):
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    monkeypatch.setattr(AS, "_MAX_FULL_DECODE_PIXELS", 2 * CAP)
+    with pytest.raises(AS._OversizedImage):
+        AS._fit_image(_png_noise((256, 192)))                                 # non-JPEG past the window
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1000)
+    with pytest.raises(AS._OversizedImage):
+        AS._fit_image(_jpeg((256, 192)))                                      # past Pillow's own bomb limit
+
+
+def test_an_unreadable_marker_means_no_marker_not_an_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    target = tmp_path / "wiki_123.png"
+    AS._refusal_marker(target, PNG_ORIG).write_bytes(b"\xff\xfe\x80 not utf-8")
+    assert AS._refusal_recorded(target, PNG_ORIG) is False
+    stream = _Stream({PNG_ORIG: _Resp(chunks=(_jpeg((16, 12)),))})
+    assert _wiki(tmp_path, _summary(original=PNG_ORIG, thumbnail=None), stream) is not None
+
+
+# ── round-2 security review: decode memory is bounded in BYTES per format ─────────────────────────
+
+def test_the_decode_constants():
+    assert AS._MAX_DECODE_BYTES == 400_000_000
+    assert AS._DECODE_BYTES_PER_PIXEL == {"WEBP": 16} and AS._DEFAULT_DECODE_BYTES_PER_PIXEL == 8
+
+
+def test_pixel_caps_per_format():
+    assert AS._pixel_cap("JPEG") == 50_000_000                     # decoded at 1/8 scale
+    assert AS._pixel_cap("PNG") == AS._pixel_cap("TIFF") == AS._pixel_cap("GIF") == 50_000_000
+    assert AS._pixel_cap("WEBP") == 25_000_000                     # ~12-15 B/px measured: 400 MB / 16
+    assert AS._pixel_cap(None) == 50_000_000                       # unknown format: the default estimate
+
+
+def test_decode_windows_per_format():
+    assert AS._decode_window("PNG") == 50_000_000                  # min(80 Mpx, 400 MB / 8)
+    assert AS._decode_window("WEBP") == 25_000_000
+
+
+def test_a_webp_over_its_byte_budget_is_refused_while_a_png_of_the_same_size_is_not(monkeypatch):
+    monkeypatch.setattr(AS, "_MAX_DECODE_BYTES", 16 * 4096)        # WebP cap 4096 px, PNG cap 8192 px
+    webp = _encoded("WEBP", (80, 60))                              # 4800 px
+    png = _encoded("PNG", (80, 60))
+    assert AS._image_ok(webp) is False
+    assert AS._image_ok(png) is True
+
+
+def test_an_over_budget_webp_is_never_decoded_or_downscaled(monkeypatch):
+    monkeypatch.setattr(AS, "_MAX_DECODE_BYTES", 16 * 4096)
+    webp = _encoded("WEBP", (80, 60))
+    with patch.object(Image.Image, "load", side_effect=AssertionError("decoded an over-budget WebP")):
+        assert AS._image_ok(webp) is False
+        assert AS._downscale_decoded(webp) is None                 # its window equals its cap
+    with pytest.raises(AS._OversizedImage):
+        AS._fit_image(webp)
+
+
+def test_a_jpeg_is_not_subject_to_the_byte_budget(monkeypatch):
+    monkeypatch.setattr(AS, "_MAX_DECODE_BYTES", 1)
+    assert AS._image_ok(_jpeg((80, 60))) is True
+
+
+# ── transient failures during the downscale are not verdicts ─────────────────────────────────────
+
+import errno
+
+
+@pytest.mark.parametrize("exc", [MemoryError(), OSError(errno.EMFILE, "Too many open files")], ids=["memory", "emfile"])
+def test_a_transient_failure_inside_a_downscale_propagates_and_is_never_remembered(monkeypatch, exc):
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    monkeypatch.setattr(AS, "_MAX_FULL_DECODE_PIXELS", 20 * CAP)
+    png = _png_noise((256, 192))
+    jpeg = _jpeg((256, 192))
+    with patch.object(Image.Image, "reduce", side_effect=exc):
+        with pytest.raises(type(exc)):
+            AS._downscale_decoded(png)
+    from PIL import JpegImagePlugin
+    with patch.object(JpegImagePlugin.JpegImageFile, "draft", side_effect=exc):
+        with pytest.raises(type(exc)):
+            AS._downscale_jpeg(jpeg)
+
+
+def test_a_transient_downscale_failure_leaves_no_marker_and_the_next_search_retries(tmp_path, monkeypatch):
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    monkeypatch.setattr(AS, "_MAX_FULL_DECODE_PIXELS", 20 * CAP)
+    png, thumb = _png_noise((256, 192)), _jpeg((16, 12))
+    with patch.object(Image.Image, "reduce", side_effect=MemoryError()):
+        r1 = _wiki(tmp_path, _summary(original=PNG_ORIG), _Stream({PNG_ORIG: _Resp(chunks=(png,)), WIKI_THUMB: _Resp(chunks=(thumb,))}))
+    assert r1 is not None and _refused(tmp_path) == []             # fell back to the thumbnail, remembered nothing
+    second = _Stream({PNG_ORIG: _Resp(chunks=(png,)), WIKI_THUMB: _Resp(chunks=(thumb,))})
+    r2 = _wiki(tmp_path, _summary(original=PNG_ORIG), second)
+    assert second.urls == [PNG_ORIG]                               # tried again, now healthy
+    (w, h), _ = _size_and_format(r2.local_path.read_bytes())
+    assert w * h <= CAP and w * h > 16 * 12 or r2.local_path.read_bytes() == thumb
+
+
+def test_a_changed_decode_window_forgets_the_refusal(tmp_path, monkeypatch):
+    thumb = _jpeg((16, 12))
+    orig = _png_noise((256, 192))
+    _two_searches(tmp_path, monkeypatch, orig, thumb)               # refused: 49152 px > window 2*CAP
+    monkeypatch.setattr(AS, "_MAX_FULL_DECODE_PIXELS", 20 * CAP)    # now inside the window
+    third = _Stream({PNG_ORIG: _Resp(chunks=(orig,)), WIKI_THUMB: _Resp(chunks=(thumb,))})
+    result = _wiki(tmp_path, _summary(original=PNG_ORIG), third)
+    assert third.urls == [PNG_ORIG] and result.local_path.name == "wiki_123.png"
+
+
+# ── a lone surrogate in an upstream URL must not raise out of search() ────────────────────────────
+
+def test_a_lone_surrogate_in_the_image_url_degrades_instead_of_raising(tmp_path):
+    bad = "https://upload.wikimedia.org/wikipedia/commons/a/ab/x\ud800.jpg"
+    stream = _Stream({})
+    assert _wiki(tmp_path, _summary(original=bad, thumbnail=None), stream) is None
+    assert AS._refusal_marker(tmp_path / "wiki_1.jpg", bad).name.endswith(".refused")
+
+
+@pytest.mark.parametrize("url,ok", [
+    ("https://api.pexels.com/videos/search", True), ("https://en.wikipedia.org/w/api.php", True),
+    ("https://169.254.169.254/latest/meta-data", False), ("https://127.0.0.1/x", False),
+    ("https://[::1]/x", False), ("https://localhost/x", False), ("https://foo.localhost/x", False),
+    ("http://api.pexels.com/x", False), ("https://user@api.pexels.com/x", False),
+])
+def test_the_api_url_check_refuses_ip_literals_and_localhost(url, ok):
+    assert AS._any_https_host(url) is ok
+
+
+def test_the_byte_budget_also_narrows_the_downscale_window(monkeypatch):
+    """window = min(_MAX_FULL_DECODE_PIXELS, bytes budget / bytes-per-pixel): a PNG that fits the pixel
+    window but not the byte budget is never decoded."""
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    monkeypatch.setattr(AS, "_MAX_FULL_DECODE_PIXELS", 20 * CAP)
+    monkeypatch.setattr(AS, "_MAX_DECODE_BYTES", 8 * 2 * CAP)       # PNG window: 2 * CAP = 8192 px
+    big, small = _encoded("PNG", (256, 192)), _encoded("PNG", (80, 60))          # 49152 px / 4800 px
+    with patch.object(Image.Image, "load", side_effect=AssertionError("decoded past the byte budget")):
+        assert AS._downscale_decoded(big) is None
+    assert AS._downscale_decoded(small) is not None
+
+
+# ── round-2 test-quality review ──────────────────────────────────────────────────────────────────
+
+from PIL import ImageOps  # noqa: E402
+
+
+def _quadrants():
+    im = Image.new("RGB", (256, 192))
+    for (x, y), c in {(0, 0): (255, 0, 0), (1, 0): (0, 255, 0), (0, 1): (0, 0, 255), (1, 1): (255, 255, 0)}.items():
+        im.paste(c, (x * 128, y * 96, x * 128 + 128, y * 96 + 96))
+    return im
+
+
+def _corner_colours(im):
+    w, h = im.size
+    return [im.getpixel((w // 4, h // 4)), im.getpixel((3 * w // 4, h // 4)),
+            im.getpixel((w // 4, 3 * h // 4)), im.getpixel((3 * w // 4, 3 * h // 4))]
+
+
+@pytest.mark.parametrize("orientation", range(1, 9))
+def test_every_exif_orientation_is_baked_into_a_downscaled_png_exactly_like_pillow_does(monkeypatch, orientation):
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    exif = Image.Exif()
+    exif[0x0112] = orientation
+    buf = io.BytesIO()
+    _quadrants().save(buf, format="PNG", exif=exif)
+    src = buf.getvalue()
+    expected = ImageOps.exif_transpose(Image.open(io.BytesIO(src))).convert("RGB")
+    got = Image.open(io.BytesIO(AS._downscale_decoded(src))).convert("RGB")
+    assert got.size[0] / got.size[1] == pytest.approx(expected.size[0] / expected.size[1], rel=0.1)
+    assert _corner_colours(got) == _corner_colours(expected)
+
+
+@pytest.mark.parametrize("size,draft", [((100, 80), (50, 40)), ((200, 150), (50, 37)),
+                                        ((400, 300), (50, 37)), ((512, 384), (64, 48)), ((1024, 768), (128, 96))])
+def test_the_smallest_dct_reduction_that_fits_is_chosen_and_the_result_always_fits(monkeypatch, size, draft):
+    from PIL import JpegImagePlugin
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    seen = []
+    real = JpegImagePlugin.JpegImageFile.draft
+    with patch.object(JpegImagePlugin.JpegImageFile, "draft",
+                      lambda self, mode, sz: (seen.append(sz), real(self, mode, sz))[1]):
+        out = AS._downscale_jpeg(_jpeg(size))
+    assert seen[0] == draft
+    with Image.open(io.BytesIO(out)) as im:
+        assert im.width * im.height <= CAP
+
+
+def test_a_palette_png_with_transparency_keeps_it_when_downscaled(monkeypatch):
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    buf = io.BytesIO()
+    Image.effect_noise((256, 192), 60).convert("P").save(buf, format="PNG", transparency=0)
+    with Image.open(io.BytesIO(AS._fit_image(buf.getvalue()))) as im:
+        assert im.mode == "RGBA"
+
+
+def test_a_failed_marker_write_is_really_exercised_and_not_fatal(tmp_path, monkeypatch):
+    real = AS._atomic_write
+    attempts = []
+
+    def flaky(path, data):
+        if str(path).endswith(".refused"):
+            attempts.append(path)
+            raise OSError("disk full")
+        return real(path, data)
+
+    monkeypatch.setattr(AS, "_atomic_write", flaky)
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    monkeypatch.setattr(AS, "_MAX_FULL_DECODE_PIXELS", 2 * CAP)     # the original cannot be rescued
+    stream = _Stream({PNG_ORIG: _Resp(chunks=(_png_noise((256, 192)),)), WIKI_THUMB: _Resp(chunks=(_jpeg((16, 12)),))})
+    assert _wiki(tmp_path, _summary(original=PNG_ORIG), stream) is not None
+    assert len(attempts) == 1                                         # the failing branch really ran
+    assert _refused(tmp_path) == []
+
+
+def test_an_unreadable_marker_counts_as_no_marker(tmp_path):
+    target = tmp_path / "wiki_1.png"
+    AS._refusal_marker(target, "https://x/y.png").mkdir()            # read_text -> IsADirectoryError, not ENOENT
+    assert AS._refusal_recorded(target, "https://x/y.png") is False
+
+
+def test_the_marker_name_carries_a_12_hex_digest(tmp_path):
+    import re
+    assert re.fullmatch(r"wiki_1\.png\.[0-9a-f]{12}\.refused", AS._refusal_marker(tmp_path / "wiki_1.png", "u").name)
+
+
+def test_a_soft_time_limit_while_checking_a_cached_image_propagates_and_keeps_the_file(tmp_path, monkeypatch):
+    from celery.exceptions import SoftTimeLimitExceeded
+    p = tmp_path / "wiki_1.jpg"
+    p.write_bytes(_jpeg((16, 12)))
+
+    def boom(source):
+        raise SoftTimeLimitExceeded()
+
+    monkeypatch.setattr(AS, "_image_ok", boom)
+    with pytest.raises(SoftTimeLimitExceeded):
+        AS._cached_media_ok(p, "image")
+    assert p.exists()
+
+
+def test_a_soft_time_limit_is_not_swallowed_by_the_window_check(monkeypatch):
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    def boom(*a, **k):
+        raise SoftTimeLimitExceeded()
+
+    monkeypatch.setattr(Image, "open", boom)
+    with pytest.raises(SoftTimeLimitExceeded):
+        AS._beyond_downscale_window(b"x")
+
+
+def test_only_not_a_file_errors_are_a_definite_verdict_on_the_head_read(tmp_path):
+    """A directory / path through a file is 'not a file' (False); EMFILE/EIO-style errors keep the file."""
+    d = tmp_path / "hf_dir.png"
+    d.mkdir()
+    assert AS._cached_media_ok(d, "image") is False
+    f = tmp_path / "hf_file.png"
+    f.write_bytes(_img("PNG"))
+    assert AS._cached_media_ok(f / "child", "image") is False         # NotADirectoryError

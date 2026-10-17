@@ -172,7 +172,7 @@ URL) with the same predicate, and gives up after `_MAX_REDIRECTS` (3) hops, so a
 cannot bounce the worker to an arbitrary one. Size: `_iter_capped()` rejects a declared
 `Content-Length` over the cap before reading and otherwise counts bytes, raising as soon as the
 cap is exceeded (`_MAX_VIDEO_BYTES` 250 MB, `_MAX_IMAGE_BYTES` 50 MB); a Pexels partial `.tmp` is
-removed and the next hit tried, an oversized Wikipedia original falls back to the thumbnail. To
+removed and the next hit tried, an original over the BYTE cap falls back to the thumbnail (a PIXEL-cap refusal is a later addition, see the last sections). To
 cap the body, Wikipedia image downloads moved from `httpx.get` to `httpx.stream` (since renamed `_http_stream`, see the Follow-up; the 429 retry
 once after 2 s is unchanged). The check guards the download only: a file already cached on disk is
 served without a request, as before.
@@ -202,7 +202,7 @@ accented or dotted title without a `pageid` used to be cached as `wiki_<that tit
 pages, so this is a defensive path). A title with a lone surrogate was already unreachable: the
 summary URL cannot encode it, so `search()` returns `None`.
 
-`tests/test_sourcer_ids.py` (77) holds the follow-up 3 tests: Pexels id accept/skip tables (bool,
+`tests/test_sourcer_ids.py` (77 when written, 87 now) holds the follow-up 3 tests: Pexels id accept/skip tables (bool,
 float, negative, traversal, Arabic-Indic digits, trailing newline, 21 digits, a 5000-character id),
 Wikipedia page-id fallback, plain-title identity, digest ids for unsafe titles, the 5000-character
 title (no `ENAMETOOLONG`), digest determinism and cache reuse. Follow-up 1 replaced one test in
@@ -284,7 +284,7 @@ defect of medium severity or higher. Fixed (tests first): `_host_for_log` raised
 dead `.lower()`; four test gaps from a 104-mutant audit (the Pexels body sharing the connect-phase budget,
 the pre-hop deadline boundary, the exact 253-character host bound, a hostile host reaching the log raw
 through the download path); dead test code and a stale test name. The two hardening gaps round 3 raised were first documented and then closed in a follow-up (below);
-the remaining documented one is a deterministic shared `.tmp` name (two concurrent renders downloading
+the remaining documented one (closed later: unique temp names) was a deterministic shared `.tmp` name (two concurrent renders downloading
 the same asset could truncate each other; render concurrency is 1; pre-existing). A read overrunning the
 budget by up to its httpx timeout, listed here at the time, is bounded by the watchdog (the connect phase before
 it arms was bounded later by the hop-timeout clamp; only DNS is left, see the final Follow-up).
@@ -374,7 +374,7 @@ one commit each (`6bd81c8`, `b3bc584`, `cabf5b3`, `fd7a732`).
   `min(configured, time left + 1 s)`, from the same single `_monotonic()` reading as the pre-hop deadline
   check (no extra clock call); the 1 s grace (`_HOP_TIMEOUT_GRACE_S`) lets the exact watchdog win once the
   connection exists instead of a racing `ReadTimeout`. Verified through the real httpx/httpcore stack (the
-  timeout that reaches `socket.create_connection`). **DNS stays unbounded by us**: `getaddrinfo` takes no
+  timeout that reaches `socket.create_connection`). **DNS stayed unbounded by us at this point** (closed later by `_dns_in_time`): `getaddrinfo` takes no
   timeout, only the OS resolver bounds it.
 - **Per-hit budgets adding up.** A Pexels search tries up to 15 hits (600 s each: 2.5 h worst case), a
   Wikipedia search 2 candidates. Each `search()` now has one budget (`_PEXELS_SEARCH_BUDGET_S` 900,
@@ -396,7 +396,7 @@ one commit each (`6bd81c8`, `b3bc584`, `cabf5b3`, `fd7a732`).
   `Content-Type` is neither cached nor billed. Files cached before this check existed are served as before.
   **Test seam**: the suite's fakes serve placeholder bytes (`b"orig"`), so `tests/conftest.py` has an autouse
   fixture that makes `_sniff_ok` permissive for every test, and tests that exercise the check carry
-  `@pytest.mark.real_media_sniffing` (registered in `pyproject.toml`). `tests/test_sourcer_sniffing.py` (79);
+  `@pytest.mark.real_media_sniffing` (registered in `pyproject.toml`). `tests/test_sourcer_sniffing.py` (79 when written, 110 now);
   18 mutants, all killed but one equivalent (the `isinstance` guard, which a non-bytes head also fails
   downstream). One real survivor (WebP accepted without the `RIFF` prefix) got its own case.
 
@@ -498,7 +498,7 @@ closed, as flagged below.
   returned as an ordinary `httpx.Response` built from the capped body. Reading stops at the limit, so the buffer
   is bounded; `_TooLarge` is caught per caller (HF: WARNING, not billed). `_body_too_large` stays as defense in
   depth. To avoid rewriting ~130 test patches, a conftest fixture points `_api_get/_api_post` back at `httpx.get/post`
-  unless a test carries `real_api` (`tests/test_sourcer_api_streaming.py`, 30).
+  unless a test carries `real_api` (`tests/test_sourcer_api_streaming.py`, 30 when written, 63 now).
 * **Image pixel cap.** `_image_ok()` reads the declared size with Pillow, refuses an unidentifiable image or one over
   `_MAX_IMAGE_PIXELS` (50 Mpx), and only then decodes the pixels (`load()`, a JPEG at 1/8 scale through `draft`), so
   a truncated or corrupt file is refused and an over-cap one is never decoded (first version: header only, which
@@ -510,9 +510,9 @@ closed, as flagged below.
   to fall back to the ~320 px summary thumbnail, which looks soft upscaled to 1080x1920. `_downscale_jpeg()`
   decodes a JPEG at the smallest DCT reduction (1/2, 1/4, 1/8) that fits the cap -- never allocating the full-size
   buffer --, bakes the EXIF rotation in (the re-encode drops the tag) and saves a JPEG; `_fit_image()` returns the
-  input if `_image_ok`, else the downscaled copy if that is `_image_ok`, else raises. Only JPEG (PNG/WebP/TIFF/GIF have no cheap partial decode) and
-  only within Pillow's own bomb limit (2x `Image.MAX_IMAGE_PIXELS`, ~179 Mpx, where `Image.open` raises); anything else
-  still falls back to the thumbnail.
+  input if `_image_ok`, else the downscaled copy if that is `_image_ok`, else tries the full-decode path for non-JPEG (next bullet), else raises. The DCT path covers a JPEG up to
+  Pillow's own bomb limit (2x `Image.MAX_IMAGE_PIXELS`, ~179 Mpx, where `Image.open` raises); a JPEG past it falls
+  back to the thumbnail.
 * **API calls get a deadline.** `_api_call` now goes through `_open_download` (new `method`/`params`/`json`/
   `follow_redirects` parameters; redirects are still never followed for an API call), so it has the per-hop timeout
   clamp, the DNS gate and the connection `_Watchdog`, plus `_iter_capped`'s per-chunk deadline. The budget is
@@ -530,23 +530,31 @@ closed, as flagged below.
   `tests/test_sourcer_render_budget.py` (22) plus 3 in `test_render_task.py`.
 * **Review fixes to the above.** `_image_ok` re-raises `MemoryError` and errno-bearing `OSError`s (EMFILE, EIO) so a
   transient failure no longer deletes a cached (possibly paid-for) image; `_cached_media_ok` keeps the file and
-  logs. Known, accepted limits: a non-JPEG original over 80 Mpx (or a JPEG past Pillow's bomb limit) still falls
+  logs. Known, accepted limits: a non-JPEG original past its decode window (or a JPEG past Pillow's bomb limit) still falls
   back to the small thumbnail (but see below: it is no longer re-downloaded on every search).
-* **Non-JPEG originals are downscaled too.** A PNG / WebP / TIFF / GIF between the 50 Mpx cap and
-  `_MAX_FULL_DECODE_PIXELS` (80 Mpx, so <= ~320 MB transient even for RGBA) is decoded in full (`load()`), shrunk by
+* **Non-JPEG originals are downscaled too.** A PNG / TIFF / GIF between the 50 Mpx cap and
+  its decode window is decoded in full (`load()`), shrunk by
   an integer box `reduce()` (factor `ceil(sqrt(pixels / cap))`, no resampling of the big image; palette images fall
   back to a converted copy), re-oriented from the EXIF tag read BEFORE the reduce (it drops the metadata), and
   re-encoded: PNG stays PNG (lossless, alpha kept), everything else becomes a JPEG. A final resize guards the
   case where `reduce()` rounds dimensions UP past the cap (11x67 at factor 2 is 204 px against a cap of 200).
-  Beyond 80 Mpx a non-JPEG is not decoded at all (no partial decode exists, so that is the memory bound) and
-  still falls back to the thumbnail, remembered by the marker below. The image check and the downscale use only
+  **The memory bound is in bytes, per format** (round-2 security review: the first version assumed <= ~320 MB
+  at 80 Mpx; measured peak RSS was ~540 MB for a 79 Mpx PNG, ~460 MB for TIFF mode I and ~960-1000 MB for a
+  lossy or animated WebP, and `_image_ok`'s own `load()` of a 49 Mpx WebP cost ~710 MB). `_pixel_cap(fmt)` =
+  `min(_MAX_IMAGE_PIXELS, _MAX_DECODE_BYTES (400 MB) // bytes-per-pixel)` with 16 B/px for WebP and 8 B/px for
+  everything else, so PNG/TIFF/GIF keep the 50 Mpx cap and WebP gets 25 Mpx; `_decode_window(fmt)` additionally
+  applies `_MAX_FULL_DECODE_PIXELS` (80 Mpx), which the byte budget makes moot for all current formats. A
+  JPEG is exempt (decoded at 1/8 scale). A non-JPEG past its window is not decoded at all (no partial decode
+  exists, so that is the memory bound) and still falls back to the thumbnail, remembered by the marker below
+  (an over-cap WebP's window equals its cap, so a WebP is never downscaled, only refused). The image check and the downscale use only
   the first frame of an animated file: the compositor opens just that frame, so a later one cannot matter (this
   was listed as a limit before; it is not one).
 * **Oversized originals are remembered.** The thumbnail that replaces a refused original is cached under its
   own extension, so the `exists()` check never fired for the original's path and a non-JPEG original (up to
   50 MB) was downloaded and refused on every search. `_fit_image` now raises `_OversizedImage` for a readable,
-  definitely-too-big image (`_is_oversized`: declared size over the cap, or Pillow's own bomb error; never a
-  corrupt file, which may be a transient bad download), and `WikipediaImageSource.search` writes a marker
+  image that is over the cap AND beyond the downscale windows (`_beyond_downscale_window`: a non-JPEG past its decode window,
+  or Pillow's own bomb error; never a corrupt/truncated file or a failed downscale inside the windows, which may
+  not repeat -- the first version recorded any over-cap image whose downscale failed, found by round-2 review), and `WikipediaImageSource.search` writes a marker
   `wiki_<id>.<ext>.<sha256(url)[:12]>.refused` holding the cap it was refused under, which later searches
   check before downloading. Keyed by URL because an original and its thumbnail often share one target path
   (the first version keyed by path and blocked the thumbnail -- caught by its own tests). A different cap
@@ -564,4 +572,39 @@ closed, as flagged below.
 Mutation checks: the image check, the budget and the review fixes were mutation-tested (one survivor, the warning
 filter, got its own test); all other mutants were killed. The original follow-up lists are closed; the limits above are the
 residue.
+
+
+### Round 2 review of the follow-ups above
+
+Four reviewers again. Security / test-quality results are summarised in the PR; the correctness and docs
+passes found only low issues, all fixed: a transient error reading a cached file's head deleted it (only a
+Pillow-level error was treated as transient); a decode failure inside the downscale windows was recorded as
+"too big" forever (see `_beyond_downscale_window`); a body-less 204/304/empty-200 with a gzip
+`Content-Encoding` raised instead of returning an empty response; an unreadable (non-UTF-8) `.refused` marker
+could raise out of `search()`; plus stale docstrings and counts. Known and accepted: a multi-member gzip body
+decodes only its first member (httpx's own decoder does the same, and the truncated JSON then fails to parse);
+a 16-bit grayscale image downscales to a clipped, near-white JPEG exactly as the compositor's own
+`convert("RGB")` renders it today (pre-existing); an MPO is not "JPEG" to Pillow so it takes the full-decode
+path and is refused past its window.
+
+Round-2 security review, additionally fixed: a lone surrogate in an upstream image URL made `search()` raise
+(the marker's `sha256(url.encode())`; now `surrogatepass`), a transient `MemoryError`/`OSError` during a
+downscale was swallowed and then recorded as a permanent "too big" marker (the downscalers now re-raise
+transient errors like `_image_ok`), the marker stamp now holds all three limits so changing any of them
+forgets it, the head-read case of `_cached_media_ok` keeps the file, and `_any_https_host` refuses IP
+literals and `localhost`. Known and accepted: a gzip response is inflated to the SAME cap as its compressed size
+(250 MB for a HuggingFace video), so a compromised HF host can cost ~2x the cap transiently (the output chunks
+plus the join) before the sniff rejects the body; a marker is not invalidated if the file at the same URL is
+later replaced by a smaller one (it is forgotten when any limit changes).
+
+Round-2 test-quality review (151 mutants, 38 survivors; 14 closed by 22+5 new tests, the rest equivalent or
+cosmetic): all seven EXIF orientation entries (compared quadrant-by-quadrant with `ImageOps.exif_transpose`),
+the smallest-DCT-reduction loop (and the otherwise-unreachable resize guard, now live), a vacuous marker-write
+test (the PNG was inside the window so the branch never ran), `SoftTimeLimitExceeded` through
+`_cached_media_ok` and the window check, `_decode_bounded`'s 1 MiB step (a tracemalloc test: a 150 MB-of-zeros
+gzip against a 1 MiB limit peaks under 20 MB) and its `unconsumed_tail` loop, the per-chunk deadline on an
+ENCODED body, a palette PNG with tRNS, an unreadable (directory) marker, the 12-hex digest and the video-skip
+warning. The review also found that a refused HF call recorded a `StageEvent(ok=True, cache_hit=False)` that
+looked like a success; it now carries `detail["skipped"] = "asset_budget_spent"` (`last_call_skipped` on the
+source). Real-socket deadline tests widened from `< 3.0 s` to `< 5.0 s` for loaded CI boxes.
 

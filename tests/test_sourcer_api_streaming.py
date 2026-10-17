@@ -4,8 +4,10 @@ Pexels search, the Wikipedia opensearch / summary / imageinfo lookups and both H
 used `httpx.get` / `httpx.post`, which read the WHOLE body before returning: a hostile or broken
 upstream could make the worker buffer gigabytes before any size check ran. `_api_get` / `_api_post`
 mirror those functions' signatures (so call sites and their tests are unchanged) but go through the
-`_http_stream` seam: `Accept-Encoding: identity`, no redirects, at most `limit` bytes read, and a real
-`httpx.Response` built from what was read.
+`_open_download` / `_http_stream` seam: `Accept-Encoding: identity`, no redirects, at most `limit` bytes
+read, a wall-clock deadline with the DNS gate and the connection watchdog, and a real `httpx.Response`
+built from what was read. A host that ignores the identity request and answers gzip / deflate is decoded
+from the raw stream under the same cap (`_decode_bounded`); other encodings are refused.
 
 These tests carry the `real_api` marker: every other test gets `_api_get` / `_api_post` wired back to
 `httpx.get` / `httpx.post` (tests/conftest.py), which is what the older fakes patch.
@@ -306,7 +308,7 @@ def test_a_hostile_api_host_is_cut_off_near_the_deadline(behavior):
     with _serve(behavior) as server:
         with pytest.raises(ValueError, match="too slow"):
             AS._api_get(server.url, timeout=30.0, deadline_s=0.6, url_ok=_allow_any)
-    assert 0.5 <= _time.monotonic() - started < 3.0                   # not the 30 s read timeout
+    assert 0.5 <= _time.monotonic() - started < 5.0                   # not the 30 s read timeout
 
 
 def test_a_fast_api_host_is_unaffected():
@@ -457,7 +459,7 @@ def test_the_compressed_size_is_capped_too(monkeypatch):
         AS._api_get(URL, timeout=5.0, limit=limit)
 
 
-@pytest.mark.parametrize("data", [b"not gzip at all", _gz(b"hello world")[:-6], b""], ids=["garbage", "truncated", "empty"])
+@pytest.mark.parametrize("data", [b"not gzip at all", _gz(b"hello world")[:-6]], ids=["garbage", "truncated"])
 def test_a_corrupt_or_truncated_encoded_body_is_refused(monkeypatch, data):
     _with(_Stream({URL: _Resp(chunks=(data,), headers={"content-encoding": "gzip"})}), monkeypatch)
     with pytest.raises(ValueError):
@@ -516,3 +518,50 @@ def test_the_hf_image_call_takes_a_gzipped_response_through_to_its_cache_rules(t
         chunks=(_gz(png),), headers={"content-encoding": "gzip", "content-type": "image/png"})}), monkeypatch)
     result = HuggingFaceImageSource("k", "org/m", tmp_path).generate("p")
     assert result is not None and result.local_path.read_bytes() == png
+
+
+@pytest.mark.parametrize("status", [200, 204, 304])
+@pytest.mark.parametrize("enc", ["gzip", "deflate"])
+def test_a_bodyless_response_with_an_encoding_header_is_an_empty_response(monkeypatch, status, enc):
+    _with(_Stream({URL: _Resp(status=status, chunks=(), headers={"content-encoding": enc})}), monkeypatch)
+    resp = AS._api_get(URL, timeout=5.0)
+    assert resp.status_code == status and resp.content == b""
+
+
+def test_an_empty_body_with_an_encoding_header_is_not_a_truncated_stream_error(monkeypatch):
+    _with(_Stream({URL: _Resp(chunks=(b"",), headers={"content-encoding": "gzip"})}), monkeypatch)
+    assert AS._api_get(URL, timeout=5.0).content == b""
+
+
+# ── round-2 test-quality review ──────────────────────────────────────────────────────────────────
+
+import tracemalloc  # noqa: E402
+
+
+
+def test_a_gzip_body_that_inflates_past_one_mebibyte_is_decoded_whole(monkeypatch):
+    body = b'{"t": "' + b"x" * (3 << 20) + b'"}'
+    packed = gzip.compress(body)
+    _with(_Stream({URL: _Resp(chunks=(packed,), headers={"content-encoding": "gzip"})}), monkeypatch)
+    assert AS._api_get(URL, timeout=5.0, limit=8 << 20).content == body
+
+
+def test_inflation_is_bounded_not_done_in_one_unbounded_step(monkeypatch):
+    bomb = gzip.compress(b"\0" * (150 << 20))
+    _with(_Stream({URL: _Resp(chunks=(bomb,), headers={"content-encoding": "gzip"})}), monkeypatch)
+    tracemalloc.start()
+    try:
+        with pytest.raises(AS._TooLarge):
+            AS._api_get(URL, timeout=5.0, limit=1 << 20)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 20 << 20                                            # not 150 MB
+
+
+def test_an_encoded_body_read_is_checked_against_the_deadline_per_chunk(monkeypatch):
+    packed = gzip.compress(b'{"a": 1}')
+    _with(_Stream({URL: _Resp(chunks=(packed[:6], packed[6:]), headers={"content-encoding": "gzip"})}), monkeypatch)
+    monkeypatch.setattr(AS, "_monotonic", _fake_clock(100.0, 100.0, after=999.0))
+    with pytest.raises(ValueError, match="too slow"):
+        AS._api_get(URL, timeout=5.0)

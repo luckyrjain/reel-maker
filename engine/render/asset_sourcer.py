@@ -98,10 +98,17 @@ _MAX_IMAGE_BYTES = 50 * 1024 * 1024    # Wikipedia originals are rarely over ~20
 # The byte cap says nothing about declared PIXELS: a 140 KB PNG can declare 12000x12000, and the compositor's
 # `Image.open(...).convert("RGB")` then allocates ~430 MB. 50 Mpx is ~7000x7000, far past any photo used here.
 _MAX_IMAGE_PIXELS = 50_000_000
-# A non-JPEG image has no cheap partial decode: shrinking one means decoding it at full size first. Up to
-# this many pixels that is done (<= ~320 MB transient even for RGBA); above it the image is refused. A JPEG
-# is decoded at 1/2-1/8 scale instead and has no such limit (only Pillow's own bomb limit).
+# A non-JPEG image has no cheap partial decode: checking one for truncation, or shrinking it, means decoding
+# it at full size. That is bounded in BYTES, not just pixels, because formats differ a lot (peak RSS measured
+# on 79 Mpx inputs: PNG ~7 B/px, TIFF ~6, lossy / animated WebP ~12-15): `_MAX_DECODE_BYTES` divided by a
+# per-format bytes-per-pixel estimate is that format's pixel cap (`_pixel_cap`), and an image over it is
+# refused or, for the formats that allow it, downscaled. `_MAX_FULL_DECODE_PIXELS` is the further ceiling on
+# what is decoded to be downscaled. A JPEG is decoded at 1/2-1/8 scale (DCT scaling) instead and is bound
+# only by `_MAX_IMAGE_PIXELS` and Pillow's own bomb limit.
 _MAX_FULL_DECODE_PIXELS = 80_000_000
+_MAX_DECODE_BYTES = 400_000_000
+_DECODE_BYTES_PER_PIXEL = {"WEBP": 16}
+_DEFAULT_DECODE_BYTES_PER_PIXEL = 8
 _MAX_API_JSON_BYTES = 8 * 1024 * 1024   # Pexels search / Wikipedia lookups are a few KB; refuse to parse more
 _MAX_REDIRECTS = 3
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
@@ -344,7 +351,8 @@ def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = N
     httpx timeout is clamped to the time left (+ `_HOP_TIMEOUT_GRACE_S`) and its host's DNS lookup is
     given at most that long (`_dns_in_time`). `Accept-Encoding: identity` is always sent
     (media is not worth compressing, and a gzip body would inflate far past its Content-Length
-    before the size cap could see it); `_iter_capped` rejects a response that is encoded anyway.
+    before the size cap could see it); `_iter_capped` rejects a response that is encoded anyway --
+    except for `_api_call`, which reads gzip / deflate RAW and inflates it under its own cap.
     """
     kwargs = {
         "follow_redirects": False,
@@ -415,6 +423,8 @@ def _decode_bounded(raw: bytes, encoding: str, limit: int) -> bytes:
     zlib-wrapped in practice but raw deflate exists in the wild, so both are tried. A corrupt or
     truncated stream raises ValueError.
     """
+    if not raw:
+        return b""                      # 204 / 304 / empty 200 with an encoding header: nothing to inflate
     wbits_options = (47,) if encoding in ("gzip", "x-gzip") else (zlib.MAX_WBITS, -zlib.MAX_WBITS)
     last: Exception | None = None
     for wbits in wbits_options:
@@ -441,8 +451,17 @@ def _decode_bounded(raw: bytes, encoding: str, limit: int) -> bytes:
 
 def _any_https_host(url) -> bool:
     """URL check for the API calls: https, default port, a plain host. The hosts are constants in this
-    module (not remote-controlled), so unlike the download hosts there is no allowlist to enforce."""
-    return _https_host(url) is not None
+    module (not remote-controlled), so unlike the download hosts there is no allowlist to enforce. An IP
+    literal or `localhost` is refused all the same: no API host is one, and it keeps a future variable URL
+    from reaching a metadata endpoint."""
+    host = _https_host(url)
+    if host is None or host == "localhost" or host.endswith(".localhost"):
+        return False
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return False
 
 
 def _api_call(method: str, url: str, limit: int, *, headers=None, timeout: float, params=None, json=None,
@@ -572,6 +591,35 @@ def _sniff_ok(kind: str, head) -> bool:
     return False
 
 
+def _bytes_per_pixel(fmt) -> int:
+    return _DECODE_BYTES_PER_PIXEL.get(fmt, _DEFAULT_DECODE_BYTES_PER_PIXEL)
+
+
+def _pixel_cap(fmt) -> int:
+    """The most pixels an image of Pillow format `fmt` may declare: `_MAX_IMAGE_PIXELS`, and for a format
+    that is decoded in full also what fits in `_MAX_DECODE_BYTES` (WebP: 25 Mpx; PNG / TIFF / GIF: 50 Mpx)."""
+    if fmt == "JPEG":
+        return _MAX_IMAGE_PIXELS                # decoded at 1/8 scale: a small buffer
+    return min(_MAX_IMAGE_PIXELS, _MAX_DECODE_BYTES // _bytes_per_pixel(fmt))
+
+
+def _decode_window(fmt) -> int:
+    """The most pixels of a non-JPEG image that may be decoded in full in order to downscale it."""
+    return min(_MAX_FULL_DECODE_PIXELS, _MAX_DECODE_BYTES // _bytes_per_pixel(fmt))
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """True for a failure that says nothing about the image: MemoryError, or an OSError carrying an errno
+    (EMFILE, EIO, ...) that is not a definite "not a file" (missing, a directory, a path through a file) or
+    Pillow's own "cannot identify image"."""
+    from PIL import UnidentifiedImageError
+    if isinstance(exc, MemoryError):
+        return True
+    return (isinstance(exc, OSError)
+            and not isinstance(exc, (FileNotFoundError, IsADirectoryError, NotADirectoryError, UnidentifiedImageError))
+            and exc.errno is not None)
+
+
 def _image_ok(source) -> bool:
     """True if Pillow can decode `source` (image bytes or a Path) and it declares <= _MAX_IMAGE_PIXELS.
 
@@ -587,26 +635,21 @@ def _image_ok(source) -> bool:
     image and is re-raised, so a caller never deletes a good (possibly paid-for) cached file over it.
     `SoftTimeLimitExceeded` is re-raised.
     """
-    from PIL import Image, UnidentifiedImageError
+    from PIL import Image
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             with Image.open(io.BytesIO(source) if isinstance(source, (bytes, bytearray)) else source) as im:
                 width, height = im.size
-                if width * height > _MAX_IMAGE_PIXELS:
+                if width * height > _pixel_cap(im.format):
                     return False
                 im.draft("RGB", (max(1, width // 8), max(1, height // 8)))   # JPEG only; a no-op otherwise
                 im.load()                                                    # raises on a truncated file
         return True
     except SoftTimeLimitExceeded:
         raise
-    except MemoryError:
-        raise
-    except FileNotFoundError:
-        return False
     except Exception as exc:
-        if isinstance(exc, OSError) and not isinstance(exc, UnidentifiedImageError) \
-                and exc.errno is not None:
+        if _is_transient(exc):
             raise
         return False
 
@@ -620,7 +663,7 @@ def _downscale_jpeg(content: bytes) -> "bytes | None":
     buffer, so such a picture is decoded at the smallest reduction that fits, its EXIF rotation is baked
     in (the re-encode drops the tag) and it is saved as a JPEG. Only up to Pillow's own bomb limit
     (2x `Image.MAX_IMAGE_PIXELS`, ~179 Mpx) -- beyond it `Image.open` raises and this returns None, as it
-    does for PNG/WebP/TIFF/GIF (no cheap partial decode), so the caller falls back to the thumbnail.
+    does for non-JPEG formats (those are handled by `_downscale_decoded`).
     """
     from PIL import Image, ImageOps
     try:
@@ -647,7 +690,9 @@ def _downscale_jpeg(content: bytes) -> "bytes | None":
         return buf.getvalue()
     except SoftTimeLimitExceeded:
         raise
-    except Exception:
+    except Exception as exc:
+        if _is_transient(exc):
+            raise                       # a MemoryError / EMFILE says nothing about the image: never remembered
         return None
 
 
@@ -655,17 +700,22 @@ class _OversizedImage(ValueError):
     """A readable image whose declared size is over `_MAX_IMAGE_PIXELS` and that could not be downscaled."""
 
 
-def _is_oversized(content: bytes) -> bool:
-    """True if `content` declares more than `_MAX_IMAGE_PIXELS` (or trips Pillow's own bomb limit).
+def _beyond_downscale_window(content: bytes) -> bool:
+    """True if `content` is a readable image that is over the cap AND cannot be downscaled by design.
 
-    False for anything else, including a corrupt file: only a definitely-too-big image is worth
-    remembering (a bad download may be transient)."""
+    That is: Pillow's own bomb error (> 2x its limit), or a non-JPEG over `_MAX_FULL_DECODE_PIXELS`.
+    Those are the only images worth REMEMBERING as too big. An image that is over the cap but inside the
+    window (a JPEG, or a non-JPEG up to 80 Mpx) that still failed to downscale failed to DECODE
+    (truncated, corrupt, a transient MemoryError): that may not repeat, so it is never recorded.
+    False for anything else, including a header Pillow cannot read."""
     from PIL import Image
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             with Image.open(io.BytesIO(content)) as im:
-                return im.size[0] * im.size[1] > _MAX_IMAGE_PIXELS
+                pixels = im.size[0] * im.size[1]
+                return (pixels > _pixel_cap(im.format) and im.format != "JPEG"
+                        and pixels > _decode_window(im.format))
     except SoftTimeLimitExceeded:
         raise
     except Image.DecompressionBombError:
@@ -697,11 +747,12 @@ def _downscale_decoded(content: bytes) -> "bytes | None":
                 fmt = im.format
                 width, height = im.size
                 pixels = width * height
-                if fmt == "JPEG" or pixels <= _MAX_IMAGE_PIXELS or pixels > _MAX_FULL_DECODE_PIXELS:
+                if fmt == "JPEG" or pixels <= _pixel_cap(fmt) or pixels > _decode_window(fmt):
                     return None
+                target = _pixel_cap("PNG" if fmt == "PNG" else "JPEG")      # the output's own format must pass _image_ok
                 orientation = im.getexif().get(0x0112)
                 im.load()
-                factor = max(2, math.ceil(math.sqrt(pixels / _MAX_IMAGE_PIXELS)))
+                factor = max(2, math.ceil(math.sqrt(pixels / target)))
                 try:
                     small = im.reduce(factor)
                 except Exception:                       # modes reduce() does not support (e.g. palette)
@@ -709,8 +760,8 @@ def _downscale_decoded(content: bytes) -> "bytes | None":
         name = _ORIENTATION_TRANSPOSE.get(orientation)
         if name:
             small = small.transpose(getattr(Image.Transpose, name))
-        if small.width * small.height > _MAX_IMAGE_PIXELS:
-            shrink = (_MAX_IMAGE_PIXELS / (small.width * small.height)) ** 0.5
+        if small.width * small.height > target:
+            shrink = (target / (small.width * small.height)) ** 0.5
             small = small.resize((max(1, int(small.width * shrink)), max(1, int(small.height * shrink))))
         buf = io.BytesIO()
         if fmt == "PNG":
@@ -720,7 +771,9 @@ def _downscale_decoded(content: bytes) -> "bytes | None":
         return buf.getvalue()
     except SoftTimeLimitExceeded:
         raise
-    except Exception:
+    except Exception as exc:
+        if _is_transient(exc):
+            raise                       # a MemoryError / EMFILE says nothing about the image: never remembered
         return None
 
 
@@ -728,8 +781,8 @@ def _fit_image(content: bytes) -> bytes:
     """`content` if `_image_ok`; else a downscaled copy of an oversized image; else ValueError (after a WARNING).
 
     The ValueError is `_OversizedImage` when the image is readable but too big and cannot be downscaled
-    (a non-JPEG over `_MAX_FULL_DECODE_PIXELS`, or a JPEG past Pillow's bomb limit), so the caller can
-    remember it."""
+    (a non-JPEG past its decode window, or any image past Pillow's bomb limit), so the caller can
+    remember it. A decode failure inside the window is a plain ValueError and never remembered."""
     if _image_ok(content):
         return content
     smaller = _downscale_jpeg(content) or _downscale_decoded(content)
@@ -737,7 +790,7 @@ def _fit_image(content: bytes) -> bytes:
         _log.info("Downscaled an oversized image (%d -> %d bytes)", len(content), len(smaller))
         return smaller
     _log.warning("Discarding a download that is not a readable image of a reasonable size")
-    if _is_oversized(content):
+    if _beyond_downscale_window(content):
         raise _OversizedImage("downloaded bytes are not a readable image: over the pixel cap and cannot be downscaled")
     raise ValueError("downloaded bytes are not a readable image")
 
@@ -747,7 +800,13 @@ def _refusal_marker(path: Path, url: str) -> Path:
 
     The URL is part of the name because an original and its thumbnail often share one target path
     (same extension): remembering the original must not block the thumbnail."""
-    return path.with_name(f"{path.name}.{hashlib.sha256(url.encode()).hexdigest()[:12]}.refused")
+    digest = hashlib.sha256(url.encode("utf-8", "surrogatepass")).hexdigest()[:12]   # a lone surrogate must not raise
+    return path.with_name(f"{path.name}.{digest}.refused")
+
+
+def _refusal_stamp() -> str:
+    """What a marker holds: the limits it was refused under. Any change to them forgets the marker."""
+    return f"{_MAX_IMAGE_PIXELS}:{_MAX_FULL_DECODE_PIXELS}:{_MAX_DECODE_BYTES}"
 
 
 def _refusal_recorded(path: Path, url: str) -> bool:
@@ -758,8 +817,8 @@ def _refusal_recorded(path: Path, url: str) -> bool:
     extension, so the `exists()` check never fires for the original's own path. The marker holds the cap
     it was recorded under; raising the cap forgets it."""
     try:
-        return _refusal_marker(path, url).read_text() == str(_MAX_IMAGE_PIXELS)
-    except OSError:
+        return _refusal_marker(path, url).read_text() == _refusal_stamp()
+    except (OSError, ValueError):       # unreadable / not UTF-8: treat as no marker
         return False
 
 
@@ -776,12 +835,21 @@ def _cached_media_ok(path: Path, kind: str) -> bool:
     A file cached before the content check existed (or by a process that died mid-write on a
     pre-`os.replace` version) would otherwise be served by the `exists()` caches forever and fail
     every later render in the compositor. The caller falls through to a fresh download.
+
+    For an image the file is also decoded (`_image_ok`). A TRANSIENT error (reading the head or inside
+    Pillow: EMFILE, EIO, MemoryError, ...) says nothing about the file, so it is KEPT and True is returned
+    -- deleting a paid HuggingFace asset over it would mean a re-billed regeneration.
     """
     try:
         with open(path, "rb") as fh:
             head = fh.read(16)
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+        head = b""                   # not a readable file at all: a definite verdict
     except OSError:
-        head = b""
+        # EMFILE / EIO / ...: says nothing about the file, so never delete it over this (for a paid
+        # HuggingFace asset that would mean a re-billed regeneration)
+        _log.warning("Could not read a cached %s (transient error); keeping it", kind, exc_info=True)
+        return True
     ok = _sniff_ok(kind, head)
     if ok and kind == "image":
         try:
@@ -1010,15 +1078,15 @@ class WikipediaImageSource:
                 if content is None:
                     continue
                 _require_media("image", content[:16])
-                content = _fit_image(content)
-                _atomic_write(lp, content)
+                content = _fit_image(content)       # may be a downscaled JPEG under a .png/.webp name: Pillow and
+                _atomic_write(lp, content)          # the sniff go by content, not extension
                 local_path = lp
                 break
             except SoftTimeLimitExceeded:
                 raise                               # the task is out of time: do not try the next candidate
             except _OversizedImage:
                 try:
-                    _atomic_write(_refusal_marker(lp, img_url), str(_MAX_IMAGE_PIXELS).encode())
+                    _atomic_write(_refusal_marker(lp, img_url), _refusal_stamp().encode())
                 except OSError:
                     pass                            # best effort: the cost is one more download next time
                 continue
@@ -1181,9 +1249,13 @@ class HuggingFaceImageSource:
         # call, no cost) or a failed/skipped call. Callers check this before
         # charging StageEvent.cost_usd, so a cached re-render isn't billed twice.
         self.last_call_was_generated = False
+        # True when the last generate() refused to call the paid API because the render's asset budget was
+        # spent (a cached asset is still served and leaves this False)
+        self.last_call_skipped = False
 
     def generate(self, prompt: str) -> "SourcedAsset | None":
         self.last_call_was_generated = False
+        self.last_call_skipped = False
         if not self.api_key:
             return None
 
@@ -1195,6 +1267,7 @@ class HuggingFaceImageSource:
         if not (local_path.exists() and _cached_media_ok(local_path, "image")):
             if _asset_budget_spent():                # after the cache lookup: a cached asset is free
                 _log.warning("Skipping HuggingFace image generation: the render's asset budget is spent")
+                self.last_call_skipped = True
                 return None
             try:
                 resp = _api_post(
@@ -1259,9 +1332,13 @@ class HuggingFaceVideoSource:
         # call, no cost) or a failed/skipped call. Callers check this before
         # charging StageEvent.cost_usd, so a cached re-render isn't billed twice.
         self.last_call_was_generated = False
+        # True when the last generate() refused to call the paid API because the render's asset budget was
+        # spent (a cached asset is still served and leaves this False)
+        self.last_call_skipped = False
 
     def generate(self, prompt: str) -> "SourcedAsset | None":
         self.last_call_was_generated = False
+        self.last_call_skipped = False
         if not self.api_key:
             return None
 
@@ -1276,6 +1353,7 @@ class HuggingFaceVideoSource:
         else:
             if _asset_budget_spent():                # after the cache lookup: a cached asset is free
                 _log.warning("Skipping HuggingFace video generation: the render's asset budget is spent")
+                self.last_call_skipped = True
                 return None
             try:
                 resp = _api_post(
@@ -1447,6 +1525,8 @@ def _generate_gated_hf_asset(db, reel_id, stage, source, query, cost_fn):
         with record_stage(db, reel_id, stage, provider="huggingface") as ev:
             result = source.generate(query)
             ev.detail["cache_hit"] = result is not None and not source.last_call_was_generated
+            if getattr(source, "last_call_skipped", False):
+                ev.detail["skipped"] = "asset_budget_spent"     # no call was made: not a success, not a failure
             if source.last_call_was_generated:
                 ev.cost_usd = cost_fn(result)
         return result

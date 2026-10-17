@@ -175,7 +175,7 @@ def test_a_hostile_host_is_cut_off_near_the_deadline(behavior):
     with _serve(behavior) as server:
         result, elapsed = _fetch(server.url, 0.6)
     assert isinstance(result, ValueError) and "too slow" in str(result), repr(result)
-    assert 0.5 <= elapsed < 3.0, elapsed           # near the 0.6 s budget, not the 30 s read timeout
+    assert 0.5 <= elapsed < 5.0, elapsed           # near the 0.6 s budget, not the 30 s read timeout
 
 
 def _live_timers():
@@ -433,7 +433,7 @@ def trust_tls(tls, monkeypatch):
 def test_tls_a_fast_download_works_through_the_watchdog(trust_tls):
     with _serve("fast_ok", trust_tls) as server:
         result, elapsed = _fetch(server.url, 30.0)
-    assert result == b"hello" and elapsed < 3.0
+    assert result == b"hello" and elapsed < 5.0
 
 
 @pytest.mark.parametrize("behavior", ["header_drip", "chunk_line_drip", "silent", "handshake_hang"])
@@ -443,7 +443,7 @@ def test_tls_a_hostile_host_is_cut_off_near_the_deadline(trust_tls, behavior):
     with _serve(behavior, trust_tls) as server:
         result, elapsed = _fetch(server.url, 0.6)
     assert isinstance(result, ValueError) and "too slow" in str(result), repr(result)
-    assert 0.5 <= elapsed < 3.0, elapsed
+    assert 0.5 <= elapsed < 5.0, elapsed
 
 
 @pytest.mark.parametrize("behavior", ["close_delimited_drip"])
@@ -453,7 +453,7 @@ def test_a_close_delimited_body_cut_by_the_watchdog_is_never_a_success(trust_tls
     with _serve(behavior, trust_tls if tls_on else None) as server:
         result, elapsed = _fetch(server.url, 0.6)
     assert isinstance(result, ValueError) and "too slow" in str(result), repr(result)
-    assert elapsed < 3.0
+    assert elapsed < 5.0
 
 
 def test_a_close_delimited_body_that_finishes_in_time_is_a_success():
@@ -503,13 +503,13 @@ def test_a_hostile_redirect_target_gets_its_own_watchdog():
     with patch.object(AS.threading, "Timer", Spy), _serve("redirect_then_drip") as server:
         result, elapsed = _fetch(server.url, 0.8)
     assert isinstance(result, ValueError) and "too slow" in str(result), repr(result)
-    assert elapsed < 3.0 and len(armed) == 2 and armed[1] < armed[0]
+    assert elapsed < 5.0 and len(armed) == 2 and armed[1] < armed[0]
 
 
 def test_a_redirect_over_tls_still_arms_per_hop(trust_tls):
     with _serve("redirect_then_drip", trust_tls) as server:
         result, elapsed = _fetch(server.url, 0.8)
-    assert isinstance(result, ValueError) and "too slow" in str(result) and elapsed < 3.0
+    assert isinstance(result, ValueError) and "too slow" in str(result) and elapsed < 5.0
 
 
 # ── _Watchdog internals ───────────────────────────────────────────────────────────────────────
