@@ -100,15 +100,24 @@ _MAX_IMAGE_BYTES = 50 * 1024 * 1024    # Wikipedia originals are rarely over ~20
 _MAX_IMAGE_PIXELS = 50_000_000
 # A non-JPEG image has no cheap partial decode: checking one for truncation, or shrinking it, means decoding
 # it at full size. That is bounded in BYTES, not just pixels, because formats differ a lot (peak RSS measured
-# on 79 Mpx inputs: PNG ~7 B/px, TIFF ~6, lossy / animated WebP ~12-15): `_MAX_DECODE_BYTES` divided by a
+# on 79 Mpx inputs: PNG ~7 B/px, TIFF ~6, lossy / lossless / animated WebP ~12-17 at 25 Mpx, hence the 20): `_MAX_DECODE_BYTES` divided by a
 # per-format bytes-per-pixel estimate is that format's pixel cap (`_pixel_cap`), and an image over it is
 # refused or, for the formats that allow it, downscaled. `_MAX_FULL_DECODE_PIXELS` is the further ceiling on
 # what is decoded to be downscaled. A JPEG is decoded at 1/2-1/8 scale (DCT scaling) instead and is bound
 # only by `_MAX_IMAGE_PIXELS` and Pillow's own bomb limit.
 _MAX_FULL_DECODE_PIXELS = 80_000_000
 _MAX_DECODE_BYTES = 400_000_000
-_DECODE_BYTES_PER_PIXEL = {"WEBP": 16}
+# Downscaling an over-cap image is a one-off decode per original (not on every cache hit), so it may use a
+# larger budget than the check: with the defaults PNG / TIFF / GIF between 50 and 75 Mpx and WebP between 20
+# and 30 Mpx are downscaled (peak RSS ~7 / ~6 / ~12-17 B/px: <= ~520 MB for a 75 Mpx PNG). Above that
+# they are refused and remembered. Without a window larger than the cap the downscale could never run.
+_MAX_DOWNSCALE_DECODE_BYTES = 600_000_000
+_DECODE_BYTES_PER_PIXEL = {"WEBP": 20}
 _DEFAULT_DECODE_BYTES_PER_PIXEL = 8
+_JPEG_FORMATS = ("JPEG", "MPO")            # an MPO is a JPEG with extra frames: same DCT-scaled decode
+# libtiff allocates a TILE-sized buffer (TileWidth x TileLength) whatever the declared image size: a 100x100
+# TIFF declaring 25000x25000 tiles made `load()` allocate ~1 GB, so the pixel caps above do not bound it.
+_MAX_TIFF_TILE_SIDE = 4096
 _MAX_API_JSON_BYTES = 8 * 1024 * 1024   # Pexels search / Wikipedia lookups are a few KB; refuse to parse more
 _MAX_REDIRECTS = 3
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
@@ -455,8 +464,13 @@ def _any_https_host(url) -> bool:
     literal or `localhost` is refused all the same: no API host is one, and it keeps a future variable URL
     from reaching a metadata endpoint."""
     host = _https_host(url)
-    if host is None or host == "localhost" or host.endswith(".localhost"):
+    if host is not None:
+        host = host.rstrip(".")                 # "localhost." is localhost
+    if not host or host == "localhost" or host.endswith(".localhost"):
         return False
+    last = host.rsplit(".", 1)[-1]
+    if last.isdigit() or last.startswith("0x"):
+        return False                            # 2130706433, 0x7f.1, 127.1, 017700000001: inet_aton IPv4 forms
     try:
         ipaddress.ip_address(host)
     except ValueError:
@@ -598,14 +612,31 @@ def _bytes_per_pixel(fmt) -> int:
 def _pixel_cap(fmt) -> int:
     """The most pixels an image of Pillow format `fmt` may declare: `_MAX_IMAGE_PIXELS`, and for a format
     that is decoded in full also what fits in `_MAX_DECODE_BYTES` (WebP: 25 Mpx; PNG / TIFF / GIF: 50 Mpx)."""
-    if fmt == "JPEG":
-        return _MAX_IMAGE_PIXELS                # decoded at 1/8 scale: a small buffer
+    if fmt in _JPEG_FORMATS:
+        return _MAX_IMAGE_PIXELS                # decoded at 1/8 scale: far less than a full-size buffer
     return min(_MAX_IMAGE_PIXELS, _MAX_DECODE_BYTES // _bytes_per_pixel(fmt))
 
 
 def _decode_window(fmt) -> int:
-    """The most pixels of a non-JPEG image that may be decoded in full in order to downscale it."""
-    return min(_MAX_FULL_DECODE_PIXELS, _MAX_DECODE_BYTES // _bytes_per_pixel(fmt))
+    """The most pixels of a non-JPEG image that may be decoded in full in order to downscale it:
+    `min(_MAX_FULL_DECODE_PIXELS, _MAX_DOWNSCALE_DECODE_BYTES // bytes-per-pixel)`."""
+    return min(_MAX_FULL_DECODE_PIXELS, _MAX_DOWNSCALE_DECODE_BYTES // _bytes_per_pixel(fmt))
+
+
+def _tiff_tiles_ok(im) -> bool:
+    """False for a TIFF declaring a tile (TileWidth / TileLength) larger than `_MAX_TIFF_TILE_SIDE`; True
+    for every other image. Checked from the header, before any pixel is decoded."""
+    if im.format != "TIFF":
+        return True
+    tags = getattr(im, "tag_v2", None)
+    if tags is None:
+        return True
+    for tag in (322, 323):                      # TileWidth, TileLength
+        value = tags.get(tag)
+        values = value if isinstance(value, (tuple, list)) else (value,)
+        if any(isinstance(v, int) and v > _MAX_TIFF_TILE_SIDE for v in values):
+            return False
+    return True
 
 
 def _is_transient(exc: BaseException) -> bool:
@@ -621,17 +652,18 @@ def _is_transient(exc: BaseException) -> bool:
 
 
 def _image_ok(source) -> bool:
-    """True if Pillow can decode `source` (image bytes or a Path) and it declares <= _MAX_IMAGE_PIXELS.
+    """True if Pillow can decode `source` (image bytes or a Path) and it declares <= `_pixel_cap(format)`
+    pixels (`_MAX_IMAGE_PIXELS`, and for a non-JPEG also what fits in `_MAX_DECODE_BYTES`: 25 Mpx for WebP).
 
     The declared size is read from the header first, and the pixels are decoded (`load()`) only when it
-    is within the cap, so the decode is bounded (<= ~150 MB for 8-bit RGB; a JPEG is decoded at 1/8
+    is within the cap, so the decode is bounded (by the per-format byte budget, `_MAX_DECODE_BYTES`; a JPEG is decoded at 1/8
     scale via DCT scaling, which still reads the whole entropy-coded stream, so truncation is caught
     without the full-size buffer). An unidentifiable or truncated/corrupt file, a file Pillow itself calls
     a decompression bomb (> 2x its own limit raises at open) and a missing path are all "not ok" -- a
     refusal, not an exception. Pillow's own `DecompressionBombWarning` (a soft warning between 1x and 2x
     its limit) is silenced: the cap here is the one that decides. Only the first frame of an animated
-    file is decoded. A TRANSIENT failure (`MemoryError`, or
-    an `OSError` carrying an errno other than "no such file": EMFILE, EIO, ...) says nothing about the
+    file is decoded. A TRANSIENT failure (see `_is_transient`: `MemoryError`, or
+    an `OSError` carrying an errno other than a definite "not a file" or Pillow's own "cannot identify": EMFILE, EIO, ...) says nothing about the
     image and is re-raised, so a caller never deletes a good (possibly paid-for) cached file over it.
     `SoftTimeLimitExceeded` is re-raised.
     """
@@ -641,7 +673,7 @@ def _image_ok(source) -> bool:
             warnings.simplefilter("ignore")
             with Image.open(io.BytesIO(source) if isinstance(source, (bytes, bytearray)) else source) as im:
                 width, height = im.size
-                if width * height > _pixel_cap(im.format):
+                if width * height > _pixel_cap(im.format) or not _tiff_tiles_ok(im):
                     return False
                 im.draft("RGB", (max(1, width // 8), max(1, height // 8)))   # JPEG only; a no-op otherwise
                 im.load()                                                    # raises on a truncated file
@@ -670,7 +702,7 @@ def _downscale_jpeg(content: bytes) -> "bytes | None":
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             with Image.open(io.BytesIO(content)) as im:
-                if im.format != "JPEG":
+                if im.format not in _JPEG_FORMATS:
                     return None
                 width, height = im.size
                 if width * height <= _MAX_IMAGE_PIXELS:
@@ -697,15 +729,15 @@ def _downscale_jpeg(content: bytes) -> "bytes | None":
 
 
 class _OversizedImage(ValueError):
-    """A readable image whose declared size is over `_MAX_IMAGE_PIXELS` and that could not be downscaled."""
+    """A readable image over its pixel cap that is beyond its decode window (or Pillow's bomb limit)."""
 
 
 def _beyond_downscale_window(content: bytes) -> bool:
     """True if `content` is a readable image that is over the cap AND cannot be downscaled by design.
 
-    That is: Pillow's own bomb error (> 2x its limit), or a non-JPEG over `_MAX_FULL_DECODE_PIXELS`.
+    That is: Pillow's own bomb error (> 2x its limit), or a non-JPEG over `_decode_window(fmt)`.
     Those are the only images worth REMEMBERING as too big. An image that is over the cap but inside the
-    window (a JPEG, or a non-JPEG up to 80 Mpx) that still failed to downscale failed to DECODE
+    window (a JPEG, or a non-JPEG up to its `_decode_window`) that still failed to downscale failed to DECODE
     (truncated, corrupt, a transient MemoryError): that may not repeat, so it is never recorded.
     False for anything else, including a header Pillow cannot read."""
     from PIL import Image
@@ -714,7 +746,7 @@ def _beyond_downscale_window(content: bytes) -> bool:
             warnings.simplefilter("ignore")
             with Image.open(io.BytesIO(content)) as im:
                 pixels = im.size[0] * im.size[1]
-                return (pixels > _pixel_cap(im.format) and im.format != "JPEG"
+                return (pixels > _pixel_cap(im.format) and im.format not in _JPEG_FORMATS
                         and pixels > _decode_window(im.format))
     except SoftTimeLimitExceeded:
         raise
@@ -732,7 +764,8 @@ def _downscale_decoded(content: bytes) -> "bytes | None":
     """A non-JPEG image over `_MAX_IMAGE_PIXELS`, decoded in full and re-encoded smaller; None otherwise.
 
     PNG / WebP / TIFF / GIF have no partial decode, so the whole image is decoded (only if it is within
-    `_MAX_FULL_DECODE_PIXELS`, which bounds the transient memory), shrunk with an integer box `reduce()`
+    `_decode_window(fmt)` = min(`_MAX_FULL_DECODE_PIXELS`, `_MAX_DOWNSCALE_DECODE_BYTES` // bytes-per-pixel), which
+    bounds the transient memory), shrunk with an integer box `reduce()`
     (cheap, no resampling allocation of the big image), has its EXIF orientation baked in (the reduce drops
     the metadata) and is re-encoded: PNG stays PNG (lossless, alpha kept), everything else becomes a
     JPEG. Only the first frame of an animated file is used -- the compositor also opens just that
@@ -747,9 +780,11 @@ def _downscale_decoded(content: bytes) -> "bytes | None":
                 fmt = im.format
                 width, height = im.size
                 pixels = width * height
-                if fmt == "JPEG" or pixels <= _pixel_cap(fmt) or pixels > _decode_window(fmt):
+                if fmt in _JPEG_FORMATS or pixels <= _pixel_cap(fmt) or pixels > _decode_window(fmt):
                     return None
-                target = _pixel_cap("PNG" if fmt == "PNG" else "JPEG")      # the output's own format must pass _image_ok
+                if not _tiff_tiles_ok(im):
+                    return None
+                target = _MAX_IMAGE_PIXELS     # always the binding cap here: window > cap implies bytes // bpp > _MAX_IMAGE_PIXELS
                 orientation = im.getexif().get(0x0112)
                 im.load()
                 factor = max(2, math.ceil(math.sqrt(pixels / target)))
@@ -805,17 +840,20 @@ def _refusal_marker(path: Path, url: str) -> Path:
 
 
 def _refusal_stamp() -> str:
-    """What a marker holds: the limits it was refused under. Any change to them forgets the marker."""
-    return f"{_MAX_IMAGE_PIXELS}:{_MAX_FULL_DECODE_PIXELS}:{_MAX_DECODE_BYTES}"
+    """What a marker holds: the limits (and the per-format bytes-per-pixel estimates) it was refused under.
+    Any change to them forgets the marker."""
+    table = ",".join(f"{k}={v}" for k, v in sorted(_DECODE_BYTES_PER_PIXEL.items()))
+    return (f"{_MAX_IMAGE_PIXELS}:{_MAX_FULL_DECODE_PIXELS}:{_MAX_DECODE_BYTES}:{_MAX_DOWNSCALE_DECODE_BYTES}"
+            f":{_DEFAULT_DECODE_BYTES_PER_PIXEL}:{table}")
 
 
 def _refusal_recorded(path: Path, url: str) -> bool:
-    """True if `url` (which would be cached at `path`) was already refused as oversized under the CURRENT cap.
+    """True if `url` (which would be cached at `path`) was already refused as oversized under the CURRENT limits.
 
     Without this a non-JPEG original over the cap is downloaded in full (up to 50 MB), refused and
     forgotten on every `search()` -- the thumbnail that replaced it is cached under a different
-    extension, so the `exists()` check never fires for the original's own path. The marker holds the cap
-    it was recorded under; raising the cap forgets it."""
+    extension, so the `exists()` check never fires for the original's own path. The marker holds the limits
+    it was recorded under (`_refusal_stamp`); changing any of them forgets it."""
     try:
         return _refusal_marker(path, url).read_text() == _refusal_stamp()
     except (OSError, ValueError):       # unreadable / not UTF-8: treat as no marker
@@ -1505,9 +1543,10 @@ def _generate_gated_hf_asset(db, reel_id, stage, source, query, cost_fn):
     """Runs source.generate(query), gated on (reel_id is not None and source.api_key) exactly
     like the two call sites below used to inline separately. Gated means wrapped in
     record_stage(..., stage, provider="huggingface") — a StageEvent is written only for a
-    call that was actually attempted (generate() is a guaranteed no-op with no api_key, and
+    call that was actually attempted or deliberately refused (a budget-skipped call carries
+    detail["skipped"] = "asset_budget_spent"). generate() is a guaranteed no-op with no api_key, and
     hf_video/hf are always constructed regardless of whether the key is set, so this gate
-    can't be pushed onto the caller). cost_fn(result) -> float lets each call site supply its
+    can't be pushed onto the caller. cost_fn(result) -> float lets each call site supply its
     own cost shape (hf_video_cost_usd() needs the generated result's duration_s; hf_image_cost_usd()
     takes no args) without this helper knowing which source it's wrapping.
 
@@ -1525,7 +1564,7 @@ def _generate_gated_hf_asset(db, reel_id, stage, source, query, cost_fn):
         with record_stage(db, reel_id, stage, provider="huggingface") as ev:
             result = source.generate(query)
             ev.detail["cache_hit"] = result is not None and not source.last_call_was_generated
-            if getattr(source, "last_call_skipped", False):
+            if getattr(source, "last_call_skipped", False) is True:
                 ev.detail["skipped"] = "asset_budget_spent"     # no call was made: not a success, not a failure
             if source.last_call_was_generated:
                 ev.cost_usd = cost_fn(result)

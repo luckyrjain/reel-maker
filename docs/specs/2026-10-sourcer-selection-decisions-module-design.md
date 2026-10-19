@@ -498,7 +498,7 @@ closed, as flagged below.
   returned as an ordinary `httpx.Response` built from the capped body. Reading stops at the limit, so the buffer
   is bounded; `_TooLarge` is caught per caller (HF: WARNING, not billed). `_body_too_large` stays as defense in
   depth. To avoid rewriting ~130 test patches, a conftest fixture points `_api_get/_api_post` back at `httpx.get/post`
-  unless a test carries `real_api` (`tests/test_sourcer_api_streaming.py`, 30 when written, 63 now).
+  unless a test carries `real_api` (`tests/test_sourcer_api_streaming.py`, 30 when written, 72 now).
 * **Image pixel cap.** `_image_ok()` reads the declared size with Pillow, refuses an unidentifiable image or one over
   `_MAX_IMAGE_PIXELS` (50 Mpx), and only then decodes the pixels (`load()`, a JPEG at 1/8 scale through `draft`), so
   a truncated or corrupt file is refused and an over-cap one is never decoded (first version: header only, which
@@ -527,7 +527,7 @@ closed, as flagged below.
   lookup (the first version put it in `_generate_gated_hf_asset`, before the lookup, so a cached, already-paid-for
   asset became a black frame and its old pin was dropped -- found by review). It gates starts only: the small API
   calls, the 429 sleep and anything in flight are not interrupted.
-  `tests/test_sourcer_render_budget.py` (22) plus 3 in `test_render_task.py`.
+  `tests/test_sourcer_render_budget.py` (27) plus 3 in `test_render_task.py`.
 * **Review fixes to the above.** `_image_ok` re-raises `MemoryError` and errno-bearing `OSError`s (EMFILE, EIO) so a
   transient failure no longer deletes a cached (possibly paid-for) image; `_cached_media_ok` keeps the file and
   logs. Known, accepted limits: a non-JPEG original past its decode window (or a JPEG past Pillow's bomb limit) still falls
@@ -541,12 +541,12 @@ closed, as flagged below.
   **The memory bound is in bytes, per format** (round-2 security review: the first version assumed <= ~320 MB
   at 80 Mpx; measured peak RSS was ~540 MB for a 79 Mpx PNG, ~460 MB for TIFF mode I and ~960-1000 MB for a
   lossy or animated WebP, and `_image_ok`'s own `load()` of a 49 Mpx WebP cost ~710 MB). `_pixel_cap(fmt)` =
-  `min(_MAX_IMAGE_PIXELS, _MAX_DECODE_BYTES (400 MB) // bytes-per-pixel)` with 16 B/px for WebP and 8 B/px for
-  everything else, so PNG/TIFF/GIF keep the 50 Mpx cap and WebP gets 25 Mpx; `_decode_window(fmt)` additionally
+  `min(_MAX_IMAGE_PIXELS, _MAX_DECODE_BYTES (400 MB) // bytes-per-pixel)` with 20 B/px for WebP (16.5-24 B/px measured at 25 Mpx; the first draft's 16 was borderline) and 8 B/px for
+  everything else, so PNG/TIFF/GIF keep the 50 Mpx cap and WebP gets 20 Mpx; `_decode_window(fmt)` additionally
   applies `_MAX_FULL_DECODE_PIXELS` (80 Mpx), which the byte budget makes moot for all current formats. A
   JPEG is exempt (decoded at 1/8 scale). A non-JPEG past its window is not decoded at all (no partial decode
   exists, so that is the memory bound) and still falls back to the thumbnail, remembered by the marker below
-  (an over-cap WebP's window equals its cap, so a WebP is never downscaled, only refused). The image check and the downscale use only
+  (round-3 review: the first byte-budget version used ONE budget for the check and the window, so for every non-JPEG the window EQUALLED the cap and the full-decode downscale could never run -- the tests hid it by monkeypatching the constants. The window now has its own, larger budget, `_MAX_DOWNSCALE_DECODE_BYTES` 600 MB: PNG/TIFF/GIF are downscaled between 50 and 75 Mpx, WebP between 20 and 30 Mpx, and a default-constants test with a real 56 Mpx PNG pins it). The image check and the downscale use only
   the first frame of an animated file: the compositor opens just that frame, so a later one cannot matter (this
   was listed as a limit before; it is not one).
 * **Oversized originals are remembered.** The thumbnail that replaces a refused original is cached under its
@@ -555,7 +555,7 @@ closed, as flagged below.
   image that is over the cap AND beyond the downscale windows (`_beyond_downscale_window`: a non-JPEG past its decode window,
   or Pillow's own bomb error; never a corrupt/truncated file or a failed downscale inside the windows, which may
   not repeat -- the first version recorded any over-cap image whose downscale failed, found by round-2 review), and `WikipediaImageSource.search` writes a marker
-  `wiki_<id>.<ext>.<sha256(url)[:12]>.refused` holding the cap it was refused under, which later searches
+  `wiki_<id>.<ext>.<sha256(url)[:12]>.refused` holding the limits it was refused under (`_refusal_stamp`), which later searches
   check before downloading. Keyed by URL because an original and its thumbnail often share one target path
   (the first version keyed by path and blocked the thumbnail -- caught by its own tests). A different cap
   forgets the marker; a failed marker write only costs one more download.
@@ -590,7 +590,7 @@ path and is refused past its window.
 Round-2 security review, additionally fixed: a lone surrogate in an upstream image URL made `search()` raise
 (the marker's `sha256(url.encode())`; now `surrogatepass`), a transient `MemoryError`/`OSError` during a
 downscale was swallowed and then recorded as a permanent "too big" marker (the downscalers now re-raise
-transient errors like `_image_ok`), the marker stamp now holds all three limits so changing any of them
+transient errors like `_image_ok`), the marker stamp now holds every limit (and the per-format estimates) so changing any of them
 forgets it, the head-read case of `_cached_media_ok` keeps the file, and `_any_https_host` refuses IP
 literals and `localhost`. Known and accepted: a gzip response is inflated to the SAME cap as its compressed size
 (250 MB for a HuggingFace video), so a compromised HF host can cost ~2x the cap transiently (the output chunks
@@ -607,4 +607,34 @@ ENCODED body, a palette PNG with tRNS, an unreadable (directory) marker, the 12-
 warning. The review also found that a refused HF call recorded a `StageEvent(ok=True, cache_hit=False)` that
 looked like a success; it now carries `detail["skipped"] = "asset_budget_spent"` (`last_call_skipped` on the
 source). Real-socket deadline tests widened from `< 3.0 s` to `< 5.0 s` for loaded CI boxes.
+
+### Round 3 review (of the round-2 fix commit)
+
+The docs and correctness reviewers independently found that the per-format byte budget had made the
+full-decode downscale dead code with the shipped constants (see the window note above); fixed with a second,
+larger byte budget for the window and a default-constants test. Also fixed: three "never decoded" tests used
+`side_effect=AssertionError` on `Image.load`, which the code under test's broad `except Exception` swallowed,
+so they passed for the wrong reason (now a counting spy that records and delegates); `getattr(source,
+"last_call_skipped", False)` is now `is True` (a MagicMock source no longer records a skip); `localhost.` and
+`foo.localhost.` are refused by the API URL check; the marker stamp includes the per-format estimates.
+Known and accepted: a cached file with EACCES/EPERM is kept (never deleted, since for a paid HuggingFace asset
+that would mean re-billing) and then fails the compositor's open until the permission is fixed; WebP files
+between 37.5 and 50 Mpx, accepted before round 2, are now refused (thumbnail fallback, remembered).
+
+Round-3 security review, additionally fixed: **a tiled TIFF dodged every pixel/byte budget** (libtiff allocates a
+TileWidth x TileLength buffer whatever the declared image size: a ~200-byte TIFF declaring a 100x100 image with
+25000x25000 tiles made `load()` allocate ~1 GB, measured; it is refused from its header now,
+`_tiff_tiles_ok`, tile sides above `_MAX_TIFF_TILE_SIDE` = 4096, checked in `_image_ok` and again in
+`_downscale_decoded`); an **MPO** (a JPEG with extra frames, Pillow format "MPO") is now treated as a JPEG
+(`_JPEG_FORMATS`) instead of being refused and remembered above the cap; `_any_https_host` also refuses the
+inet_aton IPv4 spellings (`https://2130706433/`, `0x7f.1`, `127.1`, `017700000001`: any host whose last label is
+all digits or starts with `0x`) and a trailing-dot `localhost.`; WebP's estimate went from 16 to 20 B/px
+(measured 16.5-24 at 25 Mpx), giving a 20 Mpx check cap and a 30 Mpx downscale window. Known and accepted: a
+progressive CMYK JPEG costs ~390 MB in `_image_ok` at 49 Mpx (inside the 400 MB budget but not "small"); a TIFF in
+CMYK/LAB/16-bit costs 300-435 MB in the COMPOSITOR's own `convert("RGB")` after being cached (not changed by this
+work); the tile guard is the only structural decode bound that depends on a header field. The round-3 test-quality
+review found three tests that asserted "never decoded" with `side_effect=AssertionError` on `Image.load` --
+swallowed by the code's broad `except Exception`, so they passed for the wrong reason; they now use a counting
+spy -- plus a missing `real_media_sniffing` marker that made the head-read test vacuous and four
+`_beyond_downscale_window` / marker-stamp boundary gaps, all closed.
 

@@ -43,6 +43,25 @@ def _png_declaring(width, height):
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(b"\x00")) + chunk(b"IEND", b"")
 
 
+from contextlib import contextmanager  # noqa: E402
+
+
+@contextmanager
+def _load_spy():
+    """Count `Image.load()` calls (pixel decodes) WITHOUT raising: a raised AssertionError would be swallowed by
+    the broad `except Exception` in the code under test and make a 'was never decoded' test pass for the
+    wrong reason."""
+    calls = []
+    real = Image.Image.load
+
+    def spy(self, *a, **k):
+        calls.append(1)
+        return real(self, *a, **k)
+
+    with patch.object(Image.Image, "load", spy):
+        yield calls
+
+
 # ── the check ────────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("fmt", ["JPEG", "PNG", "GIF", "WEBP", "TIFF"])
@@ -109,8 +128,9 @@ def test_pillows_bomb_warning_does_not_escape_as_an_error(monkeypatch):
 
 
 def test_pixels_of_an_over_cap_image_are_never_decoded():
-    with patch.object(Image.Image, "load", side_effect=AssertionError("decoded pixels")):
+    with _load_spy() as calls:
         assert AS._image_ok(_png_declaring(12000, 12000)) is False
+    assert calls == []
 
 
 @pytest.mark.parametrize("fmt", ["PNG", "JPEG", "GIF", "TIFF", "WEBP"])
@@ -396,10 +416,11 @@ def test_a_non_jpeg_past_the_full_decode_window_is_refused_without_being_decoded
     monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
     monkeypatch.setattr(AS, "_MAX_FULL_DECODE_PIXELS", 2 * CAP)
     big = _encoded("PNG", (256, 192))
-    with patch.object(Image.Image, "load", side_effect=AssertionError("decoded an image past the window")):
+    with _load_spy() as calls:
         assert AS._downscale_decoded(big) is None
-    with pytest.raises(AS._OversizedImage):
-        AS._fit_image(big)
+        with pytest.raises(AS._OversizedImage):
+            AS._fit_image(big)
+    assert calls == []
 
 
 def test_the_full_decode_window_boundary(monkeypatch):
@@ -717,20 +738,21 @@ def test_an_unreadable_marker_means_no_marker_not_an_error(tmp_path, monkeypatch
 # ── round-2 security review: decode memory is bounded in BYTES per format ─────────────────────────
 
 def test_the_decode_constants():
-    assert AS._MAX_DECODE_BYTES == 400_000_000
-    assert AS._DECODE_BYTES_PER_PIXEL == {"WEBP": 16} and AS._DEFAULT_DECODE_BYTES_PER_PIXEL == 8
+    assert AS._MAX_DECODE_BYTES == 400_000_000 and AS._MAX_DOWNSCALE_DECODE_BYTES == 600_000_000
+    assert AS._DECODE_BYTES_PER_PIXEL == {"WEBP": 20} and AS._DEFAULT_DECODE_BYTES_PER_PIXEL == 8
 
 
 def test_pixel_caps_per_format():
     assert AS._pixel_cap("JPEG") == 50_000_000                     # decoded at 1/8 scale
     assert AS._pixel_cap("PNG") == AS._pixel_cap("TIFF") == AS._pixel_cap("GIF") == 50_000_000
-    assert AS._pixel_cap("WEBP") == 25_000_000                     # ~12-15 B/px measured: 400 MB / 16
+    assert AS._pixel_cap("MPO") == 50_000_000                      # an MPO is a JPEG
+    assert AS._pixel_cap("WEBP") == 20_000_000                     # ~12-17 B/px measured at 25 Mpx: 400 MB / 20
     assert AS._pixel_cap(None) == 50_000_000                       # unknown format: the default estimate
 
 
 def test_decode_windows_per_format():
-    assert AS._decode_window("PNG") == 50_000_000                  # min(80 Mpx, 400 MB / 8)
-    assert AS._decode_window("WEBP") == 25_000_000
+    assert AS._decode_window("PNG") == AS._decode_window("TIFF") == 75_000_000        # min(80 Mpx, 600 MB / 8)
+    assert AS._decode_window("WEBP") == 30_000_000                                    # 600 MB / 20
 
 
 def test_a_webp_over_its_byte_budget_is_refused_while_a_png_of_the_same_size_is_not(monkeypatch):
@@ -741,14 +763,38 @@ def test_a_webp_over_its_byte_budget_is_refused_while_a_png_of_the_same_size_is_
     assert AS._image_ok(png) is True
 
 
-def test_an_over_budget_webp_is_never_decoded_or_downscaled(monkeypatch):
+def test_an_over_budget_webp_is_never_decoded_or_downscaled_when_its_window_is_also_over_budget(monkeypatch):
     monkeypatch.setattr(AS, "_MAX_DECODE_BYTES", 16 * 4096)
+    monkeypatch.setattr(AS, "_MAX_DOWNSCALE_DECODE_BYTES", 16 * 4096)
     webp = _encoded("WEBP", (80, 60))
-    with patch.object(Image.Image, "load", side_effect=AssertionError("decoded an over-budget WebP")):
+    with _load_spy() as calls:
         assert AS._image_ok(webp) is False
-        assert AS._downscale_decoded(webp) is None                 # its window equals its cap
-    with pytest.raises(AS._OversizedImage):
-        AS._fit_image(webp)
+        assert AS._downscale_decoded(webp) is None
+        with pytest.raises(AS._OversizedImage):
+            AS._fit_image(webp)
+    assert calls == []
+
+
+def test_a_webp_over_its_check_cap_but_inside_its_downscale_window_is_downscaled(monkeypatch):
+    monkeypatch.setattr(AS, "_MAX_DECODE_BYTES", 16 * 4096)                # WebP check cap 4096 px
+    monkeypatch.setattr(AS, "_MAX_DOWNSCALE_DECODE_BYTES", 16 * 16384)     # downscale window 16384 px
+    (w, h), fmt = _size_and_format(AS._fit_image(_encoded("WEBP", (80, 60))))
+    assert fmt == "JPEG" and w * h <= 4096
+
+
+def test_the_default_downscale_window_is_larger_than_the_check_cap_for_every_format():
+    """With window == cap the full-decode downscale could never run (round-3 docs review)."""
+    for fmt in ("PNG", "TIFF", "GIF", "WEBP"):
+        assert AS._decode_window(fmt) > AS._pixel_cap(fmt), fmt
+
+
+def test_a_real_56_megapixel_png_is_downscaled_with_the_default_constants():
+    buf = io.BytesIO()
+    Image.new("RGB", (7000, 8000), (10, 120, 200)).save(buf, format="PNG", compress_level=1)      # 56 Mpx
+    big = buf.getvalue()
+    assert AS._image_ok(big) is False                                        # over the 50 Mpx default cap
+    (w, h), fmt = _size_and_format(AS._fit_image(big))
+    assert fmt == "PNG" and w * h <= 50_000_000 and w * h > 10_000_000
 
 
 def test_a_jpeg_is_not_subject_to_the_byte_budget(monkeypatch):
@@ -824,10 +870,11 @@ def test_the_byte_budget_also_narrows_the_downscale_window(monkeypatch):
     window but not the byte budget is never decoded."""
     monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
     monkeypatch.setattr(AS, "_MAX_FULL_DECODE_PIXELS", 20 * CAP)
-    monkeypatch.setattr(AS, "_MAX_DECODE_BYTES", 8 * 2 * CAP)       # PNG window: 2 * CAP = 8192 px
+    monkeypatch.setattr(AS, "_MAX_DOWNSCALE_DECODE_BYTES", 8 * 2 * CAP)       # PNG window: 2 * CAP = 8192 px
     big, small = _encoded("PNG", (256, 192)), _encoded("PNG", (80, 60))          # 49152 px / 4800 px
-    with patch.object(Image.Image, "load", side_effect=AssertionError("decoded past the byte budget")):
+    with _load_spy() as calls:
         assert AS._downscale_decoded(big) is None
+    assert calls == []
     assert AS._downscale_decoded(small) is not None
 
 
@@ -949,3 +996,210 @@ def test_only_not_a_file_errors_are_a_definite_verdict_on_the_head_read(tmp_path
     f = tmp_path / "hf_file.png"
     f.write_bytes(_img("PNG"))
     assert AS._cached_media_ok(f / "child", "image") is False         # NotADirectoryError
+
+
+# ── round-3 review ───────────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("url,ok", [("https://localhost./x", False), ("https://LOCALHOST/x", False),
+                                    ("https://foo.localhost./x", False), ("https://api.pexels.com./x", True)])
+def test_the_api_url_check_normalises_trailing_dots(url, ok):
+    assert AS._any_https_host(url) is ok
+
+
+def test_the_marker_stamp_changes_with_the_per_format_estimates(monkeypatch):
+    before = AS._refusal_stamp()
+    monkeypatch.setattr(AS, "_DECODE_BYTES_PER_PIXEL", {"WEBP": 17})
+    assert AS._refusal_stamp() != before
+    monkeypatch.undo()
+    monkeypatch.setattr(AS, "_DEFAULT_DECODE_BYTES_PER_PIXEL", 9)
+    assert AS._refusal_stamp() != before
+    monkeypatch.undo()
+    monkeypatch.setattr(AS, "_MAX_DOWNSCALE_DECODE_BYTES", AS._MAX_DOWNSCALE_DECODE_BYTES + 1)
+    assert AS._refusal_stamp() != before
+
+
+def test_a_source_without_the_skipped_attribute_or_with_a_mock_one_records_no_skip(db_session, tmp_path):
+    from unittest.mock import MagicMock
+    from api import models
+    reel = models.Reel(context="c", niche="n")
+    db_session.add(reel)
+    db_session.flush()
+    src = MagicMock()                                     # last_call_skipped is a truthy MagicMock here
+    src.api_key = "k"
+    src.generate.return_value = None
+    src.last_call_was_generated = False
+    AS._generate_gated_hf_asset(db_session, reel.id, "asset_hf_image", src, "q", lambda r: 0.0)
+    ev = db_session.query(models.StageEvent).filter_by(stage="asset_hf_image").one()
+    assert "skipped" not in ev.detail
+
+
+# ── round-3 security review: tiled TIFF, MPO, numeric hosts ──────────────────────────────────────────
+
+def _tiled_tiff(tile, width=100, height=100):
+    """A ~200-byte TIFF declaring a width x height image with `tile` x `tile` TILES (junk tile data): libtiff
+    allocates a tile-sized buffer, so this used to cost ~1 GB at tile 25000 though the image is 100x100."""
+    import struct
+    tags = []
+    data_off = 8 + 2 + 12 * 12 + 4
+    tile_data = b"\x00" * 16
+    bps_off = data_off + len(tile_data)
+
+    def tag(t, ty, n, v):
+        tags.append((t, ty, n, v))
+
+    tag(256, 3, 1, width); tag(257, 3, 1, height); tag(258, 3, 3, bps_off); tag(259, 3, 1, 8); tag(262, 3, 1, 2)
+    tag(277, 3, 1, 3); tag(284, 3, 1, 1); tag(322, 3, 1, tile); tag(323, 3, 1, tile)
+    tag(324, 4, 1, data_off); tag(325, 4, 1, len(tile_data)); tag(339, 3, 1, 1)
+    tags.sort()
+    out = b"II*\x00" + struct.pack("<I", 8) + struct.pack("<H", len(tags))
+    for t, ty, n, v in tags:
+        out += struct.pack("<HHIHH", t, ty, n, v, 0) if ty == 3 and n == 1 else struct.pack("<HHII", t, ty, n, v)
+    out += struct.pack("<I", 0)
+    assert len(out) == data_off
+    return out + tile_data + struct.pack("<HHH", 8, 8, 8)
+
+
+def test_a_tiff_declaring_a_huge_tile_is_refused_from_its_header_without_decoding():
+    bomb = _tiled_tiff(8192)
+    with _load_spy() as calls:
+        assert AS._image_ok(bomb) is False
+        assert AS._downscale_decoded(bomb) is None
+    assert calls == []
+
+
+def test_the_tile_guard_reads_both_dimensions_and_the_boundary():
+    with Image.open(io.BytesIO(_tiled_tiff(AS._MAX_TIFF_TILE_SIDE))) as im:
+        assert AS._tiff_tiles_ok(im) is True
+    with Image.open(io.BytesIO(_tiled_tiff(AS._MAX_TIFF_TILE_SIDE + 1))) as im:
+        assert AS._tiff_tiles_ok(im) is False
+    with Image.open(io.BytesIO(_tiled_tiff(256))) as im:
+        assert AS._tiff_tiles_ok(im) is True
+
+
+def test_the_tile_guard_ignores_every_non_tiff_and_an_untiled_tiff():
+    for fmt in ("PNG", "JPEG", "GIF", "WEBP"):
+        with Image.open(io.BytesIO(_encoded(fmt, (16, 16)))) as im:
+            assert AS._tiff_tiles_ok(im) is True
+    with Image.open(io.BytesIO(_encoded("TIFF", (16, 16)))) as im:
+        assert AS._tiff_tiles_ok(im) is True
+
+
+def test_the_tile_limit_value():
+    assert AS._MAX_TIFF_TILE_SIDE == 4096
+
+
+def test_an_mpo_is_treated_like_a_jpeg(monkeypatch):
+    """An MPO is a JPEG with extra frames; Pillow reports format 'MPO'. It is downscaled by DCT-scaled decode
+    and is never 'beyond the window' (it used to be refused and remembered)."""
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    monkeypatch.setattr(AS, "_MAX_FULL_DECODE_PIXELS", 2 * CAP)
+    buf = io.BytesIO()
+    frames = [Image.effect_noise((256, 192), 60).convert("RGB") for _ in range(2)]
+    frames[0].save(buf, format="MPO", save_all=True, append_images=frames[1:])
+    mpo = buf.getvalue()
+    with Image.open(io.BytesIO(mpo)) as im:
+        assert im.format == "MPO"
+    (w, h), fmt = _size_and_format(AS._fit_image(mpo))
+    assert fmt == "JPEG" and w * h <= CAP
+    assert AS._beyond_downscale_window(mpo) is False
+
+
+@pytest.mark.parametrize("url", ["https://2130706433/x", "https://0x7f.1/x", "https://127.1/x", "https://017700000001/x",
+                                 "https://2852039166/x", "https://0xa9fea9fe/x", "https://0/x", "https://1.2.3.4/x",
+                                 "https://10.0.0.0x1/x"])
+def test_numeric_ipv4_spellings_are_refused(url):
+    assert AS._any_https_host(url) is False
+
+
+@pytest.mark.parametrize("url", ["https://api.pexels.com/videos/search", "https://en.wikipedia.org/w/api.php",
+                                 "https://api-inference.huggingface.co/models/x", "https://commons.wikimedia.org/w/api.php",
+                                 "https://x.io/a", "https://v1.example.com/a"])
+def test_real_api_hosts_are_still_accepted(url):
+    assert AS._any_https_host(url) is True
+
+
+# ── round-3 test-quality review ──────────────────────────────────────────────────────────────────────
+
+@pytest.mark.real_media_sniffing
+def test_r3_a_transient_head_read_error_keeps_the_file_even_with_the_real_sniff(tmp_path):
+    import builtins, errno
+    f = tmp_path / "hf_cache.png"
+    f.write_bytes(_img("PNG"))
+    real_open = builtins.open
+
+    def flaky(file, *a, **k):
+        if str(file) == str(f):
+            raise OSError(errno.EMFILE, "Too many open files")
+        return real_open(file, *a, **k)
+
+    with patch("builtins.open", flaky):
+        assert AS._cached_media_ok(f, "image") is True
+    assert f.exists()
+
+
+def test_r3_a_truncated_jpeg_beyond_the_decode_window_is_still_not_remembered(monkeypatch):
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    monkeypatch.setattr(AS, "_MAX_FULL_DECODE_PIXELS", CAP)          # JPEG window = CAP < 49152 px
+    big = _jpeg((256, 192))
+    with pytest.raises(ValueError) as exc:
+        AS._fit_image(big[: len(big) // 2])
+    assert not isinstance(exc.value, AS._OversizedImage)
+
+
+def test_r3_a_truncated_png_exactly_at_the_window_is_not_remembered(monkeypatch):
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    monkeypatch.setattr(AS, "_MAX_FULL_DECODE_PIXELS", 256 * 192)    # pixels == window: still decodable in principle
+    big = _png_noise((256, 192))
+    with pytest.raises(ValueError) as exc:
+        AS._fit_image(big[: len(big) // 2])
+    assert not isinstance(exc.value, AS._OversizedImage)
+
+
+def test_r3_a_changed_byte_budget_forgets_the_refusal(tmp_path, monkeypatch):
+    thumb, orig = _jpeg((16, 12)), _png_noise((256, 192))
+    _two_searches(tmp_path, monkeypatch, orig, thumb)               # refused and remembered
+    monkeypatch.setattr(AS, "_MAX_DECODE_BYTES", AS._MAX_DECODE_BYTES + 8)
+    third = _Stream({PNG_ORIG: _Resp(chunks=(orig,)), WIKI_THUMB: _Resp(chunks=(thumb,))})
+    _wiki(tmp_path, _summary(original=PNG_ORIG), third)
+    assert PNG_ORIG in third.urls                                    # tried again, not skipped by the old marker
+
+
+def _tiled_tiff_wl(tw, tl, width=100, height=100):
+    import struct
+    tags = []
+    data_off = 8 + 2 + 12 * 12 + 4
+    tile_data = b"\x00" * 16
+    bps_off = data_off + len(tile_data)
+    for t, ty, n, v in [(256, 3, 1, width), (257, 3, 1, height), (258, 3, 3, bps_off), (259, 3, 1, 8), (262, 3, 1, 2),
+                        (277, 3, 1, 3), (284, 3, 1, 1), (322, 3, 1, tw), (323, 3, 1, tl), (324, 4, 1, data_off),
+                        (325, 4, 1, len(tile_data)), (339, 3, 1, 1)]:
+        tags.append((t, ty, n, v))
+    tags.sort()
+    out = b"II*\x00" + struct.pack("<I", 8) + struct.pack("<H", len(tags))
+    for t, ty, n, v in tags:
+        out += struct.pack("<HHIHH", t, ty, n, v, 0) if ty == 3 and n == 1 else struct.pack("<HHII", t, ty, n, v)
+    out += struct.pack("<I", 0)
+    return out + tile_data + struct.pack("<HHH", 8, 8, 8)
+
+
+@pytest.mark.parametrize("tw,tl", [(8192, 256), (256, 8192)], ids=["wide-tile", "tall-tile"])
+def test_either_tile_dimension_alone_is_enough_to_refuse_a_tiff(tw, tl):
+    with Image.open(io.BytesIO(_tiled_tiff_wl(tw, tl))) as im:
+        assert AS._tiff_tiles_ok(im) is False
+
+
+def test_the_downscaler_also_refuses_a_tile_bomb_before_decoding(monkeypatch):
+    """Over the cap (so `_image_ok` is not what stops it) AND a giant tile: `_downscale_decoded` must not load."""
+    monkeypatch.setattr(AS, "_MAX_IMAGE_PIXELS", CAP)
+    monkeypatch.setattr(AS, "_MAX_FULL_DECODE_PIXELS", 10**9)
+    bomb = _tiled_tiff_wl(8192, 8192, width=100, height=100)               # 10000 px > CAP
+    with _load_spy() as calls:
+        assert AS._downscale_decoded(bomb) is None
+    assert calls == []
+
+
+def test_an_mpo_keeps_the_jpeg_pixel_cap_whatever_the_byte_budget(monkeypatch):
+    monkeypatch.setattr(AS, "_DECODE_BYTES_PER_PIXEL", {})
+    monkeypatch.setattr(AS, "_MAX_DECODE_BYTES", 8 * 1000)                 # PNG-like formats: 1000 px
+    assert AS._pixel_cap("PNG") == 1000
+    assert AS._pixel_cap("MPO") == AS._pixel_cap("JPEG") == AS._MAX_IMAGE_PIXELS
