@@ -5,7 +5,7 @@ from sqlalchemy import (
     Boolean, Column, Float, ForeignKey, Integer, JSON, String, Text,
     DateTime, Enum as SAEnum, UniqueConstraint, func,
 )
-from sqlalchemy.orm import DeclarativeBase, relationship
+from sqlalchemy.orm import DeclarativeBase, deferred, relationship
 
 from api.crypto import Encrypted
 
@@ -290,8 +290,14 @@ class Credential(Base):
     id = Column(Integer, primary_key=True)
     provider = Column(String(100), nullable=False)
     account_label = Column(String(255))
-    token_blob = Column(Encrypted)
-    refresh_token_blob = Column(Encrypted)
+    # deferred: SQLAlchemy would otherwise decrypt BOTH columns whenever a Credential row is
+    # loaded, so a rotated/removed CREDENTIALS_KEY made every query touching a Credential
+    # raise ValueError — including the list page, disconnect and the OAuth callback that
+    # the "re-authenticate" error message sends the operator to. Deferred, they are only
+    # decrypted where a token is actually read (publishers/metrics), which is where the
+    # clear ValueError belongs. Assigning a new value never loads (or decrypts) the old one.
+    token_blob = deferred(Column(Encrypted))
+    refresh_token_blob = deferred(Column(Encrypted))
     # Provider-specific ID discovered during OAuth that isn't a scope — e.g. the
     # Instagram Business Account ID behind a connected Facebook Page, or a
     # YouTube channel ID. Publishers read this to know what to post to.

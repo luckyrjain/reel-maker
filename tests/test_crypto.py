@@ -9,6 +9,7 @@ carries a secret.
 The settings key is always pinned explicitly (`Settings` reads `.env`, so a developer's
 own CREDENTIALS_KEY must not leak into these tests).
 """
+import base64
 import logging
 
 import pytest
@@ -18,6 +19,14 @@ from sqlalchemy import text
 from api import crypto, models
 
 SECRET = "ya29.a0-super-secret-access-token"
+
+
+def _b64d(s):
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _b64e(b):
+    return base64.urlsafe_b64encode(b).decode()
 
 
 @pytest.fixture
@@ -242,16 +251,36 @@ def test_updating_a_token_re_encrypts(db_session, set_key, key):
     assert db_session.get(models.Credential, cred.id).token_blob == "new"
 
 
-def test_rotated_key_makes_the_row_unreadable_with_a_clear_error(db_session, set_key, key):
+def test_rotated_key_row_loads_but_reading_the_token_raises_a_clear_error(db_session, set_key, key):
+    """The columns are deferred: the row (provider, label, ...) stays usable under a stale
+    key, and the ValueError fires where a token is actually read — see
+    tests/test_credentials_router.py for the pages that depend on this."""
     set_key(key)
-    cred = models.Credential(provider="youtube", token_blob=SECRET)
+    cred = models.Credential(provider="youtube", token_blob=SECRET, refresh_token_blob="r-" + SECRET,
+                             account_label="My Channel")
     db_session.add(cred)
     db_session.commit()
     cred_id = cred.id
     set_key(Fernet.generate_key().decode())
     db_session.expire_all()
+    loaded = db_session.get(models.Credential, cred_id)
+    assert loaded.account_label == "My Channel"
     with pytest.raises(ValueError, match="CREDENTIALS_KEY"):
-        db_session.get(models.Credential, cred_id)
+        loaded.token_blob
+    with pytest.raises(ValueError, match="CREDENTIALS_KEY"):
+        loaded.refresh_token_blob
+
+
+def test_token_columns_are_not_loaded_until_read(db_session, set_key, key):
+    set_key(key)
+    cred = models.Credential(provider="youtube", token_blob=SECRET)
+    db_session.add(cred)
+    db_session.commit()
+    db_session.expire_all()
+    loaded = db_session.get(models.Credential, cred.id)
+    from sqlalchemy import inspect
+    assert {"token_blob", "refresh_token_blob"} <= inspect(loaded).unloaded
+    assert loaded.token_blob == SECRET
 
 
 def test_type_decorator_passes_none_through_in_both_directions():
@@ -264,3 +293,163 @@ def test_type_decorator_is_cache_safe_text_impl():
     from sqlalchemy import Text
     assert crypto.Encrypted.cache_ok is True
     assert crypto.Encrypted.impl is Text
+
+
+# ── fail-loud on a removed key, and precise error messages ───────────────────
+
+def test_removed_key_does_not_hand_back_the_ciphertext(set_key, key):
+    """The bug this guards: with the key unset, open_() used to return a stored Fernet
+    token unchanged, so a publisher would send 'gAAAAA...' as the bearer token."""
+    set_key(key)
+    sealed = crypto.seal(SECRET)
+    set_key("")
+    with pytest.raises(ValueError) as ei:
+        crypto.open_(sealed)
+    msg = str(ei.value)
+    assert "encrypted" in msg and "CREDENTIALS_KEY is not set" in msg
+    assert sealed not in msg and SECRET not in msg
+
+
+def test_removed_key_row_loads_but_reading_the_token_raises_a_clear_error(db_session, set_key, key):
+    set_key(key)
+    cred = models.Credential(provider="youtube", token_blob=SECRET)
+    db_session.add(cred)
+    db_session.commit()
+    cred_id = cred.id
+    set_key("")
+    db_session.expire_all()
+    loaded = db_session.get(models.Credential, cred_id)
+    with pytest.raises(ValueError, match="CREDENTIALS_KEY is not set"):
+        loaded.token_blob
+
+
+@pytest.mark.parametrize("token", [
+    "ya29.a0AfH6SMBx-1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789_abcdefghij",
+    "EAAGm0PX4ZCpsBAKd8l5ZCqJ3TZBlvO1YvXq3sLZB9kjhgf7Qw0bX2mN4cV6bN8mZAsdfghjklPOIUYTREWQ1234567890zxcvbnm",
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+    "gAAAAA-looks-like-a-prefix-but-is-not-a-token",
+    "gAAAAA" + "A" * 94,             # right prefix and a plausible length, wrong structure
+    "plain-short-token",
+    "",
+])
+def test_real_plaintext_tokens_are_never_mistaken_for_ciphertext(set_key, token):
+    """With no key configured (the documented dev mode) a plaintext credential must come
+    back exactly as stored — the new fail-loud check must not fire on real token shapes."""
+    set_key("")
+    assert crypto.open_(token) == token
+
+
+def test_plaintext_row_with_a_key_set_says_it_is_unencrypted_not_rotated(set_key, key):
+    set_key(key)
+    with pytest.raises(ValueError) as ei:
+        crypto.open_("ya29.a-plaintext-token-saved-before-the-key-existed")
+    msg = str(ei.value)
+    assert "not encrypted" in msg and "CREDENTIALS_KEY" in msg
+    assert "rotated" not in msg
+
+
+def test_rotated_key_message_still_says_rotated(set_key, key):
+    set_key(key)
+    sealed = crypto.seal(SECRET)
+    set_key(Fernet.generate_key().decode())
+    with pytest.raises(ValueError, match="rotated"):
+        crypto.open_(sealed)
+
+
+def test_tampered_token_still_reads_as_a_decryption_failure_not_plaintext(set_key, key):
+    """A tampered token is still structurally a Fernet token, so it must get the
+    'failed to decrypt' message, not the 'was never encrypted' one."""
+    set_key(key)
+    sealed = crypto.seal(SECRET)
+    mid = len(sealed) // 2
+    tampered = sealed[:mid] + ("A" if sealed[mid] != "A" else "B") + sealed[mid + 1:]
+    with pytest.raises(ValueError, match="Failed to decrypt"):
+        crypto.open_(tampered)
+
+
+def test_malformed_key_error_names_the_setting_and_how_to_fix_it(set_key):
+    set_key("notakey")
+    with pytest.raises(ValueError) as ei:
+        crypto.seal(SECRET)
+    msg = str(ei.value)
+    assert "CREDENTIALS_KEY" in msg and "Fernet" in msg and "32" in msg
+    assert "Fernet.generate_key" in msg
+    assert "notakey" not in msg
+    assert isinstance(ei.value.__cause__, ValueError)       # the library error stays chained
+
+
+# ── _looks_like_fernet_token ─────────────────────────────────────────────────
+
+@pytest.mark.parametrize("n", [0, 1, 15, 16, 17, 31, 32, 100, 1000])
+def test_every_real_token_length_is_recognized(set_key, key, n):
+    set_key(key)
+    assert crypto._looks_like_fernet_token(crypto.seal("x" * n))
+
+
+def test_looks_like_rejects_structural_mismatches(set_key, key):
+    set_key(key)
+    sealed = crypto.seal(SECRET)
+    raw = _b64d(sealed)
+    assert crypto._looks_like_fernet_token(sealed)
+    assert not crypto._looks_like_fernet_token(sealed + "!")                 # outside the alphabet
+    assert not crypto._looks_like_fernet_token(sealed + "+")                 # standard-b64 char, not urlsafe
+    assert not crypto._looks_like_fernet_token(_b64e(b"\x81" + raw[1:]))    # wrong version byte
+    assert not crypto._looks_like_fernet_token(_b64e(raw[:60]))             # below the minimum
+    assert not crypto._looks_like_fernet_token(_b64e(raw + b"\x00"))        # not block-aligned
+    assert not crypto._looks_like_fernet_token(_b64e(raw[:-1]))             # not block-aligned
+    assert not crypto._looks_like_fernet_token("")
+    assert not crypto._looks_like_fernet_token(" " + sealed)
+
+
+def test_looks_like_accepts_unpadded_and_padded_forms(set_key, key):
+    set_key(key)
+    sealed = crypto.seal(SECRET)
+    assert crypto._looks_like_fernet_token(sealed.rstrip("="))
+    assert crypto._looks_like_fernet_token(sealed.rstrip("=") + "=" * (-len(sealed.rstrip("=")) % 4))
+
+
+def test_minimum_token_boundary(set_key, key):
+    """73 bytes (one cipher block) is the smallest real token; 72 and 57 are not."""
+    set_key(key)
+    raw = _b64d(crypto.seal(""))
+    assert len(raw) == 73
+    assert crypto._looks_like_fernet_token(_b64e(raw))
+    assert not crypto._looks_like_fernet_token(_b64e(raw[:72]))
+    assert not crypto._looks_like_fernet_token(_b64e(raw[:57]))
+
+
+def test_looks_like_requires_16_byte_block_alignment_not_just_8(set_key, key):
+    """73 + 8 = 81 bytes is 8-aligned but not a whole number of AES blocks."""
+    set_key(key)
+    raw = _b64d(crypto.seal(""))
+    assert not crypto._looks_like_fernet_token(_b64e(raw + b"\x00" * 8))
+    assert crypto._looks_like_fernet_token(_b64e(raw + b"\x00" * 16))       # one more real block
+
+
+def test_looks_like_rejects_standard_base64_characters(set_key, key):
+    """'+' and '/' are standard-base64; a Fernet token is urlsafe ('-' and '_'). Find a real
+    token whose bytes would need them and check the standard encoding is not recognized."""
+    set_key(key)
+    for _ in range(200):
+        raw = _b64d(crypto.seal(SECRET))
+        std = base64.b64encode(raw).decode()
+        if "+" in std or "/" in std:
+            assert not crypto._looks_like_fernet_token(std)
+            assert crypto._looks_like_fernet_token(_b64e(raw))               # the urlsafe form is fine
+            return
+    pytest.fail("never produced a token needing '+' or '/' in standard base64")
+
+
+def test_looks_like_rejects_excess_padding(set_key, key):
+    set_key(key)
+    unpadded = crypto.seal(SECRET).rstrip("=")
+    assert crypto._looks_like_fernet_token(unpadded)
+    assert not crypto._looks_like_fernet_token(unpadded + "===")
+
+
+def test_plaintext_error_is_chained_to_the_cause(set_key, key):
+    from cryptography.fernet import InvalidToken
+    set_key(key)
+    with pytest.raises(ValueError) as ei:
+        crypto.open_("ya29.a-plaintext-token")
+    assert isinstance(ei.value.__cause__, InvalidToken)

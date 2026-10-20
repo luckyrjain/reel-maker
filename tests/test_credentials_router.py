@@ -137,3 +137,72 @@ def test_disconnect_removes_credential(client):
     db = client._session_factory()
     assert db.query(models.Credential).filter(models.Credential.provider == "youtube").first() is None
     db.close()
+
+
+# ── a rotated / removed CREDENTIALS_KEY must not lock the operator out ───────
+#
+# The error message for an unreadable stored token says "re-authenticate". That is only
+# actionable if the pages used to re-authenticate still work: listing connected accounts,
+# disconnecting, and the OAuth callback that overwrites the old tokens. SQLAlchemy decrypts
+# every mapped column when it loads a row, so before token_blob/refresh_token_blob were
+# deferred, any query touching a Credential raised ValueError under a stale key.
+
+def _seed_encrypted_credential(client, monkeypatch, key):
+    monkeypatch.setattr("api.crypto.settings.credentials_key", key)
+    db = client._session_factory()
+    db.add(models.Credential(provider="youtube", token_blob="old-tok", refresh_token_blob="old-rtok",
+                             account_label="My Channel"))
+    db.commit()
+    db.close()
+
+
+@pytest.fixture(params=["rotated", "removed"])
+def stale_key_client(client, monkeypatch, request):
+    """A client whose DB holds a credential encrypted under a key that is no longer valid."""
+    from cryptography.fernet import Fernet
+    _seed_encrypted_credential(client, monkeypatch, Fernet.generate_key().decode())
+    monkeypatch.setattr(
+        "api.crypto.settings.credentials_key",
+        Fernet.generate_key().decode() if request.param == "rotated" else "",
+    )
+    return client
+
+
+def test_list_page_still_renders_when_the_stored_token_is_unreadable(stale_key_client):
+    resp = stale_key_client.get("/api/credentials")
+    assert resp.status_code == 200
+    assert "My Channel" in resp.text
+
+
+def test_disconnect_still_works_when_the_stored_token_is_unreadable(stale_key_client):
+    resp = stale_key_client.post("/api/credentials/youtube/disconnect")
+    assert resp.status_code == 303
+    db = stale_key_client._session_factory()
+    assert db.query(models.Credential).count() == 0
+    db.close()
+
+
+def test_reauthenticating_replaces_an_unreadable_token(client, monkeypatch):
+    """The recovery path the error message promises: after a key rotation, completing the
+    OAuth flow again overwrites the old tokens and the credential is readable again."""
+    from cryptography.fernet import Fernet
+
+    from api.oauth import new_state
+    _seed_encrypted_credential(client, monkeypatch, Fernet.generate_key().decode())
+    new_key = Fernet.generate_key().decode()
+    monkeypatch.setattr("api.crypto.settings.credentials_key", new_key)
+
+    fake = YouTubeOAuth("client-id", "secret", "https://example.com/cb")
+    fake.exchange_code = MagicMock(return_value={
+        "access_token": "new-tok", "refresh_token": "new-rtok", "expires_in": 3600, "scope": "a",
+    })
+    with patch("api.routers.credentials.get_oauth_provider", return_value=fake):
+        resp = client.get("/api/credentials/youtube/callback",
+                          params={"code": "abc", "state": new_state("youtube")})
+    assert resp.status_code == 303
+
+    db = client._session_factory()
+    cred = db.query(models.Credential).filter(models.Credential.provider == "youtube").one()
+    assert cred.token_blob == "new-tok"
+    assert cred.refresh_token_blob == "new-rtok"
+    db.close()
