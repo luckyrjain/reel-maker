@@ -41,6 +41,7 @@ def _looks_like_fernet_token(value: str) -> bool:
     0x80, long enough, and a whole number of 16-byte AES blocks of ciphertext. Deliberately
     strict — it only decides which error to raise, and a real OAuth access token (ya29...,
     EAA...) must never be mistaken for one."""
+    value = value.strip()      # Fernet itself tolerates surrounding whitespace, so must this check
     if not _B64URL_RE.fullmatch(value):
         return False
     try:

@@ -239,16 +239,16 @@ def test_null_columns_stay_null_and_are_never_encrypted(db_session, set_key, key
 
 def test_updating_a_token_re_encrypts(db_session, set_key, key):
     set_key(key)
-    cred = models.Credential(provider="youtube", token_blob="old")
+    cred = models.Credential(provider="youtube", token_blob="old-token-value-1")
     db_session.add(cred)
     db_session.commit()
     before = _raw(db_session, cred.id, "token_blob")
-    cred.token_blob = "new"
+    cred.token_blob = "new-token-value-2"
     db_session.commit()
     after = _raw(db_session, cred.id, "token_blob")
-    assert after != before and "new" not in after
+    assert after != before and "new-token-value-2" not in after
     db_session.expire_all()
-    assert db_session.get(models.Credential, cred.id).token_blob == "new"
+    assert db_session.get(models.Credential, cred.id).token_blob == "new-token-value-2"
 
 
 def test_rotated_key_row_loads_but_reading_the_token_raises_a_clear_error(db_session, set_key, key):
@@ -398,14 +398,7 @@ def test_looks_like_rejects_structural_mismatches(set_key, key):
     assert not crypto._looks_like_fernet_token(_b64e(raw + b"\x00"))        # not block-aligned
     assert not crypto._looks_like_fernet_token(_b64e(raw[:-1]))             # not block-aligned
     assert not crypto._looks_like_fernet_token("")
-    assert not crypto._looks_like_fernet_token(" " + sealed)
-
-
-def test_looks_like_accepts_unpadded_and_padded_forms(set_key, key):
-    set_key(key)
-    sealed = crypto.seal(SECRET)
-    assert crypto._looks_like_fernet_token(sealed.rstrip("="))
-    assert crypto._looks_like_fernet_token(sealed.rstrip("=") + "=" * (-len(sealed.rstrip("=")) % 4))
+    assert crypto._looks_like_fernet_token(" " + sealed + "\n")                     # Fernet tolerates surrounding whitespace
 
 
 def test_minimum_token_boundary(set_key, key):
@@ -453,3 +446,174 @@ def test_plaintext_error_is_chained_to_the_cause(set_key, key):
     with pytest.raises(ValueError) as ei:
         crypto.open_("ya29.a-plaintext-token")
     assert isinstance(ei.value.__cause__, InvalidToken)
+
+
+# ── second review round: leakage at every level, TTL, dev-mode exactness, padding ────
+
+# -- no secret (plaintext token, ciphertext, or the key itself) reaches an error message or a log
+def test_plaintext_row_error_does_not_echo_the_stored_plaintext_token(set_key, key):
+    set_key(key)
+    tok = "ya29.a-plaintext-token-saved-before-the-key-existed"
+    with pytest.raises(ValueError) as ei:
+        crypto.open_(tok)
+    assert tok not in str(ei.value)
+
+
+def test_no_function_logs_a_secret_key_or_ciphertext_at_any_level(set_key, key, caplog):
+    other = Fernet.generate_key().decode()
+    plain = "ya29.plain-row-token-xxxxxxxxxxxxxxxxxxxxxxxx"
+    set_key(key)
+    sealed = crypto.seal(SECRET)
+    with caplog.at_level(logging.DEBUG):
+        crypto.open_(sealed)                                   # happy path under the key
+        for bad in (plain, sealed[:-6] + "AAAAAA"):            # unencrypted row / tampered
+            with pytest.raises(ValueError):
+                crypto.open_(bad)
+        set_key(other)
+        with pytest.raises(ValueError):
+            crypto.open_(sealed)                               # rotated
+        set_key("")
+        with pytest.raises(ValueError):
+            crypto.open_(sealed)                               # removed key
+        crypto.open_(plain)                                    # dev-mode plaintext read
+        crypto.seal(SECRET)                                    # dev-mode plaintext write
+        set_key("bad-key-bad-key-bad-key")
+        with pytest.raises(ValueError):
+            crypto.seal(SECRET)
+    for needle in (key, other, "bad-key-bad-key-bad-key", sealed, plain, SECRET):
+        assert needle not in caplog.text
+
+
+def test_dev_mode_read_is_quiet_and_warning_comes_from_the_module_logger(set_key, caplog):
+    set_key("")
+    with caplog.at_level(logging.DEBUG):
+        crypto.open_(SECRET)
+    assert caplog.records == []                                # reads never warn/log
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        crypto.seal(SECRET)
+    assert [r.name for r in caplog.records] == ["api.crypto"]
+
+
+@pytest.mark.parametrize("mode", ["rotated", "removed", "plaintext"])
+def test_every_unreadable_message_tells_the_operator_to_reauthenticate(set_key, key, mode):
+    set_key(key)
+    sealed = crypto.seal(SECRET)
+    if mode == "rotated":
+        set_key(Fernet.generate_key().decode())
+        bad = sealed
+    elif mode == "removed":
+        set_key("")
+        bad = sealed
+    else:
+        bad = "ya29.a-plaintext-token-saved-before-the-key-existed"
+    with pytest.raises(ValueError) as ei:
+        crypto.open_(bad)
+    assert "re-authenticate" in str(ei.value).lower()
+
+
+def test_the_four_messages_are_distinct_and_each_names_its_own_cause(set_key, key):
+    msgs = {}
+    set_key("notakey")
+    with pytest.raises(ValueError) as ei:
+        crypto.seal("x")
+    msgs["badkey"] = str(ei.value)
+    set_key(key)
+    sealed = crypto.seal("x")
+    with pytest.raises(ValueError) as ei:
+        crypto.open_("plain-row")
+    msgs["plain"] = str(ei.value)
+    set_key(Fernet.generate_key().decode())
+    with pytest.raises(ValueError) as ei:
+        crypto.open_(sealed)
+    msgs["rotated"] = str(ei.value)
+    set_key("")
+    with pytest.raises(ValueError) as ei:
+        crypto.open_(sealed)
+    msgs["removed"] = str(ei.value)
+    assert len(set(msgs.values())) == 4
+    assert "not a valid Fernet key" in msgs["badkey"]
+    assert "not encrypted" in msgs["plain"] and "rotated" not in msgs["plain"]
+    assert "rotated" in msgs["rotated"] and "not encrypted" not in msgs["rotated"]
+    assert "is not set" in msgs["removed"] and "rotated" not in msgs["removed"]
+
+
+# -- falsy-but-not-None values through the real TypeDecorator
+def test_empty_string_token_is_encrypted_at_rest_and_round_trips(db_session, set_key, key):
+    from sqlalchemy import text
+    set_key(key)
+    cred = models.Credential(provider="youtube", token_blob="", refresh_token_blob="")
+    db_session.add(cred)
+    db_session.commit()
+    raw = db_session.execute(text("SELECT token_blob FROM credentials WHERE id=:i"), {"i": cred.id}).scalar()
+    assert raw.startswith("gAAAAA")
+    db_session.expire_all()
+    got = db_session.get(models.Credential, cred.id)
+    assert got.token_blob == "" and got.refresh_token_blob == ""
+
+
+
+# stored credentials are long-lived (Instagram ~60d): a Fernet TTL must never apply
+def test_a_credential_sealed_long_ago_still_opens(set_key, key):
+    set_key(key)
+    old = Fernet(key.encode()).encrypt_at_time(SECRET.encode(), 0).decode()      # timestamp = 1970
+    assert crypto.open_(old) == SECRET
+
+
+# dev mode returns a stored value byte-for-byte (no stripping)
+@pytest.mark.parametrize("v", [" padded ", "tok\n", "\ttok"])
+def test_dev_mode_open_returns_value_exactly_as_stored(set_key, v):
+    set_key("")
+    assert crypto.open_(v) == v
+
+
+# a Credential saved without tokens reads back NULL, not "" and not an error
+def test_token_columns_default_to_null(db_session, set_key, key):
+    set_key(key)
+    cred = models.Credential(provider="youtube")
+    db_session.add(cred)
+    db_session.commit()
+    db_session.expire_all()
+    got = db_session.get(models.Credential, cred.id)
+    assert got.token_blob is None and got.refresh_token_blob is None
+
+
+# the unpadded-input test in test_crypto.py is vacuous for SECRET (its token needs no '=');
+# use a payload whose token is padded so the padding-restoration branch is really exercised
+def test_looks_like_accepts_a_real_token_whose_padding_was_stripped(set_key, key):
+    set_key(key)
+    sealed = crypto.seal("")                 # 73 bytes -> base64 ends in '=='
+    assert sealed.endswith("==")
+    assert crypto._looks_like_fernet_token(sealed.rstrip("="))
+    assert crypto._looks_like_fernet_token(sealed.rstrip("=") + "=")      # partially padded
+    s89 = crypto.seal("x" * 16)              # 89 bytes -> single '='
+    assert s89.endswith("=") and not s89.endswith("==")
+    assert crypto._looks_like_fernet_token(s89.rstrip("="))
+
+
+def test_whitespace_padded_fernet_token_is_still_recognized_without_a_key(set_key, key):
+    """Fernet tolerates surrounding whitespace when a key is set, so the keyless check must
+    too — otherwise a stored token with a trailing newline would be handed back as the
+    credential."""
+    set_key(key)
+    sealed = crypto.seal(SECRET)
+    set_key("")
+    for padded in (sealed + "\n", " " + sealed, "\t" + sealed + " \r\n"):
+        with pytest.raises(ValueError, match="CREDENTIALS_KEY is not set"):
+            crypto.open_(padded)
+
+
+def test_assigning_none_to_an_unloaded_refresh_token_persists_null(db_session, set_key, key):
+    """The OAuth callback assigns refresh_token_blob without ever loading the old value."""
+    from sqlalchemy import text
+    set_key(key)
+    cred = models.Credential(provider="youtube", token_blob="t", refresh_token_blob="r")
+    db_session.add(cred)
+    db_session.commit()
+    db_session.expire_all()
+    loaded = db_session.get(models.Credential, cred.id)
+    loaded.refresh_token_blob = None
+    db_session.commit()
+    assert db_session.execute(text("SELECT refresh_token_blob FROM credentials WHERE id=:i"),
+                              {"i": cred.id}).scalar() is None
+

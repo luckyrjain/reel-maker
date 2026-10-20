@@ -206,3 +206,38 @@ def test_reauthenticating_replaces_an_unreadable_token(client, monkeypatch):
     assert cred.token_blob == "new-tok"
     assert cred.refresh_token_blob == "new-rtok"
     db.close()
+
+
+def test_reauth_without_a_refresh_token_works_under_a_rotated_key(client, monkeypatch):
+    """Google omits the refresh token on re-consent. The callback must overwrite it with the
+    new (absent) value, never read the stale deferred one — that read would raise under a
+    rotated key and recreate the lockout."""
+    from cryptography.fernet import Fernet
+
+    from api.oauth import new_state
+    _seed_encrypted_credential(client, monkeypatch, Fernet.generate_key().decode())
+    monkeypatch.setattr("api.crypto.settings.credentials_key", Fernet.generate_key().decode())
+    fake = YouTubeOAuth("c", "s", "https://e.com/cb")
+    fake.exchange_code = MagicMock(return_value={"access_token": "new", "expires_in": 3600})   # no refresh_token
+    with patch("api.routers.credentials.get_oauth_provider", return_value=fake):
+        resp = client.get("/api/credentials/youtube/callback",
+                          params={"code": "x", "state": new_state("youtube")})
+    assert resp.status_code == 303
+    db = client._session_factory()
+    cred = db.query(models.Credential).one()
+    assert cred.token_blob == "new" and cred.refresh_token_blob is None
+    db.close()
+
+
+def test_callback_does_not_log_tokens(client, caplog):
+    import logging
+
+    from api.oauth import new_state
+    fake = YouTubeOAuth("c", "s", "https://e.com/cb")
+    fake.exchange_code = MagicMock(return_value={
+        "access_token": "ACCESS-SECRET-1", "refresh_token": "REFRESH-SECRET-2",
+    })
+    with caplog.at_level(logging.DEBUG), patch("api.routers.credentials.get_oauth_provider", return_value=fake):
+        client.get("/api/credentials/youtube/callback", params={"code": "x", "state": new_state("youtube")})
+    assert "ACCESS-SECRET-1" not in caplog.text and "REFRESH-SECRET-2" not in caplog.text
+

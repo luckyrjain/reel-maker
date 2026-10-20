@@ -5,7 +5,7 @@ from sqlalchemy import (
     Boolean, Column, Float, ForeignKey, Integer, JSON, String, Text,
     DateTime, Enum as SAEnum, UniqueConstraint, func,
 )
-from sqlalchemy.orm import DeclarativeBase, deferred, relationship
+from sqlalchemy.orm import DeclarativeBase, deferred, relationship, undefer
 
 from api.crypto import Encrypted
 
@@ -304,3 +304,17 @@ class Credential(Base):
     provider_account_id = Column(String(255))
     scopes = Column(JSON)
     expires_at = Column(DateTime(timezone=True))
+
+
+def credential_token_loaders():
+    """Load options for code that is about to USE a credential's tokens.
+
+    token_blob/refresh_token_blob are deferred (see Credential), so a publisher's first read
+    of one would otherwise lazy-load it — autobeginning a transaction that stays open for the
+    whole upload/HTTP call, after the worker deliberately committed to avoid exactly that.
+    Pass these to the query that loads the credential so the tokens are decrypted up front,
+    where a stale CREDENTIALS_KEY raises its clear ValueError before any network call:
+
+        db.query(Credential).options(*credential_token_loaders())...
+    """
+    return (undefer(Credential.token_blob), undefer(Credential.refresh_token_blob))

@@ -270,3 +270,63 @@ def test_fetcher_exception_writes_no_snapshot_for_the_failing_cut_only(db_sessio
     assert db.query(models.CutMetricSnapshot).filter_by(cut_id=failing_cut.id).count() == 0
     assert db.query(models.CutMetricSnapshot).filter_by(cut_id=ok_cut.id).count() == 1
 
+
+
+# --- credential tokens: decrypted up front, and an unreadable one skips only its own cut ----
+
+def test_tokens_are_loaded_before_the_fetch_not_lazily_during_it(db_session):
+    """The deferred token columns must already be loaded when the fetcher runs, or its first
+    read would lazy-load them inside the HTTP call's open transaction."""
+    from sqlalchemy import inspect
+    db = db_session
+    reel = _reel(db)
+    _published_cut(db, reel)
+    db.add(models.Credential(provider="youtube", token_blob="tok", refresh_token_blob="r"))
+    db.commit()
+    seen = {}
+
+    def fetch(cut, credential, db_):
+        seen["unloaded"] = set(inspect(credential).unloaded)
+        return EngagementMetrics(views=1, likes=1, comments=1)
+
+    fetcher = MagicMock()
+    fetcher.fetch.side_effect = fetch
+    with (
+        patch("worker.tasks.metrics.SessionLocal", return_value=db),
+        patch("worker.tasks.metrics.get_metrics_fetcher", return_value=fetcher),
+        patch.object(db, "close"),
+    ):
+        pull_publish_metrics()
+    assert "unloaded" in seen                      # the fetcher really ran
+    assert not ({"token_blob", "refresh_token_blob"} & seen["unloaded"])
+
+
+def test_an_unreadable_credential_skips_its_cut_without_aborting_the_batch(db_session, monkeypatch):
+    """One platform's credential sealed under a rotated key must not stop the metrics pull
+    for every other platform (or crash the beat task)."""
+    from cryptography.fernet import Fernet
+    db = db_session
+    reel = _reel(db)
+    yt = _published_cut(db, reel, platform=models.CutPlatform.youtube_shorts, post_id="yt-1")
+    ig = _published_cut(db, reel, platform=models.CutPlatform.instagram_reels, post_id="ig-1")
+    monkeypatch.setattr("api.crypto.settings.credentials_key", Fernet.generate_key().decode())
+    db.add(models.Credential(provider="youtube", token_blob="old-tok"))
+    db.commit()
+    monkeypatch.setattr("api.crypto.settings.credentials_key", Fernet.generate_key().decode())
+    db.add(models.Credential(provider="instagram", token_blob="fresh-tok"))
+    db.commit()
+
+    fetcher = MagicMock()
+    fetcher.fetch.return_value = EngagementMetrics(views=7, likes=1, comments=1)
+    with (
+        patch("worker.tasks.metrics.SessionLocal", return_value=db),
+        patch("worker.tasks.metrics.get_metrics_fetcher", return_value=fetcher),
+        patch.object(db, "close"),
+    ):
+        pull_publish_metrics()                     # must not raise
+
+    assert fetcher.fetch.call_count == 1
+    assert fetcher.fetch.call_args.args[0].id == ig.id
+    db.refresh(ig)
+    db.refresh(yt)
+    assert ig.views == 7 and yt.views is None

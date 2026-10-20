@@ -55,6 +55,7 @@ def publish_cut(self, db, job, cut):
         provider_name = credential_provider_for_platform(cut.platform.value)
         credential = (
             db.query(models.Credential)
+            .options(*models.credential_token_loaders())   # decrypt now, not lazily mid-upload
             .filter(models.Credential.provider == provider_name)
             .first()
         )
