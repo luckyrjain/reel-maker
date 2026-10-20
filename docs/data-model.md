@@ -95,7 +95,7 @@ Cached media files. Deduplicated by `(source, source_ref)` — re-renders and re
 | `id` | integer PK | |
 | `type` | varchar(50) | `footage` \| `photo` |
 | `source` | varchar(100) | `pexels` \| `wikipedia` \| `huggingface` \| `huggingface_video` |
-| `source_ref` | varchar(255) | Pexels video ID or Wikipedia page ID |
+| `source_ref` | varchar(255) | Pexels video ID or Wikipedia page ID (a Wikipedia asset with no usable `pageid` uses its file-name-safe title, or `t` + 16 hex of the title's sha256) |
 | `local_path` | varchar(500) | Absolute path to downloaded file |
 | `license` | varchar(255) | e.g. `pexels_free`, `CC BY-SA 4.0` |
 | `license_url` | varchar(500) | URL to license text (from Wikipedia extmetadata) |

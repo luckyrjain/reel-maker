@@ -11,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 
 from api import models
 from engine.render.asset_sourcer import SourcedAsset, WikipediaImageSource, _cache_asset
+from tests.test_sourcer_selection import _wikipedia_downloads_via_get_fakes  # noqa: F401  (autouse fixture)
 
 
 @pytest.fixture

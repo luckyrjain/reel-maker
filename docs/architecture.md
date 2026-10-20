@@ -127,7 +127,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `tasks/common.py` | `job_task()` — the shared Job lifecycle decorator every task body runs under (atomic claim with fencing-token bump → heartbeat thread → `prepare` → body → fenced done-stamp → `after_commit`; retry-reset or failure stamp + per-job-type owner rollback on error, every write a compare-and-set); `heartbeat()`, `rollback_owner()`, `should_retry()`/`is_transient_error()` |
 | `tasks/enrich_context.py` | `enrich_context(job_id)` — `evaluate_context()` → `is_structured()` guard → optional `llm_enrich()` → stores `reel.enriched_context` → creates + enqueues the generate job |
 | `tasks/generate.py` | `generate_guide(job_id)` — a short orchestration sequence (Phase 7q decomposition) over `_try_structured_path()` / `_run_standard_path_attempts()` / `_maybe_regenerate_caption_hashtags()` / `_maybe_generate_hook_variants()` / `_persist_guide()`, sharing one `_GenerationContext` dataclass; retries transient failures twice |
-| `tasks/render.py` | `render_cut(job_id)` — `resolve_or_reuse()` per beat → `synth_to_budget()` → TTS-accurate timecodes → atomic MP4; writes `thumbnail_candidates`, `black_frame_beat_indices`, `rendered_pins_fingerprint`, `rendered_guide_fingerprint`, `subtitle_path`; retries transient failures twice |
+| `tasks/render.py` | `render_cut(job_id)` — `resolve_or_reuse()` per beat (under `asset_budget`, asset time only) → `synth_to_budget()` → TTS-accurate timecodes → atomic MP4; writes `thumbnail_candidates`, `black_frame_beat_indices`, `rendered_pins_fingerprint`, `rendered_guide_fingerprint`, `subtitle_path`; retries transient failures twice |
 | `tasks/publish.py` | `publish_cut(job_id)` — `assert_safe_to_publish()` → `assert_video_matches_pins()` → `assert_video_matches_guide()` → `build_published_caption()` → dispatch via `engine/publish/registry.py` → commit `platform_post_id` the moment the upload is live; `max_retries=0` (irreversible external side effect) |
 | `tasks/metrics.py` | `pull_publish_metrics()` — Celery beat task (every 6 h); pulls views/likes/comments per published cut via `get_metrics_fetcher()`, forward-fills `Cut.*`, appends a `CutMetricSnapshot` row; tolerates per-cut failures |
 | `tasks/maintenance.py` | `reap_stuck_jobs()` — Celery beat, every 60 s; fails/resumes stale jobs (see "Reliability" below) via compare-and-set, rolling back only the owner state the job's type owns |
@@ -163,7 +163,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 | File | Responsibility |
 |---|---|
-| `asset_sourcer.py` | `PexelsVideoSource` + `WikipediaImageSource` (+ license metadata) + `HuggingFaceVideoSource`/`HuggingFaceImageSource`; pure selection decisions `_choose_video_file()` / `_license_from_extmetadata()` / `_image_extension()` (Phase 7z); fallback chain Wikipedia → Pexels → HF Video → HF Image → black frame; `_generate_gated_hf_asset()` — shared gate/record_stage/cost shell for both HF tiers; `resolve_or_reuse()` — per-beat asset pinning; `LocalMusicSource.find()`; `compute_pins_fingerprint()` / `compute_pins_fingerprint_for_render()` |
+| `asset_sourcer.py` | `PexelsVideoSource` + `WikipediaImageSource` (+ license metadata) + `HuggingFaceVideoSource`/`HuggingFaceImageSource`; streamed/capped API calls (`_api_call`, with its own deadline), `_image_ok()` (50 Mpx; 20 Mpx WebP) + `_fit_image()` (downscale) + `.refused` markers, `asset_budget()` (1200 s per render); pure selection decisions `_choose_video_file()` / `_license_from_extmetadata()` / `_image_extension()` (Phase 7z); guarded downloads — `_open_download()` / `_iter_capped()` / `_pexels_url_ok()` / `_wikimedia_url_ok()`, remote-id validation `_numeric_id()` / `_title_id()`, `PexelsVideoSource._pick()` (Phase 7aa); fallback chain Wikipedia → Pexels → HF Video → HF Image → black frame; `_generate_gated_hf_asset()` — shared gate/record_stage/cost shell for both HF tiers; `resolve_or_reuse()` — per-beat asset pinning; `LocalMusicSource.find()`; `compute_pins_fingerprint()` / `compute_pins_fingerprint_for_render()` |
 | `pricing.py` | `hf_image_cost_usd()` / `hf_video_cost_usd()` — HF asset-generation cost (0 until configured) |
 | `tts.py` | `EdgeTTSProvider`/`KokoroProvider`/`SilentProvider`; `synthesize()` + `synth_to_budget()` (±25% rate adjustment); `CURATED_EDGE_VOICES` |
 | `captions.py` | `transcribe_audio()` — one Whisper pass producing both `.words` (burned-in text) and `.segments` (SRT export); no-op if Whisper isn't installed |
@@ -191,7 +191,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 ### `tests/`
 
-59 test files + `conftest.py`, **1333 tests run by default / 1334 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
+71 test files + `conftest.py`, **2200 tests run by default / 2201 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
 
 | File | Tests | File | Tests |
 |---|---|---|---|
@@ -201,7 +201,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_compositor.py` | 31 | `test_r4_gaps.py` | 30 |
 | `test_generate_task.py` | 26 | `test_common.py` | 18 |
 | `test_audio_text_sync.py` | 16 | `test_guide_edit.py` | 16 |
-| `test_render_task.py` | 16 | `test_tts.py` | 16 |
+| `test_render_task.py` | 19 | `test_tts.py` | 16 |
 | `test_asset_sourcer_cost.py` | 15 | `test_enrichment.py` | 38 |
 | `test_state.py` | 15 | `test_variants_router.py` | 8 |
 | `test_asset_sourcer.py` | 14 | `test_context_enricher.py` | 14 |
@@ -221,10 +221,16 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_asset_sourcer_names.py` | 7 | `test_enqueue.py` | 13 |
 | `test_pricing.py` | 4 | `test_config.py` | 2 |
 | `test_proportional_timing.py` | 28 | `test_sourcer_selection.py` | 96 |
-| `test_sourcer_contracts.py` | 89 | `test_sourcer_cache_and_chain.py` | 56 |
+| `test_sourcer_contracts.py` | 124 | `test_sourcer_cache_and_chain.py` | 56 |
+| `test_sourcer_download_guards.py` | 199 | `test_sourcer_ids.py` | 87 |
+| `test_sourcer_watchdog.py` | 53 | `test_sourcer_soft_limit.py` | 18 |
+| `test_sourcer_budgets.py` | 23 | `test_sourcer_sniffing.py` | 110 |
+| `test_sourcer_dns.py` | 25 | `test_sourcer_tmp_files.py` | 11 |
+| `test_sourcer_api_limits.py` | 22 | `test_sourcer_api_streaming.py` | 72 |
+| `test_sourcer_image_check.py` | 178 | `test_sourcer_render_budget.py` | 27 |
 | `test_sourcer_pins_and_music.py` | 38 | | |
 | `test_llm_judge.py` | 3 | `test_main.py` | 3 |
-| `test_observability.py` | 3 | `test_golden_reel.py` | 1 (deselected) |
+| `test_observability.py` | 7 | `test_golden_reel.py` | 1 (deselected) |
 
 Notable areas of coverage beyond what the filenames suggest: `test_job_lifecycle.py` and `test_maintenance.py` together carry the Job-fencing-token mechanism's regression suite (zombie resumed-while-still-alive detection at every `heartbeat()`/`lock_job()`/done-stamp/CAS checkpoint, differentiated per-job-type resume budgets); `test_compositor.py` covers the `ExitStack` reader-lifetime migration and the 2-up collage layout with real ffmpeg frame sampling; `test_evaluator.py` covers all 17 per-axis scorer functions in isolation; `test_publish_gate.py`/`test_cuts_publish_router.py` cover both staleness gates end-to-end.
 
@@ -517,7 +523,9 @@ Every drawtext clause carries `:expansion=none` — disables ffmpeg's own `%`-ex
 ### Stock footage (`PexelsVideoSource`)
 
 - Portraits at ≤ FHD (1920 px) preferred; falls back gracefully to landscape or 4K
-- Cached by `(source="pexels", source_ref=video_id)` in `assets` table
+- Cached by `(source="pexels", source_ref=video_id)` in `assets` table; `video_id` must be a non-negative integer or an ASCII digit string whose decimal form is 1-20 digits, otherwise that search hit is skipped
+- A malformed search hit (missing/non-numeric duration or id, null width/height, non-string link) or a non-JSON body is skipped / gives no result — it never raises into the render task
+- Downloads (Pexels and Wikipedia alike): https only, to `*.pexels.com` / `upload.wikimedia.org` (no userinfo, port 443, plain `[a-z0-9.-]` host); redirects are followed by hand with every hop re-checked (max 3), never by httpx; `Accept-Encoding: identity` is sent and an encoded response is rejected (API calls differ: gzip / deflate is decoded from the raw stream under the same cap, only br / zstd / stacked encodings are refused); the body is capped (250 MB video / 50 MB image) and bounded in wall-clock time (600 s / 120 s, one budget shared by the redirect hops and the 429 retry, checked on every network read). A download to a disallowed URL (first request or redirect target) is logged at WARNING by host; an oversized, encoded, over-redirected or per-hop/per-chunk-too-slow one is rejected silently (a deadline the watchdog had to enforce by closing the connection is logged by host). Either way the search moves on to the next hit/candidate. A `_Watchdog` (armed from httpcore's connect-time trace event; it holds a `dup()` of the socket so it still works after the TLS wrap, i.e. for every real host) shuts the connection down when the budget runs out, which is the only thing that can interrupt a read blocked on dripped response headers, a chunked-encoding size line or a TLS handshake; a fired watchdog fails the download even if the read ended cleanly (a close-delimited body reads the shutdown as EOF). A `SoftTimeLimitExceeded` raised in ANY sourcer network call (downloads, the Pexels search, the Wikipedia lookups, HuggingFace) is re-raised and ends the task, never swallowed as an ordinary failure. Each hop's httpx timeout is clamped to `min(configured, time left + 1 s)`, which bounds the connect/TLS phase before the watchdog can arm, and each `search()` has one overall budget (Pexels 900 s, Wikipedia 240 s) so the per-hit budgets cannot add up; once it is spent no further download starts, but cached hits are still served. Every download's first bytes must be a real JPEG/PNG/GIF/WebP/TIFF (images) or MP4/WebM/GIF (videos) before it is cached, and a file already on disk is checked the same way on a cache hit (a poisoned or empty one is deleted and re-downloaded); an HTML/JSON/empty body is discarded and the search moves on. Before each hop the host is resolved on a daemon thread and waited on for at most the hop's timeout (`getaddrinfo` takes no timeout), skipped for IP literals and env-proxy setups. Temp files are unique per download (`<name>.<hex>.tmp`) and old leftovers are swept when a source is created. The API calls (Pexels search, Wikipedia lookups, HuggingFace) are streamed through `_open_download` and read through `_iter_capped` (`_api_call`): reading stops at the limit (8 MB for JSON, the image/video limits for HuggingFace), so the read buffer is bounded, and each call has its own wall-clock budget (`max(30 s, 2 x timeout)`) with the same hop clamp, DNS gate and connection watchdog as a download (not clipped to `asset_budget()`, so the searches still find cached files); an oversized body is never parsed or cached (`_body_too_large` stays as defense in depth) and a HuggingFace one is not billed. An image (Wikipedia download, HuggingFace image, or a cached file) must also decode in Pillow and declare at most `_pixel_cap(format)` pixels -- 50 megapixels, 20 for WebP (`_image_ok`: the declared size is checked first and the pixels are decoded only if it passed, so a truncated file is refused and an over-cap one is never decoded). An oversized original is downscaled instead of replaced by the thumbnail (`_fit_image`: a JPEG by DCT-scaled decode, PNG/TIFF/GIF between 50 and 75 megapixels and WebP between 20 and 30 by a full decode and integer `reduce()` (a TIFF declaring tiles above 4096 per side is refused from its header: libtiff allocates a tile-sized buffer regardless of the image size; an MPO counts as a JPEG) -- non-JPEG decode memory is bounded in bytes per format: `_MAX_DECODE_BYTES` 400 MB over a per-format bytes-per-pixel estimate for the check, `_MAX_DOWNSCALE_DECODE_BYTES` 600 MB for the one-off downscale decode; EXIF rotation baked in; PNG stays PNG, the rest become JPEG); one outside those windows (a non-JPEG past its decode window, or any image past Pillow's bomb limit) falls back to the thumbnail and is remembered in a `wiki_<id>.<ext>.<sha256(url)[:12]>.refused` marker next to the file it would have been (holding the limits it was refused under, so changing any of them forgets it) so later searches do not download it again; a decode failure inside the windows is never remembered, and a refused cached file is deleted and fetched again. Each beat's `resolve_or_reuse()` runs inside `asset_budget(RENDER_ASSET_BUDGET_S - asset time spent so far)` (20 min in total, TTS time not charged): each search's budget is clipped to it, and once it is spent no download starts and the HuggingFace `generate()` calls refuse the paid API -- after their cache lookup, so cached files (Pexels, Wikipedia and HuggingFace) are still served. It gates starts only: the small API calls and anything in flight are not interrupted.
 - `safe_to_publish=True` (Pexels license is permissive)
 
 ### Player photos (`WikipediaImageSource`)
@@ -525,12 +533,14 @@ Every drawtext clause carries `:expansion=none` — disables ffmpeg's own `%`-ex
 - Triggered when a person name (`engine/names.py::person_names()` — clubs and tournaments are excluded) is found in `visual_direction`
 - Flow: opensearch → page summary REST → image download + `extmetadata` license fetch (filename `urllib.parse.unquote()`-decoded before the MediaWiki `titles=` lookup — an encoded filename otherwise matches no page and silently defaults to `license="unknown"`)
 - Rate-limit handling: 0.5 s between players, 2 s retry on 429
+- A malformed summary body (non-object, non-string image `source`) gives no photo instead of raising; the file name id is the numeric `pageid`, else the title if it is already lowercase `[a-z0-9_-]{1,64}` (so two titles differing only in case can never be one file on a case-insensitive filesystem), else `t` + 16 hex of its sha256
 - License fields stored: `license`, `license_url`, `attribution`, `safe_to_publish`
 - `safe_to_publish` is `True` only for CC0/CC-BY/public domain — most player headshots are CC-BY-SA (attribution required at publish)
 
 ### Generated fallback (HuggingFace)
 
 - `HuggingFaceVideoSource` (LTX-Video) and `HuggingFaceImageSource` (FLUX.1-schnell) — last resorts in the chain, before a black frame
+- A response body that is not a real image/video (and a cached file that is not) is discarded: neither cached nor billed, the same as the existing content-type rejection
 - Both cache by prompt fingerprint; cost (`asset_hf_video`/`asset_hf_image` StageEvents) is charged only on an actual generation call, never a cache hit
 - Always `safe_to_publish=True`
 

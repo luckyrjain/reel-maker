@@ -5,7 +5,7 @@ from api.config import settings
 from api.state import CUT_TRANSITIONS, transition
 from engine.generation.guide_schema import PlatformGuide, compute_guide_fingerprint
 from engine.observability import record_stage
-from engine.render.asset_sourcer import compute_pins_fingerprint_for_render, get_asset_sourcer, get_hf_sourcer, get_hf_video_sourcer, get_music_sourcer, get_wiki_sourcer, resolve_or_reuse
+from engine.render.asset_sourcer import RENDER_ASSET_BUDGET_S, asset_budget, _monotonic as _asset_clock, compute_pins_fingerprint_for_render, get_asset_sourcer, get_hf_sourcer, get_hf_video_sourcer, get_music_sourcer, get_wiki_sourcer, resolve_or_reuse
 from engine.render.compositor import DEFAULT_TEXT_COLOR, composite_cut
 from engine.render.tts import SilentProvider, _audio_duration, get_tts_provider
 from worker.celery_app import celery_app
@@ -56,20 +56,27 @@ def render_cut(self, db, job, ctx):
     # see docs/roadmap.md's Phase 7 asset_sourcer visibility item.
     black_frame_beats: list[int] = []
 
+    # Per-search budgets in asset_sourcer add up across beats; this bounds their sum. Only the time spent
+    # resolving assets counts (TTS, which can be slow, must not starve later beats of footage), so each
+    # beat gets what is left of the total after the earlier beats' asset time.
+    asset_time_s = 0.0
     for i, beat in enumerate(beats):
         # resolve_or_reuse: reuses pinned assets when visual_direction hasn't
         # changed; re-resolves (and re-pins) only when the direction changed.
-        pairs = resolve_or_reuse(
-            db,
-            cut=cut,
-            beat_index=beat.index,
-            visual_direction=beat.visual_direction,
-            min_duration_s=beat.duration_s,
-            sourcer=sourcer,
-            wiki=wiki,
-            hf_video=hf_video,
-            hf=hf,
-        )
+        started = _asset_clock()
+        with asset_budget(RENDER_ASSET_BUDGET_S - asset_time_s):
+            pairs = resolve_or_reuse(
+                db,
+                cut=cut,
+                beat_index=beat.index,
+                visual_direction=beat.visual_direction,
+                min_duration_s=beat.duration_s,
+                sourcer=sourcer,
+                wiki=wiki,
+                hf_video=hf_video,
+                hf=hf,
+            )
+        asset_time_s += _asset_clock() - started
         beat_asset_pairs.append(pairs)
         paths = [p for _, p in pairs]
         beat_video_paths.append(paths)
