@@ -39,9 +39,9 @@ Not defects (pinned as characterization): surrounding whitespace in the key is t
   treating an unreadable credential as "not connected". Deferral keeps the error exactly where a token
   is read (`engine/publish/youtube.py`, `instagram.py`, `metrics.py` — all in-session) and lets every
   page that doesn't read a token work. Assigning a new value never loads or decrypts the old one, so
-  the re-auth callback overwrites cleanly. The cost is one lazy SELECT per column read (two when both tokens are
-  read, as the YouTube refresh path does) — which is why the token-using call sites undefer them
-  up front (see "Found by review").
+  the re-auth callback overwrites cleanly. Unless undeferred, each token read costs one lazy SELECT
+  (two when both are read, as the YouTube refresh path does); the token-using call sites therefore
+  undefer both up front (see "Found by review").
 - Fix 1 and the deferral ship in one commit: fix 1 alone would have extended the lockout to the
   removed-key case, which used to degrade quietly.
 
@@ -65,6 +65,22 @@ Not defects (pinned as characterization): surrounding whitespace in the key is t
   exactly as stored and never log; every unreadable-token message tells the operator to re-authenticate;
   a vacuous padding test was replaced by one that exercises real padding; and one flaky assertion
   (`"new" not in ciphertext`) was found and fixed.
+
+## Found by review (round 2)
+
+A second Test-Quality pass over the round-1 fixes found gaps in the skip path and the whitespace
+handling; all closed with tests, no production defect:
+
+- The metrics skip is one WARNING line (cut id, platform, reason), not a traceback: an unreadable
+  credential is an operator-fixable condition, not a crash. The log never carries a token.
+- `except ValueError` in `_pull_one` stays narrow: a database error or Ctrl-C still surfaces.
+- A skipped cut leaves no `metrics_updated_at` stamp and no snapshot row, and the skip does not
+  depend on cut order or platform (tested both ways round).
+- Whitespace-only values are not Fernet-shaped; an unpadded token with surrounding whitespace is
+  still recognised (padding is restored from the stripped length); Unicode whitespace is tolerated;
+  tokens ending in `-` or `_` are not mangled by the strip.
+
+Review was bounded to two rounds: a Test-Quality review never reaches literally zero survivors.
 
 ## Tests
 

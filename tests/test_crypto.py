@@ -617,3 +617,37 @@ def test_assigning_none_to_an_unloaded_refresh_token_persists_null(db_session, s
     assert db_session.execute(text("SELECT refresh_token_blob FROM credentials WHERE id=:i"),
                               {"i": cred.id}).scalar() is None
 
+
+@pytest.mark.parametrize("v", [" ", "\n", " \t\r\n", "\u00a0"])
+def test_whitespace_only_is_not_fernet_shaped_and_reads_back_verbatim_without_key(set_key, v):
+    assert crypto._looks_like_fernet_token(v) is False
+    set_key("")
+    assert crypto.open_(v) == v
+
+
+def test_unpadded_token_with_surrounding_whitespace_is_still_recognized(set_key, key):
+    """The padding must be restored from the STRIPPED length, not the raw one."""
+    set_key(key)
+    sealed = crypto.seal("")                       # base64 ends in '=='
+    assert sealed.endswith("==")
+    assert crypto._looks_like_fernet_token(sealed.rstrip("=") + "\n")
+    assert crypto._looks_like_fernet_token("\t" + sealed.rstrip("=") + " ")
+
+
+def test_unicode_whitespace_around_a_token_is_tolerated(set_key, key):
+    """Fernet's decoder ignores these too, so the keyless check must not be the weak link."""
+    set_key(key)
+    sealed = crypto.seal(SECRET)
+    assert crypto._looks_like_fernet_token("\u00a0" + sealed + "\u3000")
+
+
+def test_a_token_ending_in_dash_or_underscore_is_recognized(set_key, key):
+    """'-' and '_' are valid base64url edge characters; stripping must not eat them."""
+    set_key(key)
+    for _ in range(2000):
+        sealed = crypto.seal(SECRET).rstrip("=")
+        if sealed[-1] in "-_":
+            assert crypto._looks_like_fernet_token(sealed)
+            return
+    pytest.fail("never produced a token ending in '-' or '_'")
+

@@ -191,7 +191,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 ### `tests/`
 
-72 test files + `conftest.py`, **2289 tests run by default / 2290 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
+72 test files + `conftest.py`, **2301 tests run by default / 2302 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
 
 | File | Tests | File | Tests |
 |---|---|---|---|
@@ -209,7 +209,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_publish_task.py` | 14 | `test_llm_provider.py` | 13 |
 | `test_publish_gate.py` | 13 | `test_correlation.py` | 12 |
 | `test_metrics_fetcher.py` | 12 | `test_script_parser.py` | 11 |
-| `test_metrics_task.py` | 12 | `test_credentials_router.py` | 16 |
+| `test_metrics_task.py` | 17 | `test_credentials_router.py` | 16 |
 | `test_hook_variants.py` | 9 | `test_insights_router.py` | 9 |
 | `test_youtube_publisher.py` | 9 | `test_attribution.py` | 8 |
 | `test_estimate.py` | 8 | `test_music_source.py` | 8 |
@@ -228,7 +228,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_sourcer_dns.py` | 25 | `test_sourcer_tmp_files.py` | 11 |
 | `test_sourcer_api_limits.py` | 22 | `test_sourcer_api_streaming.py` | 72 |
 | `test_sourcer_image_check.py` | 178 | `test_sourcer_render_budget.py` | 27 |
-| `test_sourcer_pins_and_music.py` | 38 | `test_crypto.py` | 78 |
+| `test_sourcer_pins_and_music.py` | 38 | `test_crypto.py` | 85 |
 | `test_llm_judge.py` | 3 | `test_main.py` | 3 |
 | `test_observability.py` | 7 | `test_golden_reel.py` | 1 (deselected) |
 
@@ -573,7 +573,7 @@ Three gates run in `publish_cut`, in order, before any upload:
 
 Both fingerprint checks treat `None` as "unknown, don't block" (pre-migration/never-rendered rows), never as a mismatch. None of the three gates run on the "finalize" branch (a cut that already has `platform_post_id` — nothing is uploaded there, so blocking it would leave a live post unrecorded with no operator way out).
 
-`Credential.token_blob`/`refresh_token_blob` are transparently Fernet-encrypted (`api/crypto.py::Encrypted`); application code reads/writes them as plain strings. `pull_publish_metrics()` (Celery beat, every 6 h) refreshes YouTube tokens proactively (short-lived, ~1 h) and best-effort-skips a cut whose platform has no `MetricsFetcher` or whose credential pull raises.
+`Credential.token_blob`/`refresh_token_blob` are transparently Fernet-encrypted (`api/crypto.py::Encrypted`); application code reads/writes them as plain strings. `pull_publish_metrics()` (Celery beat, every 6 h) refreshes YouTube tokens proactively (short-lived, ~1 h) and best-effort-skips a cut whose platform has no `MetricsFetcher` or whose stored credential is unreadable (a stale `CREDENTIALS_KEY`).
 
 ---
 

@@ -48,12 +48,13 @@ def _pull_one(db, cut: "models.Cut") -> None:
             .filter(models.Credential.provider == provider_name)
             .first()
         )
-    except ValueError:
+    except ValueError as exc:
         # Unreadable stored token (rotated/removed CREDENTIALS_KEY): skip this cut rather than
         # abort the whole batch — one stale credential must not stop every other platform.
-        _log.exception(
-            "Skipping metrics for cut_id=%s platform=%s: stored credential is unreadable",
-            cut.id, cut.platform.value,
+        # One line, no traceback: this repeats for every cut on the platform every 6 hours,
+        # and the (static, secret-free) message already says what to do.
+        _log.warning(
+            "Skipping metrics for cut_id=%s platform=%s: %s", cut.id, cut.platform.value, exc,
         )
         return
     if credential is None:
