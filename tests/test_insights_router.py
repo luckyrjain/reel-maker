@@ -110,6 +110,10 @@ def test_insights_page_reads_reels_and_jobs_once_each(client):
 
     assert _selects_from(client, "reels") == 1
     assert _selects_from(client, "jobs") == 1
+    # Cuts come in on the reels SELECT (a joinedload: `FROM reels LEFT OUTER JOIN cuts`). A
+    # standalone `FROM cuts` would be a lazy per-reel load (N+1) or an extra query, each
+    # re-reading every cut's guide JSON.
+    assert _selects_from(client, "cuts") == 0
 
 
 # ── PerformanceNote CRUD round-trip ──────────────────────────────────────────

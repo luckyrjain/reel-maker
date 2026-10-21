@@ -1,9 +1,14 @@
 """Tests for engine/analytics/correlation.py."""
+import itertools
 import math
+from types import SimpleNamespace
+
+import pytest
 
 from api import models
 from engine.analytics.correlation import (
     MIN_SAMPLE,
+    _hook_vo_for_max_views_cut,
     load_reel_stats,
     quality_engagement_correlation,
     top_bottom_performers,
@@ -273,9 +278,16 @@ def test_analyses_given_stats_issue_no_further_queries(db_session):
     stats = load_reel_stats(db)
 
     seen = []
-    event.listen(db.get_bind(), "before_cursor_execute", lambda *a: seen.append(a[2]))
-    quality_engagement_correlation(db, stats)
-    top_bottom_performers(db, stats=stats)
+
+    def record(conn, cursor, statement, *rest):
+        seen.append(statement)
+
+    event.listen(db.get_bind(), "before_cursor_execute", record)
+    try:
+        quality_engagement_correlation(db, stats)
+        top_bottom_performers(db, stats=stats)
+    finally:
+        event.remove(db.get_bind(), "before_cursor_execute", record)
     assert [q for q in seen if q.lstrip().upper().startswith("SELECT")] == []
 
 
@@ -288,4 +300,64 @@ def test_empty_stats_are_respected_not_reloaded(db_session):
 
     assert quality_engagement_correlation(db, []).sample_size == 0
     assert top_bottom_performers(db, stats=[]) == []
+
+
+# ── behaviour the shared load must keep (previously unpinned) ────────────────
+
+def test_k_sets_the_size_of_both_lists(db_session):
+    db = db_session
+    _dataset(db, [10, 20, 30, 40, 50], [1, 2, 3, 4, 5])
+    db.commit()
+
+    top, bottom = top_bottom_performers(db, k=2)
+    assert [p.views for p in top] == [5, 4]
+    assert [p.views for p in bottom] == [1, 2]
+    # 5 reels < 2*3: with the default k the same data collapses to one combined list
+    assert isinstance(top_bottom_performers(db), list)
+
+
+def test_latest_quality_score_wins_by_job_creation_time(db_session):
+    from datetime import datetime, timedelta, timezone
+
+    db = db_session
+    reel = _reel(db)
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    # inserted newest-first so only the ORDER BY (not insertion order) can pick the latest
+    for score, age in ((90, 2), (40, 0)):
+        job = _quality_job(db, reel.id, score)
+        job.created_at = t0 + timedelta(hours=age)
+    _cut(db, reel.id, views=10)
+    db.commit()
+
+    [stat] = load_reel_stats(db)
+    assert stat.quality == 90
+
+
+def test_hook_comes_from_the_max_views_cut_not_the_first_cut(db_session):
+    db = db_session
+    reel = _reel(db, niche="finance")
+    _quality_job(db, reel.id, 70)
+    # the max-views cut sits in the MIDDLE: reel.cuts has no guaranteed order (SQLite returns it
+    # newest-first), so only a middle maximum is neither first nor last in either direction
+    _cut(db, reel.id, views=5, guide=_guide_dict("Low-view cut hook?"))
+    _cut(db, reel.id, views=500, guide=_guide_dict("High-view cut hook?"))
+    _cut(db, reel.id, views=6, guide=_guide_dict("Other low-view cut hook?"))
+    db.commit()
+
+    [p] = top_bottom_performers(db)
+    assert p.hook_vo == "High-view cut hook?"
+    assert (p.niche, p.quality_score, p.views) == ("finance", 70, 500)
+
+
+@pytest.mark.parametrize("order", list(itertools.permutations([0, 1, 2])))
+def test_hook_is_the_max_views_cuts_whatever_order_the_cuts_come_in(order):
+    """reel.cuts has no guaranteed order (SQLite returns it in an arbitrary one), so the
+    max-views cut must be found at any position: first, middle or last."""
+    cuts = [
+        SimpleNamespace(views=5, guide=_guide_dict("Low-view hook?")),
+        SimpleNamespace(views=500, guide=_guide_dict("High-view hook?")),
+        SimpleNamespace(views=6, guide=_guide_dict("Other low-view hook?")),
+    ]
+    reel = SimpleNamespace(cuts=[cuts[i] for i in order])
+    assert _hook_vo_for_max_views_cut(reel) == "High-view hook?"
 

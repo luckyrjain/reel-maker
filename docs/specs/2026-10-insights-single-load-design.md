@@ -22,13 +22,22 @@ against it with its body and assertions unmodified (checked before any test was 
 edits to existing test code are the new imports and one fixture line (`c._engine = engine`) that the
 new page-level test needs.
 
-## Tests (5 new)
+## Tests (13 new in test_correlation.py, 1 new in test_insights_router.py)
 
 - `load_reel_stats` keeps only reels with both quality and views, and takes the max-views cut.
 - Both analyses given shared stats equal their self-loading results.
 - Given stats, neither issues any SELECT.
 - `stats=[]` is respected and not reloaded.
-- The page issues exactly one SELECT on `reels` and one on `jobs` (SQLAlchemy `before_cursor_execute`).
+- The page issues exactly one SELECT on `reels` and one on `jobs`, and none on a standalone `cuts`
+  (SQLAlchemy `before_cursor_execute`). Cuts arrive through the reels `joinedload`, so a lazy per-reel
+  load or an extra cuts query would show up as `FROM cuts` and re-read every guide.
+
+A review round added tests for behaviour that no test pinned before this change but that the shared
+load now owns: `k` sets the size of both lists, the latest generate job's score wins by `created_at`
+(not insertion order), and the hook comes from the max-views cut at any position of `reel.cuts`.
+That last one is parametrized over all 6 orderings, because SQLite returns `reel.cuts` in an arbitrary
+order (a two-cut fixture happened to put the maximum first, and a mutant picking the first cut
+survived it).
 
 Mutation-checked, each failing for the predicted reason: router back to the old double call (either
 analysis), `if not stats` in either analysis, an analysis ignoring the passed stats, dropping the

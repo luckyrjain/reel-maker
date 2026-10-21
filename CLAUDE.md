@@ -47,7 +47,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 2205 tests across 71 files, default run (11 test_compositor tests need ffmpeg
+.venv/bin/pytest                            # 2214 tests across 71 files, default run (11 test_compositor tests need ffmpeg
                                              # on PATH; 3 tests skip without optional packages — kokoro voice, two whisper
                                              # caption tests; 1 golden-reel test is deselected by default — see below)
 .venv/bin/pytest -m golden                  # the golden-reel smoke test (real edge-tts + real ffmpeg, ~20s, needs network)
@@ -1206,13 +1206,13 @@ tests/
                               SoftTimeLimitExceeded from its final StageEvent commit (rolling the session back first, and
                               replacing any error already propagating) while an ordinary commit failure is still swallowed
                               and a soft limit inside the block is recorded (ok=False) and re-raised
-  test_correlation.py         16 tests (4 added in Phase 8b: load_reel_stats keeps only reels with both quality and views and takes the max-views cut; both analyses given shared stats equal their self-loading results and issue no further queries; `stats=[]` is respected, not reloaded) — quality_engagement_correlation() (below-MIN_SAMPLE, zero-variance
+  test_correlation.py         25 tests (13 added in Phase 8b: load_reel_stats keeps only reels with both quality and views and takes the max-views cut; both analyses given shared stats equal their self-loading results and issue no further queries; `stats=[]` is respected, not reloaded; review-driven, covering behaviour no test pinned before: `k` sizes both lists, the latest generate job's score wins by `created_at`, and the hook comes from the max-views cut at any position of `reel.cuts` -- 6 permutations, since the load order is arbitrary) — quality_engagement_correlation() (below-MIN_SAMPLE, zero-variance
                               quality/views, a hand-computed synthetic dataset checked to a fixed tolerance
                               — not trusted circularly via numpy, multi-cut-per-reel uses the max-views cut,
                               quality-without-views/views-without-quality excluded); top_bottom_performers()
                               (n < 2k combined list, n >= 2k top/bottom no-overlap, ties, a max-views cut
                               with no guide degrades to hook_vo=None instead of crashing)
-  test_insights_router.py     10 tests (1 added in Phase 8b: the page issues exactly one SELECT on reels and one on jobs, counted with a SQLAlchemy engine event) — GET /api/insights with 0/some/enough data; PerformanceNote
+  test_insights_router.py     10 tests (1 added in Phase 8b: the page issues exactly one SELECT on reels and one on jobs and none on a standalone cuts, counted with a SQLAlchemy engine event; a lazy or extra cuts load would otherwise re-read every guide) — GET /api/insights with 0/some/enough data; PerformanceNote
                               create/toggle/delete round-trip through the DB; deleted note gone from a
                               fresh GET; unknown-id toggle/delete (404 / no-op)
   test_config.py               2 tests — Settings.evaluator_axis_weight_multipliers defaults to `{}`;
