@@ -1,7 +1,9 @@
 """Tests for api/routers/insights.py — GET /api/insights and PerformanceNote CRUD."""
+import re
+
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -30,6 +32,7 @@ def client():
     app.dependency_overrides[get_db] = _override_get_db
     with TestClient(app) as c:
         c._session_factory = TestingSessionLocal
+        c._engine = engine
         yield c
     app.dependency_overrides.clear()
 
@@ -81,6 +84,32 @@ def test_insights_page_renders_with_enough_data(client):
     assert resp.status_code == 200
     assert "correlation" in resp.text.lower()
     assert "(n = 5)" in resp.text
+
+
+def _selects_from(client, table, *, path="/api/insights"):
+    """Number of SELECT statements the request issues that read `table`."""
+    seen: list[str] = []
+
+    def record(conn, cursor, statement, params, context, executemany):
+        seen.append(statement)
+
+    event.listen(client._engine, "before_cursor_execute", record)
+    try:
+        assert client.get(path).status_code == 200
+    finally:
+        event.remove(client._engine, "before_cursor_execute", record)
+    pattern = re.compile(rf"\bFROM {table}\b", re.IGNORECASE)
+    return sum(1 for q in seen if q.lstrip().upper().startswith("SELECT") and pattern.search(q))
+
+
+def test_insights_page_reads_reels_and_jobs_once_each(client):
+    """The page needs two analyses over the same reels/jobs; it must load them once.
+    (Reels are read through the reels table, cuts through a join -- count the reels table.)"""
+    for i in range(6):
+        _make_reel_with_metrics(client._session_factory, quality_score=50 + i, views=100 * (i + 1))
+
+    assert _selects_from(client, "reels") == 1
+    assert _selects_from(client, "jobs") == 1
 
 
 # ── PerformanceNote CRUD round-trip ──────────────────────────────────────────

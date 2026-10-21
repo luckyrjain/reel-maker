@@ -8,6 +8,7 @@ from api.db import get_db
 from api import models
 from engine.analytics.correlation import (
     MIN_SAMPLE,
+    load_reel_stats,
     quality_engagement_correlation,
     top_bottom_performers,
 )
@@ -26,8 +27,9 @@ def _notes(db: Session) -> list[models.PerformanceNote]:
 
 @router.get("/insights", response_class=HTMLResponse)
 def insights_page(request: Request, db: Session = Depends(get_db)):
-    correlation = quality_engagement_correlation(db)
-    performers = top_bottom_performers(db)
+    stats = load_reel_stats(db)   # one load shared by both analyses
+    correlation = quality_engagement_correlation(db, stats)
+    performers = top_bottom_performers(db, stats=stats)
     if isinstance(performers, tuple):
         top_performers, bottom_performers = performers
         combined_performers = None

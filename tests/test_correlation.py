@@ -4,6 +4,7 @@ import math
 from api import models
 from engine.analytics.correlation import (
     MIN_SAMPLE,
+    load_reel_stats,
     quality_engagement_correlation,
     top_bottom_performers,
 )
@@ -232,3 +233,59 @@ def test_hook_vo_extracted_from_max_views_cut_guide(db_session):
     assert isinstance(result, list)
     top_performer = next(p for p in result if p.views == 100)
     assert top_performer.hook_vo == "Nobody talks about this weakness."
+
+
+# ── load_reel_stats / sharing one load between the two analyses ──────────────
+
+def test_load_reel_stats_keeps_only_reels_with_both_quality_and_views(db_session):
+    db = db_session
+    both = _reel(db)
+    _quality_job(db, both.id, 70)
+    _cut(db, both.id, views=10)
+    _cut(db, both.id, views=400)          # max across cuts wins
+    no_views = _reel(db)
+    _quality_job(db, no_views.id, 80)
+    _cut(db, no_views.id, views=None)
+    no_quality = _reel(db)
+    _cut(db, no_quality.id, views=999)
+    db.commit()
+
+    stats = load_reel_stats(db)
+    assert [(s.reel.id, s.quality, s.views) for s in stats] == [(both.id, 70, 400)]
+
+
+def test_both_analyses_given_the_same_stats_match_their_self_loading_results(db_session):
+    db = db_session
+    _dataset(db, [10, 20, 30, 40, 50, 60, 70], [2, 4, 5, 4, 5, 9, 12])
+    db.commit()
+
+    stats = load_reel_stats(db)
+    assert quality_engagement_correlation(db, stats) == quality_engagement_correlation(db)
+    assert top_bottom_performers(db, stats=stats) == top_bottom_performers(db)
+
+
+def test_analyses_given_stats_issue_no_further_queries(db_session):
+    from sqlalchemy import event
+
+    db = db_session
+    _dataset(db, [10, 20, 30, 40, 50, 60, 70], [2, 4, 5, 4, 5, 9, 12])
+    db.commit()
+    stats = load_reel_stats(db)
+
+    seen = []
+    event.listen(db.get_bind(), "before_cursor_execute", lambda *a: seen.append(a[2]))
+    quality_engagement_correlation(db, stats)
+    top_bottom_performers(db, stats=stats)
+    assert [q for q in seen if q.lstrip().upper().startswith("SELECT")] == []
+
+
+def test_empty_stats_are_respected_not_reloaded(db_session):
+    """`stats=[]` means "no qualifying reels", not "load them yourself" -- an `if not stats`
+    check would silently reload on an empty page."""
+    db = db_session
+    _dataset(db, [10, 20, 30, 40, 50], [1, 2, 3, 4, 5])
+    db.commit()
+
+    assert quality_engagement_correlation(db, []).sample_size == 0
+    assert top_bottom_performers(db, stats=[]) == []
+
