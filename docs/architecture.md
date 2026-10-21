@@ -187,7 +187,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 | File | Responsibility |
 |---|---|
-| `correlation.py` | `quality_engagement_correlation()` — Pearson `r` + sample size, refusing below `MIN_SAMPLE=5` or on zero variance; `top_bottom_performers()` — top/bottom-3 (or one combined list below `2k`) |
+| `correlation.py` | `load_reel_stats()` — the one read of reels/cuts/jobs, paired into `ReelStat`s and shared by both analyses below; `quality_engagement_correlation()` — Pearson `r` + sample size, refusing below `MIN_SAMPLE=5` or on zero variance; `top_bottom_performers()` — top/bottom-3 (or one combined list below `2k`) |
 
 ### `tests/`
 
@@ -579,7 +579,7 @@ Both fingerprint checks treat `None` as "unknown, don't block" (pre-migration/ne
 
 ## Insights & performance feedback
 
-`engine/analytics/correlation.py::quality_engagement_correlation()` computes a Pearson `r` between each reel's latest `quality_score` (`engine/observability.py::latest_quality_scores()`) and its max per-cut `views`, refusing below `MIN_SAMPLE=5` reels or on zero variance in either series (`GET /api/insights` always shows `r` with `sample_size` together, with a permanent restriction-of-range caveat). `top_bottom_performers()` returns a top/bottom-3 table (or one combined list below `2×k`) for the operator to write `PerformanceNote`s from — a deliberate human-in-the-loop design, not automatic few-shot injection of raw past-reel content (see `docs/specs/2026-09-phase5-quality-engagement-feedback.md`). Every active note is seeded into `generate_guide`'s standard-path `prior_feedback`; `evaluator_axis_weight_multipliers` is a manual, human-set per-axis scoring lever informed by the same data — nothing in this repo fits it statistically.
+`engine/analytics/correlation.py::load_reel_stats()` reads every reel, cut and job once (the insights page shares that one load between the two analyses below). `quality_engagement_correlation()` computes a Pearson `r` between each reel's latest `quality_score` (`engine/observability.py::latest_quality_scores()`) and its max per-cut `views`, refusing below `MIN_SAMPLE=5` reels or on zero variance in either series (`GET /api/insights` always shows `r` with `sample_size` together, with a permanent restriction-of-range caveat). `top_bottom_performers()` returns a top/bottom-3 table (or one combined list below `2×k`) for the operator to write `PerformanceNote`s from — a deliberate human-in-the-loop design, not automatic few-shot injection of raw past-reel content (see `docs/specs/2026-09-phase5-quality-engagement-feedback.md`). Every active note is seeded into `generate_guide`'s standard-path `prior_feedback`; `evaluator_axis_weight_multipliers` is a manual, human-set per-axis scoring lever informed by the same data — nothing in this repo fits it statistically.
 
 ---
 

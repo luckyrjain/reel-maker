@@ -17,8 +17,10 @@ keep reels that have both. So the page ran those queries twice and kept two copi
 - `stats=None` still loads its own, so every existing caller and all 21 pre-existing tests are
   unchanged. `stats=[]` means "no qualifying reels", not "load them": the check is `is None`.
 
-A pure refactor: the pre-existing `test_correlation.py` and `test_insights_router.py` tests pass
-unmodified against it (checked before any test was added).
+A pure refactor: every pre-existing `test_correlation.py` and `test_insights_router.py` test passes
+against it with its body and assertions unmodified (checked before any test was added). The only
+edits to existing test code are the new imports and one fixture line (`c._engine = engine`) that the
+new page-level test needs.
 
 ## Tests (5 new)
 

@@ -326,11 +326,12 @@ engine/
                       stats=None) both take that result so GET /api/insights does one load, not two (it used
                       to run the identical reels+jobs queries once per analysis) -- `stats=None` loads its own,
                       `stats=[]` means "no qualifying reels" (an `if not stats` would silently reload on an
-                      empty page; pinned by a test); quality_engagement_correlation(db, stats) -> CorrelationResult (Pearson r + sample_size +
-                      insufficient_variance flag; refuses to compute below MIN_SAMPLE=5 reels or when
-                      either series has zero variance — np.corrcoef returns NaN on zero variance, guarded
-                      explicitly rather than let "nan" leak into the UI string); top_bottom_performers(db, k=3)
-                      -> (top, bottom) sorted by views desc/asc, or one combined list when n < 2k. Both read
+                      empty page; pinned by a test). quality_engagement_correlation returns a
+                      CorrelationResult (Pearson r + sample_size + insufficient_variance flag; refuses to
+                      compute below MIN_SAMPLE=5 reels or when either series has zero variance —
+                      np.corrcoef returns NaN on zero variance, guarded explicitly rather than let "nan"
+                      leak into the UI string); top_bottom_performers returns (top, bottom) sorted by views
+                      desc/asc, or one combined list when n < 2k. Both read
                       `Cut.views` (max per reel, matching _reel_list_metrics()'s existing "views" definition)
                       against latest_quality_scores() — no new schema, no cached/denormalized column, no
                       chart library (see docs/specs/2026-09-phase5-quality-engagement-feedback.md §2.1). New
