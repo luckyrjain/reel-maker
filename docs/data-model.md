@@ -13,10 +13,10 @@ One reel = one topic/context. Owns two cuts (one per platform) and all jobs.
 | Column | Type | Notes |
 |---|---|---|
 | `id` | integer PK | |
-| `context` | text | User's topic/prompt — required; always the raw input, never modified |
+| `context` | text | User's topic/prompt — required. Stored as typed except that invisible Unicode tag characters (U+E0000-E007F) are removed, keeping the England/Scotland/Wales flag emoji; a context that is empty after that is a 422. Never rewritten later (enrichment goes to `enriched_context`) |
 | `enriched_context` | text | LLM-enriched version; set only when context scores < 60; nullable |
-| `niche` | varchar(255) | Optional category label |
-| `voiceover_mode` | varchar(50) | `voiceover` \| `music_only` \| `silent` |
+| `niche` | varchar(255) | Optional category label; tag characters removed as for `context` |
+| `voiceover_mode` | varchar(50) | `voiceover` \| `music_only` \| `silent`; any other submitted value is stored as `voiceover` |
 | `tts_voice` | varchar(100), nullable | Edge-tts voice name from `CURATED_EDGE_VOICES`; `None` = provider default. Ignored when `TTS_PROVIDER=kokoro`. |
 | `text_color` | varchar(20), nullable | On-screen text color from `CURATED_TEXT_COLORS`; `None` = `DEFAULT_TEXT_COLOR` ("white"). Interpolated unescaped into the ffmpeg drawtext filter — validated at both the router and `_build_text_filter()`, not just curated for UX. |
 | `status` | enum `ReelStatus` | See state machine |
@@ -212,7 +212,7 @@ Operator-written, plain-English notes synthesizing past reel performance (e.g. "
 |---|---|---|
 | `id` | integer PK | |
 | `text` | text | Operator-written note; required |
-| `active` | boolean | Default `true`. Only active notes are seeded into `generate_guide`'s `prior_feedback` (standard LLM path only) — see `docs/evaluation.md`'s "Performance-informed feedback" section |
+| `active` | boolean | Default `true`. Only active notes are seeded into `generate_guide`'s `prior_feedback` (standard LLM path only; invisible Unicode tag characters are stripped when the note is written and again when it is seeded, and a note that is nothing but hidden text is dropped from the prompt) — see `docs/evaluation.md`'s "Performance-informed feedback" section |
 | `created_at` | timestamptz | |
 
 Deliberately **not** automated few-shot injection of raw past-reel content — see `docs/specs/2026-09-phase5-quality-engagement-feedback.md` §3.1. CRUD is hard-delete (no soft-delete/undo — these are cheap, operator-owned free text, unlike a `Job`/`Cut` state machine): `POST /api/insights/notes` (create, `active=true`), `POST /api/insights/notes/{id}/toggle` (flip `active`), `DELETE /api/insights/notes/{id}`.
