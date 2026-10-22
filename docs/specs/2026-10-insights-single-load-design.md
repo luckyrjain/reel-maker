@@ -22,7 +22,7 @@ against it with its body and assertions unmodified (checked before any test was 
 edits to existing test code are the new imports and one fixture line (`c._engine = engine`) that the
 new page-level test needs.
 
-## Tests (23 new in test_correlation.py, 23 new in test_insights_router.py, 173 in the new test_display.py)
+## Tests (23 new in test_correlation.py, 30 new in test_insights_router.py, 173 in the new test_display.py)
 
 - `load_reel_stats` keeps only reels with both quality and views, and takes the max-views cut.
 - Both analyses given shared stats equal their self-loading results.
@@ -101,6 +101,17 @@ quality filter.
   ordered by creation time, not id). Also the trim is checked against EVERY character Python calls
   whitespace, not six samples. Ordering of reels with equal views is unspecified (no ORDER BY on
   reels), and a code decision such as a `reel_id` tie-break would be needed to pin it: left as is.
+
+## Test gaps found by the round-6 review, and closed in this PR
+
+Seven tests for behaviour a mutant could change with every earlier test green: the page chrome and the
+note form's wiring (`hx-post`, `hx-target`, `hx-swap`, the reset, the required `text` textarea, the one
+`id="performance-notes"`, the script tags); the fragment's root id equal to every `hx-target` and
+`hx-confirm` present; the table header order; create, toggle and delete each returning the whole note
+list (a delete that returned `[]` passed before); a missing `text` field being a 422; an exactly-zero
+correlation shown as `r = 0.00` (a truthiness check would show "not enough data"); and a positive `r`
+without a plus sign. Cosmetic survivors (heading text, hint paragraphs, CSS classes, `title=`
+attributes) are left alone.
 
 ## Left alone
 

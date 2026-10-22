@@ -522,3 +522,88 @@ def test_notes_are_ordered_by_creation_time_not_by_id(client):
     html = client.get("/api/insights").text
     assert html.index("newest note") < html.index("middle note") < html.index("oldest note")
 
+
+# ── page wiring and route responses (round-6 test-quality review) ─────────────────────────────
+# Each of these pins something a mutant could change with every earlier test still green.
+
+def _seed_notes(session_factory, *texts):
+    db = session_factory()
+    try:
+        for text in texts:
+            db.add(models.PerformanceNote(text=text, active=True))
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_page_chrome_and_note_form_wiring(client):
+    html = client.get("/api/insights").text
+
+    assert "<title>Insights — Reel Maker</title>" in html
+    assert 'href="/"' in html and 'href="/api/reels"' in html
+    assert "/static/htmx-errors.js" in html and "htmx.org@2" in html
+    form = re.search(r"<form([^>]*)>(.*?)</form>", html, re.S)
+    attrs, body = form.group(1), form.group(2)
+    assert 'hx-post="/api/insights/notes"' in attrs
+    assert 'hx-swap="outerHTML"' in attrs and 'hx-target="#performance-notes"' in attrs
+    assert "this.reset()" in attrs
+    assert re.search(r'<textarea[^>]*name="text"[^>]*required', body, re.S)
+    assert html.count('id="performance-notes"') == 1
+
+
+def test_note_fragment_swaps_onto_its_own_root_id(client):
+    _seed_notes(client._session_factory, "a note")
+
+    fragment = client.post("/api/insights/notes", data={"text": "b"}).text
+
+    assert fragment.lstrip().startswith('<div id="performance-notes"')
+    assert set(re.findall(r'hx-target="([^"]+)"', fragment)) == {"#performance-notes"}
+    assert fragment.count('hx-swap="outerHTML"') == 2 * 2  # toggle + delete, for each of the 2 notes
+    assert "hx-confirm=" in fragment
+
+
+def test_table_header_order(client):
+    for i in range(7):
+        _make_reel_with_metrics(client._session_factory, quality_score=50, views=100 * (i + 1))
+
+    headings = re.findall(r"<th>(.*?)</th>", client.get("/api/insights").text)
+
+    assert headings[:5] == ["Reel", "Niche", "Quality", "Views", "Hook line"]
+
+
+def test_create_toggle_and_delete_all_return_the_whole_note_list(client):
+    _seed_notes(client._session_factory, "keep one", "keep two", "drop me")
+    db = client._session_factory()
+    try:
+        drop = db.query(models.PerformanceNote).filter_by(text="drop me").one().id
+        keep = db.query(models.PerformanceNote).filter_by(text="keep one").one().id
+    finally:
+        db.close()
+
+    deleted = client.request("DELETE", f"/api/insights/notes/{drop}").text
+    toggled = client.post(f"/api/insights/notes/{keep}/toggle").text
+    created = client.post("/api/insights/notes", data={"text": "fresh"}).text
+
+    assert "keep one" in deleted and "keep two" in deleted and "drop me" not in deleted
+    assert "keep one" in toggled and "keep two" in toggled
+    assert "keep one" in created and "keep two" in created and "fresh" in created
+
+
+def test_creating_a_note_without_the_text_field_is_a_422(client):
+    assert client.post("/api/insights/notes", data={}).status_code == 422
+
+
+def test_an_exactly_zero_correlation_is_shown_as_r_0_00_not_as_missing(client):
+    # numpy returns exactly 0.0 for these: a truthiness check on r would show "not enough data".
+    for quality, views in zip([1, 2, 3, 4, 5], [1, 3, 5, 3, 1]):
+        _make_reel_with_metrics(client._session_factory, quality_score=quality, views=views)
+
+    assert "r = 0.00" in client.get("/api/insights").text
+
+
+def test_a_positive_correlation_is_shown_without_a_plus_sign(client):
+    for quality, views in zip([1, 2, 3, 4, 5], [10, 20, 31, 40, 52]):
+        _make_reel_with_metrics(client._session_factory, quality_score=quality, views=views)
+
+    assert "r = 1.00</strong>" in client.get("/api/insights").text
+
