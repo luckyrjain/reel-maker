@@ -346,7 +346,7 @@ Create a new, active `PerformanceNote`. Accepts `multipart/form-data`.
 
 | Field | Type | Description |
 |---|---|---|
-| `text` | string | Required; a blank/whitespace-only value is silently ignored (no row created, no error) |
+| `text` | string | Required; a blank/whitespace-only value is silently ignored (no row created, no error). Invisible Unicode tag characters (U+E0000-E007F) are removed before saving -- the England/Scotland/Wales flag emoji excepted -- so a value that is only hidden text is also ignored |
 
 **Response:** `text/html` — `fragments/performance_notes.html` (the full current list).
 
