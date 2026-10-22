@@ -22,7 +22,7 @@ against it with its body and assertions unmodified (checked before any test was 
 edits to existing test code are the new imports and one fixture line (`c._engine = engine`) that the
 new page-level test needs.
 
-## Tests (13 new in test_correlation.py, 1 new in test_insights_router.py)
+## Tests (23 new in test_correlation.py, 8 new in test_insights_router.py, 97 in the new test_display.py)
 
 - `load_reel_stats` keeps only reels with both quality and views, and takes the max-views cut.
 - Both analyses given shared stats equal their self-loading results.
@@ -43,6 +43,31 @@ Mutation-checked, each failing for the predicted reason: router back to the old 
 analysis), `if not stats` in either analysis, an analysis ignoring the passed stats, dropping the
 quality filter.
 
+## Found by the round-2 review, and fixed in this PR
+
+- **Memory held through the render.** The shared `stats` (every reel, with every cut's guide JSON)
+  stayed referenced in the handler until the response was built -- about 170 MB at 2000 reels x 3
+  cuts x 25 beats, where `main` freed it between the two analyses. The peak did not change (it
+  happens during the load), but the memory outlived its use. The page's context is now built in
+  `_insights_context()`, which returns before the template renders, so the reels are freed first.
+  Pinned by a test that holds a weakref to every `Reel` and asserts all are collected by the time
+  `TemplateResponse` runs.
+- **Control and bidi-override characters reached the page.** Jinja autoescape handles HTML only.
+  NUL and other C0/C1 controls, and the bidi overrides/embeddings/isolates (U+202A-202E,
+  U+2066-2069) in `niche`, hook text or a performance note, were rendered as-is: an override can
+  reorder the text around it so that it reads differently from what is stored. This predates the
+  PR (same template, same path); it is fixed here at the user's request. `api/display.py::safe_text`
+  removes them at display time (whitespace controls become one space); the stored value is never
+  rewritten. The directional MARKS (LRM, RLM, ALM) are kept deliberately: ordinary Arabic/Hebrew
+  uses them. Applied as a Jinja filter to the three free-text fields on the insights page and in the
+  notes fragment (which the create/toggle routes also return). Other pages that show `niche` or hook
+  text (reel list, cut card) are not changed here.
+- **Tests that did not exist for behaviour this change owns:** a reel with 0 views or quality 0 is
+  data, not "missing" (four truthiness mutants had survived); performers are ranked by views, not
+  quality; the sign of `r`; the page's top/bottom tables list the right reel ids in the right order
+  and the combined table below `2k` reels; `_hook_vo_for_max_views_cut` degrades to `None` for a
+  missing or malformed guide, a non-hook first beat and a blank hook line.
+
 ## Left alone
 
 - `stats` is an optional parameter, so a future caller can forget it and silently pay for a second
@@ -54,3 +79,6 @@ quality filter.
   `Job.type == generate` filter would be a cheap follow-up (the original note in the code).
 - `api/routers/reels.py::_reel_list_metrics()` computes a similar reel -> (quality, views) pairing for
   the reel list page. It is a different page with its own query shape; not merged here.
+- `_hook_vo_for_max_views_cut()`'s `if not guide.beats` check is unreachable: `PlatformGuide`
+  rejects an empty `beats` list at validation, which the `except` above already turns into `None`.
+  Left as is (pre-existing, harmless).

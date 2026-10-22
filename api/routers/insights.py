@@ -6,6 +6,7 @@ from typing import Annotated
 
 from api.db import get_db
 from api import models
+from api.display import safe_text
 from engine.analytics.correlation import (
     MIN_SAMPLE,
     load_reel_stats,
@@ -15,6 +16,7 @@ from engine.analytics.correlation import (
 
 router = APIRouter()
 templates = Jinja2Templates(directory="ui/templates")
+templates.env.filters["safe_text"] = safe_text   # for free text read from the DB (niche, hooks, notes)
 
 
 def _notes(db: Session) -> list[models.PerformanceNote]:
@@ -25,8 +27,10 @@ def _notes(db: Session) -> list[models.PerformanceNote]:
     )
 
 
-@router.get("/insights", response_class=HTMLResponse)
-def insights_page(request: Request, db: Session = Depends(get_db)):
+def _insights_context(db: Session) -> dict:
+    """Everything the page shows. A separate function so the loaded reels/cuts (`stats`, which
+    hold every cut's guide JSON) are released when it returns -- before the template renders --
+    instead of living until the response is built."""
     stats = load_reel_stats(db)   # one load shared by both analyses
     correlation = quality_engagement_correlation(db, stats)
     performers = top_bottom_performers(db, stats=stats)
@@ -36,18 +40,19 @@ def insights_page(request: Request, db: Session = Depends(get_db)):
     else:
         top_performers = bottom_performers = None
         combined_performers = performers
+    return {
+        "correlation": correlation,
+        "top_performers": top_performers,
+        "bottom_performers": bottom_performers,
+        "combined_performers": combined_performers,
+        "notes": _notes(db),
+        "min_sample": MIN_SAMPLE,
+    }
 
-    return templates.TemplateResponse(
-        request, "insights.html",
-        {
-            "correlation": correlation,
-            "top_performers": top_performers,
-            "bottom_performers": bottom_performers,
-            "combined_performers": combined_performers,
-            "notes": _notes(db),
-            "min_sample": MIN_SAMPLE,
-        },
-    )
+
+@router.get("/insights", response_class=HTMLResponse)
+def insights_page(request: Request, db: Session = Depends(get_db)):
+    return templates.TemplateResponse(request, "insights.html", _insights_context(db))
 
 
 @router.post("/insights/notes", response_class=HTMLResponse)

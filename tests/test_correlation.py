@@ -361,3 +361,85 @@ def test_hook_is_the_max_views_cuts_whatever_order_the_cuts_come_in(order):
     reel = SimpleNamespace(cuts=[cuts[i] for i in order])
     assert _hook_vo_for_max_views_cut(reel) == "High-view hook?"
 
+
+# ── zero values are data, not "missing" (round-2 review) ─────────────────────
+
+def test_a_reel_with_zero_views_is_kept(db_session):
+    db = db_session
+    reel = _reel(db)
+    _quality_job(db, reel.id, 50)
+    _cut(db, reel.id, views=0)
+    db.commit()
+
+    [stat] = load_reel_stats(db)
+    assert (stat.quality, stat.views) == (50, 0)
+
+
+def test_a_reel_with_zero_quality_is_kept(db_session):
+    db = db_session
+    reel = _reel(db)
+    _quality_job(db, reel.id, 0)
+    _cut(db, reel.id, views=7)
+    db.commit()
+
+    [stat] = load_reel_stats(db)
+    assert (stat.quality, stat.views) == (0, 7)
+
+
+def test_zero_views_cut_still_counts_when_picking_the_max_views_cut():
+    """views=0 is a measured value: a reel whose only measured cut has 0 views still has a hook."""
+    reel = SimpleNamespace(cuts=[SimpleNamespace(views=0, guide=_guide_dict("Zero-view hook?"))])
+    assert _hook_vo_for_max_views_cut(reel) == "Zero-view hook?"
+
+
+# ── ranking and sign ─────────────────────────────────────────────────────────
+
+def test_performers_are_ranked_by_views_not_by_quality(db_session):
+    db = db_session
+    # quality FALLS as views RISE, so a sort on the wrong key gives the opposite order
+    _dataset(db, [60, 50, 40, 30, 20, 10], [10, 20, 30, 40, 50, 60])
+    db.commit()
+
+    top, bottom = top_bottom_performers(db)
+    assert [p.views for p in top] == [60, 50, 40]
+    assert [p.views for p in bottom] == [10, 20, 30]
+
+
+def test_a_negative_relationship_gives_a_negative_r(db_session):
+    db = db_session
+    _dataset(db, [1, 2, 3, 4, 5], [50, 40, 30, 20, 10])
+    db.commit()
+
+    assert quality_engagement_correlation(db).r == pytest.approx(-1.0)
+
+
+# ── _hook_vo_for_max_views_cut degrades to None rather than raising ──────────
+
+def _reel_with_guide(guide):
+    return SimpleNamespace(cuts=[SimpleNamespace(views=10, guide=guide)])
+
+
+def test_hook_is_none_when_the_max_views_cut_has_no_guide():
+    assert _hook_vo_for_max_views_cut(_reel_with_guide(None)) is None
+    assert _hook_vo_for_max_views_cut(_reel_with_guide({})) is None
+
+
+def test_hook_is_none_for_a_malformed_guide():
+    assert _hook_vo_for_max_views_cut(_reel_with_guide({"beats": "not a list"})) is None
+    assert _hook_vo_for_max_views_cut(_reel_with_guide(["junk"])) is None   # TypeError, not ValidationError
+
+
+def test_hook_is_none_when_the_first_beat_is_not_a_hook():
+    guide = _guide_dict("Not a hook")
+    guide["beats"][0]["type"] = "body"
+    assert _hook_vo_for_max_views_cut(_reel_with_guide(guide)) is None
+
+
+def test_hook_is_none_not_an_empty_string_for_a_blank_hook_line():
+    assert _hook_vo_for_max_views_cut(_reel_with_guide(_guide_dict(""))) is None
+
+
+def test_hook_is_none_when_no_cut_has_views():
+    reel = SimpleNamespace(cuts=[SimpleNamespace(views=None, guide=_guide_dict("Unmeasured?"))])
+    assert _hook_vo_for_max_views_cut(reel) is None
+

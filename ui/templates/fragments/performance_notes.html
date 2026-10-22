@@ -12,7 +12,7 @@
              hx-swap="outerHTML"
              title="Active — seeded into future guide generation when checked">
       <span style="flex:1;{% if not note.active %}color:#9ca3af;text-decoration:line-through;{% endif %}">
-        {{ note.text }}
+        {{ note.text|safe_text }}
       </span>
       <button type="button" class="btn-delete" title="Delete"
               hx-delete="/api/insights/notes/{{ note.id }}"
