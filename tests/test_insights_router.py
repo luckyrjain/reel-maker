@@ -419,3 +419,106 @@ def test_performance_notes_are_listed_once_each_newest_first(client):
     assert [html.count(t) for t in ("oldest note", "middle note", "newest note")] == [1, 1, 1]
     assert html.index("newest note") < html.index("middle note") < html.index("oldest note")
 
+
+# ── what the page shows (round-5 review): numbers, links, branches, empty states, note markup ──
+
+def _performer_rows(html):
+    """[(reel_id_in_link, [cell text, ...])] for every performer row, in page order."""
+    out = []
+    for m in re.finditer(r"<tr onclick=\"window.location='/api/reels/(\d+)'\"[^>]*>(.*?)</tr>", html, re.S):
+        cells = [c.strip() for c in re.findall(r"<td[^>]*>(.*?)</td>", m.group(2), re.S)]
+        out.append((int(m.group(1)), cells))
+    return out
+
+
+def test_correlation_line_shows_the_computed_r_to_two_decimals_with_sign_and_the_real_n(client):
+    import numpy as np
+
+    qualities = [10, 20, 30, 40, 50, 60]
+    views = [900, 700, 800, 300, 400, 100]            # falls as quality rises: r is negative
+    for q, v in zip(qualities, views):
+        _make_reel_with_metrics(client._session_factory, quality_score=q, views=v)
+    r = float(np.corrcoef(qualities, views)[0, 1])
+    assert r < -0.5 and f"{r:.2f}" not in (f"{r:.1f}", f"{r:.3f}")   # this data can tell the formats apart
+
+    html = client.get("/api/insights").text
+    assert f"r = {r:.2f}</strong>" in html                # exact: not 1 or 3 decimals, sign kept
+    assert "(n = 6)" in html                              # the real sample size, not MIN_SAMPLE
+
+
+def test_performer_rows_link_to_their_reel_and_show_quality_views_with_separators(client):
+    first = _add_reel(client._session_factory, niche="n-a", hook_vo="h", quality=11, views=10)
+    second = _add_reel(client._session_factory, niche="n-b", hook_vo="h", quality=22, views=12345)
+    third = _add_reel(client._session_factory, niche="n-c", hook_vo="h", quality=33, views=100)
+
+    rows = _performer_rows(client.get("/api/insights").text)
+    # combined table (3 < 2k), most views first: so ids are NOT in 1,2,3 order (a loop.index link would show)
+    assert [rid for rid, _ in rows] == [second, third, first]
+    by_id = dict(rows)
+    assert by_id[second] == [f"#{second}", "n-b", "22", "12,345", "h"]
+    assert by_id[third][2:4] == ["33", "100"]
+    assert by_id[first][2:4] == ["11", "10"]
+
+
+def test_five_reels_with_identical_quality_show_the_same_score_message(client):
+    for views in (100, 200, 300, 400, 500):
+        _make_reel_with_metrics(client._session_factory, quality_score=50, views=views)
+
+    html = client.get("/api/insights").text
+    assert "Every measured reel scored the same" in html
+    assert "r = " not in html and "Not enough published" not in html
+
+
+def test_an_empty_database_shows_all_three_empty_states(client):
+    html = client.get("/api/insights").text
+    assert "Not enough published, measured reels yet" in html
+    assert "(n = 0 of 5 needed)" in html
+    assert "No published, measured reels yet." in html
+    assert "No performance notes yet." in html
+
+
+def test_note_rows_link_toggle_and_delete_to_their_own_id_and_mark_inactive_ones(client):
+    from datetime import datetime, timezone
+
+    db = client._session_factory()
+    try:
+        # ids deliberately unlike their list position
+        db.add(models.PerformanceNote(id=7, text="inactive note", active=False,
+                                      created_at=datetime(2026, 1, 2, tzinfo=timezone.utc)))
+        db.add(models.PerformanceNote(id=3, text="active note", active=True,
+                                      created_at=datetime(2026, 1, 1, tzinfo=timezone.utc)))
+        db.commit()
+    finally:
+        db.close()
+
+    html = client.get("/api/insights").text
+    items = {m.group(1): m.group(0) for m in re.finditer(r"<li[^>]*>.*?(inactive note|active note).*?</li>", html, re.S)}
+    inactive, active = items["inactive note"], items["active note"]
+
+    assert 'hx-post="/api/insights/notes/7/toggle"' in inactive
+    assert 'hx-delete="/api/insights/notes/7"' in inactive
+    assert 'hx-post="/api/insights/notes/3/toggle"' in active
+    assert 'hx-delete="/api/insights/notes/3"' in active
+    # `checked` is the attribute right after type= (the title text also contains the word "checked")
+    assert re.search(r'<input type="checkbox"\s+checked\s', active)
+    assert not re.search(r'<input type="checkbox"\s+checked\s', inactive)
+    assert "line-through" in inactive and "line-through" not in active
+
+
+def test_notes_are_ordered_by_creation_time_not_by_id(client):
+    """The newest note has the LOWEST id here, so ordering by id would reverse the list."""
+    from datetime import datetime, timedelta, timezone
+
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    db = client._session_factory()
+    try:
+        db.add(models.PerformanceNote(id=1, text="newest note", active=True, created_at=base + timedelta(hours=2)))
+        db.add(models.PerformanceNote(id=2, text="middle note", active=True, created_at=base + timedelta(hours=1)))
+        db.add(models.PerformanceNote(id=3, text="oldest note", active=True, created_at=base))
+        db.commit()
+    finally:
+        db.close()
+
+    html = client.get("/api/insights").text
+    assert html.index("newest note") < html.index("middle note") < html.index("oldest note")
+

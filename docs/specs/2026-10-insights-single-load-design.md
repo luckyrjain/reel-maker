@@ -22,7 +22,7 @@ against it with its body and assertions unmodified (checked before any test was 
 edits to existing test code are the new imports and one fixture line (`c._engine = engine`) that the
 new page-level test needs.
 
-## Tests (23 new in test_correlation.py, 17 new in test_insights_router.py, 144 in the new test_display.py)
+## Tests (23 new in test_correlation.py, 23 new in test_insights_router.py, 173 in the new test_display.py)
 
 - `load_reel_stats` keeps only reels with both quality and views, and takes the max-views cut.
 - Both analyses given shared stats equal their self-loading results.
@@ -77,13 +77,22 @@ quality filter.
 - **A value with nothing visible rendered a blank cell.** `"\n"` became `" "`, which is truthy, so the
   template's `or "—"` never ran. `safe_text` now trims outer whitespace, so such a value is empty and
   the fallback shows. The filter must stay BEFORE the `or` (a test pins that). The `\x1c`-`\x1f`
-  information separators are now whitespace (one space), like the other `splitlines` separators,
-  instead of being deleted.
+  information separators are now whitespace (one space), like Python's `str.isspace()` / `str.split()`
+  (`str.splitlines()` does not split on `\x1f`, so it is not the right comparison), instead of being
+  deleted.
 - **Tests for the new code:** an interior NBSP, soft hyphen, ZWNJ (Persian), ZWSP, word joiner and
   BOM are kept (outer Unicode spaces, NBSP included, are trimmed by `.strip()`); every whitespace
   run collapses (not just the first); falsy non-None values (0, False) are shown; HTML in the
   niche cell and in a note is escaped; both fallbacks show; notes are listed once each, newest
   first.
+- **Round 5 (test quality) added:** the page's own output was barely asserted, so a template regression
+  could pass every test: the correlation line (r to two decimals with its sign, the real n), the
+  thousands separator, the Quality column, each row's link to its own reel (ids that differ from the
+  list position), the same-score branch and all three empty-state messages, and the notes markup
+  (toggle and delete URLs use the note id; `checked` and `line-through` on the right rows; notes
+  ordered by creation time, not id). Also the trim is checked against EVERY character Python calls
+  whitespace, not six samples. Ordering of reels with equal views is unspecified (no ORDER BY on
+  reels), and a code decision such as a `reel_id` tie-break would be needed to pin it: left as is.
 - **Round 4 (test quality) added:** the trim must run AFTER the removals (`"\x00 x"` is `" x"` until
   the control is gone); outer Unicode spaces (U+3000, U+2003, NBSP, U+202F, U+1680) are trimmed but
   kept inside text; and the code points just outside every stripped or collapsed range are kept

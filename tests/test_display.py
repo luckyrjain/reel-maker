@@ -177,3 +177,14 @@ def test_neighbours_of_every_stripped_or_collapsed_range_are_kept_as_they_are(ch
     """A range that is one code point too wide would silently eat or rewrite real text."""
     assert safe_text(f"a{ch}b") == f"a{ch}b"
 
+
+def _every_unicode_whitespace_character():
+    return [chr(c) for c in range(0x110000) if chr(c).isspace()]
+
+
+@pytest.mark.parametrize("space", _every_unicode_whitespace_character(), ids=lambda c: f"U+{ord(c):04X}")
+def test_every_character_python_calls_whitespace_is_trimmed_at_the_edges(space):
+    """Not just the six sampled ones: the trim is `str.strip()`'s whole definition of whitespace."""
+    assert safe_text(space) == ""
+    assert safe_text(f"{space}x{space}") == "x"
+
