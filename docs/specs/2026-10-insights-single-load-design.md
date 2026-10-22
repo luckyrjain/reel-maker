@@ -74,9 +74,10 @@ quality filter.
   carry the `\ud800` escape; the response then cannot be encoded as UTF-8. (`niche` cannot hold one:
   the insert fails.) `safe_text` now removes U+D800-DFFF. A real astral character such as an emoji
   is a different code point and is kept.
-- **A value with nothing visible rendered a blank cell.** `"\n"` became `" "`, which is truthy, so the
+- **A value made only of whitespace or removed characters rendered a blank cell.** `"\n"` became `" "`, which is truthy, so the
   template's `or "—"` never ran. `safe_text` now trims outer whitespace, so such a value is empty and
-  the fallback shows. The filter must stay BEFORE the `or` (a test pins that). The `\x1c`-`\x1f`
+  the fallback shows (a value made only of the kept zero-width characters, which are not whitespace, still
+  renders blank: see "Left alone"). The filter must stay BEFORE the `or` (a test pins that). The `\x1c`-`\x1f`
   information separators are now whitespace (one space), like Python's `str.isspace()` / `str.split()`
   (`str.splitlines()` does not split on `\x1f`, so it is not the right comparison), instead of being
   deleted.
@@ -112,6 +113,15 @@ list (a delete that returned `[]` passed before); a missing `text` field being a
 correlation shown as `r = 0.00` (a truthiness check would show "not enough data"); and a positive `r`
 without a plus sign. Cosmetic survivors (heading text, hint paragraphs, CSS classes, `title=`
 attributes) are left alone.
+
+## Found by the round-7 review, and fixed in this PR
+
+Docs: the combined-list threshold in `docs/api.md` is `2 × k` (6), not `2 × MIN_SAMPLE`; the spec now
+says the notes fragment is returned by create, toggle AND delete, lists the reel page among the pages
+not changed, and calls #47 open; `CLAUDE.md`'s layout entry for `insights.py` names
+`_insights_context` and the filter. Tests: an always-true format guard in the r-formatting test was
+removed (the exact `r = ...</strong>` assertion does the work). The round-8 docs review then found the
+"nothing visible" wording too absolute (zero-width characters are kept and render blank) and fixed it.
 
 ## Left alone
 

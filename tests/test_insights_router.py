@@ -85,6 +85,7 @@ def test_insights_page_renders_with_enough_data(client):
 
     resp = client.get("/api/insights")
     assert resp.status_code == 200
+    assert "correlation" in resp.text.lower()
     assert "(n = 5)" in resp.text
 
 
