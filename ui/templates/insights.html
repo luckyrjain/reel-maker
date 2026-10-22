@@ -62,10 +62,10 @@
                 {% for p in performers %}
                 <tr onclick="window.location='/api/reels/{{ p.reel_id }}'" class="reel-row">
                     <td class="mono">#{{ p.reel_id }}</td>
-                    <td>{{ p.niche or "—" }}</td>
+                    <td>{{ p.niche|safe_text or "—" }}</td>
                     <td class="mono">{{ p.quality_score }}</td>
                     <td class="mono">{{ "{:,}".format(p.views) }}</td>
-                    <td>{{ p.hook_vo or "no hook text available" }}</td>
+                    <td>{{ p.hook_vo|safe_text or "no hook text available" }}</td>
                 </tr>
                 {% endfor %}
             </tbody>

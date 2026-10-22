@@ -24,7 +24,19 @@ class CorrelationResult:
     insufficient_variance: bool  # True when r is None because scores (or views) were all identical
 
 
-def quality_engagement_correlation(db) -> CorrelationResult:
+@dataclass
+class ReelStat:
+    """One reel that has both a quality score and a views figure -- the only reels either
+    analysis can use."""
+    reel: models.Reel
+    quality: int
+    views: int   # max across the reel's cuts, matching _reel_list_metrics()'s "views"
+
+
+def load_reel_stats(db) -> list[ReelStat]:
+    """Read every reel (with its cuts) and every job ONCE and pair each reel's latest quality
+    score with its max-views figure. The insights page needs this for two analyses; both take
+    the result so the page does one load, not two (each load reads every cut's guide JSON)."""
     reels = db.query(models.Reel).options(joinedload(models.Reel.cuts)).all()
     reel_ids = [r.id for r in reels]
     jobs = (
@@ -39,13 +51,22 @@ def quality_engagement_correlation(db) -> CorrelationResult:
         # ever shows up in a query-count budget
     quality_by_reel = latest_quality_scores(jobs)
 
-    pairs = []
+    stats: list[ReelStat] = []
     for r in reels:
         q = quality_by_reel.get(r.id)
         views = [c.views for c in r.cuts if c.views is not None]
         v = max(views) if views else None
         if q is not None and v is not None:
-            pairs.append((q, v))
+            stats.append(ReelStat(reel=r, quality=q, views=v))
+    return stats
+
+
+def quality_engagement_correlation(db, stats: list[ReelStat] | None = None) -> CorrelationResult:
+    """`stats` lets a caller that also needs another analysis share one load_reel_stats()
+    call; omitted, this loads its own."""
+    if stats is None:
+        stats = load_reel_stats(db)
+    pairs = [(s.quality, s.views) for s in stats]
 
     n = len(pairs)
     if n < MIN_SAMPLE:
@@ -93,33 +114,23 @@ def _hook_vo_for_max_views_cut(reel: models.Reel) -> str | None:
     return hook.vo_script or None
 
 
-def top_bottom_performers(db, k: int = 3):
+def top_bottom_performers(db, k: int = 3, stats: list[ReelStat] | None = None):
     """Returns (top_k, bottom_k) sorted by views descending/ascending, or one combined
-    views-descending list when n < 2*k (top/bottom would otherwise overlap)."""
-    reels = db.query(models.Reel).options(joinedload(models.Reel.cuts)).all()
-    reel_ids = [r.id for r in reels]
-    jobs = (
-        db.query(models.Job)
-        .filter(models.Job.reel_id.in_(reel_ids))
-        .order_by(models.Job.created_at)
-        .all()
-    )
-    quality_by_reel = latest_quality_scores(jobs)
+    views-descending list when n < 2*k (top/bottom would otherwise overlap).
+    `stats`: see quality_engagement_correlation()."""
+    if stats is None:
+        stats = load_reel_stats(db)
 
-    performers: list[Performer] = []
-    for r in reels:
-        q = quality_by_reel.get(r.id)
-        views = [c.views for c in r.cuts if c.views is not None]
-        v = max(views) if views else None
-        if q is None or v is None:
-            continue
-        performers.append(Performer(
-            reel_id=r.id,
-            niche=r.niche,
-            quality_score=q,
-            views=v,
-            hook_vo=_hook_vo_for_max_views_cut(r),
-        ))
+    performers: list[Performer] = [
+        Performer(
+            reel_id=s.reel.id,
+            niche=s.reel.niche,
+            quality_score=s.quality,
+            views=s.views,
+            hook_vo=_hook_vo_for_max_views_cut(s.reel),
+        )
+        for s in stats
+    ]
 
     performers.sort(key=lambda p: p.views, reverse=True)
 
