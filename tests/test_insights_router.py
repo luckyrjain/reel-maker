@@ -492,7 +492,7 @@ def test_note_rows_link_toggle_and_delete_to_their_own_id_and_mark_inactive_ones
         db.close()
 
     html = client.get("/api/insights").text
-    items = {m.group(1): m.group(0) for m in re.finditer(r"<li[^>]*>.*?(inactive note|active note).*?</li>", html, re.S)}
+    items = {m.group(1): m.group(0) for m in re.finditer(r"<li\b[^>]*>.*?(inactive note|active note).*?</li>", html, re.S)}
     inactive, active = items["inactive note"], items["active note"]
 
     assert 'hx-post="/api/insights/notes/7/toggle"' in inactive
