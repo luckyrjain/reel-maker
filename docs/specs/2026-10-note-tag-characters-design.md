@@ -51,7 +51,7 @@ the injection.
   was stored and later read back into the guide prompt, which made it a third route for hidden text. It is the
   only place a reel is created, so the structured-script stubs, `enriched_context` and every prompt that
   reads them later get clean text; the stored value is exactly what the operator saw. A missing niche
-  stays `None`.
+  stays `None`, and a niche that is empty once cleaned becomes `None` too (as an empty submit already is).
 - `api/routers/reels.py::estimate_reel` cleans the context too, so the path the form's estimate shows is
   the one the stored context takes (a hidden character inside a header line changes whether a script
   counts as structured).
@@ -77,7 +77,7 @@ the injection.
   the England flag, removes a message hidden in a flag shape, still stores `niche=None`, and a
   structured script with hidden text in a section parses to clean stubs; a context that is only hidden
   characters is a 422 and leaves no `Reel` or `Job` row, while an empty or whitespace-only context
-  behaves as before; a niche that is only hidden characters is stored as `""`; each valid
+  behaves as before; a niche that is only hidden characters is stored as `None`, like an empty niche; each valid
   `voiceover_mode` is stored and any other value falls back to `voiceover`; the cost estimate reports the
   path of the cleaned context. `create_reel` cleaning is tested on `auto`, `standard` and `structured`.
 - `tests/test_insights_router.py` (+6): a hidden instruction is not stored, a tags-only note and a

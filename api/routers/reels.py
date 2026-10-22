@@ -74,7 +74,7 @@ def create_reel(
     # place a reel is created, so the stub parser, the enrichment and the visuals prompts that read
     # them later are all covered. What is stored is what the operator sees.
     context = strip_tag_chars(context)
-    niche = strip_tag_chars(niche) if niche is not None else None
+    niche = (strip_tag_chars(niche) or None) if niche is not None else None
     # An empty context is a 422 (FastAPI's required-field rule); text that was nothing but hidden
     # characters must not slip past it as a reel with no topic.
     if not context:

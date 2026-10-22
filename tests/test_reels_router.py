@@ -877,8 +877,12 @@ def test_an_empty_context_is_still_a_422(client):
 def test_a_niche_made_only_of_tag_characters_stores_the_same_as_an_empty_niche(client):
     with patch("api.routers.reels.enrich_context"):
         client.post("/api/reels", data={"context": "A" * 60, "niche": _tag("hidden"), "generation_path": "standard"})
+        tags_only = _latest_reel(client).niche
+        client.post("/api/reels", data={"context": "A" * 60, "niche": "", "generation_path": "standard"})
+        empty = _latest_reel(client).niche
 
-    assert _latest_reel(client).niche == ""
+    assert tags_only is None
+    assert tags_only == empty
 
 
 @pytest.mark.parametrize("mode", ["voiceover", "music_only", "silent"])
