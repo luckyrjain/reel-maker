@@ -352,7 +352,7 @@ engine/
                       compute below MIN_SAMPLE=5 reels or when either series has zero variance —
                       np.corrcoef returns NaN on zero variance, guarded explicitly rather than let "nan"
                       leak into the UI string); top_bottom_performers returns (top, bottom) sorted by views
-                      desc/asc, or one combined list when n < 2k. Both rank by the views of the shared `ReelStat`s, which
+                      desc/asc, or one combined list when n < 2k. Both use the views of the shared `ReelStat`s (only top_bottom_performers sorts by them), which
                       are `Cut.views` (max per reel, matching _reel_list_metrics()'s existing "views" definition)
                       against latest_quality_scores() — no new schema, no cached/denormalized column, no
                       chart library (see docs/specs/2026-09-phase5-quality-engagement-feedback.md §2.1). New
@@ -1435,7 +1435,8 @@ ui/templates/
                       not-yet-available
   insights.html       Quality↔engagement correlation (r + sample_size, always with the statistical-honesty
                       caveat text — never r alone) + top/bottom (or combined, n<6) performer table
-                      (hook line from the max-views cut) + performance-notes form/list — GET /api/insights.
+                      (hook line from the max-views cut) + performance-notes form/list — GET /api/insights; niche, hook
+                      and note text pass through `|safe_text` before the `or` fallback.
                       Linked from index.html and reels_list.html as a plain `<a>` (no shared nav template
                       in this app — see api/routers/insights.py)
   fragments/
