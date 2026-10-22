@@ -2,6 +2,9 @@
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
+import pytest
+from sqlalchemy.exc import OperationalError
+
 from api import models
 from engine.publish.metrics import EngagementMetrics
 from worker.tasks.metrics import pull_publish_metrics
@@ -270,3 +273,155 @@ def test_fetcher_exception_writes_no_snapshot_for_the_failing_cut_only(db_sessio
     assert db.query(models.CutMetricSnapshot).filter_by(cut_id=failing_cut.id).count() == 0
     assert db.query(models.CutMetricSnapshot).filter_by(cut_id=ok_cut.id).count() == 1
 
+
+
+# --- credential tokens: decrypted up front, and an unreadable one skips only its own cut ----
+
+def test_tokens_are_loaded_before_the_fetch_not_lazily_during_it(db_session):
+    """The deferred token columns must already be loaded when the fetcher runs, or its first
+    read would lazy-load them inside the HTTP call's open transaction."""
+    from sqlalchemy import inspect
+    db = db_session
+    reel = _reel(db)
+    _published_cut(db, reel)
+    db.add(models.Credential(provider="youtube", token_blob="tok", refresh_token_blob="r"))
+    db.commit()
+    seen = {}
+
+    def fetch(cut, credential, db_):
+        seen["unloaded"] = set(inspect(credential).unloaded)
+        return EngagementMetrics(views=1, likes=1, comments=1)
+
+    fetcher = MagicMock()
+    fetcher.fetch.side_effect = fetch
+    with (
+        patch("worker.tasks.metrics.SessionLocal", return_value=db),
+        patch("worker.tasks.metrics.get_metrics_fetcher", return_value=fetcher),
+        patch.object(db, "close"),
+    ):
+        pull_publish_metrics()
+    assert "unloaded" in seen                      # the fetcher really ran
+    assert not ({"token_blob", "refresh_token_blob"} & seen["unloaded"])
+
+
+def test_an_unreadable_credential_skips_its_cut_without_aborting_the_batch(db_session, monkeypatch, caplog):
+    """One platform's credential sealed under a rotated key must not stop the metrics pull
+    for every other platform (or crash the beat task)."""
+    from cryptography.fernet import Fernet
+    db = db_session
+    reel = _reel(db)
+    yt = _published_cut(db, reel, platform=models.CutPlatform.youtube_shorts, post_id="yt-1")
+    ig = _published_cut(db, reel, platform=models.CutPlatform.instagram_reels, post_id="ig-1")
+    monkeypatch.setattr("api.crypto.settings.credentials_key", Fernet.generate_key().decode())
+    db.add(models.Credential(provider="youtube", token_blob="old-tok"))
+    db.commit()
+    monkeypatch.setattr("api.crypto.settings.credentials_key", Fernet.generate_key().decode())
+    db.add(models.Credential(provider="instagram", token_blob="fresh-tok"))
+    db.commit()
+
+    fetcher = MagicMock()
+    fetcher.fetch.return_value = EngagementMetrics(views=7, likes=1, comments=1)
+    import logging
+    with (
+        patch("worker.tasks.metrics.SessionLocal", return_value=db),
+        patch("worker.tasks.metrics.get_metrics_fetcher", return_value=fetcher),
+        patch.object(db, "close"),
+        caplog.at_level(logging.WARNING, logger="worker.tasks.metrics"),
+    ):
+        pull_publish_metrics()                     # must not raise
+
+    skipped = [r for r in caplog.records if "Skipping metrics" in r.getMessage()]
+    assert len(skipped) == 1 and skipped[0].levelno == logging.WARNING
+    assert skipped[0].exc_info is None             # one line, no traceback per cut
+    assert "CREDENTIALS_KEY" in skipped[0].getMessage() and "old-tok" not in caplog.text
+    assert fetcher.fetch.call_count == 1
+    assert fetcher.fetch.call_args.args[0].id == ig.id
+    db.refresh(ig)
+    db.refresh(yt)
+    assert ig.views == 7 and yt.views is None
+
+
+# ── the skip path: which cuts it covers, what it leaves behind, what it must NOT swallow ──
+
+def _two_cuts_one_stale(db, monkeypatch, stale="youtube"):
+    """Both platforms have a published cut; `stale`'s credential was sealed under a key that
+    is no longer current. Cuts are created in the opposite order to the test above so a
+    swallow that depends on order or platform is caught."""
+    from cryptography.fernet import Fernet
+    reel = _reel(db)
+    ig = _published_cut(db, reel, platform=models.CutPlatform.instagram_reels, post_id="ig-1")
+    yt = _published_cut(db, reel, platform=models.CutPlatform.youtube_shorts, post_id="yt-1")
+    monkeypatch.setattr("api.crypto.settings.credentials_key", Fernet.generate_key().decode())
+    db.add(models.Credential(provider=stale, token_blob="OLDTOK7"))
+    db.commit()
+    monkeypatch.setattr("api.crypto.settings.credentials_key", Fernet.generate_key().decode())
+    db.add(models.Credential(provider="instagram" if stale == "youtube" else "youtube",
+                             token_blob="FRESHTOK9"))
+    db.commit()
+    return ig, yt
+
+
+def _run_pull(db, fetcher):
+    with (
+        patch("worker.tasks.metrics.SessionLocal", return_value=db),
+        patch("worker.tasks.metrics.get_metrics_fetcher", return_value=fetcher),
+        patch.object(db, "close"),
+    ):
+        pull_publish_metrics()
+
+
+def test_a_stale_instagram_credential_does_not_stop_the_youtube_cut(db_session, monkeypatch):
+    ig, yt = _two_cuts_one_stale(db_session, monkeypatch, stale="instagram")
+    fetcher = MagicMock()
+    fetcher.fetch.return_value = EngagementMetrics(views=5, likes=1, comments=1)
+    _run_pull(db_session, fetcher)
+    assert fetcher.fetch.call_count == 1 and fetcher.fetch.call_args.args[0].id == yt.id
+
+
+def test_a_skipped_cut_leaves_no_stamp_and_no_snapshot(db_session, monkeypatch):
+    ig, yt = _two_cuts_one_stale(db_session, monkeypatch, stale="youtube")
+    fetcher = MagicMock()
+    fetcher.fetch.return_value = EngagementMetrics(views=5, likes=1, comments=1)
+    _run_pull(db_session, fetcher)
+    db_session.refresh(yt)
+    assert yt.metrics_updated_at is None
+    assert db_session.query(models.CutMetricSnapshot).filter_by(cut_id=yt.id).count() == 0
+
+
+def test_the_skip_is_one_warning_line_with_ids_and_no_secret(db_session, monkeypatch, caplog):
+    import logging
+    ig, yt = _two_cuts_one_stale(db_session, monkeypatch, stale="youtube")
+    fetcher = MagicMock()
+    fetcher.fetch.return_value = EngagementMetrics(views=5, likes=1, comments=1)
+    with caplog.at_level(logging.DEBUG):
+        _run_pull(db_session, fetcher)
+    recs = [r for r in caplog.records if r.name == "worker.tasks.metrics"
+            and "Skipping metrics" in r.getMessage()]
+    assert len(recs) == 1
+    rec = recs[0]
+    assert rec.levelno == logging.WARNING and rec.exc_info is None
+    assert f"cut_id={yt.id}" in rec.getMessage() and "platform=youtube_shorts" in rec.getMessage()
+    assert "OLDTOK7" not in caplog.text and "FRESHTOK9" not in caplog.text
+
+
+@pytest.mark.parametrize("exc", [OperationalError("s", {}, Exception("db down")), KeyboardInterrupt()])
+def test_only_an_unreadable_token_is_skipped_a_db_failure_still_surfaces(db_session, exc):
+    """`except ValueError` must stay narrow: a database outage or Ctrl-C is not an
+    'unreadable credential' and must not be swallowed as one."""
+    db = db_session
+    _published_cut(db, _reel(db))
+    real_query = db.query
+
+    def query(model, *a, **k):
+        if model is models.Credential:
+            raise exc
+        return real_query(model, *a, **k)
+
+    with (
+        patch.object(db, "query", side_effect=query),
+        patch("worker.tasks.metrics.SessionLocal", return_value=db),
+        patch("worker.tasks.metrics.get_metrics_fetcher", return_value=MagicMock()),
+        patch.object(db, "close"),
+    ):
+        with pytest.raises(type(exc)):
+            pull_publish_metrics()

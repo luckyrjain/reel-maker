@@ -105,7 +105,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 |---|---|
 | `main.py` | FastAPI app factory; mounts static files, Jinja2 templates, all 5 routers; `lifespan` hook runs `validate_configured_models()` at startup (best-effort, never blocks) |
 | `config.py` | `pydantic-settings` `Settings` — LLM/NVIDIA/HuggingFace/Pexels keys, `credentials_key`, OAuth client id/secret pairs, `public_base_url`, `music_library_dir`, `max_paid_llm_calls_per_reel`, `evaluator_axis_weight_multipliers` (dict, the first dict-typed setting) |
-| `crypto.py` | Fernet `seal()`/`open_()` + `Encrypted` SQLAlchemy TypeDecorator for encrypted columns (`Credential.token_blob`/`refresh_token_blob`) |
+| `crypto.py` | Fernet `seal()`/`open_()` + `Encrypted` SQLAlchemy TypeDecorator for encrypted columns (`Credential.token_blob`/`refresh_token_blob`, both `deferred()` so a stale key fails only where a token is read); fails loud on a removed key (Phase 8a) |
 | `db.py` | SQLAlchemy engine (`pool_pre_ping=True`, `hide_parameters=True`), `SessionLocal`, `get_db()` FastAPI dependency |
 | `enqueue.py` | `enqueue_job(db, job, task, *, what)` — the one router-side add → commit → `task.delay` → unwind-on-failure (`fail_unenqueued` + 503) sequence, used by `create_reel`, `trigger_render`, `trigger_publish` |
 | `models.py` | All ORM models and status enums — `Reel`, `Cut`, `CutMetricSnapshot`, `Asset`, `CutAsset`, `Job`, `StageEvent`, `PerformanceNote`, `Credential` |
@@ -191,13 +191,13 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 ### `tests/`
 
-71 test files + `conftest.py`, **2200 tests run by default / 2201 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
+72 test files + `conftest.py`, **2301 tests run by default / 2302 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
 
 | File | Tests | File | Tests |
 |---|---|---|---|
 | `test_job_lifecycle.py` | 133 | `test_evaluator.py` | 47 |
 | `test_maintenance.py` | 52 | `test_reels_router.py` | 38 |
-| `test_r3_proposed.py` | 38 | `test_cuts_publish_router.py` | 34 |
+| `test_r3_proposed.py` | 40 | `test_cuts_publish_router.py` | 34 |
 | `test_compositor.py` | 31 | `test_r4_gaps.py` | 30 |
 | `test_generate_task.py` | 26 | `test_common.py` | 18 |
 | `test_audio_text_sync.py` | 16 | `test_guide_edit.py` | 16 |
@@ -209,7 +209,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_publish_task.py` | 14 | `test_llm_provider.py` | 13 |
 | `test_publish_gate.py` | 13 | `test_correlation.py` | 12 |
 | `test_metrics_fetcher.py` | 12 | `test_script_parser.py` | 11 |
-| `test_metrics_task.py` | 10 | `test_credentials_router.py` | 9 |
+| `test_metrics_task.py` | 17 | `test_credentials_router.py` | 16 |
 | `test_hook_variants.py` | 9 | `test_insights_router.py` | 9 |
 | `test_youtube_publisher.py` | 9 | `test_attribution.py` | 8 |
 | `test_estimate.py` | 8 | `test_music_source.py` | 8 |
@@ -228,7 +228,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_sourcer_dns.py` | 25 | `test_sourcer_tmp_files.py` | 11 |
 | `test_sourcer_api_limits.py` | 22 | `test_sourcer_api_streaming.py` | 72 |
 | `test_sourcer_image_check.py` | 178 | `test_sourcer_render_budget.py` | 27 |
-| `test_sourcer_pins_and_music.py` | 38 | | |
+| `test_sourcer_pins_and_music.py` | 38 | `test_crypto.py` | 85 |
 | `test_llm_judge.py` | 3 | `test_main.py` | 3 |
 | `test_observability.py` | 7 | `test_golden_reel.py` | 1 (deselected) |
 
@@ -573,7 +573,7 @@ Three gates run in `publish_cut`, in order, before any upload:
 
 Both fingerprint checks treat `None` as "unknown, don't block" (pre-migration/never-rendered rows), never as a mismatch. None of the three gates run on the "finalize" branch (a cut that already has `platform_post_id` — nothing is uploaded there, so blocking it would leave a live post unrecorded with no operator way out).
 
-`Credential.token_blob`/`refresh_token_blob` are transparently Fernet-encrypted (`api/crypto.py::Encrypted`); application code reads/writes them as plain strings. `pull_publish_metrics()` (Celery beat, every 6 h) refreshes YouTube tokens proactively (short-lived, ~1 h) and best-effort-skips a cut whose platform has no `MetricsFetcher` or whose credential pull raises.
+`Credential.token_blob`/`refresh_token_blob` are transparently Fernet-encrypted (`api/crypto.py::Encrypted`); application code reads/writes them as plain strings. `pull_publish_metrics()` (Celery beat, every 6 h) refreshes YouTube tokens proactively (short-lived, ~1 h) and best-effort-skips a cut whose platform has no `MetricsFetcher` or whose stored credential is unreadable (a stale `CREDENTIALS_KEY`).
 
 ---
 
