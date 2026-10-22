@@ -22,7 +22,7 @@ against it with its body and assertions unmodified (checked before any test was 
 edits to existing test code are the new imports and one fixture line (`c._engine = engine`) that the
 new page-level test needs.
 
-## Tests (23 new in test_correlation.py, 8 new in test_insights_router.py, 97 in the new test_display.py)
+## Tests (23 new in test_correlation.py, 17 new in test_insights_router.py, 123 in the new test_display.py)
 
 - `load_reel_stats` keeps only reels with both quality and views, and takes the max-views cut.
 - Both analyses given shared stats equal their self-loading results.
@@ -68,7 +68,35 @@ quality filter.
   and the combined table below `2k` reels; `_hook_vo_for_max_views_cut` degrades to `None` for a
   missing or malformed guide, a non-hook first beat and a blank hook line.
 
+## Found by the round-3 review, and fixed in this PR
+
+- **A lone surrogate in a hook line returned a 500.** `Cut.guide` is a JSON column and JSON text can
+  carry the `\ud800` escape; the response then cannot be encoded as UTF-8. (`niche` cannot hold one:
+  the insert fails.) `safe_text` now removes U+D800-DFFF. A real astral character such as an emoji
+  is a different code point and is kept.
+- **A value with nothing visible rendered a blank cell.** `"\n"` became `" "`, which is truthy, so the
+  template's `or "—"` never ran. `safe_text` now trims outer whitespace, so such a value is empty and
+  the fallback shows. The filter must stay BEFORE the `or` (a test pins that). The `\x1c`-`\x1f`
+  information separators are now whitespace (one space), like the other `splitlines` separators,
+  instead of being deleted.
+- **Tests for the new code:** NBSP, soft hyphen, ZWNJ (Persian), ZWSP, word joiner and BOM are kept; every
+  whitespace run collapses (not just the first); falsy non-None values (0, False) are shown; HTML in
+  the niche cell and in a note is escaped; both fallbacks show; notes are listed once each, newest
+  first.
+
 ## Left alone
+
+- **Hidden Unicode TAG characters (U+E0000-E007F) in a performance note.** They are invisible in the
+  browser but `generate.py` puts active notes into `prior_feedback`, so the LLM receives them: a
+  hidden-instruction ("ASCII smuggling") route for text an operator pastes in. Stripping them in
+  `safe_text` would not change what the LLM gets; it has to happen when the note is written
+  (`create_note`) or when notes are seeded. Not changed here: the tag characters also spell the
+  England/Scotland/Wales flag emoji, so stripping them degrades those flags to a plain black flag.
+  Needs an owner's decision; a follow-up.
+- Other invisible or layout characters (ZWSP/ZWNJ/ZWJ, word joiner, BOM, soft hyphen, variation
+  selectors, odd spaces) pass through on purpose: on this page they are cosmetic, and ZWJ/ZWNJ are
+  part of correct emoji, Indic and Persian text.
+- Other pages that show `niche` or hook text (reel list, reel page, cut card) are not changed here.
 
 - `stats` is an optional parameter, so a future caller can forget it and silently pay for a second
   load. It costs time, not correctness, and the page-level query-count test guards the only caller.

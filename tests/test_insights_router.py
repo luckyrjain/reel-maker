@@ -363,3 +363,59 @@ def test_below_two_k_reels_the_page_shows_one_combined_table_by_views(client):
     assert m
     assert [int(i) for i in re.findall(r"#(\d+)</td>", m.group(1))] == [ids[3], ids[2], ids[1], ids[0]]
 
+
+def test_a_lone_surrogate_in_a_hook_does_not_break_the_page(client):
+    """A JSON guide can carry a lone-surrogate escape; encoding it as UTF-8 used to 500 the page."""
+    _add_reel(client._session_factory, niche="n", hook_vo="hello \ud800 world")
+
+    resp = client.get("/api/insights")
+    assert resp.status_code == 200
+    assert "hello  world" in resp.text
+
+
+@pytest.mark.parametrize("blank", ["\n", "\t", "   ", "\x00", "\u202e"])
+def test_a_niche_with_nothing_visible_shows_the_dash_fallback(client, blank):
+    _add_reel(client._session_factory, niche=blank, hook_vo="hook?")
+
+    cells = re.findall(r"<td>(.*?)</td>", client.get("/api/insights").text, re.S)
+    assert "—" in cells
+
+
+def test_html_in_the_niche_cell_and_in_a_note_is_escaped_too(client):
+    """Escaping was only asserted for the hook cell: a `|safe` on the niche or the note text
+    would have passed every test."""
+    _add_reel(client._session_factory, niche="<b>bold</b>", hook_vo="hook?")
+    created = client.post("/api/insights/notes", data={"text": "<i>note</i>"})
+
+    page = client.get("/api/insights").text
+    assert "<b>bold</b>" not in page and "&lt;b&gt;bold&lt;/b&gt;" in page
+    for html in (page, created.text):
+        assert "<i>note</i>" not in html and "&lt;i&gt;note&lt;/i&gt;" in html
+
+
+def test_a_hook_and_niche_with_nothing_visible_show_both_fallbacks(client):
+    """`|safe_text` must run BEFORE `or`: a value that is only controls has to reach the fallback
+    ("—" / "no hook text available") instead of rendering an empty cell."""
+    _add_reel(client._session_factory, niche="\x00", hook_vo="\x00")
+
+    html = client.get("/api/insights").text
+    assert "no hook text available" in html
+    assert "<td>—</td>" in html
+
+
+def test_performance_notes_are_listed_once_each_newest_first(client):
+    from datetime import datetime, timedelta, timezone
+
+    db = client._session_factory()
+    try:
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        for age, text in enumerate(["oldest note", "middle note", "newest note"]):
+            db.add(models.PerformanceNote(text=text, active=True, created_at=base + timedelta(hours=age)))
+        db.commit()
+    finally:
+        db.close()
+
+    html = client.get("/api/insights").text
+    assert [html.count(t) for t in ("oldest note", "middle note", "newest note")] == [1, 1, 1]
+    assert html.index("newest note") < html.index("middle note") < html.index("oldest note")
+
