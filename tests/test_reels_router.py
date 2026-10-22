@@ -858,13 +858,16 @@ def test_a_structured_script_with_hidden_text_in_a_section_reaches_the_parser_cl
 
 def test_a_context_made_only_of_hidden_tag_characters_is_rejected_like_an_empty_one(client):
     with patch("api.routers.reels.enrich_context") as mock_enrich:
-        resp = client.post("/api/reels", data={"context": _tag("hidden only"), "generation_path": "standard"})
+        resp = client.post("/api/reels", data={
+            "context": _tag("hidden only"), "niche": "football", "generation_path": "standard",
+        })
 
     assert resp.status_code == 422
     mock_enrich.delay.assert_not_called()
     db = client._session_factory()
     try:
         assert db.query(models.Reel).count() == 0 and db.query(models.Job).count() == 0
+        assert db.query(models.Cut).count() == 0
     finally:
         db.close()
 
@@ -938,3 +941,21 @@ def test_estimate_does_not_call_a_script_structured_because_of_hidden_text(clien
 
     assert a.text == b.text
 
+
+def test_a_niche_of_whitespace_plus_hidden_characters_is_stored_like_a_whitespace_niche(client):
+    # Only a niche that is EMPTY once cleaned becomes None; a whitespace-only niche was stored as is
+    # before this change and still is.
+    with patch("api.routers.reels.enrich_context"):
+        client.post("/api/reels", data={"context": "A" * 60, "niche": "  " + _tag("x"), "generation_path": "standard"})
+
+    assert _latest_reel(client).niche == "  "
+
+
+def test_a_message_hidden_after_a_flag_is_removed_from_the_niche(client):
+    england = chr(0x1F3F4) + _tag("gbeng") + chr(0xE007F)
+    with patch("api.routers.reels.enrich_context"):
+        client.post("/api/reels", data={
+            "context": "A" * 60, "niche": "football " + england + _tag("payload"), "generation_path": "standard",
+        })
+
+    assert _latest_reel(client).niche == "football " + england

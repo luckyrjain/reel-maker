@@ -64,7 +64,7 @@ the injection.
 - Every invisible character in the module and its tests is built with `chr()` or a visible `\U`
   escape, never as a literal character, so the source can be reviewed by eye.
 
-## Tests (84 new)
+## Tests (87 new)
 
 - `tests/test_hidden_text.py` (53): text without tag characters is unchanged; the whole block is
   removed (each boundary, and in one go) while the neighbouring code points are kept; the three flags
@@ -73,17 +73,20 @@ the injection.
   removed; any other subdivision, a payload spliced into a flag and a flag missing its cancel tag all
   degrade to a plain black flag; idempotent; a 3000-case randomized property (no tag character
   survives outside the three flags, and the visible characters are all still there in order).
-- `tests/test_reels_router.py` (+22): `create_reel` stores context and niche without hidden text, keeps
+- `tests/test_reels_router.py` (+24): `create_reel` stores context and niche without hidden text, keeps
   the England flag, removes a message hidden in a flag shape, still stores `niche=None`, and a
   structured script with hidden text in a section parses to clean stubs; a context that is only hidden
   characters is a 422 and leaves no `Reel` or `Job` row, while an empty or whitespace-only context
   behaves as before; a niche that is only hidden characters is stored as `None`, like an empty niche; each valid
   `voiceover_mode` is stored and any other value falls back to `voiceover`; the cost estimate reports the
-  path of the cleaned context. `create_reel` cleaning is tested on `auto`, `standard` and `structured`.
+  path of the cleaned context. `create_reel` cleaning is tested on `auto`, `standard` and `structured`; a tags-only context with
+  a niche also leaves no `Cut`; a niche of whitespace plus hidden characters is stored as the
+  whitespace (only an empty cleaned niche becomes `None`); a message hidden after a flag is removed from
+  the niche.
 - `tests/test_insights_router.py` (+6): a hidden instruction is not stored, a tags-only note and a
   whitespace-plus-tags note are not saved, the England flag survives, a message hidden in a flag shape
   is removed, and `"  x  " + tags` is stored as `"x"` (the trim runs).
-- `tests/test_generate_task.py` (+3): `_note_texts_for_prompt` cleans and drops; keeps the flag; and
+- `tests/test_generate_task.py` (+4): `_note_texts_for_prompt` cleans and drops; keeps the flag; removes a message hidden after a flag; and
   end to end through `generate_guide()` the prompt receives `["Real advice."]`.
   Also fixed `test_structured_path_skipped_when_parse_disagrees_with_is_structured`, whose mock answered
   the `PerformanceNote` query with a `Cut` (whose `.text` is a MagicMock, not the string real note text

@@ -192,15 +192,15 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 ### `tests/`
 
-73 test files + `conftest.py`, **2385 tests run by default / 2386 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
+73 test files + `conftest.py`, **2388 tests run by default / 2389 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
 
 | File | Tests | File | Tests |
 |---|---|---|---|
 | `test_job_lifecycle.py` | 133 | `test_evaluator.py` | 47 |
-| `test_maintenance.py` | 52 | `test_reels_router.py` | 60 |
+| `test_maintenance.py` | 52 | `test_reels_router.py` | 62 |
 | `test_r3_proposed.py` | 40 | `test_cuts_publish_router.py` | 34 |
 | `test_compositor.py` | 31 | `test_r4_gaps.py` | 30 |
-| `test_generate_task.py` | 29 | `test_common.py` | 18 |
+| `test_generate_task.py` | 30 | `test_common.py` | 18 |
 | `test_audio_text_sync.py` | 16 | `test_guide_edit.py` | 16 |
 | `test_render_task.py` | 19 | `test_tts.py` | 16 |
 | `test_asset_sourcer_cost.py` | 15 | `test_enrichment.py` | 38 |
