@@ -22,7 +22,7 @@ against it with its body and assertions unmodified (checked before any test was 
 edits to existing test code are the new imports and one fixture line (`c._engine = engine`) that the
 new page-level test needs.
 
-## Tests (23 new in test_correlation.py, 32 new in test_insights_router.py, 173 in the new test_display.py)
+## Tests (24 new in test_correlation.py, 33 new in test_insights_router.py, 173 in the new test_display.py)
 
 - `load_reel_stats` keeps only reels with both quality and views, and takes the max-views cut.
 - Both analyses given shared stats equal their self-loading results.
@@ -129,6 +129,14 @@ Two tests: "Correlation, not causation." is on the page both without data and ne
 the caveat passed before, although the docs say `r` is never shown alone), and a padded note is stored
 trimmed (storing the untrimmed text passed, because the page trims it again at display time while
 `prior_feedback` would have received the padding). Both fail against their mutant.
+
+## Test gaps found by the round-9 review, and closed in this PR
+
+Two new tests and one strengthened assertion: the hook is taken only from the cut with the most views
+(a lower-view cut that has a guide must not stand in when the top cut has none); the
+restriction-of-range sentence of the caveat is on the page ("cluster near the acceptance threshold",
+"weakens any correlation"); and the delete button's confirmation is asserted as the exact text, not just
+as a present attribute (an empty `hx-confirm` means no prompt in htmx). Each fails against its mutant.
 
 ## Left alone
 

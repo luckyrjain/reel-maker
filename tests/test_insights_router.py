@@ -559,7 +559,7 @@ def test_note_fragment_swaps_onto_its_own_root_id(client):
     assert fragment.lstrip().startswith('<div id="performance-notes"')
     assert set(re.findall(r'hx-target="([^"]+)"', fragment)) == {"#performance-notes"}
     assert fragment.count('hx-swap="outerHTML"') == 2 * 2  # toggle + delete, for each of the 2 notes
-    assert "hx-confirm=" in fragment
+    assert 'hx-confirm="Delete this performance note?"' in fragment   # an empty confirm means "no prompt"
 
 
 def test_table_header_order(client):
@@ -627,4 +627,13 @@ def test_a_padded_note_is_stored_trimmed(client):
         assert [n.text for n in db.query(models.PerformanceNote).all()] == ["padded advice"]
     finally:
         db.close()
+
+
+
+
+def test_the_restriction_of_range_caveat_is_part_of_the_permanent_caveat(client):
+    html = client.get("/api/insights").text
+
+    assert "cluster near the acceptance threshold" in html
+    assert "weakens any correlation" in html
 

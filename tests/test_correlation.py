@@ -413,6 +413,16 @@ def test_a_negative_relationship_gives_a_negative_r(db_session):
     assert quality_engagement_correlation(db).r == pytest.approx(-1.0)
 
 
+def test_hook_comes_only_from_the_max_views_cut_even_when_that_cut_has_no_guide():
+    """The page says the hook line is from the cut that drew the most views: a lower-view cut that
+    does have a guide must not stand in for it."""
+    reel = SimpleNamespace(cuts=[
+        SimpleNamespace(views=500, guide=None),
+        SimpleNamespace(views=5, guide=_guide_dict("Low-view hook?")),
+    ])
+    assert _hook_vo_for_max_views_cut(reel) is None
+
+
 # ── _hook_vo_for_max_views_cut degrades to None rather than raising ──────────
 
 def _reel_with_guide(guide):
