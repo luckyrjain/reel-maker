@@ -200,7 +200,7 @@ OAuth tokens for publishing. `token_blob`/`refresh_token_blob` are encrypted at 
 | `scopes` | JSON | OAuth scopes granted, split from the token response's space-separated `scope` string |
 | `expires_at` | timestamptz, nullable | |
 
-Set `CREDENTIALS_KEY` in `.env` (a 32-byte URL-safe base64 Fernet key). Rotating the key invalidates stored tokens — just re-auth. If the key is not set, values are stored as plaintext with a logged warning — safe for dev, not for production.
+Set `CREDENTIALS_KEY` in `.env` (a 32-byte URL-safe base64 Fernet key). Rotating the key invalidates stored tokens — just re-auth (Disconnect, then Connect, on `/api/credentials`). If the key is not set, values are stored as plaintext with a logged warning — safe for dev, not for production. Reading a token that cannot be decrypted (rotated key, tampered value, a plaintext row after a key was set, or an encrypted row after the key was removed) raises a `ValueError` that says which; `token_blob`/`refresh_token_blob` are deferred columns, so the connected-accounts page, disconnect and the OAuth callback still work under a stale key and the error surfaces only where a token is actually read.
 
 ---
 

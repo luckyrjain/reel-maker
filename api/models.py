@@ -5,7 +5,7 @@ from sqlalchemy import (
     Boolean, Column, Float, ForeignKey, Integer, JSON, String, Text,
     DateTime, Enum as SAEnum, UniqueConstraint, func,
 )
-from sqlalchemy.orm import DeclarativeBase, relationship
+from sqlalchemy.orm import DeclarativeBase, deferred, relationship, undefer
 
 from api.crypto import Encrypted
 
@@ -290,11 +290,31 @@ class Credential(Base):
     id = Column(Integer, primary_key=True)
     provider = Column(String(100), nullable=False)
     account_label = Column(String(255))
-    token_blob = Column(Encrypted)
-    refresh_token_blob = Column(Encrypted)
+    # deferred: SQLAlchemy would otherwise decrypt BOTH columns whenever a Credential row is
+    # loaded, so a rotated/removed CREDENTIALS_KEY made every query touching a Credential
+    # raise ValueError — including the list page, disconnect and the OAuth callback that
+    # the "re-authenticate" error message sends the operator to. Deferred, they are only
+    # decrypted where a token is actually read (publishers/metrics), which is where the
+    # clear ValueError belongs. Assigning a new value never loads (or decrypts) the old one.
+    token_blob = deferred(Column(Encrypted))
+    refresh_token_blob = deferred(Column(Encrypted))
     # Provider-specific ID discovered during OAuth that isn't a scope — e.g. the
     # Instagram Business Account ID behind a connected Facebook Page, or a
     # YouTube channel ID. Publishers read this to know what to post to.
     provider_account_id = Column(String(255))
     scopes = Column(JSON)
     expires_at = Column(DateTime(timezone=True))
+
+
+def credential_token_loaders():
+    """Load options for code that is about to USE a credential's tokens.
+
+    token_blob/refresh_token_blob are deferred (see Credential), so a publisher's first read
+    of one would otherwise lazy-load it — autobeginning a transaction that stays open for the
+    whole upload/HTTP call, after the worker deliberately committed to avoid exactly that.
+    Pass these to the query that loads the credential so the tokens are decrypted up front,
+    where a stale CREDENTIALS_KEY raises its clear ValueError before any network call:
+
+        db.query(Credential).options(*credential_token_loaders())...
+    """
+    return (undefer(Credential.token_blob), undefer(Credential.refresh_token_blob))

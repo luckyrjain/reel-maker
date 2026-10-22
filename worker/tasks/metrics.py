@@ -41,11 +41,22 @@ def _pull_one(db, cut: "models.Cut") -> None:
         return
 
     provider_name = credential_provider_for_platform(cut.platform.value)
-    credential = (
-        db.query(models.Credential)
-        .filter(models.Credential.provider == provider_name)
-        .first()
-    )
+    try:
+        credential = (
+            db.query(models.Credential)
+            .options(*models.credential_token_loaders())   # decrypt now, not lazily mid-request
+            .filter(models.Credential.provider == provider_name)
+            .first()
+        )
+    except ValueError as exc:
+        # Unreadable stored token (rotated/removed CREDENTIALS_KEY): skip this cut rather than
+        # abort the whole batch — one stale credential must not stop every other platform.
+        # One line, no traceback: this repeats for every cut on the platform every 6 hours,
+        # and the (static, secret-free) message already says what to do.
+        _log.warning(
+            "Skipping metrics for cut_id=%s platform=%s: %s", cut.id, cut.platform.value, exc,
+        )
+        return
     if credential is None:
         return
 

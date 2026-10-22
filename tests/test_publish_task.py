@@ -55,7 +55,7 @@ def _db_with(job, cut, unsafe_rows=(), credential=MagicMock()):
     db = MagicMock()
     db.get.side_effect = lambda model, _id: job if model is models.Job else cut
     db.query.return_value.join.return_value.filter.return_value.all.return_value = list(unsafe_rows)
-    db.query.return_value.filter.return_value.first.return_value = credential
+    db.query.return_value.options.return_value.filter.return_value.first.return_value = credential
     return db
 
 

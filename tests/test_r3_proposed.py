@@ -638,3 +638,44 @@ def test_the_retry_carries_the_original_exception(factory):
         with pytest.raises(Retry):
             task(job_id)
     assert retry.call_args.kwargs["exc"] is err
+
+
+# --- credential tokens are decrypted up front, not lazily mid-upload ----------------------
+# Credential.token_blob/refresh_token_blob are deferred (api/models.py). publish_cut commits
+# right before the upload to end its read transaction; a publisher's first read of a deferred
+# token would lazy-load it and autobegin a NEW transaction that stays open for the whole
+# upload. The mocked-publisher test above cannot see this because nothing reads a token.
+def test_reading_the_tokens_during_the_upload_does_not_reopen_a_transaction(factory):
+    from sqlalchemy import inspect
+
+    from engine.publish.base import PublishResult
+    from worker.tasks.publish import publish_cut
+    job_id, cut_id = _publish_setup(factory)
+    seen = {}
+
+    def upload(cut, credential, db, caption):
+        seen["unloaded_at_entry"] = set(inspect(credential).unloaded)
+        _ = credential.token_blob, credential.refresh_token_blob       # what the real publishers read
+        seen["in_transaction_after_reads"] = db.in_transaction()
+        return PublishResult(platform_post_id="yt-1", url="u")
+
+    with patch("worker.tasks.publish.get_publisher") as gp, patch("worker.tasks.publish.record_stage"):
+        gp.return_value.publish.side_effect = upload
+        publish_cut(job_id)
+    assert not ({"token_blob", "refresh_token_blob"} & seen["unloaded_at_entry"])
+    assert seen["in_transaction_after_reads"] is False
+
+
+def test_a_stale_credentials_key_fails_the_publish_before_any_upload(factory, monkeypatch):
+    """The unreadable token must surface as the clear ValueError at the credential load, not
+    as a garbage bearer token or a failure halfway through an upload."""
+    from cryptography.fernet import Fernet
+
+    from worker.tasks.publish import publish_cut
+    monkeypatch.setattr("api.crypto.settings.credentials_key", Fernet.generate_key().decode())
+    job_id, cut_id = _publish_setup(factory)               # token sealed under the first key
+    monkeypatch.setattr("api.crypto.settings.credentials_key", Fernet.generate_key().decode())
+    with patch("worker.tasks.publish.get_publisher") as gp, patch("worker.tasks.publish.record_stage"):
+        with pytest.raises(ValueError, match="CREDENTIALS_KEY"):
+            publish_cut(job_id)
+    gp.return_value.publish.assert_not_called()
