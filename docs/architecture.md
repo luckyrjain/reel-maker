@@ -136,7 +136,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 | File | Responsibility |
 |---|---|
-| `hidden_text.py` | `strip_tag_chars()` — removes invisible Unicode tag characters from operator text shown to a person and fed to an LLM (a reel's context and niche, performance notes), keeping only the England/Scotland/Wales flag emoji by an exact allowlist (stdlib-only; used by `create_reel`, `create_note` and `generate.py`'s prompt seeding) (Phase 8c) |
+| `hidden_text.py` | `strip_tag_chars()` — removes invisible Unicode tag characters from operator text shown to a person and fed to an LLM (a reel's context and niche, performance notes), keeping only the England/Scotland/Wales flag emoji by an exact allowlist (stdlib-only; used by `create_reel`, `estimate_reel`, `create_note` and `generate.py`'s prompt seeding) (Phase 8c) |
 | `names.py` | `person_names()` / `first_person_name()` — the one shared person-name extractor — strips leading sentence openers, excludes clubs/leagues/tournaments (stdlib-only; used by `evaluator.py`, `visual_fallback.py` and `asset_sourcer.py`) |
 | `observability.py` | `record_stage()` context manager — writes a `StageEvent` row on exit (success or failure); `paid_call_count()`; `latest_quality_scores()` (shared by the reel list/detail pages and `engine/analytics/correlation.py`) |
 

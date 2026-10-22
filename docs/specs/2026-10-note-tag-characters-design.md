@@ -48,7 +48,7 @@ the injection.
   that is empty once the hidden characters are gone is a 422 (a whitespace-only context is accepted, as
   before). `voiceover_mode` is checked against `voiceover` / `music_only` / `silent` and anything else
   falls back to `voiceover` (same drop-don't-422 policy as `tts_voice`): it was a free-text field that
-  was stored and later read back into the guide prompt, which made it a third route for hidden text. It is the
+  was stored and later read back into the guide prompt, which made it a fourth route for hidden text. It is the
   only place a reel is created, so the structured-script stubs, `enriched_context` and every prompt that
   reads them later get clean text; the stored value is exactly what the operator saw. A missing niche
   stays `None`, and a niche that is empty once cleaned becomes `None` too (as an empty submit already is).
