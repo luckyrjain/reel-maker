@@ -192,12 +192,12 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 ### `tests/`
 
-73 test files + `conftest.py`, **2367 tests run by default / 2368 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
+73 test files + `conftest.py`, **2385 tests run by default / 2386 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
 
 | File | Tests | File | Tests |
 |---|---|---|---|
 | `test_job_lifecycle.py` | 133 | `test_evaluator.py` | 47 |
-| `test_maintenance.py` | 52 | `test_reels_router.py` | 43 |
+| `test_maintenance.py` | 52 | `test_reels_router.py` | 60 |
 | `test_r3_proposed.py` | 40 | `test_cuts_publish_router.py` | 34 |
 | `test_compositor.py` | 31 | `test_r4_gaps.py` | 30 |
 | `test_generate_task.py` | 29 | `test_common.py` | 18 |
@@ -232,7 +232,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_sourcer_pins_and_music.py` | 38 | `test_crypto.py` | 85 |
 | `test_llm_judge.py` | 3 | `test_main.py` | 3 |
 | `test_observability.py` | 7 | `test_golden_reel.py` | 1 (deselected) |
-| `test_hidden_text.py` | 52 | | |
+| `test_hidden_text.py` | 53 | | |
 
 Notable areas of coverage beyond what the filenames suggest: `test_job_lifecycle.py` and `test_maintenance.py` together carry the Job-fencing-token mechanism's regression suite (zombie resumed-while-still-alive detection at every `heartbeat()`/`lock_job()`/done-stamp/CAS checkpoint, differentiated per-job-type resume budgets); `test_compositor.py` covers the `ExitStack` reader-lifetime migration and the 2-up collage layout with real ffmpeg frame sampling; `test_evaluator.py` covers all 17 per-axis scorer functions in isolation; `test_publish_gate.py`/`test_cuts_publish_router.py` cover both staleness gates end-to-end.
 

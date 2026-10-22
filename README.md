@@ -215,7 +215,7 @@ The **Insights** page (linked in the top nav, `/api/insights`) has three section
 
 1. **Quality ↔ engagement correlation** — a Pearson *r* between each reel's quality score and its max cut views, always shown together with the sample size (`n = ...`), never *r* alone. It refuses to compute below 5 measured reels, or when either series has zero variance, and always shows a caveat that quality scores cluster near the acceptance threshold by construction, which weakens any correlation this can detect — correlation, not causation.
 2. **Top / bottom performers** — a table of your best- and worst-performing published reels by views (combined into one table if you don't have enough data yet for a meaningful split), each row showing quality score, views, and the hook line from whichever cut drew the most views. This is meant to inform performance notes below — raw reel content is never fed back into generation automatically.
-3. **Performance notes** — plain-English notes you write yourself (e.g. *"Hooks phrased as a direct question outperform statement hooks"*). Every *active* note (invisible Unicode tag characters stripped, so nothing hidden reaches the model) is seeded into the standard LLM generation path's feedback from attempt 1 onward (structured-script generation doesn't use this). Toggle a note's checkbox to activate/deactivate it, or click × to delete it — both update immediately.
+3. **Performance notes** — plain-English notes you write yourself (e.g. *"Hooks phrased as a direct question outperform statement hooks"*). Every *active* note is seeded into the standard LLM generation path's feedback from attempt 1 onward (structured-script generation doesn't use this). Invisible Unicode tag characters are stripped from notes, so no hidden tag-character text reaches the model. Toggle a note's checkbox to activate/deactivate it, or click × to delete it — both update immediately.
 
 ### Reel list and pipeline panel
 
@@ -344,7 +344,7 @@ All values are read from `.env` (or environment variables). Defaults below are t
 ## Development
 
 ```bash
-# Run all tests (2367 tests; 1 more — the `golden` marker — is deselected by default)
+# Run all tests (2385 tests; 1 more — the `golden` marker — is deselected by default)
 .venv/bin/pytest
 
 # Run the golden-reel smoke test too (real edge-tts + real ffmpeg, ~20s, needs network)

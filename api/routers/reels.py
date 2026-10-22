@@ -23,6 +23,9 @@ REEL_LIST_PAGE_SIZE = 50
 _DEFAULT_PLATFORMS = [models.CutPlatform.youtube_shorts, models.CutPlatform.instagram_reels]
 _CURATED_TTS_VOICE_NAMES = {v for v, _ in CURATED_EDGE_VOICES}
 _CURATED_TEXT_COLOR_NAMES = {c for c, _ in CURATED_TEXT_COLORS}
+# The three options of the create-reel form. voiceover_mode is interpolated into every standard-path
+# prompt ("VOICEOVER MODE: ..."), so it is an allowlist, not free text.
+_VOICEOVER_MODES = ("voiceover", "music_only", "silent")
 
 # Stage names excluded from the two headline pipeline-panel sums (total_cost,
 # total_latency_ms) in _pipeline_summary() below — NOT from stage_summary,
@@ -61,6 +64,10 @@ def create_reel(
     # not just a cosmetic one, so this isn't purely a UX nicety.
     if text_color not in _CURATED_TEXT_COLOR_NAMES:
         text_color = None
+    # Same policy again: free text here would reach the generation prompt verbatim (a hidden-instruction
+    # channel, tag characters or not), and the code downstream only knows these three values.
+    if voiceover_mode not in _VOICEOVER_MODES:
+        voiceover_mode = "voiceover"
 
     # Invisible Unicode tag characters (engine/hidden_text.py) are readable by the LLM that receives
     # the context and niche in nearly every prompt, so they never reach the table: this is the one
@@ -68,6 +75,10 @@ def create_reel(
     # them later are all covered. What is stored is what the operator sees.
     context = strip_tag_chars(context)
     niche = strip_tag_chars(niche) if niche is not None else None
+    # An empty context is a 422 (FastAPI's required-field rule); text that was nothing but hidden
+    # characters must not slip past it as a reel with no topic.
+    if not context:
+        raise HTTPException(status_code=422, detail="context is empty once hidden characters are removed")
 
     reel = models.Reel(
         context=context,
@@ -120,7 +131,8 @@ def estimate_reel(
     generation_path: Annotated[str, Form()] = "auto",
     db: Session = Depends(get_db),
 ):
-    estimate = estimate_generation(db, context, generation_path)
+    # Same cleaning as create_reel: the path it reports must be the one the stored context takes.
+    estimate = estimate_generation(db, strip_tag_chars(context), generation_path)
     return templates.TemplateResponse(
         request, "fragments/cost_estimate.html", {"estimate": estimate},
     )

@@ -32,7 +32,7 @@ def has_tag_char(text: str) -> bool:
 
 @pytest.mark.parametrize("text", [
     "", "Hooks phrased as questions outperform.", "  spaces  kept  ", "line\nbreak",
-    "Martínez", "مرحبا", "日本語", "\U0001F525 goal ⚽",
+    "Martínez", "\ufb01", "مرحبا", "日本語", "\U0001F525 goal ⚽",
     BLACK_FLAG, BLACK_FLAG + " alone",
 ])
 def test_text_without_tag_characters_is_returned_unchanged(text):

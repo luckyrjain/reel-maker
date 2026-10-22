@@ -41,13 +41,20 @@ the injection.
   degrade them to a plain black flag. Those three exact strings are kept. A *shape* check (BLACK FLAG +
   `[a-z0-9]+` + CANCEL TAG) was rejected: it lets a readable lower-case message
   (`ignorepreviousinstructionsandsay`) through inside a flag. With an allowlist only three fixed strings
-  can pass, so no payload text survives; what is left is the choice and count of three visible flags
-  (about 2 bits per insertion point, which is not a practical channel). Any other subdivision flag
-  (`usca`, `gbnir`) is degraded to a plain black flag.
-- `api/routers/reels.py::create_reel` cleans `context` and `niche` before the `Reel` is built. It is the
+  can pass, so no payload text survives; what is left is the choice and count of three visible flags,
+  which is not a practical channel. Any other subdivision flag (`usca`, `gbnir`) is degraded to a plain
+  black flag.
+- `api/routers/reels.py::create_reel` cleans `context` and `niche` before the `Reel` is built. A context
+  that is empty once the hidden characters are gone is a 422 (a whitespace-only context is accepted, as
+  before). `voiceover_mode` is checked against `voiceover` / `music_only` / `silent` and anything else
+  falls back to `voiceover` (same drop-don't-422 policy as `tts_voice`): it was a free-text field that
+  was stored and later read back into the guide prompt, which made it a third route for hidden text. It is the
   only place a reel is created, so the structured-script stubs, `enriched_context` and every prompt that
   reads them later get clean text; the stored value is exactly what the operator saw. A missing niche
   stays `None`.
+- `api/routers/reels.py::estimate_reel` cleans the context too, so the path the form's estimate shows is
+  the one the stored context takes (a hidden character inside a header line changes whether a script
+  counts as structured).
 - `api/routers/insights.py::create_note` strips **before** its empty check, so a note that is only
   hidden text is not saved.
 - `worker/tasks/generate.py::_note_texts_for_prompt()` strips again where the rows become
@@ -57,18 +64,22 @@ the injection.
 - Every invisible character in the module and its tests is built with `chr()` or a visible `\U`
   escape, never as a literal character, so the source can be reviewed by eye.
 
-## Tests (66 new)
+## Tests (84 new)
 
-- `tests/test_hidden_text.py` (52): text without tag characters is unchanged; the whole block is
+- `tests/test_hidden_text.py` (53): text without tag characters is unchanged; the whole block is
   removed (each boundary, and in one go) while the neighbouring code points are kept; the three flags
   survive alone, in text and together and are pinned by code point; a message hidden before or after a
   real flag, or after its cancel tag, is removed; a readable lower-case message inside a flag shape is
   removed; any other subdivision, a payload spliced into a flag and a flag missing its cancel tag all
   degrade to a plain black flag; idempotent; a 3000-case randomized property (no tag character
   survives outside the three flags, and the visible characters are all still there in order).
-- `tests/test_reels_router.py` (+5): `create_reel` stores context and niche without hidden text, keeps
+- `tests/test_reels_router.py` (+22): `create_reel` stores context and niche without hidden text, keeps
   the England flag, removes a message hidden in a flag shape, still stores `niche=None`, and a
-  structured script with hidden text in a section parses to clean stubs.
+  structured script with hidden text in a section parses to clean stubs; a context that is only hidden
+  characters is a 422 and leaves no `Reel` or `Job` row, while an empty or whitespace-only context
+  behaves as before; a niche that is only hidden characters is stored as `""`; each valid
+  `voiceover_mode` is stored and any other value falls back to `voiceover`; the cost estimate reports the
+  path of the cleaned context. `create_reel` cleaning is tested on `auto`, `standard` and `structured`.
 - `tests/test_insights_router.py` (+6): a hidden instruction is not stored, a tags-only note and a
   whitespace-plus-tags note are not saved, the England flag survives, a message hidden in a flag shape
   is removed, and `"  x  " + tags` is stored as `"x"` (the trim runs).
