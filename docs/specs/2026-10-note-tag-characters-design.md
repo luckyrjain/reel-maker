@@ -111,6 +111,12 @@ which is not a tag character, so both can never match at one position).
   reorder text. The first three have legitimate uses (emoji and Indic/Persian text need ZWJ/ZWNJ) and
   far smaller bandwidth; the bidi overrides are visible, if oddly ordered. None is touched here. A
   note made only of them survives and shows as a blank, still-active row.
+- **Reels created before this change.** A reel's context, niche and voiceover mode are cleaned when the
+  reel is created and not again where the worker reads them (notes are, because they are stored
+  separately and can predate the fix). A reel created before the deploy whose enrich or generate job is
+  still queued, or is resumed by the reaper, would send its old text. No route regenerates an existing
+  reel, so this only touches jobs in flight at deploy time; draining the queue before deploying avoids
+  it.
 - **Notes stored before this change** keep their tag characters in the database and the insights page
   still renders them (invisibly); they are cleaned only when seeded into the prompt. A one-off data
   clean-up is not done.
