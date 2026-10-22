@@ -60,8 +60,8 @@ quality filter.
   removes them at display time (whitespace controls become one space); the stored value is never
   rewritten. The directional MARKS (LRM, RLM, ALM) are kept deliberately: ordinary Arabic/Hebrew
   uses them. Applied as a Jinja filter to the three free-text fields on the insights page and in the
-  notes fragment (which the create/toggle routes also return). Other pages that show `niche` or hook
-  text (reel list, cut card) are not changed here.
+  notes fragment (which the create/toggle/delete routes also return). Other pages that show `niche` or hook
+  text (reel list, reel page, cut card) are not changed here.
 - **Tests that did not exist for behaviour this change owns:** a reel with 0 views or quality 0 is
   data, not "missing" (four truthiness mutants had survived); performers are ranked by views, not
   quality; the sign of `r`; the page's top/bottom tables list the right reel ids in the right order
@@ -121,7 +121,7 @@ attributes) are left alone.
   `safe_text` would not change what the LLM gets; it has to happen when the note is written
   (`create_note`) or when notes are seeded. Not changed here: the tag characters also spell the
   England/Scotland/Wales flag emoji, so stripping them degrades those flags to a plain black flag.
-  Needs an owner's decision. Implemented separately in PR #47 (which also covers a reel's context
+  Needs an owner's decision. Proposed separately in PR #47 (open) (which also covers a reel's context
   and niche).
 - Other invisible or layout characters (ZWSP/ZWNJ/ZWJ, word joiner, BOM, soft hyphen, variation
   selectors, odd spaces) pass through on purpose: on this page they are cosmetic, and ZWJ/ZWNJ are

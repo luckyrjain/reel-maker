@@ -214,7 +214,10 @@ api/
                       report + performance-notes UI, one page — see engine/analytics/correlation.py);
                       POST /api/insights/notes (create), POST /api/insights/notes/{id}/toggle,
                       DELETE /api/insights/notes/{id} — all three return the
-                      fragments/performance_notes.html partial for htmx swap
+                      fragments/performance_notes.html partial for htmx swap; the page context is built in
+                      _insights_context(db) (one load_reel_stats(), shared by both analyses, returns before
+                      the template renders so the loaded reels are freed) and the api/display.py::safe_text
+                      Jinja filter is registered here for niche, hook line and note text (Phase 8b)
 
 worker/
   celery_app.py       Celery instance; acks_late=True, beat schedule, split queues
