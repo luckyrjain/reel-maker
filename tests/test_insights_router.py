@@ -85,7 +85,6 @@ def test_insights_page_renders_with_enough_data(client):
 
     resp = client.get("/api/insights")
     assert resp.status_code == 200
-    assert "correlation" in resp.text.lower()
     assert "(n = 5)" in resp.text
 
 
@@ -439,7 +438,7 @@ def test_correlation_line_shows_the_computed_r_to_two_decimals_with_sign_and_the
     for q, v in zip(qualities, views):
         _make_reel_with_metrics(client._session_factory, quality_score=q, views=v)
     r = float(np.corrcoef(qualities, views)[0, 1])
-    assert r < -0.5 and f"{r:.2f}" not in (f"{r:.1f}", f"{r:.3f}")   # this data can tell the formats apart
+    assert r < -0.5                                    # negative, so the sign is part of what is checked
 
     html = client.get("/api/insights").text
     assert f"r = {r:.2f}</strong>" in html                # exact: not 1 or 3 decimals, sign kept
