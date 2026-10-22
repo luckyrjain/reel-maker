@@ -80,7 +80,7 @@ def test_is_idempotent():
     assert safe_text(safe_text(dirty)) == safe_text(dirty)
 
 
-def test_a_large_value_is_cleaned_in_linear_time():
+def test_a_large_value_is_fully_cleaned():
     big = ("x\x00\u202e " * 200_000)
     out = safe_text(big)
     assert "\x00" not in out and "\u202e" not in out and len(out) == 399_999   # "x x x ... x": trailing space trimmed
@@ -139,4 +139,41 @@ def test_every_whitespace_run_is_collapsed_not_just_the_first():
 @pytest.mark.parametrize("falsy, shown", [(0, "0"), (False, "False"), (0.0, "0.0")])
 def test_falsy_non_none_values_are_shown_not_dropped(falsy, shown):
     assert safe_text(falsy) == shown
+
+
+# ── round-4 review additions ─────────────────────────────────────────────────
+
+@pytest.mark.parametrize("raw", [
+    "\u202e x \x00",              # bidi override then space ... control
+    "\x00 x",                      # a control hides the space that follows it
+    "x \u202e",                    # trailing: space then override
+    "\x00 \u202e x \u2066 \x7f",
+])
+def test_whitespace_exposed_by_removing_a_character_is_trimmed(raw):
+    """Trimming must happen AFTER the removals: '\x00 x' is ' x' once the control is gone."""
+    assert safe_text(raw) == "x"
+
+
+@pytest.mark.parametrize("space", [" ", "\u3000", "\u2003", "\u00a0", "\u202f", "\u1680"])
+def test_outer_unicode_spaces_are_trimmed_and_a_value_of_only_them_is_empty(space):
+    assert safe_text(space) == ""
+    assert safe_text(f"{space}x{space}") == "x"
+    assert safe_text(f"a{space}b") == f"a{space}b"       # interior ones are kept
+
+
+@pytest.mark.parametrize("ch", [
+    "\ud7ff",          # just below the surrogate range
+    "\ue000",          # just above it (private use)
+    "\U00010000",      # first astral code point
+    "\U0010ffff",      # last code point
+    "\u2027",          # just below the bidi overrides
+    "\u202f",          # narrow no-break space, between 202E and 2066
+    "\u2065",          # unassigned, just below the isolates
+    "\u206a",          # just above the isolates
+    "\ufffd",          # replacement character
+    "\u3000", "\u2003",
+])
+def test_neighbours_of_every_stripped_or_collapsed_range_are_kept_as_they_are(ch):
+    """A range that is one code point too wide would silently eat or rewrite real text."""
+    assert safe_text(f"a{ch}b") == f"a{ch}b"
 

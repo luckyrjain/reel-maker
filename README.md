@@ -344,7 +344,7 @@ All values are read from `.env` (or environment variables). Defaults below are t
 ## Development
 
 ```bash
-# Run all tests (2464 tests; 1 more — the `golden` marker — is deselected by default)
+# Run all tests (2485 tests; 1 more — the `golden` marker — is deselected by default)
 .venv/bin/pytest
 
 # Run the golden-reel smoke test too (real edge-tts + real ffmpeg, ~20s, needs network)

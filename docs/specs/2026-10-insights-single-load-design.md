@@ -22,7 +22,7 @@ against it with its body and assertions unmodified (checked before any test was 
 edits to existing test code are the new imports and one fixture line (`c._engine = engine`) that the
 new page-level test needs.
 
-## Tests (23 new in test_correlation.py, 17 new in test_insights_router.py, 123 in the new test_display.py)
+## Tests (23 new in test_correlation.py, 17 new in test_insights_router.py, 144 in the new test_display.py)
 
 - `load_reel_stats` keeps only reels with both quality and views, and takes the max-views cut.
 - Both analyses given shared stats equal their self-loading results.
@@ -79,10 +79,16 @@ quality filter.
   the fallback shows. The filter must stay BEFORE the `or` (a test pins that). The `\x1c`-`\x1f`
   information separators are now whitespace (one space), like the other `splitlines` separators,
   instead of being deleted.
-- **Tests for the new code:** NBSP, soft hyphen, ZWNJ (Persian), ZWSP, word joiner and BOM are kept; every
-  whitespace run collapses (not just the first); falsy non-None values (0, False) are shown; HTML in
-  the niche cell and in a note is escaped; both fallbacks show; notes are listed once each, newest
+- **Tests for the new code:** an interior NBSP, soft hyphen, ZWNJ (Persian), ZWSP, word joiner and
+  BOM are kept (outer Unicode spaces, NBSP included, are trimmed by `.strip()`); every whitespace
+  run collapses (not just the first); falsy non-None values (0, False) are shown; HTML in the
+  niche cell and in a note is escaped; both fallbacks show; notes are listed once each, newest
   first.
+- **Round 4 (test quality) added:** the trim must run AFTER the removals (`"\x00 x"` is `" x"` until
+  the control is gone); outer Unicode spaces (U+3000, U+2003, NBSP, U+202F, U+1680) are trimmed but
+  kept inside text; and the code points just outside every stripped or collapsed range are kept
+  (U+D7FF/U+E000 around the surrogates, U+10000, U+2027, U+202F, U+2065, U+206A, U+FFFD), so a range
+  that is one code point too wide fails a test.
 
 ## Left alone
 
