@@ -22,7 +22,7 @@ against it with its body and assertions unmodified (checked before any test was 
 edits to existing test code are the new imports and one fixture line (`c._engine = engine`) that the
 new page-level test needs.
 
-## Tests (23 new in test_correlation.py, 30 new in test_insights_router.py, 173 in the new test_display.py)
+## Tests (23 new in test_correlation.py, 32 new in test_insights_router.py, 173 in the new test_display.py)
 
 - `load_reel_stats` keeps only reels with both quality and views, and takes the max-views cut.
 - Both analyses given shared stats equal their self-loading results.
@@ -122,6 +122,13 @@ not changed, and calls #47 open; `CLAUDE.md`'s layout entry for `insights.py` na
 `_insights_context` and the filter. Tests: an always-true format guard in the r-formatting test was
 removed (the exact `r = ...</strong>` assertion does the work). The round-8 docs review then found the
 "nothing visible" wording too absolute (zero-width characters are kept and render blank) and fixed it.
+
+## Test gaps found by the round-8 review, and closed in this PR
+
+Two tests: "Correlation, not causation." is on the page both without data and next to `r` (deleting
+the caveat passed before, although the docs say `r` is never shown alone), and a padded note is stored
+trimmed (storing the untrimmed text passed, because the page trims it again at display time while
+`prior_feedback` would have received the padding). Both fail against their mutant.
 
 ## Left alone
 

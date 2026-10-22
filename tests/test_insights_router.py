@@ -607,3 +607,24 @@ def test_a_positive_correlation_is_shown_without_a_plus_sign(client):
 
     assert "r = 1.00</strong>" in client.get("/api/insights").text
 
+
+def test_the_correlation_caveat_is_shown_with_r_and_without_it(client):
+    # The page never shows r alone: "correlation, not causation" is there with no data and with r.
+    assert "Correlation, not causation." in client.get("/api/insights").text
+    for quality, views in zip([1, 2, 3, 4, 5], [2, 4, 5, 4, 5]):
+        _make_reel_with_metrics(client._session_factory, quality_score=quality, views=views)
+
+    html = client.get("/api/insights").text
+
+    assert "r = " in html and "Correlation, not causation." in html
+
+
+def test_a_padded_note_is_stored_trimmed(client):
+    client.post("/api/insights/notes", data={"text": "  padded advice  "})
+
+    db = client._session_factory()
+    try:
+        assert [n.text for n in db.query(models.PerformanceNote).all()] == ["padded advice"]
+    finally:
+        db.close()
+
