@@ -136,7 +136,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 | File | Responsibility |
 |---|---|
-| `hidden_text.py` | `strip_tag_chars()` — removes invisible Unicode tag characters from text shown to a person and fed to an LLM (performance notes), keeping only the England/Scotland/Wales flag emoji by an exact allowlist (stdlib-only; used by `create_note` and `generate.py`'s prompt seeding) (Phase 8c) |
+| `hidden_text.py` | `strip_tag_chars()` — removes invisible Unicode tag characters from operator text shown to a person and fed to an LLM (a reel's context and niche, performance notes), keeping only the England/Scotland/Wales flag emoji by an exact allowlist (stdlib-only; used by `create_reel`, `create_note` and `generate.py`'s prompt seeding) (Phase 8c) |
 | `names.py` | `person_names()` / `first_person_name()` — the one shared person-name extractor — strips leading sentence openers, excludes clubs/leagues/tournaments (stdlib-only; used by `evaluator.py`, `visual_fallback.py` and `asset_sourcer.py`) |
 | `observability.py` | `record_stage()` context manager — writes a `StageEvent` row on exit (success or failure); `paid_call_count()`; `latest_quality_scores()` (shared by the reel list/detail pages and `engine/analytics/correlation.py`) |
 
@@ -192,12 +192,12 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 ### `tests/`
 
-73 test files + `conftest.py`, **2361 tests run by default / 2362 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
+73 test files + `conftest.py`, **2367 tests run by default / 2368 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
 
 | File | Tests | File | Tests |
 |---|---|---|---|
 | `test_job_lifecycle.py` | 133 | `test_evaluator.py` | 47 |
-| `test_maintenance.py` | 52 | `test_reels_router.py` | 38 |
+| `test_maintenance.py` | 52 | `test_reels_router.py` | 43 |
 | `test_r3_proposed.py` | 40 | `test_cuts_publish_router.py` | 34 |
 | `test_compositor.py` | 31 | `test_r4_gaps.py` | 30 |
 | `test_generate_task.py` | 29 | `test_common.py` | 18 |
@@ -211,7 +211,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_publish_gate.py` | 13 | `test_correlation.py` | 12 |
 | `test_metrics_fetcher.py` | 12 | `test_script_parser.py` | 11 |
 | `test_metrics_task.py` | 17 | `test_credentials_router.py` | 16 |
-| `test_hook_variants.py` | 9 | `test_insights_router.py` | 14 |
+| `test_hook_variants.py` | 9 | `test_insights_router.py` | 15 |
 | `test_youtube_publisher.py` | 9 | `test_attribution.py` | 8 |
 | `test_estimate.py` | 8 | `test_music_source.py` | 8 |
 | `test_srt.py` | 8 | `test_guide_schema.py` | 7 |
@@ -281,7 +281,7 @@ The form's "Generation path" dropdown sends `generation_path=auto|structured|sta
 
 ```
 _strip_stale_fallback_meta()
-  → _load_active_performance_notes()
+  → _load_active_performance_notes()      # then _note_texts_for_prompt(): tag characters stripped, hidden-only notes dropped
   → _try_structured_path(ctx, stubs)       # falls back to:
   → _run_standard_path_attempts(ctx, stubs)
   → _maybe_regenerate_caption_hashtags(ctx, guide)   # standard path only

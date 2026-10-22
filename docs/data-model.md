@@ -212,7 +212,7 @@ Operator-written, plain-English notes synthesizing past reel performance (e.g. "
 |---|---|---|
 | `id` | integer PK | |
 | `text` | text | Operator-written note; required |
-| `active` | boolean | Default `true`. Only active notes are seeded into `generate_guide`'s `prior_feedback` (standard LLM path only) — see `docs/evaluation.md`'s "Performance-informed feedback" section |
+| `active` | boolean | Default `true`. Only active notes are seeded into `generate_guide`'s `prior_feedback` (standard LLM path only; invisible Unicode tag characters are stripped when the note is written and again when it is seeded, and a note that is nothing but hidden text is dropped from the prompt) — see `docs/evaluation.md`'s "Performance-informed feedback" section |
 | `created_at` | timestamptz | |
 
 Deliberately **not** automated few-shot injection of raw past-reel content — see `docs/specs/2026-09-phase5-quality-engagement-feedback.md` §3.1. CRUD is hard-delete (no soft-delete/undo — these are cheap, operator-owned free text, unlike a `Job`/`Cut` state machine): `POST /api/insights/notes` (create, `active=true`), `POST /api/insights/notes/{id}/toggle` (flip `active`), `DELETE /api/insights/notes/{id}`.

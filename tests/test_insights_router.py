@@ -230,3 +230,10 @@ def test_a_hidden_message_smuggled_in_a_flag_shape_is_removed_from_a_note(client
     client.post("/api/insights/notes", data={"text": "ok " + smuggled})
 
     assert _stored_notes(client) == ["ok " + chr(0x1F3F4)]
+
+
+def test_a_note_with_outer_whitespace_and_hidden_text_is_stored_trimmed(client):
+    client.post("/api/insights/notes", data={"text": "  x  " + _tag("hidden")})
+
+    assert _stored_notes(client) == ["x"]
+

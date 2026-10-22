@@ -6,6 +6,7 @@ from typing import Annotated, Optional
 
 from api.db import get_db
 from api.enqueue import enqueue_job
+from engine.hidden_text import strip_tag_chars
 from api import models
 from api.routers.cuts import active_job_for_cut, latest_failed_job_for_cut
 from api.state import transition, REEL_TRANSITIONS
@@ -60,6 +61,13 @@ def create_reel(
     # not just a cosmetic one, so this isn't purely a UX nicety.
     if text_color not in _CURATED_TEXT_COLOR_NAMES:
         text_color = None
+
+    # Invisible Unicode tag characters (engine/hidden_text.py) are readable by the LLM that receives
+    # the context and niche in nearly every prompt, so they never reach the table: this is the one
+    # place a reel is created, so the stub parser, the enrichment and the visuals prompts that read
+    # them later are all covered. What is stored is what the operator sees.
+    context = strip_tag_chars(context)
+    niche = strip_tag_chars(niche) if niche is not None else None
 
     reel = models.Reel(
         context=context,

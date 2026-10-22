@@ -14,8 +14,8 @@ Create a reel (+ one `Cut` per selected platform) and enqueue **context enrichme
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `context` | string | yes | — | Topic/prompt for the reel |
-| `niche` | string | no | `null` | Content category |
+| `context` | string | yes | — | Topic/prompt for the reel. Invisible Unicode tag characters (U+E0000-E007F) are removed before saving (the England/Scotland/Wales flag emoji excepted) |
+| `niche` | string | no | `null` | Content category. Tag characters are removed as for `context` |
 | `voiceover_mode` | string | no | `voiceover` | `voiceover` \| `music_only` \| `silent` |
 | `target_length_s` | float | no | `45.0` | Target video length in seconds (30/45/60/75/90) |
 | `generation_path` | string | no | `auto` | `auto` \| `structured` \| `standard` — see guide generation paths in `docs/architecture.md` |
