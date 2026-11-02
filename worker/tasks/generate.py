@@ -26,6 +26,7 @@ from engine.generation.pricing import llm_cost_usd
 from engine.generation.prompt import build_messages, build_visuals_messages
 from engine.generation.script_parser import BeatStub
 from engine.generation import script_parser
+from engine.hidden_text import strip_tag_chars
 from engine.generation.visual_fallback import (
     _fallback_visual,
     _first_person,
@@ -386,6 +387,15 @@ def _strip_stale_fallback_meta(db, job) -> None:
         db.commit()
 
 
+def _note_texts_for_prompt(notes) -> list[str]:
+    """The text of each note as it goes into the generation prompt: Unicode tag characters (invisible
+    to the operator, readable by the LLM) removed, and a note that was nothing BUT hidden text dropped
+    rather than sent as an empty bullet. New notes are cleaned when written (create_note); this covers
+    rows stored before that, and is the last line before the prompt either way."""
+    cleaned = (strip_tag_chars(n.text) for n in notes)
+    return [t for t in cleaned if t.strip()]
+
+
 def _load_active_performance_notes(db) -> list["models.PerformanceNote"]:
     """Queried once, unconditionally, before the structured-vs-standard branch — the shared
     job.meta write at the end of generate_guide (reached by BOTH paths) records
@@ -691,7 +701,7 @@ def generate_guide(self, db, job, reel):
     effective_context = reel.enriched_context or reel.context
     _strip_stale_fallback_meta(db, job)
     active_notes_rows = _load_active_performance_notes(db)
-    active_notes = [n.text for n in active_notes_rows]
+    active_notes = _note_texts_for_prompt(active_notes_rows)
 
     cuts = db.query(models.Cut).filter(models.Cut.reel_id == reel.id).all()
     platforms = [c.platform.value for c in cuts]

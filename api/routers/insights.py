@@ -7,6 +7,7 @@ from typing import Annotated
 from api.db import get_db
 from api import models
 from api.display import safe_text
+from engine.hidden_text import strip_tag_chars
 from engine.analytics.correlation import (
     MIN_SAMPLE,
     load_reel_stats,
@@ -61,7 +62,10 @@ def create_note(
     text: Annotated[str, Form()],
     db: Session = Depends(get_db),
 ):
-    text = text.strip()
+    # Tag characters are invisible to the operator but readable by the LLM that receives every active
+    # note (ASCII smuggling), so they never reach the table. Cleaned BEFORE the empty check: a note
+    # made only of them is not a note.
+    text = strip_tag_chars(text).strip()
     if text:
         note = models.PerformanceNote(text=text, active=True)
         db.add(note)

@@ -14,9 +14,9 @@ Create a reel (+ one `Cut` per selected platform) and enqueue **context enrichme
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `context` | string | yes | — | Topic/prompt for the reel |
-| `niche` | string | no | `null` | Content category |
-| `voiceover_mode` | string | no | `voiceover` | `voiceover` \| `music_only` \| `silent` |
+| `context` | string | yes | — | Topic/prompt for the reel. Invisible Unicode tag characters (U+E0000-E007F) are removed before saving (the England/Scotland/Wales flag emoji excepted) |
+| `niche` | string | no | `null` | Content category. Tag characters are removed as for `context` |
+| `voiceover_mode` | string | no | `voiceover` | `voiceover` \| `music_only` \| `silent`; any other value is silently dropped to `voiceover` (same policy as `tts_voice`) |
 | `target_length_s` | float | no | `45.0` | Target video length in seconds (30/45/60/75/90) |
 | `generation_path` | string | no | `auto` | `auto` \| `structured` \| `standard` — see guide generation paths in `docs/architecture.md` |
 | `platforms` | list of strings (repeated form field) | no | `["youtube_shorts", "instagram_reels"]` | One `Cut` is created per valid value in `CutPlatform` (`youtube_shorts`, `instagram_reels`, `tiktok`). Unrecognized values are silently dropped rather than causing a 422; if nothing valid remains, the default two-platform set is used. |
@@ -26,6 +26,7 @@ Create a reel (+ one `Cut` per selected platform) and enqueue **context enrichme
 **Response:** `text/html` — `fragments/pipeline_status.html` fragment polling `GET /api/reels/{reel_id}/active-job-fragment` every 2 s.
 
 **Errors:**
+- `422` — `context` is missing, or is empty once invisible tag characters are removed (a whitespace-only context is accepted)
 - `503` — the job could not be queued (broker unreachable); the reel and job are rolled back to `failed` so it can be retried at once
 
 ---
@@ -40,6 +41,8 @@ Pre-generation cost/time estimate for the create-reel form, sourced from real `S
 |---|---|---|---|
 | `context` | string | no | `""` |
 | `generation_path` | string | no | `auto` |
+
+The context is cleaned of invisible Unicode tag characters first, exactly as `POST /api/reels` does, so the reported path is the one the stored context takes.
 
 **Response:** `text/html` — `fragments/cost_estimate.html`. Reports "no history yet" rather than fabricating a number when there's no matching history.
 
@@ -346,7 +349,7 @@ Create a new, active `PerformanceNote`. Accepts `multipart/form-data`.
 
 | Field | Type | Description |
 |---|---|---|
-| `text` | string | Required; a blank/whitespace-only value is silently ignored (no row created, no error) |
+| `text` | string | Required; a blank/whitespace-only value is silently ignored (no row created, no error). Invisible Unicode tag characters (U+E0000-E007F) are removed before saving -- the England/Scotland/Wales flag emoji excepted -- so a value that is only hidden text is also ignored |
 
 **Response:** `text/html` — `fragments/performance_notes.html` (the full current list).
 
