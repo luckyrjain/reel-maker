@@ -20,10 +20,10 @@ same fixture shape as `tests/test_cut_media.py`):
 - `progress` 0 is returned, not dropped; a failed job's error text (including non-ASCII and newlines, at the 2000-character maximum `job_task` stores) is returned verbatim, not cut;
 - no internal column is exposed: `meta` (scores, note ids, a marker string), the fencing counter and the
   reaper counter are not in the body;
-- the requested job is the one returned, with three jobs of different types (enrich, render, publish), states
-  and progress (including 100) and job ids that differ from their reels' ids; the running one carries a
-  "transient failure, retry 1" error, because a retried job keeps its error through the next claim; a reel id
-  is not mistaken for a job id;
+- the requested job is the one returned, with four jobs of different types, in each of the four statuses, with
+  different progress (including 100) and job ids that differ from their reels' ids; the running and the pending
+  ones carry a "transient failure, retry N" error (a retried job is reset to pending with its old progress and
+  keeps the error through the next claim); a reel id is not mistaken for a job id;
 - an unknown id is a 404 with `{"detail": "Job not found"}`; 0 and negative ids are also 404;
 - a non-integer id (`abc`, `1.5`, `1e3`) is a 422;
 - reading a job changes nothing (status, progress, error, `updated_at`, `claim_token` before and after two
@@ -32,14 +32,15 @@ same fixture shape as `tests/test_cut_media.py`):
 
 ## Verification
 
-Twenty mutants over `api/routers/jobs.py` and `api/schemas.py`, restored after each: `meta` or `claim_token`
+Twenty-six mutants over `api/routers/jobs.py` and `api/schemas.py`, restored after each: `meta` or `claim_token`
 added to the response schema, the `error` or `progress` field dropped, lookup by `reel_id` instead of the job
 id, the 404 replaced by a default body, the 404 text changed, the id typed `str`, `response_model_exclude_none`
 and `response_model_exclude_defaults` added, a read that increments `progress` and commits, POST also routed, and (added after review) the route moved to a
 trailing-slash path, the error cut to 200 characters, `progress` typed `float` and newlines in the error
 replaced by spaces, the error shown only for a failed job, `progress` clamped at 99, and a job type (enrich,
-render or publish) answered with a 404.
-Nineteen are killed. The survivor (a default value on `JobResponse.status`) is equivalent: the attribute is
+render or publish) answered with a 404, and the error hidden or the `progress` zeroed for a job in one given
+status (pending, running, failed or done: the full status-by-field grid, six mutants).
+Twenty-five are killed. The survivor (a default value on `JobResponse.status`) is equivalent: the attribute is
 always present on a loaded row, so the default is never used.
 
 ## Left alone

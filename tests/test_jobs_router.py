@@ -113,10 +113,11 @@ def test_no_internal_column_is_exposed(client):
 
 
 def test_the_requested_job_is_the_one_returned(client):
-    """Three jobs of different types and states, and ids that differ from their reels' ids.
+    """Four jobs of different types and states, and ids that differ from their reels' ids.
 
-    The running job carries an error on purpose: a retried job is reset to pending with a
-    "transient failure, retry N" error and the next claim does not clear it, so a job that is not
+    Together they cover every status for both `error` and `progress`. The pending and running jobs
+    carry an error on purpose: a retried job is reset to pending with a "transient failure, retry N"
+    error and its old progress, and the next claim does not clear the error, so a job that is not
     `failed` can still have one, and it has to be shown.
     """
     first = _make_job(client._session_factory, status=models.JobStatus.done, progress=100, reel_count=2,
@@ -125,7 +126,9 @@ def test_the_requested_job_is_the_one_returned(client):
                        error="transient failure, retry 1: ReadTimeout", job_type=models.JobType.render)
     third = _make_job(client._session_factory, status=models.JobStatus.failed, progress=10, error="boom",
                       job_type=models.JobType.publish)
-    assert len({first, second, third}) == 3
+    fourth = _make_job(client._session_factory, status=models.JobStatus.pending, progress=30, reel_count=1,
+                       error="transient failure, retry 2: HTTP 503", job_type=models.JobType.generate)
+    assert len({first, second, third, fourth}) == 4
 
     assert client.get(f"/api/jobs/{first}").json() == {
         "id": first, "status": "done", "progress": 100, "error": None,
@@ -135,6 +138,9 @@ def test_the_requested_job_is_the_one_returned(client):
     }
     assert client.get(f"/api/jobs/{third}").json() == {
         "id": third, "status": "failed", "progress": 10, "error": "boom",
+    }
+    assert client.get(f"/api/jobs/{fourth}").json() == {
+        "id": fourth, "status": "pending", "progress": 30, "error": "transient failure, retry 2: HTTP 503",
     }
 
 
