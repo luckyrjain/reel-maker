@@ -307,7 +307,7 @@ def test_the_refreshed_token_is_what_the_metrics_fetcher_sends_to_the_api(real_p
 def test_neither_a_successful_nor_a_failed_refresh_logs_a_secret(real_provider, caplog, status):
     """The refresh token and client secret travel in a request body, and the access tokens are bearer
     credentials; nothing may write any of them to a log, at any level (httpx logs the request line,
-    which has no body). The tokens are mixed case so a lowercased copy would still show."""
+    which has no body). The access tokens are distinctive values, so they cannot match other text by accident."""
     import logging
 
     body = {"access_token": "Fresh-TOK-9", "expires_in": 3599} if status == 200 else {"error": "invalid_grant"}

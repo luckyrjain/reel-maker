@@ -1344,7 +1344,7 @@ tests/
                               EVERY argument refresh() passes to the transport and the test asserts there are none), a
                               30 s timeout, the JSON body returned, and HTTPStatusError for 400/401/403/429/500/503
                               (a non-JSON 503 body too: the status check comes before any parsing) with neither the refresh token nor the client secret in the error text (it reaches
-                              job.error and logs), no retry of a rejected grant, and no secret in any log record (the refresh token, the client secret and both access tokens, mixed case). `get_valid_access_token` through
+                              job.error and logs), no retry of a rejected grant, and no secret in any log record (the refresh token, the client secret and both the fresh and the stale access token). `get_valid_access_token` through
                               the REAL `get_oauth_provider("youtube")` (only `httpx.post` is faked): refreshes and persists
                               (token, expiry ~now+expires_in, one commit, refresh token kept), no request for a valid or
                               expiry-less credential, a failed refresh or a response without `access_token` leaves the

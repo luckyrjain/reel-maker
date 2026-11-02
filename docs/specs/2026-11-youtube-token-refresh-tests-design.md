@@ -51,7 +51,7 @@ comparison inverted or dropped, the token not stored, seconds changed to minutes
 expiry kept, the wrong token sent to Google, the wrong provider, the no-refresh-token guard removed, the
 expiry-less guard removed, and the old token returned, plus (added after review) `params=`, a secret in
 `headers=`, `auth=` and `follow_redirects=` passed to the post, the guard changed to `is None`, a retry of
-a failed refresh, the refresh token, client secret or an access token written to a log, the response JSON
+a failed refresh, the refresh token, client secret or either access token (fresh or stale) written to a log, the response JSON
 parsed before the status is checked (a non-JSON 503 body), and `commit()` called with arguments.
 
 ## Left alone
