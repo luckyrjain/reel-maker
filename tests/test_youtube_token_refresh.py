@@ -40,16 +40,20 @@ class _Google:
         self.body = {"access_token": "fresh-tok", "expires_in": 3599, "token_type": "Bearer"} if body is None else body
         self.requests: list[httpx.Request] = []
         self.timeouts: list = []
+        self.extra_kwargs: list[dict] = []
 
     def __call__(self, url, *, data=None, timeout=None, **kwargs):
         self.timeouts.append(timeout)
+        self.extra_kwargs.append(kwargs)
 
         def handler(request):
             self.requests.append(request)
             return httpx.Response(self.status, json=self.body, request=request)
 
+        # Everything refresh() passes must reach the transport: dropping an argument here would
+        # hide a `params=` (secret in the URL), a header or a redirect setting from every test.
         with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-            return client.post(url, data=data, timeout=timeout)
+            return client.post(url, data=data, timeout=timeout, **kwargs)
 
     @property
     def form(self) -> dict[str, str]:
@@ -91,9 +95,12 @@ def test_refresh_keeps_the_refresh_token_and_client_secret_out_of_the_url():
     with patch("api.oauth.httpx.post", side_effect=google):
         _provider().refresh("refresh-tok-3")
 
-    url = str(google.requests[0].url)
-    assert "?" not in url
+    request = google.requests[0]
+    url = str(request.url)
+    assert "?" not in url and request.url.query == b""
     assert "refresh-tok-3" not in url and "client-secret-2" not in url
+    assert google.extra_kwargs == [{}]                 # no params=, headers= or anything else was passed
+    assert "refresh-tok-3" not in str(request.headers) and "client-secret-2" not in str(request.headers)
 
 
 def test_refresh_sends_a_timeout():
@@ -155,6 +162,19 @@ def test_an_expired_token_is_refreshed_through_the_real_provider_and_persisted(r
     db.commit.assert_called_once()
 
 
+def test_a_refresh_token_in_the_response_is_ignored_current_behaviour(real_provider):
+    """Characterization: Google normally sends no new refresh token on a refresh, and if one came
+    it would be dropped (the stored one is kept). Pinned so changing it is a deliberate decision."""
+    credential = _credential(expires_in_s=-60)
+    body = {"access_token": "fresh-tok", "expires_in": 3599, "refresh_token": "rotated-refresh"}
+
+    with patch("api.oauth.httpx.post", side_effect=_Google(body=body)):
+        get_valid_access_token(credential, MagicMock())
+
+    assert credential.token_blob == "fresh-tok"
+    assert credential.refresh_token_blob == "refresh-tok-3"
+
+
 def test_a_token_that_is_still_valid_is_returned_without_any_request(real_provider):
     google = _Google()
     credential = _credential(expires_in_s=3600)
@@ -192,6 +212,7 @@ def test_a_failed_refresh_leaves_the_credential_untouched_and_commits_nothing(re
     assert credential.token_blob == "stale-tok"
     assert credential.refresh_token_blob == "refresh-tok-3"
     assert credential.expires_at == expired_at
+    assert len(google.requests) == 1                    # no silent retry of a rejected grant
     db.commit.assert_not_called()
 
 
@@ -208,9 +229,10 @@ def test_a_refresh_response_without_an_access_token_does_not_half_update_the_cre
     db.commit.assert_not_called()
 
 
-def test_an_expired_token_with_no_refresh_token_fails_before_any_request(real_provider):
+@pytest.mark.parametrize("missing", [None, ""])
+def test_an_expired_token_with_no_refresh_token_fails_before_any_request(real_provider, missing):
     google = _Google()
-    credential = _credential(refresh_token=None)
+    credential = _credential(refresh_token=missing)
     db = MagicMock()
 
     with patch("api.oauth.httpx.post", side_effect=google):
@@ -264,3 +286,21 @@ def test_the_refreshed_token_is_what_the_metrics_fetcher_sends_to_the_api(real_p
     assert result.views == 7
     _, kwargs = mock_get.call_args
     assert kwargs["headers"]["Authorization"] == "Bearer fresh-tok"
+
+
+@pytest.mark.parametrize("status", [200, 400])
+def test_neither_a_successful_nor_a_failed_refresh_logs_a_secret(real_provider, caplog, status):
+    """The refresh token and client secret travel in a request body; nothing may write them to a
+    log, at any level (httpx logs the request line, which has no body)."""
+    import logging
+
+    body = {"access_token": "fresh-tok", "expires_in": 3599} if status == 200 else {"error": "invalid_grant"}
+    credential = _credential(expires_in_s=-60)
+
+    with caplog.at_level(logging.DEBUG), patch("api.oauth.httpx.post", side_effect=_Google(status=status, body=body)):
+        try:
+            get_valid_access_token(credential, MagicMock())
+        except httpx.HTTPStatusError:
+            pass
+
+    assert "refresh-tok-3" not in caplog.text and "client-secret-2" not in caplog.text

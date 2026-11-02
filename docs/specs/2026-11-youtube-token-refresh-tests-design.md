@@ -16,19 +16,22 @@ or the token URL would have passed everything.
 
 ## Change
 
-Tests only, in the new `tests/test_youtube_token_refresh.py` (19 tests). No production code changed.
+Tests only, in the new `tests/test_youtube_token_refresh.py` (23 tests). No production code changed.
 
 - **`refresh()`**: `httpx.post` is the only thing faked, and it answers through a real `httpx.Client` with a
-  `MockTransport`, so the request is built as httpx would send it. Pinned: method, Google's token URL, the
-  `application/x-www-form-urlencoded` content type, the exact four-field body, secrets only in the body (the
-  URL has no query), a 30 s timeout, the JSON body returned unchanged, and `HTTPStatusError` for every
-  error status with neither the refresh token nor the client secret in the error text.
+  `MockTransport`, so the request is built as httpx would send it, and EVERY argument `refresh()` passes
+  reaches the transport (a first version of the fake silently dropped extras, which hid a leaked `params=`
+  from every test until a review caught it). Pinned: method, Google's token URL, the
+  `application/x-www-form-urlencoded` content type, the exact four-field body, secrets only in the body (no query string, no
+  extra arguments, no secret in the headers), a 30 s timeout, the JSON body returned unchanged, and `HTTPStatusError` for
+  400/401/403/429/500/503 with neither the refresh token nor the client secret in the error text, no retry
+  of a rejected grant, and no secret in any log record at any level.
 - **`get_valid_access_token`** through the real `get_oauth_provider("youtube")` (settings patched to known
   ids): an expired credential is refreshed and persisted (new token, expiry about now + `expires_in`, one
   commit, refresh token kept because Google does not send a new one); a valid or expiry-less credential
   causes no request and no commit; a rejected refresh or a response without `access_token` leaves the
   credential untouched with no commit (the assignment order matters: `tokens["access_token"]` is read before
-  anything is written); no stored refresh token fails before any request; `expires_in` as a string works.
+  anything is written); no stored refresh token (None or an empty string) fails before any request; `expires_in` as a string works.
 - **The chain a scheduled pull takes**: expired credential, real refresh, then the metrics API call carries
   the new bearer token.
 
@@ -36,16 +39,19 @@ Tests only, in the new `tests/test_youtube_token_refresh.py` (19 tests). No prod
 
 A response without `expires_in` stores `expires_at = None`, and a credential with no expiry is treated as
 never expiring, so that token would not be refreshed again. Google always sends `expires_in`, so this is not
-reachable today; it is pinned so changing it is a deliberate decision.
+reachable today; it is pinned so changing it is a deliberate decision. Likewise a `refresh_token` in the
+refresh response is ignored and the stored one kept (Google normally sends none).
 
 ## Verification
 
-A 23-mutant battery over `refresh()` and `get_valid_access_token()` is all killed: the grant type, each of the
+A 31-mutant battery over `refresh()` and `get_valid_access_token()` is all killed: the grant type, each of the
 three other body fields and the refresh-token key, `data=` changed to `params=`, `raise_for_status` removed,
 returning the response instead of its JSON, two timeouts, the token URL, the commit removed, the expiry
 comparison inverted or dropped, the token not stored, seconds changed to minutes, `int()` removed, the old
 expiry kept, the wrong token sent to Google, the wrong provider, the no-refresh-token guard removed, the
-expiry-less guard removed, and the old token returned.
+expiry-less guard removed, and the old token returned, plus (added after review) `params=`, a secret in
+`headers=`, `auth=` and `follow_redirects=` passed to the post, the guard changed to `is None`, a retry of
+a failed refresh, and the refresh token or client secret written to a log.
 
 ## Left alone
 
