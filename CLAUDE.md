@@ -8,6 +8,7 @@ All-Python: FastAPI + Celery/Redis + PostgreSQL + SQLAlchemy/Alembic + MoviePy/F
 
 ## Runtime requirements
 
+- **Dependency caps** — CI installs the dev extras unpinned, so an unannounced major/minor release can break `main` for a reason unrelated to the change under test (this happened once: pytest 9.2 rejected a nested `pytest.approx`). Three tools are therefore capped: `pytest>=8.0,<10` and `httpx>=0.27,<0.29` in `pyproject.toml` (httpx is a 0.x library whose minor releases have removed arguments, and `asset_sourcer.py` leans on `httpx.Client.stream` and httpcore's `connection.connect_tcp.complete` trace event for the download watchdog), and `ruff>=0.16,<0.17` in `.github/workflows/ci.yml` (0.x minors change rule behaviour even inside `--select F,E9`). Raise a cap deliberately, with a full test run on the new version, not by loosening it.
 - **Starlette ≥ 0.36 / 1.x** — `TemplateResponse` takes `request` as the first positional argument, not inside the context dict. All template calls use `templates.TemplateResponse(request, "template.html", {...})`.
 - **LLM — two tiers:**
   - `LLM_MODEL` (main generation, default `qwen3:14b`) — used for full guide generation and visuals prompts. Any OpenAI-compatible model works. The 3.2B `llama3.2` model is too small — it fails schema validation. Test a new model with one generation before relying on it.
@@ -162,7 +163,7 @@ api/
                       reel-level sibling of cuts.py's latest_failed_job_for_cut(): the most
                       recently failed enrich/generate Job for a "failed" reel, not type-filtered
                       (a reel can fail either stage) — see Key conventions
-    jobs.py           GET /api/jobs/{id} (JSON + HTML fragment)
+    jobs.py           GET /api/jobs/{id} (JSON only: id, status, progress, error — the one JSON endpoint; the HTML job fragments come from reels.py)
     cuts.py           POST /render, PATCH, POST /approve, POST /publish, render-status,
                       publish-status, POST /thumbnail (choose a candidate), POST /hook-variant
                       (swap the hook beat's vo_script). The 3 GET file-streaming routes
@@ -739,7 +740,7 @@ tests/
                               on_screen_text re-derivation, made replace_beat_vo() mutate in place)
                               — each confirmed to fail for the predicted reason, then restored. See
                               docs/specs/2026-09-guide-edit-module-design.md
-  test_state.py               11 tests — REEL_TRANSITIONS, CUT_TRANSITIONS, invalid moves
+  test_state.py               15 tests — REEL_TRANSITIONS (incl. draft -> enriching -> generating/failed, and enriching never straight to guide_ready), CUT_TRANSITIONS, invalid moves
   test_enrichment.py          38 tests — coerce_beat_type, _enrich_batch response parsing, topic fence;
                               niche branching (Phase 7u) — _enrich_batch() selects the football vs.
                               generic system prompt correctly; _is_shallow_beat() genuinely consults
@@ -1047,7 +1048,7 @@ tests/
   test_srt.py                  8 tests — write_srt() (Phase 5d): timestamp formatting incl. hour-boundary and
                               millisecond-rounding, sequential numbering, empty-cues returns None with no file written,
                               multi-cue/multi-beat concatenation with pre-shifted absolute offsets, parent-dir creation
-  test_context_enricher.py    13 tests — evaluate_context axes, llm_enrich
+  test_context_enricher.py    14 tests — evaluate_context axes, llm_enrich (incl. that it asks for free text, not JSON)
   test_enrich_context_task.py 14 tests — enrichment gating, LLM failure fallback, structured script guard, missing reel, owner rollback wiring, orphan generate-job cleanup (only when it claimed the orphan)
   test_maintenance.py         52 tests — reaper on in-memory SQLite: per-job-type owner rollback, stale running/pending jobs, per-job-type pending thresholds, healthy jobs untouched, updated_at keying, compare-and-set back-off, status pin = SELECT snapshot, one bad job doesn't stop the rest, done-orphan sweep (lost after_commit_failed fail-stamp) per job type, existing-error/freshness exclusions; budget-2 (enrich/render) resume-then-exhaust boundary alongside budget-1 (generate); resume log line and exhausted-budget failure message both surface the resume count; publish's structural exclusion via a real callable helper (`_check_publish_excluded`), not a locally-asserted literal;
                               reaper-resume (Phase 7f) — `_RESUMABLE_TASKS` disabled to `{}` by the shared `factory`
@@ -1229,10 +1230,10 @@ tests/
                               tie-break and the reel.html display line each independently
                               mutation-tested
   test_pricing.py              4 tests — llm_cost_usd() rate application, zero-rate default
-  test_llm_provider.py         12 tests — OllamaProvider last_usage/total_usage capture;
+  test_llm_provider.py         13 tests — OllamaProvider last_usage/total_usage capture;
                               check_model_available()/validate_configured_models() — model listed/
                               not listed/timeout/network error/non-2xx, dedup by (base_url, model),
-                              local-Ollama vs NVIDIA-NIM warning wording
+                              local-Ollama vs NVIDIA-NIM warning wording, non-string model ids in the listing ignored
   test_main.py                 3 tests — lifespan hook logs a warning per misconfigured model,
                               never crashes startup when every model checks out
   test_estimate.py             8 tests — generation path resolution, historical cost averaging incl. structured-fallback exclusion
@@ -1275,7 +1276,7 @@ tests/
                               encode/decode drift (a non-terminating float, unicode, smart quotes, an
                               emoji, an explicit None field), forces db.expire_all() so the next read is a
                               genuine fresh SELECT, confirms the fingerprint is unchanged
-  test_oauth.py               13 tests — OAuth state CSRF, YouTube/Instagram authorize+exchange, long-lived token swap, token-in-header regression
+  test_oauth.py               14 tests — OAuth state CSRF, YouTube/Instagram authorize+exchange, long-lived token swap, token-in-header regression, redirect URI built from public_base_url
   test_credentials_router.py   16 tests — connect/callback/disconnect routes; 7 added in Phase 8a: the lockout under a rotated and a
                               removed CREDENTIALS_KEY (list page, disconnect — both parametrized — and the re-auth callback
                               overwriting an unreadable token, with and without a refresh token in the provider response), plus
@@ -1383,7 +1384,7 @@ tests/
                               no row at all); a fetcher exception, missing credential, and missing platform
                               fetcher all correctly write zero snapshot rows (extends the file's existing
                               skip-path tests with a row-count assertion)
-  test_compositor.py           29 tests — _build_ffmpeg_args no-music/sidechain/no-VO branches, real ffmpeg music-mixing end-to-end (11 of these need ffmpeg on PATH), _write_thumbnail_candidates (no ffmpeg — a fake clip object) covering first-candidate-is-original-path, distinct sibling files, short-clip clamping; _build_text_filter text_color — default, a curated color, an uncurated value falling back to default, a filter-graph-injection attempt rejected;
+  test_compositor.py           31 tests — _build_ffmpeg_args no-music/sidechain/no-VO branches, real ffmpeg music-mixing end-to-end (11 of these need ffmpeg on PATH), _write_thumbnail_candidates (no ffmpeg — a fake clip object) covering first-candidate-is-original-path, distinct sibling files, short-clip clamping; _build_text_filter text_color — default, a curated color, an uncurated value falling back to default, a filter-graph-injection attempt rejected;
                               _build_text_filter drawtext `%`-expansion fix (Phase 7j) — a pure string-building test
                               asserting `:expansion=none` is always present in the built filter chain, a pure
                               `_escape_drawtext("50% off") == "50% off"` test (the function must no longer
@@ -1432,7 +1433,9 @@ tests/
                               both real sub-clips have already opened readers, proving _build_collage_clip()'s
                               try/except covers that window too, not just the second _build_media_sub_clip()
                               call — mutation-tested by narrowing the try block back to the original (first-
-                              draft) scope and confirming this test then fails with both readers leaked
+                              draft) scope and confirming this test then fails with both readers leaked; plus (Phase 7r) a reader whose close()
+                              raises never replaces the original render error (`_closing()`), and (Phase 7y) a real-ffmpeg guard
+                              that the no-Whisper SRT cues are shifted onto the reel timeline
   test_golden_reel.py          1 test (marked `golden`, deselected by default — see Commands) — real edge-tts synthesis
                               + real ffmpeg composite_cut(), no mocks anywhere in the chain; asserts real video+audio
                               streams at the correct dimensions; mutation-verified against the real historical

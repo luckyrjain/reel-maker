@@ -103,7 +103,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 | File | Responsibility |
 |---|---|
-| `main.py` | FastAPI app factory; mounts static files, Jinja2 templates, all 5 routers; `lifespan` hook runs `validate_configured_models()` at startup (best-effort, never blocks) |
+| `main.py` | FastAPI app factory; mounts static files, Jinja2 templates, all 6 routers; `lifespan` hook runs `validate_configured_models()` at startup (best-effort, never blocks) |
 | `config.py` | `pydantic-settings` `Settings` — LLM/NVIDIA/HuggingFace/Pexels keys, `credentials_key`, OAuth client id/secret pairs, `public_base_url`, `music_library_dir`, `max_paid_llm_calls_per_reel`, `evaluator_axis_weight_multipliers` (dict, the first dict-typed setting) |
 | `crypto.py` | Fernet `seal()`/`open_()` + `Encrypted` SQLAlchemy TypeDecorator for encrypted columns (`Credential.token_blob`/`refresh_token_blob`, both `deferred()` so a stale key fails only where a token is read); fails loud on a removed key (Phase 8a) |
 | `display.py` | `safe_text()` — display-time cleaning of DB free text (controls, lone surrogates, bidi overrides; whitespace controls collapsed, outer whitespace trimmed) for the insights page; stored values are never rewritten (Phase 8b) |
