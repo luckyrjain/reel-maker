@@ -68,6 +68,8 @@ def test_returns_exactly_id_status_progress_and_error(client):
     assert resp.status_code == 200
     assert resp.headers["content-type"] == "application/json"
     assert resp.json() == {"id": job_id, "status": "running", "progress": 70, "error": None}
+    # 70.0 == 70 in Python, so equality alone would let a float through; strict clients reject it.
+    assert type(resp.json()["progress"]) is int and type(resp.json()["id"]) is int
 
 
 @pytest.mark.parametrize("status", list(models.JobStatus))
@@ -85,7 +87,9 @@ def test_progress_zero_is_returned_not_dropped(client):
 
 def test_a_failed_jobs_error_text_is_returned_verbatim(client):
     """The longest error `job_task` stores is 2000 characters; it must come back whole, not cut."""
-    message = ("LLM returned invalid JSON: Expecting ',' delimiter — résumé ✓ " * 40)[:2000]
+    # Multi-line on purpose: `_error_text` keeps interior newlines, so they must survive the response too.
+    message = ("LLM returned invalid JSON:\nExpecting ',' delimiter — résumé ✓ " * 40)[:2000]
+    assert "\n" in message
     assert len(message) == 2000
     job_id = _make_job(client._session_factory, status=models.JobStatus.failed, error=message)
 
