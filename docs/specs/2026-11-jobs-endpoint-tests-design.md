@@ -39,7 +39,8 @@ and `response_model_exclude_defaults` added, a read that increments `progress` a
 trailing-slash path, the error cut to 200 characters, `progress` typed `float` and newlines in the error
 replaced by spaces, the error shown only for a failed job, `progress` clamped at 99, and a job type (enrich,
 render or publish) answered with a 404, and the error hidden or the `progress` zeroed for a job in one given
-status (pending, running, failed or done: the full status-by-field grid, six mutants).
+status (six mutants across pending, running, failed and done; a job in `done` has no error to hide, because the
+done-stamp writes `error = None`, and its `progress` is covered by the clamp mutant).
 Twenty-five are killed. The survivor (a default value on `JobResponse.status`) is equivalent: the attribute is
 always present on a loaded row, so the default is never used.
 
