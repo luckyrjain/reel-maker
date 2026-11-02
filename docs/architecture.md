@@ -106,6 +106,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `main.py` | FastAPI app factory; mounts static files, Jinja2 templates, all 5 routers; `lifespan` hook runs `validate_configured_models()` at startup (best-effort, never blocks) |
 | `config.py` | `pydantic-settings` `Settings` — LLM/NVIDIA/HuggingFace/Pexels keys, `credentials_key`, OAuth client id/secret pairs, `public_base_url`, `music_library_dir`, `max_paid_llm_calls_per_reel`, `evaluator_axis_weight_multipliers` (dict, the first dict-typed setting) |
 | `crypto.py` | Fernet `seal()`/`open_()` + `Encrypted` SQLAlchemy TypeDecorator for encrypted columns (`Credential.token_blob`/`refresh_token_blob`, both `deferred()` so a stale key fails only where a token is read); fails loud on a removed key (Phase 8a) |
+| `display.py` | `safe_text()` — display-time cleaning of DB free text (controls, lone surrogates, bidi overrides; whitespace controls collapsed, outer whitespace trimmed) for the insights page; stored values are never rewritten (Phase 8b) |
 | `db.py` | SQLAlchemy engine (`pool_pre_ping=True`, `hide_parameters=True`), `SessionLocal`, `get_db()` FastAPI dependency |
 | `enqueue.py` | `enqueue_job(db, job, task, *, what)` — the one router-side add → commit → `task.delay` → unwind-on-failure (`fail_unenqueued` + 503) sequence, used by `create_reel`, `trigger_render`, `trigger_publish` |
 | `models.py` | All ORM models and status enums — `Reel`, `Cut`, `CutMetricSnapshot`, `Asset`, `CutAsset`, `Job`, `StageEvent`, `PerformanceNote`, `Credential` |
@@ -187,11 +188,11 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 | File | Responsibility |
 |---|---|
-| `correlation.py` | `quality_engagement_correlation()` — Pearson `r` + sample size, refusing below `MIN_SAMPLE=5` or on zero variance; `top_bottom_performers()` — top/bottom-3 (or one combined list below `2k`) |
+| `correlation.py` | `load_reel_stats()` — the one read of reels/cuts/jobs, paired into `ReelStat`s and shared by both analyses below; `quality_engagement_correlation()` — Pearson `r` + sample size, refusing below `MIN_SAMPLE=5` or on zero variance; `top_bottom_performers()` — top/bottom-3 (or one combined list below `2k`) |
 
 ### `tests/`
 
-72 test files + `conftest.py`, **2301 tests run by default / 2302 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
+73 test files + `conftest.py`, **2531 tests run by default / 2532 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
 
 | File | Tests | File | Tests |
 |---|---|---|---|
@@ -207,10 +208,10 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_asset_sourcer.py` | 14 | `test_context_enricher.py` | 14 |
 | `test_enrich_context_task.py` | 14 | `test_oauth.py` | 14 |
 | `test_publish_task.py` | 14 | `test_llm_provider.py` | 13 |
-| `test_publish_gate.py` | 13 | `test_correlation.py` | 12 |
+| `test_publish_gate.py` | 13 | `test_correlation.py` | 36 |
 | `test_metrics_fetcher.py` | 12 | `test_script_parser.py` | 11 |
 | `test_metrics_task.py` | 17 | `test_credentials_router.py` | 16 |
-| `test_hook_variants.py` | 9 | `test_insights_router.py` | 9 |
+| `test_hook_variants.py` | 9 | `test_insights_router.py` | 42 |
 | `test_youtube_publisher.py` | 9 | `test_attribution.py` | 8 |
 | `test_estimate.py` | 8 | `test_music_source.py` | 8 |
 | `test_srt.py` | 8 | `test_guide_schema.py` | 7 |
@@ -231,6 +232,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_sourcer_pins_and_music.py` | 38 | `test_crypto.py` | 85 |
 | `test_llm_judge.py` | 3 | `test_main.py` | 3 |
 | `test_observability.py` | 7 | `test_golden_reel.py` | 1 (deselected) |
+| `test_display.py` | 173 | | |
 
 Notable areas of coverage beyond what the filenames suggest: `test_job_lifecycle.py` and `test_maintenance.py` together carry the Job-fencing-token mechanism's regression suite (zombie resumed-while-still-alive detection at every `heartbeat()`/`lock_job()`/done-stamp/CAS checkpoint, differentiated per-job-type resume budgets); `test_compositor.py` covers the `ExitStack` reader-lifetime migration and the 2-up collage layout with real ffmpeg frame sampling; `test_evaluator.py` covers all 17 per-axis scorer functions in isolation; `test_publish_gate.py`/`test_cuts_publish_router.py` cover both staleness gates end-to-end.
 
@@ -579,7 +581,7 @@ Both fingerprint checks treat `None` as "unknown, don't block" (pre-migration/ne
 
 ## Insights & performance feedback
 
-`engine/analytics/correlation.py::quality_engagement_correlation()` computes a Pearson `r` between each reel's latest `quality_score` (`engine/observability.py::latest_quality_scores()`) and its max per-cut `views`, refusing below `MIN_SAMPLE=5` reels or on zero variance in either series (`GET /api/insights` always shows `r` with `sample_size` together, with a permanent restriction-of-range caveat). `top_bottom_performers()` returns a top/bottom-3 table (or one combined list below `2×k`) for the operator to write `PerformanceNote`s from — a deliberate human-in-the-loop design, not automatic few-shot injection of raw past-reel content (see `docs/specs/2026-09-phase5-quality-engagement-feedback.md`). Every active note is seeded into `generate_guide`'s standard-path `prior_feedback`; `evaluator_axis_weight_multipliers` is a manual, human-set per-axis scoring lever informed by the same data — nothing in this repo fits it statistically.
+`engine/analytics/correlation.py::load_reel_stats()` reads every reel, cut and job once (the insights page shares that one load between the two analyses below). `quality_engagement_correlation()` computes a Pearson `r` between each reel's latest `quality_score` (`engine/observability.py::latest_quality_scores()`) and its max per-cut `views`, refusing below `MIN_SAMPLE=5` reels or on zero variance in either series (`GET /api/insights` always shows `r` with `sample_size` together, with a permanent restriction-of-range caveat). `top_bottom_performers()` returns a top/bottom-3 table (or one combined list below `2×k`) for the operator to write `PerformanceNote`s from — a deliberate human-in-the-loop design, not automatic few-shot injection of raw past-reel content (see `docs/specs/2026-09-phase5-quality-engagement-feedback.md`). Every active note is seeded into `generate_guide`'s standard-path `prior_feedback`; `evaluator_axis_weight_multipliers` is a manual, human-set per-axis scoring lever informed by the same data — nothing in this repo fits it statistically.
 
 ---
 

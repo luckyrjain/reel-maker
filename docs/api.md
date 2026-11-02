@@ -334,7 +334,7 @@ All routes in `api/routers/insights.py`.
 
 ### `GET /api/insights`
 
-Quality↔engagement correlation (Pearson `r` + sample size, always shown together with a restriction-of-range caveat — never `r` alone; refuses to compute below `MIN_SAMPLE=5` reels or on zero variance in either series) + a top/bottom-3 performer table (or one combined list when fewer than `2 × MIN_SAMPLE` reels have both a quality score and views — hook line sourced from the max-views cut) + the `PerformanceNote` list/form.
+Quality↔engagement correlation (Pearson `r` + sample size, always shown together with a restriction-of-range caveat — never `r` alone; refuses to compute below `MIN_SAMPLE=5` reels or on zero variance in either series) + a top/bottom-3 performer table (or one combined list when fewer than `2 × k` (6) reels have both a quality score and views — hook line sourced from the max-views cut) + the `PerformanceNote` list/form.
 
 **Response:** `text/html` — `insights.html`
 
