@@ -48,7 +48,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 2642 tests across 75 files, default run (11 test_compositor tests need ffmpeg
+.venv/bin/pytest                            # 2642 tests across 75 files, default run (18 test_compositor tests need ffmpeg
                                              # on PATH; 3 tests skip without optional packages — kokoro voice, two whisper
                                              # caption tests; 1 golden-reel test is deselected by default — see below)
 .venv/bin/pytest -m golden                  # the golden-reel smoke test (real edge-tts + real ffmpeg, ~20s, needs network)
@@ -163,7 +163,7 @@ api/
                       reel-level sibling of cuts.py's latest_failed_job_for_cut(): the most
                       recently failed enrich/generate Job for a "failed" reel, not type-filtered
                       (a reel can fail either stage) — see Key conventions
-    jobs.py           GET /api/jobs/{id} (JSON only: id, status, progress, error — the one JSON endpoint; the HTML job fragments come from reels.py)
+    jobs.py           GET /api/jobs/{id} (JSON only: id, status, progress, error — the one JSON endpoint; the HTML job fragments come from elsewhere: `active-job-fragment` in reels.py, `render-status`/`publish-status` in cuts.py)
     cuts.py           POST /render, PATCH, POST /approve, POST /publish, render-status,
                       publish-status, POST /thumbnail (choose a candidate), POST /hook-variant
                       (swap the hook beat's vo_script). The 3 GET file-streaming routes
@@ -1384,7 +1384,7 @@ tests/
                               no row at all); a fetcher exception, missing credential, and missing platform
                               fetcher all correctly write zero snapshot rows (extends the file's existing
                               skip-path tests with a row-count assertion)
-  test_compositor.py           31 tests — _build_ffmpeg_args no-music/sidechain/no-VO branches, real ffmpeg music-mixing end-to-end (11 of these need ffmpeg on PATH), _write_thumbnail_candidates (no ffmpeg — a fake clip object) covering first-candidate-is-original-path, distinct sibling files, short-clip clamping; _build_text_filter text_color — default, a curated color, an uncurated value falling back to default, a filter-graph-injection attempt rejected;
+  test_compositor.py           31 tests — _build_ffmpeg_args no-music/sidechain/no-VO branches, real ffmpeg music-mixing end-to-end (18 of these need ffmpeg on PATH), _write_thumbnail_candidates (no ffmpeg — a fake clip object) covering first-candidate-is-original-path, distinct sibling files, short-clip clamping; _build_text_filter text_color — default, a curated color, an uncurated value falling back to default, a filter-graph-injection attempt rejected;
                               _build_text_filter drawtext `%`-expansion fix (Phase 7j) — a pure string-building test
                               asserting `:expansion=none` is always present in the built filter chain, a pure
                               `_escape_drawtext("50% off") == "50% off"` test (the function must no longer

@@ -20,7 +20,7 @@ Reel Maker is a local-first, single-operator pipeline that turns a text prompt i
                            │ HTTP
 ┌──────────────────────────▼─────────────────────────────────────────┐
 │                      FastAPI (api/)                                 │
-│  Routers: reels · jobs · cuts · credentials · insights               │
+│  Routers: reels · jobs · cuts · cut_media · credentials · insights   │
 │  Returns HTML fragments (Jinja2) — only GET /api/jobs/{id} is JSON  │
 └────────────┬────────────────────────┬────────────────────────────────┘
              │ SQLAlchemy             │ Celery .delay()
