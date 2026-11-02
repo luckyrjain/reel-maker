@@ -28,6 +28,15 @@ def _windows(beats, durations):
     ]
 
 
+def _assert_rows_approx(actual, expected):
+    """Compare a list of tuples element-wise. `pytest.approx` of a list of tuples is rejected by
+    pytest >= 9.2 ("does not support nested data structures"), so each row is compared on its own;
+    the row count is still checked."""
+    assert len(actual) == len(expected)
+    for got, want in zip(actual, expected):
+        assert got == pytest.approx(want)
+
+
 def _cues(vo, duration):
     return [(c.text, c.start_s, c.end_s) for c in _proportional_caption_cues(vo, duration)]
 
@@ -92,7 +101,7 @@ def test_drawtext_empty_vo_splits_equally_across_lines():
             beat["vo_script"] = vo
         wins = _windows([beat], [6.0])
         assert [w[0] for w in wins] == ["a", "b", "c"]
-        assert [w[1:] for w in wins] == pytest.approx([(0.0, 2.0), (2.0, 4.0), (4.0, 6.0)])
+        _assert_rows_approx([w[1:] for w in wins], [(0.0, 2.0), (2.0, 4.0), (4.0, 6.0)])
 
 
 def test_drawtext_fewer_lines_than_sentences_uses_all_sentences_as_denominator():
@@ -115,7 +124,7 @@ def test_drawtext_more_lines_than_sentences_pads_weight_one_and_stops_at_end():
     beat = {"vo_script": "One. Two.", "on_screen_text": ["a", "b", "c", "d"]}
     wins = _windows([beat], [8.0])
     assert [w[0] for w in wins] == ["a", "b"]
-    assert [w[1:] for w in wins] == pytest.approx([(0.0, 4.0), (4.0, 8.0)])
+    _assert_rows_approx([w[1:] for w in wins], [(0.0, 4.0), (4.0, 8.0)])
 
 
 def test_drawtext_windows_are_absolute_across_beats():
@@ -124,7 +133,7 @@ def test_drawtext_windows_are_absolute_across_beats():
         {"vo_script": "One two. Three four five six.", "on_screen_text": ["a", "b"]},
     ]
     wins = _windows(beats, [2.0, 9.0])
-    assert [w[1:] for w in wins] == pytest.approx([(0.0, 2.0), (2.0, 5.0), (5.0, 11.0)])
+    _assert_rows_approx([w[1:] for w in wins], [(0.0, 2.0), (2.0, 5.0), (5.0, 11.0)])
 
 
 def test_drawtext_floor_drops_lines_that_do_not_fit_current_behavior():
@@ -136,8 +145,8 @@ def test_drawtext_floor_drops_lines_that_do_not_fit_current_behavior():
     }
     wins = _windows([beat], [1.0])
     assert [w[0] for w in wins] == ["l0", "l1", "l2", "l3"]
-    assert [w[1:] for w in wins] == pytest.approx(
-        [(0.0, 0.3), (0.3, 0.6), (0.6, 0.9), (0.9, 1.0)]
+    _assert_rows_approx(
+        [w[1:] for w in wins], [(0.0, 0.3), (0.3, 0.6), (0.6, 0.9), (0.9, 1.0)]
     )
 
 
@@ -167,7 +176,7 @@ def test_drawtext_none_vo_script_is_treated_as_empty():
     the empty-VO equal-split path."""
     beat = {"vo_script": None, "on_screen_text": ["a", "b"]}
     wins = _windows([beat], [4.0])
-    assert [w[1:] for w in wins] == pytest.approx([(0.0, 2.0), (2.0, 4.0)])
+    _assert_rows_approx([w[1:] for w in wins], [(0.0, 2.0), (2.0, 4.0)])
 
 
 def test_drawtext_zero_duration_places_nothing():
@@ -179,12 +188,12 @@ def test_drawtext_zero_duration_places_nothing():
 
 def test_spans_share_duration_by_weight():
     spans = _proportional_spans([1, 3], 4, 8.0)
-    assert spans == pytest.approx([(0, 0.0, 2.0), (1, 2.0, 8.0)])
+    _assert_rows_approx(spans, [(0, 0.0, 2.0), (1, 2.0, 8.0)])
 
 
 def test_spans_start_offsets_absolute_time():
     spans = _proportional_spans([1, 1], 2, 4.0, start=10.0)
-    assert spans == pytest.approx([(0, 10.0, 12.0), (1, 12.0, 14.0)])
+    _assert_rows_approx(spans, [(0, 10.0, 12.0), (1, 12.0, 14.0)])
 
 
 def test_spans_total_weight_is_independent_of_weights():
