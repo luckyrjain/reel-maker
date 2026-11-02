@@ -16,7 +16,7 @@ or the token URL would have passed everything.
 
 ## Change
 
-Tests only, in the new `tests/test_youtube_token_refresh.py` (23 tests). No production code changed.
+Tests only, in the new `tests/test_youtube_token_refresh.py` (24 tests). No production code changed.
 
 - **`refresh()`**: `httpx.post` is the only thing faked, and it answers through a real `httpx.Client` with a
   `MockTransport`, so the request is built as httpx would send it, and EVERY argument `refresh()` passes
@@ -44,14 +44,15 @@ refresh response is ignored and the stored one kept (Google normally sends none)
 
 ## Verification
 
-A 31-mutant battery over `refresh()` and `get_valid_access_token()` is all killed: the grant type, each of the
+A 35-mutant battery over `refresh()` and `get_valid_access_token()` is all killed: the grant type, each of the
 three other body fields and the refresh-token key, `data=` changed to `params=`, `raise_for_status` removed,
 returning the response instead of its JSON, two timeouts, the token URL, the commit removed, the expiry
 comparison inverted or dropped, the token not stored, seconds changed to minutes, `int()` removed, the old
 expiry kept, the wrong token sent to Google, the wrong provider, the no-refresh-token guard removed, the
 expiry-less guard removed, and the old token returned, plus (added after review) `params=`, a secret in
 `headers=`, `auth=` and `follow_redirects=` passed to the post, the guard changed to `is None`, a retry of
-a failed refresh, and the refresh token or client secret written to a log.
+a failed refresh, the refresh token, client secret or an access token written to a log, the response JSON
+parsed before the status is checked (a non-JSON 503 body), and `commit()` called with arguments.
 
 ## Left alone
 

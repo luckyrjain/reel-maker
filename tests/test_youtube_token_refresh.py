@@ -130,8 +130,23 @@ def test_refresh_raises_on_a_rejected_grant_without_echoing_the_secrets():
 
 
 @pytest.mark.parametrize("status", [401, 403, 429, 500, 503])
-def test_refresh_raises_for_every_error_status(status):
+def test_refresh_raises_on_error_statuses(status):
     with patch("api.oauth.httpx.post", side_effect=_Google(status=status, body={"error": "x"})):
+        with pytest.raises(httpx.HTTPStatusError):
+            _provider().refresh("refresh-tok-3")
+
+
+def test_refresh_raises_on_an_error_status_with_a_non_json_body():
+    """A gateway error page is HTML, not JSON: the status check must come before any JSON parsing."""
+
+    def handler(request):
+        return httpx.Response(503, text="<html>Service Unavailable</html>", request=request)
+
+    def post(url, **kwargs):
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            return client.post(url, **kwargs)
+
+    with patch("api.oauth.httpx.post", side_effect=post):
         with pytest.raises(httpx.HTTPStatusError):
             _provider().refresh("refresh-tok-3")
 
@@ -159,7 +174,7 @@ def test_an_expired_token_is_refreshed_through_the_real_provider_and_persisted(r
     assert google.form["client_id"] == "client-id-1" and google.form["client_secret"] == "client-secret-2"
     assert credential.refresh_token_blob == "refresh-tok-3"          # Google sends no new one: keep ours
     assert before + timedelta(seconds=3599) <= credential.expires_at <= datetime.now(timezone.utc) + timedelta(seconds=3599)
-    db.commit.assert_called_once()
+    db.commit.assert_called_once_with()
 
 
 def test_a_refresh_token_in_the_response_is_ignored_current_behaviour(real_provider):
@@ -290,12 +305,13 @@ def test_the_refreshed_token_is_what_the_metrics_fetcher_sends_to_the_api(real_p
 
 @pytest.mark.parametrize("status", [200, 400])
 def test_neither_a_successful_nor_a_failed_refresh_logs_a_secret(real_provider, caplog, status):
-    """The refresh token and client secret travel in a request body; nothing may write them to a
-    log, at any level (httpx logs the request line, which has no body)."""
+    """The refresh token and client secret travel in a request body, and the access tokens are bearer
+    credentials; nothing may write any of them to a log, at any level (httpx logs the request line,
+    which has no body). The tokens are mixed case so a lowercased copy would still show."""
     import logging
 
-    body = {"access_token": "fresh-tok", "expires_in": 3599} if status == 200 else {"error": "invalid_grant"}
-    credential = _credential(expires_in_s=-60)
+    body = {"access_token": "Fresh-TOK-9", "expires_in": 3599} if status == 200 else {"error": "invalid_grant"}
+    credential = _credential(expires_in_s=-60, token="Stale-TOK-8")
 
     with caplog.at_level(logging.DEBUG), patch("api.oauth.httpx.post", side_effect=_Google(status=status, body=body)):
         try:
@@ -303,4 +319,5 @@ def test_neither_a_successful_nor_a_failed_refresh_logs_a_secret(real_provider, 
         except httpx.HTTPStatusError:
             pass
 
-    assert "refresh-tok-3" not in caplog.text and "client-secret-2" not in caplog.text
+    for secret in ("refresh-tok-3", "client-secret-2", "Fresh-TOK-9", "Stale-TOK-8"):
+        assert secret not in caplog.text, secret
