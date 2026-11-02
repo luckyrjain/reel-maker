@@ -15,9 +15,9 @@ consumers are external clients nobody here controls.
 `tests/test_jobs_router.py`, 21 tests, through a real `TestClient` with an in-memory SQLite database (the
 same fixture shape as `tests/test_cut_media.py`):
 
-- the body is exactly `{id, status, progress, error}` with the right values and `application/json`;
+- the body is exactly `{id, status, progress, error}` with the right values and `application/json`, with redirects not followed (a route moved to a trailing-slash path would answer the old URL with a 307 that the client silently follows);
 - each of the four `JobStatus` values is serialized as its plain string;
-- `progress` 0 is returned, not dropped; a failed job's error text (including non-ASCII) is returned verbatim;
+- `progress` 0 is returned, not dropped; a failed job's error text (including non-ASCII, at the 2000-character maximum `job_task` stores) is returned verbatim, not cut;
 - no internal column is exposed: `meta` (scores, note ids, a marker string), the fencing counter and the
   reaper counter are not in the body;
 - the requested job is the one returned, with three jobs in different states and job ids that differ from
@@ -30,11 +30,12 @@ same fixture shape as `tests/test_cut_media.py`):
 
 ## Verification
 
-Thirteen mutants over `api/routers/jobs.py` and `api/schemas.py`, restored after each: `meta` or `claim_token`
+Fifteen mutants over `api/routers/jobs.py` and `api/schemas.py`, restored after each: `meta` or `claim_token`
 added to the response schema, the `error` or `progress` field dropped, lookup by `reel_id` instead of the job
 id, the 404 replaced by a default body, the 404 text changed, the id typed `str`, `response_model_exclude_none`
-and `response_model_exclude_defaults` added, a read that increments `progress` and commits, POST also routed.
-Twelve are killed. The survivor (a default value on `JobResponse.status`) is equivalent: the attribute is
+and `response_model_exclude_defaults` added, a read that increments `progress` and commits, POST also routed, and (added after review) the route moved to a
+trailing-slash path and the error cut to 200 characters.
+Fourteen are killed. The survivor (a default value on `JobResponse.status`) is equivalent: the attribute is
 always present on a loaded row, so the default is never used.
 
 ## Left alone

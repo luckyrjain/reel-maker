@@ -62,7 +62,8 @@ def _make_job(session_factory, *, status=models.JobStatus.pending, progress=0, e
 def test_returns_exactly_id_status_progress_and_error(client):
     job_id = _make_job(client._session_factory, status=models.JobStatus.running, progress=70)
 
-    resp = client.get(f"/api/jobs/{job_id}")
+    # No redirect is followed: a route moved to a trailing-slash path would answer the old URL with a 307.
+    resp = client.get(f"/api/jobs/{job_id}", follow_redirects=False)
 
     assert resp.status_code == 200
     assert resp.headers["content-type"] == "application/json"
@@ -83,7 +84,9 @@ def test_progress_zero_is_returned_not_dropped(client):
 
 
 def test_a_failed_jobs_error_text_is_returned_verbatim(client):
-    message = "LLM returned invalid JSON: Expecting ',' delimiter — résumé ✓"
+    """The longest error `job_task` stores is 2000 characters; it must come back whole, not cut."""
+    message = ("LLM returned invalid JSON: Expecting ',' delimiter — résumé ✓ " * 40)[:2000]
+    assert len(message) == 2000
     job_id = _make_job(client._session_factory, status=models.JobStatus.failed, error=message)
 
     body = client.get(f"/api/jobs/{job_id}").json()
