@@ -47,7 +47,7 @@ DATABASE_URL=... .venv/bin/celery -A worker.celery_app beat -l info             
 ollama serve                                                                                  # local LLM (skip if using NVIDIA)
 
 # Tests
-.venv/bin/pytest                            # 2642 tests across 75 files, default run (11 test_compositor tests need ffmpeg
+.venv/bin/pytest                            # 2663 tests across 76 files, default run (11 test_compositor tests need ffmpeg
                                              # on PATH; 3 tests skip without optional packages — kokoro voice, two whisper
                                              # caption tests; 1 golden-reel test is deselected by default — see below)
 .venv/bin/pytest -m golden                  # the golden-reel smoke test (real edge-tts + real ffmpeg, ~20s, needs network)
@@ -1461,6 +1461,13 @@ tests/
                               test_variants_router.py (Phase 7t) mirroring the cuts.py -> cut_media.py
                               production split. See docs/specs/2026-09-video-store-guard-module-design.md
                               and docs/specs/2026-09-cut-media-router-split-module-design.md
+  test_jobs_router.py         21 tests (new, Phase 8e) — GET /api/jobs/{id}, the one JSON endpoint (nothing in the UI calls it, so it had
+                              no test): the body is exactly id/status/progress/error with the right values; each JobStatus as its plain
+                              string; progress 0 kept; a failed job's error text verbatim; no internal column (meta, claim_token) leaked;
+                              the requested job returned among several, and a reel id never taken for a job id; 404 with the message for
+                              an unknown, zero or negative id; 422 for a non-integer id; a read changes nothing; only GET allowed. A
+                              13-mutant battery (schema leaks, dropped fields, lookup by reel id, no 404, `exclude_none`/`exclude_defaults`,
+                              a mutating read, POST routed) is killed except one equivalent. See docs/specs/2026-11-jobs-endpoint-tests-design.md
 
 ui/templates/
   index.html          Context-entry form; niche/platform picker + target_length + voiceover_mode +
