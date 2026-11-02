@@ -38,7 +38,7 @@ def client():
 
 
 def _make_job(session_factory, *, status=models.JobStatus.pending, progress=0, error=None,
-              meta=None, reel_count=0):
+              meta=None, reel_count=0, job_type=models.JobType.generate):
     """Insert a job (after `reel_count` filler reels, so reel ids and job ids differ) and return its id."""
     db = session_factory()
     try:
@@ -49,7 +49,7 @@ def _make_job(session_factory, *, status=models.JobStatus.pending, progress=0, e
         db.add(reel)
         db.flush()
         job = models.Job(
-            type=models.JobType.generate, reel_id=reel.id, status=status, progress=progress,
+            type=job_type, reel_id=reel.id, status=status, progress=progress,
             error=error, meta=meta if meta is not None else {},
         )
         db.add(job)
@@ -113,19 +113,29 @@ def test_no_internal_column_is_exposed(client):
 
 
 def test_the_requested_job_is_the_one_returned(client):
-    """Three jobs with different states, and ids that differ from their reels' ids."""
-    first = _make_job(client._session_factory, status=models.JobStatus.done, progress=100, reel_count=2)
-    second = _make_job(client._session_factory, status=models.JobStatus.running, progress=40, reel_count=3)
-    third = _make_job(client._session_factory, status=models.JobStatus.failed, progress=10, error="boom")
+    """Three jobs of different types and states, and ids that differ from their reels' ids.
+
+    The running job carries an error on purpose: a retried job is reset to pending with a
+    "transient failure, retry N" error and the next claim does not clear it, so a job that is not
+    `failed` can still have one, and it has to be shown.
+    """
+    first = _make_job(client._session_factory, status=models.JobStatus.done, progress=100, reel_count=2,
+                      job_type=models.JobType.enrich)
+    second = _make_job(client._session_factory, status=models.JobStatus.running, progress=40, reel_count=3,
+                       error="transient failure, retry 1: ReadTimeout", job_type=models.JobType.render)
+    third = _make_job(client._session_factory, status=models.JobStatus.failed, progress=10, error="boom",
+                      job_type=models.JobType.publish)
     assert len({first, second, third}) == 3
 
+    assert client.get(f"/api/jobs/{first}").json() == {
+        "id": first, "status": "done", "progress": 100, "error": None,
+    }
     assert client.get(f"/api/jobs/{second}").json() == {
-        "id": second, "status": "running", "progress": 40, "error": None,
+        "id": second, "status": "running", "progress": 40, "error": "transient failure, retry 1: ReadTimeout",
     }
     assert client.get(f"/api/jobs/{third}").json() == {
         "id": third, "status": "failed", "progress": 10, "error": "boom",
     }
-    assert client.get(f"/api/jobs/{first}").json()["status"] == "done"
 
 
 def test_an_unknown_job_is_a_404_with_a_message(client):
