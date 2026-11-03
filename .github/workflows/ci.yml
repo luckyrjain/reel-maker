@@ -24,7 +24,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
-          pip install edge-tts ruff
+          pip install edge-tts "ruff>=0.16,<0.17"
 
       # Scoped to F/E9 (real bugs): the wider bugbear ruleset flags this repo's routine
       # FastAPI `Depends()`-in-default-argument idiom as B008, which isn't a real issue here.
