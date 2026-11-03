@@ -1,6 +1,6 @@
 # API Reference
 
-All endpoints are prefixed with `/api` (5 routers: `reels`, `jobs`, `cuts`, `credentials`, `insights` — mounted in `api/main.py`). The browser receives HTML fragments (Jinja2 templates via HTMX) for every endpoint except `GET /api/jobs/{job_id}`, which is the one JSON endpoint in the app. `GET /` (not prefixed) serves the context-entry form.
+All endpoints are prefixed with `/api` (6 routers: `reels`, `jobs`, `cuts`, `cut_media`, `credentials`, `insights` — mounted in `api/main.py`). The browser receives HTML fragments (Jinja2 templates via HTMX) for every endpoint except `GET /api/jobs/{job_id}`, which is the one JSON endpoint in the app. `GET /` (not prefixed) serves the context-entry form.
 
 ---
 
