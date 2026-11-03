@@ -193,7 +193,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 ### `tests/`
 
-75 test files + `conftest.py`, **2642 tests run by default / 2643 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
+76 test files + `conftest.py`, **2663 tests run by default / 2664 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
 
 | File | Tests | File | Tests |
 |---|---|---|---|
@@ -234,7 +234,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_llm_judge.py` | 3 | `test_main.py` | 3 |
 | `test_observability.py` | 7 | `test_golden_reel.py` | 1 (deselected) |
 | `test_display.py` | 173 | `test_hidden_text.py` | 53 |
-| `test_youtube_token_refresh.py` | 24 | | |
+| `test_youtube_token_refresh.py` | 24 | `test_jobs_router.py` | 21 |
 
 Notable areas of coverage beyond what the filenames suggest: `test_job_lifecycle.py` and `test_maintenance.py` together carry the Job-fencing-token mechanism's regression suite (zombie resumed-while-still-alive detection at every `heartbeat()`/`lock_job()`/done-stamp/CAS checkpoint, differentiated per-job-type resume budgets); `test_compositor.py` covers the `ExitStack` reader-lifetime migration and the 2-up collage layout with real ffmpeg frame sampling; `test_evaluator.py` covers all 17 per-axis scorer functions in isolation; `test_publish_gate.py`/`test_cuts_publish_router.py` cover both staleness gates end-to-end.
 
