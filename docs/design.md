@@ -101,17 +101,23 @@ longer tell "the run that currently owns this row" apart from "a run that used t
 resumed run's claim also satisfies `WHERE status='running'`.
 
 `Job.claim_token` is a counter bumped on every `pending→running` claim; each run captures its
-own token once at claim time, and six separate checkpoints (`heartbeat()`, `lock_job()`, the
-done-stamp CAS, two failure-recording CAS sites, and the shutdown-signal path) compare against
-it so a superseded run is told apart from the current one even while `status` alone would say
-"running" for both. This went through three independent review passes — two at design time, one
-on the merged code — each catching a genuine, distinct gap in the same mechanism. The full
-blow-by-blow (all six checkpoints, four additional gaps found after the mechanism first shipped,
-and why three specific CAS sites deliberately carry *no* token) lives in CLAUDE.md's "Fencing
-token (`Job.claim_token`)" entry — read that before touching any of `job_task`'s failure paths.
+own token once at claim time into an immutable `Claim` (`job_id`, token, owner pair), and eight
+separate writes (`heartbeat()`, `lock_job()`, the done-stamp CAS, two failure-recording CAS
+sites, the heartbeat thread's own write, the shutdown-signal path and the owned
+refused-retry path) compare against it so a superseded run is told apart from the current one
+even while `status` alone would say "running" for both. The mechanism went through several
+independent review passes (design time, the merged code, and later passes), each catching a
+genuine, distinct gap in it; the fence used to be an optional `token=None`
+parameter, so forgetting it silently disabled fencing, which is why `Claim` now makes it a
+required keyword and pins the exact set of unfenced writes with tests. The full blow-by-blow (all
+eight fenced writes, the further gaps found after the mechanism first shipped, why the
+claim write, the unclaimed-job failure paths, `_fail_job_keep_owner` and the reaper's two CAS
+sites deliberately carry *no* token, and the known gaps the `Claim` does not close) lives in
+CLAUDE.md's "Fencing token (`Job.claim_token`)" entry — read that before touching any of
+`job_task`'s failure paths.
 
 Pointers: `worker/tasks/common.py`, `worker/tasks/maintenance.py::reap_stuck_jobs`,
-`tests/test_job_lifecycle.py` (133 tests), `tests/test_maintenance.py` (52 tests),
+`tests/test_job_lifecycle.py` (133 tests), `tests/test_job_claim.py` (100 tests), `tests/test_maintenance.py` (52 tests),
 `docs/specs/2026-09-reaper-resume-killed-jobs-system-design.md`.
 
 ---

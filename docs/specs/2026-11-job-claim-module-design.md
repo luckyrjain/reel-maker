@@ -1,10 +1,12 @@
 # The job `Claim` — one object for the fencing identity
 
-Status: approved for implementation, revision 6 (after review rounds 1–6; round 6 found only LOW wording items, all fixed). Source: candidate C1 of the 2026-11-03 full-codebase
+Status: implemented (Phase 8f), revision 6 (after spec-review rounds 1–6; round 6 found only LOW wording items, all fixed). Source: candidate C1 of the 2026-11-03 full-codebase
 architecture review (strength "Strong"), grilled and settled in a nine-question session (Q1–Q9, §3).
 Scope: `worker/tasks/common.py` (+ its tests and the docs that describe it). No schema change, no new
 endpoint, no behavior change except the two deliberate, harmless SQL deltas in §5 and the unpinned-fallback type
 lookup in §4.1.
+
+Line numbers in this document refer to `origin/main` (`6310fcd`) unless stated otherwise; refer to code and tests by name.
 
 Terminology used throughout (and written into `CONTEXT.md`, §8): **`Claim`** is the immutable object;
 **`Claim.token`** is its value; **`claim_token`** names the `Job.claim_token` DB column (and, in the "today" columns/quotes below, the existing local
@@ -239,7 +241,16 @@ issues a refresh `SELECT` (and on a dead connection the message formatting could
 | `lock_job` `JobLost` | SELECT, UPDATE, SELECT | UPDATE |
 
 Keeping `job.id` would preserve a latent masking bug, so the deltas are accepted, pinned by test 9 and expected
-exactly so in the differential (§6). A third, separate behavior difference is the unpinned-fallback type lookup
+exactly so in the differential (§6).
+
+Two consequences the differential (§10) measured, both the same expired-instance cause and both behavior-neutral:
+(a) a `JobLost` from `heartbeat()`/`lock_job()` loses the message's refresh `SELECT` even without an earlier mid-body
+rollback, because `JobLost`'s own `db.rollback()` expires the instance and the old message read `job.id` afterwards;
+(b) when a body calls `lock_job()` after a mid-body rollback and then returns without anything else touching `job`, the
+instance is still expired at `run()`'s ORM mirror of the done-stamp (`job.status = done; …; db.commit()`), so the
+`SELECT` that `lock_job()` no longer issues happens at that final flush instead, and that mirror `UPDATE` then includes
+`error = NULL` (on the freshly refreshed instance of the old code `error` was already `None`, so it was not a change).
+The net statement count is unchanged and the value written is `None` either way. A third, separate behavior difference is the unpinned-fallback type lookup
 (§4.1), which exists only for `Job`s that did not come through `job_task`.
 
 ## 6. Test strategy and acceptance
@@ -277,7 +288,7 @@ The same applies to every mutation run and to the SQL differential.
 
 ### Step 2 (commit 2) — allowed edits to existing tests
 Existing tests may change only in (a) call arguments/keywords, (b) comment/docstring text, (c) helper additions;
-**no behavior assertion changes**. Check: `git diff -U0 HEAD~1..HEAD -- tests/ | grep '^-.*\(assert\|pytest.raises\)'`
+**no behavior assertion changes**. Check: `git diff -U0 origin/main...HEAD -- tests/test_job_lifecycle.py tests/test_r3_proposed.py tests/test_r4_gaps.py | grep '^-.*\(assert\|pytest.raises\)'`
 (removed lines only) is empty for the step-2 commit, plus a manual read of every `+` line inside a modified hunk.
 Enumerated edits: `_fail_interrupted(…)` at `:1767, 1823, 1853` (`claim=<claim>`); `_fail_rejected_retry(…, claim=None)`
 at `:1785` and `test_r4_gaps.py:198, 205` (they must keep calling `_fail_rejected_retry`, not `_fail_unclaimed`,
@@ -290,6 +301,8 @@ imports it from there, so there is no circular import) and builds a `Claim` from
 row, with the owner pair from `JOB_IN_FLIGHT[job.type.value]`.
 
 ### Mutation re-run (against the final code of each commit; apply, the named test must fail, revert)
+All `test_job_lifecycle.py`/`test_r3_proposed.py`/`test_r4_gaps.py` line numbers in this section are those at `origin/main` (the edited files
+are slightly longer or shorter; refer to the tests by name).
 | # | Mutant | Must be killed by |
 |---|---|---|
 | M1 | `_advance` ignores the claim's token (no `claim_token` predicate) | zombie tests for heartbeat / lock_job / done-stamp (`test_job_lifecycle.py` L2042–2160) |
@@ -437,4 +450,26 @@ None.
 
 ## 10. Implementation record
 
-(Filled in when implemented: SQL differential result, mutation results, review rounds.)
+Commits on branch `refactor/job-claim`: commit 1 `9118970` (step 1) and commit 2 (step 2 + docs; `git log`).
+
+**Commit 1 acceptance.** `git diff --diff-filter=MD --name-only origin/main -- tests/` empty; default suite 2690 passed,
+3 skipped, 1 deselected (2663 + 30 new); `ruff check --select F,E9 .` clean; mutations M1–M12, M14–M16 (and M5/M6/M8/M9
+on the unchanged shims) each killed by the named test.
+
+**Commit 2 acceptance.** Default suite 2760 passed, 3 skipped, 1 deselected (`tests/test_job_claim.py` has 100 tests, after the implementation-review rounds added the owner-kind/owner-state split, job-id≠token coverage, the in-memory mirror assertion, a render-job `for_loaded_job` case and the owned-Reject dead-connection test);
+`git diff -U0 origin/main...HEAD -- tests/test_job_lifecycle.py tests/test_r3_proposed.py tests/test_r4_gaps.py | grep '^-.*\(assert\|pytest.raises\)'` empty (restricted to the three pre-existing files: the only other removed assertion line is this branch's own commit-1 guard test, replaced by a module-level assertion in `tests/test_job_claim.py`); ruff clean. The existing-test edits were
+exactly the enumerated ones (§6); one commit-1 test was removed and four changed: the redundant wrong-tree test (replaced by the module-level assertion), `test_advance_resolves_the_module_level_advance_at_call_time` (its spy signature moved from `token=` to `claim=`; the assertion line is unchanged), and three strengthened by the review rounds (the render-job `for_loaded_job` case, and the extra `in_transaction` and in-memory-mirror assertions in the unpinned tests). Mutations M1–M16, the M13
+variants (each consistency check removed in turn, and a `_settle_failure` that checks only in the not-committed
+branch), defaulted-`claim` mutants on every lifecycle function and on a `Claim` field, a fenced `_fail_unclaimed`, and a
+bulk `Job` update added outside `_advance`: all killed (40 mutants, none survived).
+
+**SQL differential** (26 scenarios incl. the ledger set, render-typed variants, zombie endings, `JobLost` with and
+without a prior rollback; statements, normalized parameters, begin/commit/rollback order and final rows) on
+`origin/main` (A), commit 1 (B) and the final tree (C): **B = C in all 26**; **A = B = C in 20**; the remaining six are
+exactly the §5 deltas — `heartbeat` after a rollback (SELECT moves after the UPDATE), `lock_job` after a rollback (SELECT
+leaves `lock_job`; it reappears at the done-stamp mirror flush, §5 (b)), and `JobLost` from either function with or without
+a prior rollback (the message SELECT is gone). No UPDATE predicate, SET clause, parameter, commit or rollback changed
+anywhere else.
+
+**Review rounds.** Six spec-review rounds (four personas each; real findings 35 in round 1, then 29 → 26 → 15 → 7 → 6 for
+rounds 2–6, the last round's all LOW wording items) before implementation; the implementation review rounds are recorded in the pull request.

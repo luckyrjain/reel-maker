@@ -1,5 +1,10 @@
 # Implementation plan — the job `Claim`
 
+Status: executed on branch `refactor/job-claim` (commit 1 `9118970`, then the step-2 commit; see `git log`). Outcomes are
+recorded in spec §10, in prose rather than tables; T7 (review loop) and T8 (ship) are tracked in the pull request. The
+task descriptions below are the forward plan as written; the code passes `claim=claim` (not `claim if owned else None`)
+to the recorders, which is equivalent because `claim` is `None` exactly when the run is not owned.
+
 Spec: `docs/specs/2026-11-job-claim-module-design.md` (revision 6, approved). Worktree
 `/Users/luckyjain/Projects/reel-maker-wt-c1`, branch `refactor/job-claim`, base `origin/main` = `6310fcd`.
 Single repository, single PR, **two commits** (spec §3 Q1, Q9). Everything below is sequential: each task
@@ -115,7 +120,7 @@ Push, open the PR (body with the proof commands and results, trailer per repo co
 | Check | When | Command / evidence |
 |---|---|---|
 | No existing test modified/deleted | after T1 | `git diff --diff-filter=MD --name-only origin/main -- tests/` empty |
-| No behavior assertion changed | after T4 | `git diff -U0 HEAD~1..HEAD -- tests/ \| grep '^-.*\(assert\|pytest.raises\)'` empty |
+| No behavior assertion changed | after T4 | `git diff -U0 origin/main...HEAD -- tests/test_job_lifecycle.py tests/test_r3_proposed.py tests/test_r4_gaps.py \| grep '^-.*\(assert\|pytest.raises\)'` empty (the three pre-existing files only) |
 | Suite green | every task | `python -m pytest -q` |
 | Lint | every commit | `ruff check --select F,E9 .` |
 | Mutations M1–M16 | T1 (commit-1 subset), T4/T6 (all) | spec §6 table; results recorded in §10 |

@@ -195,14 +195,15 @@ def test_fail_rejected_retry_leaves_a_job_a_sibling_already_claimed_alone(factor
     job_id, reel_id, cut_id = _make(factory, models.JobType.render, status=models.JobStatus.running,
                                     cut_status=models.CutStatus.rendering)
     db = factory()
-    common._fail_rejected_retry(db, job_id, ConnectionError("broker down"), "cut", "rendering")
+    common._fail_rejected_retry(db, job_id, ConnectionError("broker down"), "cut", "rendering", claim=None)
     job, _, cut = _read(factory, job_id, reel_id, cut_id)
     assert job.status == models.JobStatus.running and cut.status == models.CutStatus.rendering
 
 
 def test_fail_rejected_retry_records_why(factory):
     job_id, reel_id, cut_id = _make(factory, models.JobType.render, cut_status=models.CutStatus.rendering)
-    common._fail_rejected_retry(factory(), job_id, ConnectionError("broker down"), "cut", "rendering")
+    common._fail_rejected_retry(factory(), job_id, ConnectionError("broker down"), "cut", "rendering",
+                                claim=None)
     job, _, cut = _read(factory, job_id, reel_id, cut_id)
     assert "could not schedule retry" in job.error and "broker down" in job.error
     assert cut.status == models.CutStatus.failed

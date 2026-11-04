@@ -86,27 +86,6 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _advance(db, job_id, from_status, values: dict, token: int | None = None) -> bool:
-    """Compare-and-set the Job's status; False when the row is no longer in from_status.
-
-    Every status transition goes through this, so a worker that lost the job
-    (reaped, or claimed by a sibling) never overwrites the winner's state.
-
-    ``token``, when given, ALSO requires ``Job.claim_token == token`` — the fencing check a
-    resumable job type needs once the reaper can put a `running`-stale job back to `pending`
-    for a second worker to claim: `status='running'` alone stops proving THIS run still owns
-    the row, because a live process whose heartbeat merely stalled can be resumed underneath
-    it. See CLAUDE.md's Key conventions entry on the fencing-token mechanism for which call sites
-    pass a token and why the others (`_fail_job_keep_owner`, the reaper's own resume-CAS) provably
-    don't need one. Owned writes reach this through ``Claim.advance``.
-    """
-    filters = [models.Job.id == job_id, models.Job.status == from_status]
-    if token is not None:
-        filters.append(models.Job.claim_token == token)
-    updated = db.query(models.Job).filter(*filters).update(values, synchronize_session=False)
-    return updated != 0
-
-
 @dataclass(frozen=True, slots=True)
 class Claim:
     """This run's ownership of one Job row. Created once, by job_task, right after the claim write.
@@ -128,7 +107,7 @@ class Claim:
 
         Resolves ``_advance`` as a module global at call time (tests patch ``common._advance``).
         """
-        return _advance(db, self.job_id, from_status, values, token=self.token)
+        return _advance(db, self.job_id, from_status, values, claim=self)
 
     @classmethod
     def for_loaded_job(cls, job) -> "Claim":
@@ -140,6 +119,35 @@ class Claim:
         """
         owner_kind, owner_state = JOB_IN_FLIGHT[job.type.value]
         return cls(job.id, job.claim_token, owner_kind, owner_state)
+
+
+def _advance(db, job_id, from_status, values: dict, *, claim: Claim | None) -> bool:
+    """Compare-and-set the Job's status; False when the row is no longer in from_status.
+
+    Every status transition goes through this, so a worker that lost the job
+    (reaped, or claimed by a sibling) never overwrites the winner's state.
+
+    ``claim`` has no default, so a write cannot silently lose its fence by omission. A ``Claim`` ALSO
+    requires ``Job.claim_token == claim.token`` -- the fencing check a resumable job type needs once
+    the reaper can put a `running`-stale job back to `pending` for a second worker to claim:
+    `status='running'` alone stops proving THIS run still owns the row, because a live process whose
+    heartbeat merely stalled can be resumed underneath it. Passing None is the deliberate unfenced
+    write and is spelled out at exactly three places: the claim write itself (it creates the token),
+    ``_fail_job_keep_owner`` (see there) and ``_fail_unclaimed`` (a Job this process never claimed).
+    Owned writes reach this through ``Claim.advance`` or, for the failure recorders, through
+    ``_fail_job(..., claim=claim)``. See CLAUDE.md's Key conventions entry on the
+    fencing token for why the reaper's own resume-CAS carries none.
+
+    A claim for another job is a programming error and raises ValueError before anything is written
+    (an explicit raise, not an ``assert``, which ``python -O`` strips).
+    """
+    if claim is not None and claim.job_id != job_id:
+        raise ValueError(f"claim is for job {claim.job_id}, not job {job_id}")
+    filters = [models.Job.id == job_id, models.Job.status == from_status]
+    if claim is not None:
+        filters.append(models.Job.claim_token == claim.token)
+    updated = db.query(models.Job).filter(*filters).update(values, synchronize_session=False)
+    return updated != 0
 
 
 def _claim_of(job) -> Claim:
@@ -312,31 +320,45 @@ def _heartbeat_loop(claim: Claim, stop: threading.Event, max_runtime_s: float) -
 
 
 def _fail_job(db, job_id, from_status, message: str, owner_kind: str, owner_state: str,
-              token: int | None = None) -> bool:
+              *, claim: Claim | None) -> bool:
     """Compare-and-set the Job to failed and free its owner (no commit). False if the job had moved on.
 
-    The one place a job is failed from a state we hold no claim on: a sibling that claimed it,
-    or the reaper that already failed it, makes the CAS lose and leaves job and owner alone.
+    A sibling that claimed the job, or the reaper that already failed it, makes the CAS lose and
+    leaves job and owner alone.
 
-    ``token`` is forwarded to the underlying _advance() call. _settle_failure's non-retriable,
-    already-owned branch and _fail_interrupted pass this run's own claim_token, guarding against a
-    zombie flipping a RESUMED run's row out from under it. _fail_rejected_retry also passes its own
-    claim_token when owned (the retry-reset just before it succeeded under that same token, so the
-    job was still this run's at that point) — even though the resulting window before the CAS below
-    runs is narrow (nothing re-claims a `pending` job with no message ever sent for it), fencing it
-    matches every other post-claim CAS in this file rather than leaving one exception to explain.
-    fail_unenqueued and _settle_failure's own not-owned branch keep passing none: neither ever
-    captured a claim_token for this run in the first place (fail_unenqueued's job was never even
-    claimed by this process; the not-owned branch runs before any claim exists to guard).
+    ``claim`` is forwarded to the underlying _advance() call. _settle_failure's non-retriable,
+    already-owned branch and _fail_interrupted pass this run's own Claim, guarding against a zombie
+    flipping a RESUMED run's row out from under it. _fail_rejected_retry also passes its own Claim
+    when owned (the retry-reset just before it succeeded under that same token, so the job was still
+    this run's at that point) — even though the resulting window before the CAS below runs is narrow
+    (nothing re-claims a `pending` job with no message ever sent for it), fencing it matches every
+    other post-claim CAS in this file rather than leaving one exception to explain. A job this
+    process never claimed (fail_unenqueued, _settle_failure's and _fail_rejected_retry's not-owned
+    branches) has no Claim to carry and goes through ``_fail_unclaimed`` instead.
+
+    The owner pair duplicates the Claim's, so a mismatch is a programming error: it raises ValueError
+    as the FIRST statement, before anything is written. (The job id is checked once, by _advance.)
     """
+    if claim is not None and (claim.owner_kind, claim.owner_state) != (owner_kind, owner_state):
+        raise ValueError(f"claim owns {claim.owner_kind}/{claim.owner_state}, not {owner_kind}/{owner_state}")
     if not _advance(db, job_id, from_status, {"status": models.JobStatus.failed, "error": message[:2000]},
-                    token=token):
+                    claim=claim):
         return False
     job = db.get(models.Job, job_id)
     job.status = models.JobStatus.failed   # mirror the CAS onto the loaded object
     job.error = message[:2000]
     rollback_owner(db, job, owner_kind, {owner_state})
     return True
+
+
+def _fail_unclaimed(db, job_id, from_status, message: str, owner_kind: str, owner_state: str) -> bool:
+    """``_fail_job`` for a Job this process never claimed: no Claim exists, so none is taken.
+
+    The one place a job is failed from a state we hold no claim on (fail_unenqueued; the not-owned
+    branches of _settle_failure and _fail_rejected_retry), and one of the only three places an
+    unfenced ``_advance`` is spelled out (see ``_advance``).
+    """
+    return _fail_job(db, job_id, from_status, message, owner_kind, owner_state, claim=None)
 
 
 def _commit_or_log(db, job_id, context: str) -> None:
@@ -482,24 +504,30 @@ def _recover_from_hook_failure(db, job_id, message: str, nested) -> bool:
     return True
 
 
-def _settle_failure(self, db, job_id, exc, *, owned, committed, owner_kind, owner_state,
-                    result, after_commit_failed, max_runtime_s, token: int | None = None) -> bool:
+def _settle_failure(self, db, job_id, exc, *, claim: Claim | None, committed, owner_kind, owner_state,
+                    result, after_commit_failed, max_runtime_s) -> bool:
     """Record a failure. True when the caller should raise ``self.retry()``.
 
     Every write is a compare-and-set on Job.status, so a run that lost its job (reaped, or
     claimed by a sibling) leaves both the job and its owner alone.
 
-    ``token`` fences the two CAS sites below that are reachable by a run that has NOT yet had
-    its own claim_token checked by heartbeat()/lock_job()/the done-stamp — the retry-reset branch
-    and the fail-CAS (via _fail_job) — because a body can raise straight into this function
-    without ever calling either of those first. Without gating these two as well, a zombie
+    ``claim`` is this run's Claim, or None for a run that never claimed its job (``owned`` below is
+    exactly ``claim is not None``). It fences the two CAS sites below that are reachable by a run
+    that has NOT yet had its own token checked by heartbeat()/lock_job()/the done-stamp — the
+    retry-reset branch and the fail-CAS (via _fail_job) — because a body can raise straight into this
+    function without ever calling either of those first. Without gating these two as well, a zombie
     reaching this function after a resume has landed underneath it could still bounce the
     RESUMED run's row back to `pending` (and schedule a THIRD concurrent execution via its own
     self.retry()) or straight to `failed` (discarding the resumed run's still-in-progress or
     already-completed work) — reopening the exact concurrent-execution hazard the token exists
-    to close, through a door neither of those two functions covers. `token` is only ever
-    non-None when `owned` is True: an unclaimed run never captured a claim_token, and its
-    existing (unchanged) behavior needs none, since it was never the row's owner to begin with.
+    to close, through a door neither of those two functions covers. An unclaimed run never held a
+    token, and its existing (unchanged) behavior needs none, since it was never the row's owner to
+    begin with.
+
+    ``job_id`` and the owner pair duplicate the Claim's, so they are checked against it (ValueError)
+    before any branch runs: the retriable path writes through ``claim.advance`` (which uses
+    ``claim.job_id``) and the ``committed`` path never reaches ``_advance`` with the claim at all, so
+    neither would catch a mismatch by itself.
 
     Not routed through `_finalize_or_reconnect`: that helper exists for the three terminal
     recorders that have no caller left to fall back on if they fail. This one is the hot,
@@ -512,6 +540,12 @@ def _settle_failure(self, db, job_id, exc, *, owned, committed, owner_kind, owne
     reconnect-retry here would give this path faster recovery than it has today; that's a
     reasonable future improvement, not something this function currently does.
     """
+    owned = claim is not None
+    if owned:
+        if claim.job_id != job_id:
+            raise ValueError(f"claim is for job {claim.job_id}, not job {job_id}")
+        if (claim.owner_kind, claim.owner_state) != (owner_kind, owner_state):
+            raise ValueError(f"claim owns {claim.owner_kind}/{claim.owner_state}, not {owner_kind}/{owner_state}")
     db.rollback()
     db.expire_all()   # rollback() is a no-op when no transaction is open; never trust cached rows
     message = _describe(exc, max_runtime_s)
@@ -522,21 +556,22 @@ def _settle_failure(self, db, job_id, exc, *, owned, committed, owner_kind, owne
         # Never claimed and never retried again: no message will come back for this job, so fail it
         # now instead of leaving it pending (and its owner in flight) for the reaper. If a sibling
         # did claim it, the CAS loses and it is left alone.
-        _fail_job(db, job_id, models.JobStatus.pending, f"could not start: {message}", owner_kind, owner_state)
+        _fail_unclaimed(db, job_id, models.JobStatus.pending, f"could not start: {message}",
+                        owner_kind, owner_state)
         db.commit()
         return False
     if not committed and retriable:
-        ok = _advance(db, job_id, models.JobStatus.running, {
+        ok = claim.advance(db, models.JobStatus.running, {
             "status": models.JobStatus.pending,
             "error": f"transient failure, retry {self.request.retries + 1}: {message}"[:2000],
-        }, token=token)
+        })
         db.commit()
         return ok              # only after the reset is durable
     if committed:
         # The body already ran and its owner state moved on; only the hook knows what to undo.
         _stamp_failed_and_run_cleanup(db, job_id, message, after_commit_failed, result)
     else:
-        _fail_job(db, job_id, models.JobStatus.running, message, owner_kind, owner_state, token=token)
+        _fail_job(db, job_id, models.JobStatus.running, message, owner_kind, owner_state, claim=claim)
     db.commit()
     return False
 
@@ -552,7 +587,10 @@ def _fail_job_keep_owner(db, job_id, message: str) -> bool:
     however it was written, is already durable to the SAVEPOINT before the hook's code runs -- only
     calling this function AFTER the SAVEPOINT had opened would put its write at risk.
     """
-    if not _advance(db, job_id, models.JobStatus.done, {"status": models.JobStatus.failed, "error": message[:2000]}):
+    # Unfenced on purpose: reachable only after this run's own done-stamp CAS matched, so its token was
+    # current at that moment and no superseded run can get here (see CLAUDE.md's fencing-token entry).
+    if not _advance(db, job_id, models.JobStatus.done, {"status": models.JobStatus.failed, "error": message[:2000]},
+                    claim=None):
         return False
     job = db.get(models.Job, job_id)
     job.status = models.JobStatus.failed
@@ -589,7 +627,7 @@ def _finalize_or_reconnect(db, job_id: int, write) -> None:
 
 
 def _fail_interrupted(db, job_id, exc: BaseException, owner_kind: str, owner_state: str,
-                       token: int | None = None) -> None:
+                       *, claim: Claim) -> None:
     """SystemExit / KeyboardInterrupt while the job was running (worker shut down or killed by a
     Celery hard time limit): fail it now. Do NOT hand it back to pending: Celery has already
     acked or dropped the message, so nothing would ever pick a pending job up again.
@@ -598,24 +636,26 @@ def _fail_interrupted(db, job_id, exc: BaseException, owner_kind: str, owner_sta
     calls are (a graceful shutdown signal, e.g. SIGTERM before a hard time limit's SIGKILL, is a
     real, catchable-in-Python event this codebase already treats as first-class -- not the SIGKILL
     case this whole design's resume mechanism is built around). Always called with owned=True (the
-    one caller in job_task's run() only invokes this `if owned and not committed`), so `token` is
-    always this run's own claim_token here -- without it, a zombie superseded by a resumed claim
-    could still flip the RESUMED run's row to failed and roll back its owner on its way out."""
+    one caller in job_task's run() only invokes this `if owned and not committed`), so ``claim`` is
+    always this run's own Claim here and has no None case -- without it, a zombie superseded by a
+    resumed claim could still flip the RESUMED run's row to failed and roll back its owner on its way out."""
     message = (f"Worker was shut down while the job was running ({type(exc).__name__}). "
                "The work was not finished; retry it.")
     _finalize_or_reconnect(db, job_id, lambda s, jid: _fail_job(
-        s, jid, models.JobStatus.running, message, owner_kind, owner_state, token=token))
+        s, jid, models.JobStatus.running, message, owner_kind, owner_state, claim=claim))
 
 
-def _fail_rejected_retry(db, job_id, exc, owner_kind, owner_state, token: int | None = None) -> None:
+def _fail_rejected_retry(db, job_id, exc, owner_kind, owner_state, *, claim: Claim | None) -> None:
     """The broker refused the retry message (Reject): it is dropped, so fail the job now
     rather than leaving it pending until the reaper's pending threshold.
 
-    ``token`` is this run's own claim_token when it owned the job (None otherwise), forwarded to
-    _fail_job's CAS -- see _fail_job's own docstring for why this call passes one at all."""
+    ``claim`` is this run's own Claim when it owned the job, forwarded to _fail_job's CAS -- see
+    _fail_job's own docstring for why this call passes one at all -- or None when the run never
+    claimed it (a Reject on a pre-claim retry), which goes through ``_fail_unclaimed`` instead."""
     message = f"could not schedule retry: {_error_text(exc)}"
-    _finalize_or_reconnect(db, job_id, lambda s, jid: _fail_job(
-        s, jid, models.JobStatus.pending, message, owner_kind, owner_state, token=token))
+    _finalize_or_reconnect(db, job_id, lambda s, jid: (
+        _fail_unclaimed(s, jid, models.JobStatus.pending, message, owner_kind, owner_state) if claim is None
+        else _fail_job(s, jid, models.JobStatus.pending, message, owner_kind, owner_state, claim=claim)))
 
 
 def fail_unenqueued(db, job_id: int, job_type: str, exc: BaseException) -> None:
@@ -633,7 +673,8 @@ def fail_unenqueued(db, job_id: int, job_type: str, exc: BaseException) -> None:
     """
     kind, state = JOB_IN_FLIGHT[job_type]
     message = f"could not enqueue: {_error_text(exc)}"
-    _finalize_or_reconnect(db, job_id, lambda s, jid: _fail_job(s, jid, models.JobStatus.pending, message, kind, state))
+    _finalize_or_reconnect(db, job_id, lambda s, jid: _fail_unclaimed(
+        s, jid, models.JobStatus.pending, message, kind, state))
 
 
 def job_task(
@@ -743,7 +784,7 @@ def job_task(
                 if not _advance(db, job_id, models.JobStatus.pending, {
                     "status": models.JobStatus.running, "heartbeat_at": _now(),
                     "claim_token": models.Job.claim_token + 1,   # SQL-side increment — the fencing counter
-                }):
+                }, claim=None):   # unfenced on purpose: this write CREATES the token
                     db.rollback()
                     return
                 db.commit()
@@ -836,11 +877,10 @@ def job_task(
                 retry = False
                 try:
                     retry = _settle_failure(
-                        self, db, job_id, exc, owned=owned, committed=committed,
+                        self, db, job_id, exc, claim=claim, committed=committed,
                         owner_kind=owner_kind, owner_state=owner_state,
                         result=result, after_commit_failed=after_commit_failed,
                         max_runtime_s=max_runtime_s,
-                        token=(claim.token if owned else None),
                     )
                 except Exception:
                     # Never let a bookkeeping failure replace the real error.
@@ -864,8 +904,7 @@ def job_task(
                         # The same "no message is coming back" reasoning _settle_failure applies to
                         # an unclaimed job with no retries left applies here too.
                         try:
-                            _fail_rejected_retry(db, job_id, exc, owner_kind, owner_state,
-                                                  token=(claim.token if owned else None))
+                            _fail_rejected_retry(db, job_id, exc, owner_kind, owner_state, claim=claim)
                         except Exception:
                             _log.exception("could not fail job %s after a refused retry", job_id)
                         raise
@@ -876,7 +915,7 @@ def job_task(
                 # limit is killing this process. Fail the job now (see _fail_interrupted).
                 if owned and not committed:
                     try:
-                        _fail_interrupted(db, job_id, exc, owner_kind, owner_state, token=claim.token)
+                        _fail_interrupted(db, job_id, exc, owner_kind, owner_state, claim=claim)
                     except Exception:
                         _log.exception("could not fail job %s on shutdown", job_id)
                 raise

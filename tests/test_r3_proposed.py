@@ -283,10 +283,10 @@ def test_a_transient_error_on_the_done_stamp_commit_is_retried_not_treated_as_do
     state = {"stamped": False, "raised": False}
     real_advance = common._advance
 
-    def spy(db, jid, frm, values, token=None):
+    def spy(db, jid, frm, values, *, claim):
         if values.get("status") == models.JobStatus.done:
             state["stamped"] = True
-        return real_advance(db, jid, frm, values, token=token)
+        return real_advance(db, jid, frm, values, claim=claim)
 
     class Flaky(sessionmaker(bind=factory.kw["bind"]).class_):
         def commit(self):
