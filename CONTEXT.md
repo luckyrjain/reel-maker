@@ -16,16 +16,31 @@ behind anything summarized here.
 Surfaced via `/domain-modeling` session on the reaper-resume mechanism (Phase 7f,
 `docs/specs/2026-09-reaper-resume-killed-jobs-system-design.md`).
 
-- **Claim** — the atomic `pending → running` transition a worker performs to take ownership of a `Job`
-  row. `worker/tasks/common.py::job_task`'s `run()`.
-- **Claim token** (`Job.claim_token`) — a monotonically increasing counter bumped via a SQL-side
-  `Job.claim_token + 1` on every claim. Exists because `status` alone stops being a reliable ownership
+- **Claim** — the immutable value (`@dataclass(frozen=True, slots=True)`, `worker/tasks/common.py::Claim`)
+  that is one run's ownership of one `Job` row: `job_id`, `token`, `owner_kind`, `owner_state`, no field
+  with a default. Created exactly once per run, by `job_task`'s `run()` right after the **claim write**,
+  and pinned onto the `Job` as `job._claim`. Identity only: run phase (`owned`, `committed`, `result`)
+  deliberately stays in `job_task`. The fenced write is `_advance(..., claim=<Claim>)`; `Claim.advance(db, from_status, values)` is its shorthand.
+  (Phase 8f; before it, the token and these three other facts travelled as loose parameters. Not to be
+  confused with the **claim write**, which this word used to name.)
+- **Claim write** — the atomic `pending → running` transition a worker performs to take ownership of a
+  `Job` row (`UPDATE ... WHERE status = 'pending'`, also bumping `claim_token`); the write that
+  *creates* a token, so it cannot be fenced by it (the other unfenced writes are listed under **Fencing**). `worker/tasks/common.py::job_task`'s
+  `run()`, `_advance(..., claim=None)`.
+- **Claim token** (`Claim.token`, mirrored in the DB column `Job.claim_token`) — a monotonically
+  increasing counter bumped via a SQL-side `Job.claim_token + 1` on every claim write; the `Claim` holds
+  the value this run read back from the row once, and never re-reads it. Exists because `status` alone stops being a reliable ownership
   signal once a stale job can be *resumed* (put back to `pending` for a second worker) rather than only
   ever failed — two different runs can both have `status='running'` at different points in time, and
   `claim_token` is what tells "the run that currently owns this row" apart from "a run that used to."
 - **Fencing** — gating a state-changing write (a compare-and-set) on `claim_token == <this run's
   captured token>`, not just `status`. A write from a superseded run fails the CAS even though `status`
-  still superficially matches. `_advance()`, `worker/tasks/common.py`.
+  still superficially matches. `Claim.advance()` is the shorthand for the fenced write; `_advance(db, job_id, from_status,
+  values, *, claim)` (`worker/tasks/common.py`) adds the token predicate when `claim` is not `None`, and
+  `claim` is a required keyword with no default, so a fence cannot be dropped by omission. Eight writes
+  are fenced; the unfenced ones (the claim write, `_fail_job_keep_owner`, `_fail_unclaimed` for a Job
+  this process never claimed) are enumerated and pinned by tests (`tests/test_job_claim.py`); the reaper's two CAS
+  sites and `enrich_context.py::_abandon_generate` are outside that scope (CLAUDE.md, known gaps).
 - **Resume** (reaper resume) — `reap_stuck_jobs()` returning a stale `running` job of a *resumable* type
   (`enrich`, `render`, `generate`) to `pending`, instead of failing it outright. Bounded by a per-type
   **resume budget** (`enrich`/`render`: 2, `generate`: 1, deliberately lower). `publish` is structurally
@@ -35,14 +50,16 @@ Surfaced via `/domain-modeling` session on the reaper-resume mechanism (Phase 7f
   a resume (and a second worker's subsequent claim). Fenced off at its *next* heartbeat/lock/CAS
   checkpoint (bounded wasted work), not immediately — this is the central property the fencing-token
   mechanism exists to guarantee.
-- **`job._run_claim_token`** — a plain, unmapped instance attribute (not an ORM column) pinning a run's
-  own captured token across mid-run `db.rollback()` calls, which otherwise expire the mapped
-  `job.claim_token` and silently resync a naive re-read to whatever (possibly fresher, superseding)
-  value the row holds now.
+- **`job._claim`** — a plain, unmapped instance attribute (not an ORM column) pinning the run's `Claim`
+  (and with it its captured token) across mid-run `db.rollback()` calls, which otherwise expire the
+  mapped `job.claim_token` and silently resync a naive re-read to whatever (possibly fresher,
+  superseding) value the row holds now. Read through `_claim_of(job)`. It replaced the earlier
+  `job._run_claim_token` (a bare int) in Phase 8f.
 
-See CLAUDE.md's own "Fencing token" Key-conventions entry for the full six-checkpoint, three-review-round
-account of how this shipped (each round catching a genuine, distinct correctness gap in the same
-mechanism) and `docs/design.md` §3 for the summary-level why.
+See CLAUDE.md's own "Fencing token" Key-conventions entry for the full account of how this shipped and
+grew (a first design review and a second round that each caught a genuine, distinct gap in the same
+mechanism, then later gaps through Phase 8f's `Claim`, which turned "remember to fence every write" into
+a signature, a behavioral ledger and an AST guard) and `docs/design.md` §3 for the summary-level why.
 
 **Related but distinct** — don't conflate with the *publish-time* staleness gates
 (`Cut.rendered_pins_fingerprint` / `rendered_guide_fingerprint`, Phase 7e/7m): those fence a re-render
