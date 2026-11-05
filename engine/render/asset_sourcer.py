@@ -1,30 +1,23 @@
 import hashlib
-import io
-import ipaddress
 import logging
 import math
 import os
 import re
-import socket
-import threading
+import sys
 import time
+import types
 import urllib.parse
-import urllib.request
 import uuid
-import warnings
-import zlib
-from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
-import httpx
 from celery.exceptions import SoftTimeLimitExceeded
 
 from api import models
 from api.config import settings
 from engine.names import person_names
 from engine.observability import record_stage
+from engine.render import media_policy, safe_fetch
 from engine.render.pricing import hf_image_cost_usd, hf_video_cost_usd
 
 _log = logging.getLogger(__name__)
@@ -86,825 +79,32 @@ def _atomic_write(path: Path, data: bytes) -> None:
         raise
 
 
-# ── guarded downloads ────────────────────────────────────────────────────────
-# Download URLs (Pexels `link`, Wikipedia `originalimage`/`thumbnail` `source`) come straight from
-# remote JSON, so a tampered or compromised upstream response could otherwise point the worker at
-# any URL (blind SSRF) or hand it an unbounded body. Every download is https-only to an expected
-# host, re-checked on each redirect hop (httpx is never asked to follow redirects itself), and
-# size-capped.
-
+# ── what the adapters ask of the fetch layer ───────────────────────────────
+# The mechanism (URL guards, redirects, caps, deadlines, watchdog, asset budget) is in `engine.render.safe_fetch`;
+# the limits below are the adapters' own request of it. Byte limits, given to `safe_fetch.iter_capped`:
 _MAX_VIDEO_BYTES = 250 * 1024 * 1024   # FHD portrait Pexels clips are tens of MB
 _MAX_IMAGE_BYTES = 50 * 1024 * 1024    # Wikipedia originals are rarely over ~20 MB
-# The byte cap says nothing about declared PIXELS: a 140 KB PNG can declare 12000x12000, and the compositor's
-# `Image.open(...).convert("RGB")` then allocates ~430 MB. 50 Mpx is ~7000x7000, far past any photo used here.
-_MAX_IMAGE_PIXELS = 50_000_000
-# A non-JPEG image has no cheap partial decode: checking one for truncation, or shrinking it, means decoding
-# it at full size. That is bounded in BYTES, not just pixels, because formats differ a lot (peak RSS measured
-# on 79 Mpx inputs: PNG ~7 B/px, TIFF ~6, lossy / lossless / animated WebP ~12-17 at 25 Mpx, hence the 20): `_MAX_DECODE_BYTES` divided by a
-# per-format bytes-per-pixel estimate is that format's pixel cap (`_pixel_cap`), and an image over it is
-# refused or, for the formats that allow it, downscaled. `_MAX_FULL_DECODE_PIXELS` is the further ceiling on
-# what is decoded to be downscaled. A JPEG is decoded at 1/2-1/8 scale (DCT scaling) instead and is bound
-# only by `_MAX_IMAGE_PIXELS` and Pillow's own bomb limit.
-_MAX_FULL_DECODE_PIXELS = 80_000_000
-_MAX_DECODE_BYTES = 400_000_000
-# Downscaling an over-cap image is a one-off decode per original (not on every cache hit), so it may use a
-# larger budget than the check: with the defaults PNG / TIFF / GIF between 50 and 75 Mpx and WebP between 20
-# and 30 Mpx are downscaled (peak RSS ~7 / ~6 / ~12-17 B/px: <= ~520 MB for a 75 Mpx PNG). Above that
-# they are refused and remembered. Without a window larger than the cap the downscale could never run.
-_MAX_DOWNSCALE_DECODE_BYTES = 600_000_000
-_DECODE_BYTES_PER_PIXEL = {"WEBP": 20}
-_DEFAULT_DECODE_BYTES_PER_PIXEL = 8
-_JPEG_FORMATS = ("JPEG", "MPO")            # an MPO is a JPEG with extra frames: same DCT-scaled decode
-# libtiff allocates a TILE-sized buffer (TileWidth x TileLength) whatever the declared image size: a 100x100
-# TIFF declaring 25000x25000 tiles made `load()` allocate ~1 GB, so the pixel caps above do not bound it.
-_MAX_TIFF_TILE_SIDE = 4096
-_MAX_API_JSON_BYTES = 8 * 1024 * 1024   # Pexels search / Wikipedia lookups are a few KB; refuse to parse more
-_MAX_REDIRECTS = 3
-_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
-# httpx timeouts are per read, so a server that trickles never trips them: each download also gets a
-# wall-clock budget, shared by its redirect hops / 429 retry. It is enforced in three places: before
-# every hop (`_open_download`), after every network read (`_iter_capped`), and by a `_Watchdog` that
-# shuts the socket down when the budget runs out -- the only thing that can interrupt a read blocked
-# on a server dripping response headers or a chunked-encoding size line, where httpx yields nothing for
-# the other two to check. Each hop's httpx timeout is also clamped to the time left (see
-# `_HOP_TIMEOUT_GRACE_S`), which bounds the TCP connect / TLS handshake before the watchdog exists, and
-# each search() has one overall budget (below), and the host's DNS lookup is given at most that long
-# (`_dns_in_time`; getaddrinfo takes no timeout). The API calls are streamed and capped while they are
-# read (`_api_call`), and a render's total is bounded by `asset_budget()` (below). SoftTimeLimitExceeded
-# raised in ANY network call of this module is re-raised (it ends the task), never swallowed as a failed
-# download.
+# Per-download wall-clock budgets, turned into the `deadline_at` given to `safe_fetch.open_download`:
 _VIDEO_DEADLINE_S = 600.0
 _IMAGE_DEADLINE_S = 120.0
+# Per-search budgets (the adapters' own; `safe_fetch.clip_to_asset_budget` clips them to the render's budget).
 # One budget per search() call, so the per-download budgets of its hits/candidates cannot add up (a
 # Pexels search tries up to 15 hits, a Wikipedia search 2 candidates). A download's own budget is
 # clipped to what is left of it, and no further download is started once it is spent.
 _PEXELS_SEARCH_BUDGET_S = 900.0
 _WIKI_SEARCH_BUDGET_S = 240.0
-_monotonic = time.monotonic     # indirection so tests can drive a fake clock
-
-# One budget for a whole render's asset sourcing. The per-search budgets above can still add up across a
-# render's beats unless something bounds the sum: `asset_budget()` sets a deadline that every search()
-# inside it is clipped to, after which no download starts and no HuggingFace generation is requested
-# (a cached file, Pexels / Wikipedia / HuggingFace alike, is still served). It gates the START of
-# downloads and paid calls only: the small API calls (search / summary / license lookups, the 429 retry
-# sleep) and anything already in flight are not interrupted. `render_cut` wraps each beat's asset
-# resolution in it, with the time left out of `RENDER_ASSET_BUDGET_S`. Unset (the default) changes nothing.
-RENDER_ASSET_BUDGET_S = 1200.0
-_asset_deadline_at: ContextVar["float | None"] = ContextVar("asset_deadline_at", default=None)
-
-
-@contextmanager
-def asset_budget(seconds: float):
-    """Bound the asset sourcing done inside this block to `seconds` of wall clock (nesting only tightens)."""
-    deadline = _monotonic() + seconds
-    outer = _asset_deadline_at.get()
-    token = _asset_deadline_at.set(deadline if outer is None else min(deadline, outer))
-    try:
-        yield
-    finally:
-        _asset_deadline_at.reset(token)
-
-
-def _clip_to_asset_budget(deadline_at: float) -> float:
-    """`deadline_at`, or the active asset budget's deadline if that is sooner (no clock reading either way)."""
-    budget = _asset_deadline_at.get()
-    return deadline_at if budget is None else min(deadline_at, budget)
-
-
-def _asset_budget_spent() -> bool:
-    budget = _asset_deadline_at.get()
-    return budget is not None and _monotonic() >= budget
-# Per hop, httpx's own timeout is clamped to the budget that is left plus this grace: it bounds the TCP
-# connect and TLS handshake (before the watchdog exists) and one read that would outlive the budget,
-# while the watchdog -- exact, but only armed once connected -- still wins when the connection is up.
-# DNS is gated separately (`_dns_in_time`), with this same hop timeout.
-_HOP_TIMEOUT_GRACE_S = 1.0
-
-
-_HOST_RE = re.compile(r"[a-z0-9.-]+")
-
-
-def _https_host(url) -> "str | None":
-    """Lowercased host of an https URL on the default port with no userinfo, else None.
-
-    Deliberately stricter than urlsplit: it silently strips tab/CR/LF and accepts hosts that httpx
-    (the parser that actually connects) rejects or reads differently, so a URL with any whitespace,
-    control character or backslash is refused outright and the host must be plain `[a-z0-9.-]`.
-    """
-    if not isinstance(url, str) or any(c.isspace() or c == "\\" or ord(c) < 0x20 or ord(c) == 0x7F for c in url):
-        return None
-    try:
-        parts = urllib.parse.urlsplit(url)
-        port = parts.port
-    except ValueError:
-        return None
-    if parts.scheme != "https" or parts.username is not None or parts.password is not None:
-        return None
-    if port not in (None, 443):
-        return None
-    if not parts.netloc.isascii():      # hostname.lower() would map e.g. U+212A (Kelvin) to "k"
-        return None
-    host = (parts.hostname or "").lower()
-    return host if _HOST_RE.fullmatch(host) else None
 
 
 def _pexels_url_ok(url) -> bool:
     """`*.pexels.com` (videos.pexels.com serves the files), not the apex or a look-alike."""
-    host = _https_host(url)
+    host = safe_fetch.https_host(url)
     return host is not None and host.endswith(".pexels.com") and host != ".pexels.com" \
         and ".." not in host
 
 
 def _wikimedia_url_ok(url) -> bool:
     """upload.wikimedia.org: the image CDN both `originalimage` and `thumbnail` point at."""
-    return _https_host(url) == "upload.wikimedia.org"
-
-
-def _host_for_log(url) -> str:
-    """Host of `url` for a log line: a short plain `[a-z0-9.-]` host, else "?".
-
-    Never the path, query or userinfo (tokens), and never raw control characters or an unbounded
-    string from a hostile upstream.
-    """
-    if not isinstance(url, str):
-        return "?"
-    try:
-        host = urllib.parse.urlsplit(url).hostname or ""       # already lower-cased by urlsplit
-    except ValueError:
-        return "?"
-    return host if len(host) <= 253 and _HOST_RE.fullmatch(host) else "?"
-
-
-@contextmanager
-def _http_stream(method, url, *, extensions=None, **kwargs):
-    """`httpx.stream()` plus the `extensions` parameter it lacks (needed for the connect-time trace).
-
-    A module-level seam so tests can substitute the transport; same call shape as `httpx.stream`.
-    """
-    with httpx.Client() as client:
-        with client.stream(method, url, extensions=extensions, **kwargs) as response:
-            yield response
-
-
-class _Watchdog:
-    """Shuts a download's connection down once its wall-clock budget is spent.
-
-    httpx timeouts are per read, and the deadline checks in `_open_download`/`_iter_capped` only run
-    when httpx hands back a response or a body chunk; a server dripping response headers, a chunked
-    size line / extension, or a TLS handshake produces none of those, so nothing else can interrupt
-    that blocked read. `trace` (the request's `trace` extension) arms it on httpcore's
-    `connection.connect_tcp.complete` event: the raw socket exists before any response does, and
-    a `dup()` of it is kept, not the socket itself -- for HTTPS (every allowlisted host) httpcore
-    next wraps the socket in TLS, which *detaches* the original object (fileno -1), so shutting that
-    down would silently do nothing. `shutdown()` acts on the connection, not the descriptor, so the
-    dup still breaks a blocked read in any phase. `cancel()` it when the hop ends. When it fires,
-    `fired` is True: the caller must treat the download as failed even if the read ended *cleanly*
-    (a close-delimited body reads a shutdown as a valid EOF).
-    """
-
-    def __init__(self, deadline_at: "float | None"):
-        self._deadline_at = deadline_at
-        self._lock = threading.Lock()
-        self._timer: "threading.Timer | None" = None
-        self._sock: "socket.socket | None" = None
-        self.fired = False
-
-    def trace(self, event_name: str, info: dict) -> None:
-        if self._deadline_at is None or self._timer is not None:
-            return
-        if event_name != "connection.connect_tcp.complete":
-            return
-        try:
-            raw = info["return_value"].get_extra_info("socket")
-            if not isinstance(raw, socket.socket):
-                return
-            dup = raw.dup()
-        except SoftTimeLimitExceeded:
-            raise                                   # a few microseconds wide, but the task is out of time
-        except Exception:                                   # noqa: BLE001 - never break the request
-            return
-        timer = threading.Timer(max(self._deadline_at - _monotonic(), 0.0), self._fire)
-        timer.daemon = True
-        with self._lock:
-            self._sock, self._timer = dup, timer
-        timer.start()
-
-    def _fire(self) -> None:
-        with self._lock:                                    # cancel() closes the dup under this lock
-            if self._sock is None:
-                return
-            self.fired = True                               # before the shutdown: the read thread may
-            try:                                            # see the error the instant it returns
-                self._sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                self.fired = False                          # nothing was closed; do not claim it was
-
-    def cancel(self) -> None:
-        with self._lock:
-            timer, sock, self._sock = self._timer, self._sock, None
-        if timer is not None:
-            timer.cancel()
-        if sock is not None:
-            try:
-                sock.close()
-            except OSError:
-                pass
-
-
-def _dns_in_time(host: str, port: int, timeout: float) -> bool:
-    """False only if resolving `host` is still pending after `timeout` seconds.
-
-    `socket.getaddrinfo` takes no timeout, so neither httpx's connect/read timeouts nor the watchdog
-    (which needs a connection) bound a stalled resolver. The lookup runs on a daemon thread (a hung
-    getaddrinfo cannot be cancelled, so it is simply abandoned and must not block interpreter exit)
-    and is waited on for at most `timeout`. A resolution that FAILS counts as in time: reporting it is
-    httpx's job. Skipped (True) for IP literals and when an environment proxy is configured, because
-    the proxy then resolves the name. This is a gate, not a guarantee: httpx resolves again when it
-    connects (normally an OS-cache hit); a resolver that answers once and then stalls is not covered.
-    """
-    try:
-        ipaddress.ip_address(host)
-        return True
-    except ValueError:
-        pass
-    env = urllib.request.getproxies_environment()
-    if any(env.get(k) for k in ("all", "https", "http")):
-        return True
-    done = threading.Event()
-
-    def resolve():
-        try:
-            socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-        except Exception:                                   # noqa: BLE001 - httpx reports a failed lookup
-            pass
-        finally:
-            done.set()
-
-    threading.Thread(target=resolve, daemon=True, name="sourcer-dns").start()
-    return done.wait(timeout)
-
-
-@contextmanager
-def _open_download(url: str, url_ok, *, timeout: float, headers: dict | None = None,
-                   deadline_at: "float | None" = None, method: str = "GET", params=None, json=None,
-                   follow_redirects: bool = True):
-    """Stream a request to `url` (GET by default), following redirects by hand so every hop is checked by `url_ok`.
-
-    `method`/`params`/`json` are for the API calls (`_api_call`); `follow_redirects=False` yields a
-    redirect response to the caller as it is (the API calls never follow one).
-
-    Raises ValueError for a disallowed URL (first or redirected), a redirect with no Location, or
-    more than `_MAX_REDIRECTS` hops, if the wall-clock `deadline_at` has passed before a hop, or if a
-    `_Watchdog` had to close the connection at the deadline. Yields the final (non-redirect) response;
-    the caller still owns `raise_for_status()` and the status handling. With a `deadline_at`, each hop's
-    httpx timeout is clamped to the time left (+ `_HOP_TIMEOUT_GRACE_S`) and its host's DNS lookup is
-    given at most that long (`_dns_in_time`). `Accept-Encoding: identity` is always sent
-    (media is not worth compressing, and a gzip body would inflate far past its Content-Length
-    before the size cap could see it); `_iter_capped` rejects a response that is encoded anyway --
-    except for `_api_call`, which reads gzip / deflate RAW and inflates it under its own cap.
-    """
-    kwargs = {
-        "follow_redirects": False,
-        "timeout": timeout,
-        "headers": {**(headers or {}), "Accept-Encoding": "identity"},
-    }
-    if params is not None:
-        kwargs["params"] = params
-    if json is not None:
-        kwargs["json"] = json
-    for _ in range(_MAX_REDIRECTS + 1):
-        hop_kwargs = kwargs
-        if deadline_at is not None:
-            now = _monotonic()                              # one reading: the check and the clamp
-            if now > deadline_at:
-                raise ValueError("download too slow: deadline exceeded before the request")
-            hop_kwargs = {**kwargs, "timeout": min(timeout, deadline_at - now + _HOP_TIMEOUT_GRACE_S)}
-        if not url_ok(url):
-            _log.warning("Refusing download from a disallowed URL (host %s)", _host_for_log(url))
-            raise ValueError(f"download URL not allowed: {url!r}")
-        if deadline_at is not None and not _dns_in_time(
-                urllib.parse.urlsplit(url).hostname or "", 443, hop_kwargs["timeout"]):
-            _log.warning("DNS resolution for %s did not finish in time; giving up on the download",
-                         _host_for_log(url))
-            raise ValueError("download too slow: DNS resolution did not finish in time")
-        guard = _Watchdog(deadline_at)
-        try:
-            with _http_stream(method, url, extensions={"trace": guard.trace}, **hop_kwargs) as r:
-                if not follow_redirects or r.status_code not in _REDIRECT_STATUSES:
-                    yield r
-                    if guard.fired:
-                        # the body ended "cleanly" only because we shut the connection down (a
-                        # close-delimited body reads that as EOF): it is truncated, never a success
-                        raise ValueError("download too slow: deadline exceeded (connection closed)")
-                    return
-                location = r.headers.get("location")
-        except SoftTimeLimitExceeded:
-            raise
-        except Exception as exc:
-            if guard.fired:
-                _log.warning("Download from %s exceeded its deadline; connection closed", _host_for_log(url))
-                raise ValueError("download too slow: deadline exceeded (connection closed)") from exc
-            raise
-        finally:
-            guard.cancel()
-        if not location or not isinstance(location, str):
-            raise ValueError(f"redirect without a Location from {url!r}")
-        url = urllib.parse.urljoin(url, location)
-    raise ValueError("too many redirects")
-
-
-_API_MIN_DEADLINE_S = 30.0
-_API_DECODABLE_ENCODINGS = ("gzip", "x-gzip", "deflate")
-_API_DROPPED_HEADERS = ("content-encoding", "content-length", "transfer-encoding")
-
-
-def _content_encoding(headers) -> str:
-    """The lower-cased Content-Encoding header, or "" (a list like "gzip, gzip" stays as written)."""
-    value = headers.get("content-encoding")
-    return value.strip().lower() if isinstance(value, str) else ""
-
-
-def _decode_bounded(raw: bytes, encoding: str, limit: int) -> bytes:
-    """Inflate a gzip / deflate body, refusing (`_TooLarge`) as soon as the OUTPUT passes `limit`.
-
-    httpx's own decoder would inflate the whole thing before any cap could look at it (a few KB of gzip
-    is gigabytes of zeros), so the body is read raw and inflated here in bounded steps. `deflate` is
-    zlib-wrapped in practice but raw deflate exists in the wild, so both are tried. A corrupt or
-    truncated stream raises ValueError.
-    """
-    if not raw:
-        return b""                      # 204 / 304 / empty 200 with an encoding header: nothing to inflate
-    wbits_options = (47,) if encoding in ("gzip", "x-gzip") else (zlib.MAX_WBITS, -zlib.MAX_WBITS)
-    last: Exception | None = None
-    for wbits in wbits_options:
-        d = zlib.decompressobj(wbits)
-        out: list[bytes] = []
-        total = 0
-        data = raw
-        try:
-            while data:
-                chunk = d.decompress(data, 1 << 20)
-                total += len(chunk)
-                if total > limit:
-                    raise _TooLarge(f"download too large: more than {limit} bytes once decoded")
-                out.append(chunk)
-                data = d.unconsumed_tail
-            if not d.eof:
-                raise ValueError("compressed response body is truncated")
-        except zlib.error as exc:
-            last = exc
-            continue
-        return b"".join(out)
-    raise ValueError(f"compressed response body is corrupt: {last}")
-
-
-def _any_https_host(url) -> bool:
-    """URL check for the API calls: https, default port, a plain host. The hosts are constants in this
-    module (not remote-controlled), so unlike the download hosts there is no allowlist to enforce. An IP
-    literal or `localhost` is refused all the same: no API host is one, and it keeps a future variable URL
-    from reaching a metadata endpoint."""
-    host = _https_host(url)
-    if host is not None:
-        host = host.rstrip(".")                 # "localhost." is localhost
-    if not host or host == "localhost" or host.endswith(".localhost"):
-        return False
-    last = host.rsplit(".", 1)[-1]
-    if last.isdigit() or last.startswith("0x"):
-        return False                            # 2130706433, 0x7f.1, 127.1, 017700000001: inet_aton IPv4 forms
-    try:
-        ipaddress.ip_address(host)
-    except ValueError:
-        return True
-    return False
-
-
-def _api_call(method: str, url: str, limit: int, *, headers=None, timeout: float, params=None, json=None,
-              deadline_s: "float | None" = None, url_ok=_any_https_host):
-    """One API request, streamed through `_open_download` and read at most `limit` bytes.
-
-    `httpx.get` / `httpx.post` read the WHOLE body before returning, so a hostile or broken upstream
-    could make the worker buffer gigabytes before any size check ran. Here `Accept-Encoding: identity`
-    is sent; a host that ignores it and answers gzip / deflate anyway is still served -- the body is
-    read raw (capped as sent) and inflated under the same cap (`_decode_bounded`) -- while any other
-    encoding (br, zstd, a stack of them) is refused. No redirect is followed (same as the httpx functions), reading stops with `_TooLarge` as soon as
-    `limit` is crossed, and what was read is returned as a real `httpx.Response` (`.json()`,
-    `.content`, `.headers`, `.raise_for_status()` work as call sites expect).
-
-    The call also has a wall-clock budget (`deadline_s`, default `max(30 s, 2 x timeout)`), because
-    httpx's timeout is per read: a host dripping headers, a chunked size line or the body would
-    otherwise hold the worker for as long as it likes. It gets the same guards as a download -- the
-    per-hop timeout clamp, the DNS gate and the connection `_Watchdog` -- and a spent budget raises
-    `ValueError("download too slow ...")`, which every caller treats like any other failed request.
-    It is NOT clipped to `asset_budget()`: the searches must still run after it is spent so that cached
-    files can be found and served.
-    """
-    if deadline_s is None:
-        deadline_s = max(_API_MIN_DEADLINE_S, 2 * timeout)
-    deadline_at = _monotonic() + deadline_s
-    with _open_download(url, url_ok, timeout=timeout, headers=headers, deadline_at=deadline_at,
-                        method=method, params=params, json=json, follow_redirects=False) as r:
-        if _content_encoding(r.headers) in _API_DECODABLE_ENCODINGS:
-            body = _decode_bounded(b"".join(_iter_capped(r, limit, deadline_at, raw=True)),
-                                   _content_encoding(r.headers), limit)
-        else:
-            body = b"".join(_iter_capped(r, limit, deadline_at))
-        headers = {k: v for k, v in r.headers.items() if k.lower() not in _API_DROPPED_HEADERS}
-        return httpx.Response(r.status_code, headers=headers, content=body,
-                              request=httpx.Request(method, url))
-
-
-def _api_get(url: str, *, limit: int | None = None, **kw):
-    """`httpx.get(url, **kw)` (params/headers/timeout), streamed and capped at `limit` (default 8 MB)."""
-    return _api_call("GET", url, _MAX_API_JSON_BYTES if limit is None else limit, **kw)
-
-
-def _api_post(url: str, *, limit: int | None = None, **kw):
-    """`httpx.post(url, **kw)` (headers/json/timeout), streamed and capped at `limit` (default 8 MB)."""
-    return _api_call("POST", url, _MAX_API_JSON_BYTES if limit is None else limit, **kw)
-
-
-def _body_too_large(resp, limit: int) -> bool:
-    """True if `resp` declares (Content-Length) or actually holds (decoded) more than `limit` bytes.
-
-    Defense in depth behind `_api_call`, which already stops reading at the limit: this keeps an
-    oversized body from being handed to `.json()` (parse time/memory amplification) or written to the
-    asset cache (disk) if a response reaches the caller some other way. A header that understates
-    (gzip) is caught by the decoded length; a missing or unparsable header falls back to it.
-    """
-    try:
-        declared = int(resp.headers.get("content-length"))
-    except (TypeError, ValueError, AttributeError):
-        declared = None
-    if declared is not None and declared > limit:
-        return True
-    content = getattr(resp, "content", None)
-    return isinstance(content, (bytes, bytearray)) and len(content) > limit
-
-
-class _TooLarge(ValueError):
-    """A response body exceeded its size limit (declared Content-Length, or bytes actually read)."""
-
-
-def _iter_capped(r, limit: int, deadline_at: "float | None" = None, *, raw: bool = False):
-    """Yield `r`'s body in chunks; `_TooLarge` (a ValueError) once it exceeds `limit` bytes, plain ValueError past `deadline_at` or for an encoded body.
-
-    Also refuses a response with a non-identity Content-Encoding, whose decoded size is not what
-    Content-Length (or the network read) says -- unless `raw=True`, which reads the UNDECODED stream
-    (`iter_raw()`) so the limit and the deadline apply to the bytes on the wire and the caller decodes
-    them itself under its own cap (`_decode_bounded`). `iter_bytes()` is called without a chunk size on
-    purpose: with one, httpx buffers that many bytes before yielding anything, so a slow body would
-    never reach the deadline check; without it, every network read does.
-    """
-    encoding = r.headers.get("content-encoding")
-    if not raw and isinstance(encoding, str) and encoding.strip().lower() not in ("", "identity"):
-        raise ValueError(f"download is Content-Encoding {encoding!r}, expected identity")
-    try:
-        declared = int(r.headers.get("content-length"))
-    except (TypeError, ValueError):
-        declared = None
-    if declared is not None and declared > limit:
-        raise _TooLarge(f"download too large: Content-Length {declared} > {limit}")
-    total = 0
-    for chunk in (r.iter_raw() if raw else r.iter_bytes()):
-        total += len(chunk)
-        if total > limit:
-            raise _TooLarge(f"download too large: more than {limit} bytes")
-        if deadline_at is not None and _monotonic() > deadline_at:
-            raise ValueError("download too slow: deadline exceeded")
-        yield chunk
-
-
-# ── downloaded bytes must look like what they claim to be ─────────────────────────────────────
-# The download guards bound where bytes come from, how many and how long; a 200 text/html or JSON body
-# (a CDN error page, a captive portal, a compromised allowlisted host) or an empty one would otherwise
-# be written as pexels_N.mp4 / wiki_N.jpg / hf_*.png and then reused forever by the `exists()` caches.
-# The first bytes are checked against the formats the pipeline actually decodes (MoviePy/PIL/ffmpeg).
-
-_IMAGE_MAGIC = (b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF87a", b"GIF89a", b"II*\x00", b"MM\x00*")
-_VIDEO_MAGIC = (b"\x1a\x45\xdf\xa3", b"GIF87a", b"GIF89a")             # WebM/EBML, GIF
-# First ISO-BMFF box type, at offset 4. `ftyp` is what progressive MP4 (Pexels) starts with; the rest are
-# first boxes of decodable QuickTime / fragmented / CMAF files. A false reject would silently drop a hit to
-# the paid HuggingFace tier, while this is only a sanity check (it cannot prove the rest of the file).
-_MP4_BOXES = (b"ftyp", b"moov", b"mdat", b"free", b"wide", b"skip",
-              b"styp", b"moof", b"sidx", b"junk", b"pnot", b"uuid")
-
-
-def _sniff_ok(kind: str, head) -> bool:
-    """True if `head` (the first <=16 bytes) is a JPEG/PNG/GIF/WebP/TIFF image or an MP4/WebM/GIF video.
-
-    `kind` is "image" or "video"; anything else, or a non-bytes `head`, is not ok. SVG, BMP, HTML,
-    JSON, PDF and an empty body are all refused.
-    """
-    if not isinstance(head, (bytes, bytearray)):
-        return False
-    head = bytes(head)
-    if kind == "image":
-        return head.startswith(_IMAGE_MAGIC) or (head[:4] == b"RIFF" and head[8:12] == b"WEBP")
-    if kind == "video":
-        return head[4:8] in _MP4_BOXES or head.startswith(_VIDEO_MAGIC)
-    return False
-
-
-def _bytes_per_pixel(fmt) -> int:
-    return _DECODE_BYTES_PER_PIXEL.get(fmt, _DEFAULT_DECODE_BYTES_PER_PIXEL)
-
-
-def _pixel_cap(fmt) -> int:
-    """The most pixels an image of Pillow format `fmt` may declare: `_MAX_IMAGE_PIXELS`, and for a format
-    that is decoded in full also what fits in `_MAX_DECODE_BYTES` (WebP: 25 Mpx; PNG / TIFF / GIF: 50 Mpx)."""
-    if fmt in _JPEG_FORMATS:
-        return _MAX_IMAGE_PIXELS                # decoded at 1/8 scale: far less than a full-size buffer
-    return min(_MAX_IMAGE_PIXELS, _MAX_DECODE_BYTES // _bytes_per_pixel(fmt))
-
-
-def _decode_window(fmt) -> int:
-    """The most pixels of a non-JPEG image that may be decoded in full in order to downscale it:
-    `min(_MAX_FULL_DECODE_PIXELS, _MAX_DOWNSCALE_DECODE_BYTES // bytes-per-pixel)`."""
-    return min(_MAX_FULL_DECODE_PIXELS, _MAX_DOWNSCALE_DECODE_BYTES // _bytes_per_pixel(fmt))
-
-
-def _tiff_tiles_ok(im) -> bool:
-    """False for a TIFF declaring a tile (TileWidth / TileLength) larger than `_MAX_TIFF_TILE_SIDE`; True
-    for every other image. Checked from the header, before any pixel is decoded."""
-    if im.format != "TIFF":
-        return True
-    tags = getattr(im, "tag_v2", None)
-    if tags is None:
-        return True
-    for tag in (322, 323):                      # TileWidth, TileLength
-        value = tags.get(tag)
-        values = value if isinstance(value, (tuple, list)) else (value,)
-        if any(isinstance(v, int) and v > _MAX_TIFF_TILE_SIDE for v in values):
-            return False
-    return True
-
-
-def _is_transient(exc: BaseException) -> bool:
-    """True for a failure that says nothing about the image: MemoryError, or an OSError carrying an errno
-    (EMFILE, EIO, ...) that is not a definite "not a file" (missing, a directory, a path through a file) or
-    Pillow's own "cannot identify image"."""
-    from PIL import UnidentifiedImageError
-    if isinstance(exc, MemoryError):
-        return True
-    return (isinstance(exc, OSError)
-            and not isinstance(exc, (FileNotFoundError, IsADirectoryError, NotADirectoryError, UnidentifiedImageError))
-            and exc.errno is not None)
-
-
-def _image_ok(source) -> bool:
-    """True if Pillow can decode `source` (image bytes or a Path) and it declares <= `_pixel_cap(format)`
-    pixels (`_MAX_IMAGE_PIXELS`, and for a non-JPEG also what fits in `_MAX_DECODE_BYTES`: 25 Mpx for WebP).
-
-    The declared size is read from the header first, and the pixels are decoded (`load()`) only when it
-    is within the cap, so the decode is bounded (by the per-format byte budget, `_MAX_DECODE_BYTES`; a JPEG is decoded at 1/8
-    scale via DCT scaling, which still reads the whole entropy-coded stream, so truncation is caught
-    without the full-size buffer). An unidentifiable or truncated/corrupt file, a file Pillow itself calls
-    a decompression bomb (> 2x its own limit raises at open) and a missing path are all "not ok" -- a
-    refusal, not an exception. Pillow's own `DecompressionBombWarning` (a soft warning between 1x and 2x
-    its limit) is silenced: the cap here is the one that decides. Only the first frame of an animated
-    file is decoded. A TRANSIENT failure (see `_is_transient`: `MemoryError`, or
-    an `OSError` carrying an errno other than a definite "not a file" or Pillow's own "cannot identify": EMFILE, EIO, ...) says nothing about the
-    image and is re-raised, so a caller never deletes a good (possibly paid-for) cached file over it.
-    `SoftTimeLimitExceeded` is re-raised.
-    """
-    from PIL import Image
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            with Image.open(io.BytesIO(source) if isinstance(source, (bytes, bytearray)) else source) as im:
-                width, height = im.size
-                if width * height > _pixel_cap(im.format) or not _tiff_tiles_ok(im):
-                    return False
-                im.draft("RGB", (max(1, width // 8), max(1, height // 8)))   # JPEG only; a no-op otherwise
-                im.load()                                                    # raises on a truncated file
-        return True
-    except SoftTimeLimitExceeded:
-        raise
-    except Exception as exc:
-        if _is_transient(exc):
-            raise
-        return False
-
-
-def _downscale_jpeg(content: bytes) -> "bytes | None":
-    """A JPEG over `_MAX_IMAGE_PIXELS`, re-encoded smaller; None for anything else or on any failure.
-
-    Wikimedia originals are often JPEG photos over the cap (a 75 Mpx featured picture) and the only
-    alternative, the summary thumbnail, is ~320 px wide: far too small for a 1080x1920 frame. A JPEG
-    can be decoded at 1/2, 1/4 or 1/8 scale (DCT scaling) without ever allocating the full-size
-    buffer, so such a picture is decoded at the smallest reduction that fits, its EXIF rotation is baked
-    in (the re-encode drops the tag) and it is saved as a JPEG. Only up to Pillow's own bomb limit
-    (2x `Image.MAX_IMAGE_PIXELS`, ~179 Mpx) -- beyond it `Image.open` raises and this returns None, as it
-    does for non-JPEG formats (those are handled by `_downscale_decoded`).
-    """
-    from PIL import Image, ImageOps
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            with Image.open(io.BytesIO(content)) as im:
-                if im.format not in _JPEG_FORMATS:
-                    return None
-                width, height = im.size
-                if width * height <= _MAX_IMAGE_PIXELS:
-                    return None
-                scale = 2
-                while scale < 8 and (width // scale) * (height // scale) > _MAX_IMAGE_PIXELS:
-                    scale *= 2
-                im.draft("RGB", (max(1, width // scale), max(1, height // scale)))
-                im.load()
-                out = ImageOps.exif_transpose(im).convert("RGB")
-        if out.width * out.height > _MAX_IMAGE_PIXELS:
-            out.thumbnail((out.width, out.height))          # unreachable in practice; keep the cap a guarantee
-            factor = (_MAX_IMAGE_PIXELS / (out.width * out.height)) ** 0.5
-            out = out.resize((max(1, int(out.width * factor)), max(1, int(out.height * factor))))
-        buf = io.BytesIO()
-        out.save(buf, format="JPEG", quality=92)
-        return buf.getvalue()
-    except SoftTimeLimitExceeded:
-        raise
-    except Exception as exc:
-        if _is_transient(exc):
-            raise                       # a MemoryError / EMFILE says nothing about the image: never remembered
-        return None
-
-
-class _OversizedImage(ValueError):
-    """A readable image over its pixel cap that is beyond its decode window (or Pillow's bomb limit)."""
-
-
-def _beyond_downscale_window(content: bytes) -> bool:
-    """True if `content` is a readable image that is over the cap AND cannot be downscaled by design.
-
-    That is: Pillow's own bomb error (> 2x its limit), or a non-JPEG over `_decode_window(fmt)`.
-    Those are the only images worth REMEMBERING as too big. An image that is over the cap but inside the
-    window (a JPEG, or a non-JPEG up to its `_decode_window`) that still failed to downscale failed to DECODE
-    (truncated, corrupt, a transient MemoryError): that may not repeat, so it is never recorded.
-    False for anything else, including a header Pillow cannot read."""
-    from PIL import Image
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            with Image.open(io.BytesIO(content)) as im:
-                pixels = im.size[0] * im.size[1]
-                return (pixels > _pixel_cap(im.format) and im.format not in _JPEG_FORMATS
-                        and pixels > _decode_window(im.format))
-    except SoftTimeLimitExceeded:
-        raise
-    except Image.DecompressionBombError:
-        return True
-    except Exception:
-        return False
-
-
-_ORIENTATION_TRANSPOSE = {2: "FLIP_LEFT_RIGHT", 3: "ROTATE_180", 4: "FLIP_TOP_BOTTOM", 5: "TRANSPOSE",
-                          6: "ROTATE_270", 7: "TRANSVERSE", 8: "ROTATE_90"}
-
-
-def _downscale_decoded(content: bytes) -> "bytes | None":
-    """A non-JPEG image over `_MAX_IMAGE_PIXELS`, decoded in full and re-encoded smaller; None otherwise.
-
-    PNG / WebP / TIFF / GIF have no partial decode, so the whole image is decoded (only if it is within
-    `_decode_window(fmt)` = min(`_MAX_FULL_DECODE_PIXELS`, `_MAX_DOWNSCALE_DECODE_BYTES` // bytes-per-pixel), which
-    bounds the transient memory), shrunk with an integer box `reduce()`
-    (cheap, no resampling allocation of the big image), has its EXIF orientation baked in (the reduce drops
-    the metadata) and is re-encoded: PNG stays PNG (lossless, alpha kept), everything else becomes a
-    JPEG. Only the first frame of an animated file is used -- the compositor also opens just that
-    (`Image.open(...).convert("RGB")`). None for a JPEG (see `_downscale_jpeg`), for an image outside the
-    size window, or on any failure.
-    """
-    from PIL import Image
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            with Image.open(io.BytesIO(content)) as im:
-                fmt = im.format
-                width, height = im.size
-                pixels = width * height
-                if fmt in _JPEG_FORMATS or pixels <= _pixel_cap(fmt) or pixels > _decode_window(fmt):
-                    return None
-                if not _tiff_tiles_ok(im):
-                    return None
-                target = _MAX_IMAGE_PIXELS     # always the binding cap here: window > cap implies bytes // bpp > _MAX_IMAGE_PIXELS
-                orientation = im.getexif().get(0x0112)
-                im.load()
-                factor = max(2, math.ceil(math.sqrt(pixels / target)))
-                try:
-                    small = im.reduce(factor)
-                except Exception:                       # modes reduce() does not support (e.g. palette)
-                    small = im.convert("RGBA" if "A" in im.getbands() or "transparency" in im.info else "RGB").reduce(factor)
-        name = _ORIENTATION_TRANSPOSE.get(orientation)
-        if name:
-            small = small.transpose(getattr(Image.Transpose, name))
-        if small.width * small.height > target:
-            shrink = (target / (small.width * small.height)) ** 0.5
-            small = small.resize((max(1, int(small.width * shrink)), max(1, int(small.height * shrink))))
-        buf = io.BytesIO()
-        if fmt == "PNG":
-            small.convert("RGBA" if "A" in small.getbands() else "RGB").save(buf, format="PNG")
-        else:
-            small.convert("RGB").save(buf, format="JPEG", quality=92)
-        return buf.getvalue()
-    except SoftTimeLimitExceeded:
-        raise
-    except Exception as exc:
-        if _is_transient(exc):
-            raise                       # a MemoryError / EMFILE says nothing about the image: never remembered
-        return None
-
-
-def _fit_image(content: bytes) -> bytes:
-    """`content` if `_image_ok`; else a downscaled copy of an oversized image; else ValueError (after a WARNING).
-
-    The ValueError is `_OversizedImage` when the image is readable but too big and cannot be downscaled
-    (a non-JPEG past its decode window, or any image past Pillow's bomb limit), so the caller can
-    remember it. A decode failure inside the window is a plain ValueError and never remembered."""
-    if _image_ok(content):
-        return content
-    smaller = _downscale_jpeg(content) or _downscale_decoded(content)
-    if smaller is not None and _image_ok(smaller):
-        _log.info("Downscaled an oversized image (%d -> %d bytes)", len(content), len(smaller))
-        return smaller
-    _log.warning("Discarding a download that is not a readable image of a reasonable size")
-    if _beyond_downscale_window(content):
-        raise _OversizedImage("downloaded bytes are not a readable image: over the pixel cap and cannot be downscaled")
-    raise ValueError("downloaded bytes are not a readable image")
-
-
-def _refusal_marker(path: Path, url: str) -> Path:
-    """Where a refused-as-oversized image is remembered: next to the file it would have been, keyed by URL.
-
-    The URL is part of the name because an original and its thumbnail often share one target path
-    (same extension): remembering the original must not block the thumbnail."""
-    digest = hashlib.sha256(url.encode("utf-8", "surrogatepass")).hexdigest()[:12]   # a lone surrogate must not raise
-    return path.with_name(f"{path.name}.{digest}.refused")
-
-
-def _refusal_stamp() -> str:
-    """What a marker holds: the limits (and the per-format bytes-per-pixel estimates) it was refused under.
-    Any change to them forgets the marker."""
-    table = ",".join(f"{k}={v}" for k, v in sorted(_DECODE_BYTES_PER_PIXEL.items()))
-    return (f"{_MAX_IMAGE_PIXELS}:{_MAX_FULL_DECODE_PIXELS}:{_MAX_DECODE_BYTES}:{_MAX_DOWNSCALE_DECODE_BYTES}"
-            f":{_DEFAULT_DECODE_BYTES_PER_PIXEL}:{table}")
-
-
-def _refusal_recorded(path: Path, url: str) -> bool:
-    """True if `url` (which would be cached at `path`) was already refused as oversized under the CURRENT limits.
-
-    Without this a non-JPEG original over the cap is downloaded in full (up to 50 MB), refused and
-    forgotten on every `search()` -- the thumbnail that replaced it is cached under a different
-    extension, so the `exists()` check never fires for the original's own path. The marker holds the limits
-    it was recorded under (`_refusal_stamp`); changing any of them forgets it."""
-    try:
-        return _refusal_marker(path, url).read_text() == _refusal_stamp()
-    except (OSError, ValueError):       # unreadable / not UTF-8: treat as no marker
-        return False
-
-
-def _require_media(kind: str, head) -> None:
-    """Raise ValueError (after a WARNING) if `head` is not a `kind` per `_sniff_ok`."""
-    if not _sniff_ok(kind, head):
-        _log.warning("Discarding a download that is not a valid %s", kind)
-        raise ValueError(f"downloaded bytes are not a valid {kind}")
-
-
-def _cached_media_ok(path: Path, kind: str) -> bool:
-    """True if the cached file at `path` starts like a real `kind`; otherwise delete it and say so.
-
-    A file cached before the content check existed (or by a process that died mid-write on a
-    pre-`os.replace` version) would otherwise be served by the `exists()` caches forever and fail
-    every later render in the compositor. The caller falls through to a fresh download.
-
-    For an image the file is also decoded (`_image_ok`). A TRANSIENT error (reading the head or inside
-    Pillow: EMFILE, EIO, MemoryError, ...) says nothing about the file, so it is KEPT and True is returned
-    -- deleting a paid HuggingFace asset over it would mean a re-billed regeneration.
-    """
-    try:
-        with open(path, "rb") as fh:
-            head = fh.read(16)
-    except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
-        head = b""                   # not a readable file at all: a definite verdict
-    except OSError:
-        # EMFILE / EIO / ...: says nothing about the file, so never delete it over this (for a paid
-        # HuggingFace asset that would mean a re-billed regeneration)
-        _log.warning("Could not read a cached %s (transient error); keeping it", kind, exc_info=True)
-        return True
-    ok = _sniff_ok(kind, head)
-    if ok and kind == "image":
-        try:
-            ok = _image_ok(path)
-        except SoftTimeLimitExceeded:
-            raise
-        except Exception:
-            _log.warning("Could not check a cached image (transient error); keeping it", exc_info=True)
-            return True
-    if ok:
-        return True
-    _log.warning("Discarding a cached file that is not a valid %s", kind)
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        pass
-    return False
+    return safe_fetch.https_host(url) == "upload.wikimedia.org"
 
 
 # ── ids that become local file names ─────────────────────────────────────────
@@ -996,7 +196,7 @@ class WikipediaImageSource:
     def _fetch_license(self, page_title: str) -> dict:
         """Return license metadata for a Wikimedia file via the imageinfo API."""
         try:
-            resp = _api_get(
+            resp = safe_fetch.api_get(
                 self._SEARCH,
                 params={
                     "action": "query",
@@ -1009,7 +209,7 @@ class WikipediaImageSource:
                 timeout=10.0,
             )
             resp.raise_for_status()
-            if _body_too_large(resp, _MAX_API_JSON_BYTES):
+            if safe_fetch.body_too_large(resp, safe_fetch.MAX_API_JSON_BYTES):
                 raise ValueError("license lookup response too large")
             pages = resp.json().get("query", {}).get("pages", {})
             page = next(iter(pages.values()), {})
@@ -1027,30 +227,30 @@ class WikipediaImageSource:
         to the next candidate URL). `search_deadline` is the whole search's budget: this download
         gets `_IMAGE_DEADLINE_S` or what is left of it, whichever is less.
         """
-        now = _monotonic()
+        now = safe_fetch.now()
         if now >= search_deadline:
             return None
         deadline_at = min(now + _IMAGE_DEADLINE_S, search_deadline)
         for attempt in (0, 1):
-            with _open_download(url, _wikimedia_url_ok, timeout=30.0, headers=self._HEADERS,
+            with safe_fetch.open_download(url, _wikimedia_url_ok, timeout=30.0, headers=self._HEADERS,
                                 deadline_at=deadline_at) as r:
                 if r.status_code != 429:
                     r.raise_for_status()
-                    return b"".join(_iter_capped(r, _MAX_IMAGE_BYTES, deadline_at))
+                    return b"".join(safe_fetch.iter_capped(r, _MAX_IMAGE_BYTES, deadline_at))
             if attempt == 0:
                 time.sleep(2.0)
         return None
 
     def search(self, person_name: str) -> "SourcedAsset | None":
         try:
-            resp = _api_get(
+            resp = safe_fetch.api_get(
                 self._SEARCH,
                 params={"action": "opensearch", "search": person_name, "limit": 1, "format": "json"},
                 headers=self._HEADERS,
                 timeout=10.0,
             )
             resp.raise_for_status()
-            if _body_too_large(resp, _MAX_API_JSON_BYTES):
+            if safe_fetch.body_too_large(resp, safe_fetch.MAX_API_JSON_BYTES):
                 raise ValueError("opensearch response too large")
             results = resp.json()
             if not results[1]:
@@ -1064,9 +264,9 @@ class WikipediaImageSource:
         try:
             # safe="": the title is ONE path segment, so a "/" in it ("AC/DC") must become %2F
             safe = urllib.parse.quote(page_title.replace(" ", "_"), safe="")
-            resp = _api_get(f"{self._SUMMARY}/{safe}", headers=self._HEADERS, timeout=10.0)
+            resp = safe_fetch.api_get(f"{self._SUMMARY}/{safe}", headers=self._HEADERS, timeout=10.0)
             resp.raise_for_status()
-            if _body_too_large(resp, _MAX_API_JSON_BYTES):
+            if safe_fetch.body_too_large(resp, safe_fetch.MAX_API_JSON_BYTES):
                 raise ValueError("summary response too large")
             data = resp.json()
         except SoftTimeLimitExceeded:
@@ -1103,28 +303,28 @@ class WikipediaImageSource:
         }
 
         local_path = None
-        search_deadline = _clip_to_asset_budget(_monotonic() + _WIKI_SEARCH_BUDGET_S)
+        search_deadline = safe_fetch.clip_to_asset_budget(safe_fetch.now() + _WIKI_SEARCH_BUDGET_S)
         for img_url in candidate_urls:
             lp = self.store_dir / f"wiki_{page_id}.{_image_extension(img_url)}"
-            if lp.exists() and _cached_media_ok(lp, "image"):
+            if lp.exists() and media_policy.cached_media_ok(lp, "image"):
                 local_path = lp
                 break
-            if _refusal_recorded(lp, img_url):
+            if media_policy.refusal_recorded(lp, img_url):
                 continue                            # known too big: don't download it again
             try:
                 content = self._download(img_url, search_deadline)
                 if content is None:
                     continue
-                _require_media("image", content[:16])
-                content = _fit_image(content)       # may be a downscaled JPEG under a .png/.webp name: Pillow and
+                media_policy.require_media("image", content[:16])
+                content = media_policy.fit_image(content)       # may be a downscaled JPEG under a .png/.webp name: Pillow and
                 _atomic_write(lp, content)          # the sniff go by content, not extension
                 local_path = lp
                 break
             except SoftTimeLimitExceeded:
                 raise                               # the task is out of time: do not try the next candidate
-            except _OversizedImage:
+            except media_policy.OversizedImage:
                 try:
-                    _atomic_write(_refusal_marker(lp, img_url), _refusal_stamp().encode())
+                    _atomic_write(media_policy.refusal_marker(lp, img_url), media_policy.refusal_stamp().encode())
                 except OSError:
                     pass                            # best effort: the cost is one more download next time
                 continue
@@ -1201,7 +401,7 @@ class PexelsVideoSource:
             return None
 
         try:
-            resp = _api_get(
+            resp = safe_fetch.api_get(
                 f"{self._API}/search",
                 headers={"Authorization": self.api_key},
                 params={
@@ -1213,7 +413,7 @@ class PexelsVideoSource:
                 timeout=30.0,
             )
             resp.raise_for_status()
-            if _body_too_large(resp, _MAX_API_JSON_BYTES):
+            if safe_fetch.body_too_large(resp, safe_fetch.MAX_API_JSON_BYTES):
                 raise ValueError("search response too large")
             videos = resp.json().get("videos", [])
             if not isinstance(videos, list):
@@ -1223,7 +423,7 @@ class PexelsVideoSource:
         except Exception:
             return None
 
-        search_deadline = _clip_to_asset_budget(_monotonic() + _PEXELS_SEARCH_BUDGET_S)
+        search_deadline = safe_fetch.clip_to_asset_budget(safe_fetch.now() + _PEXELS_SEARCH_BUDGET_S)
         for video in videos:
             picked = self._pick(video, min_duration_s)
             if picked is None:
@@ -1231,21 +431,21 @@ class PexelsVideoSource:
             vid_id, duration, link = picked
             local_path = self.store_dir / f"pexels_{vid_id}.mp4"
 
-            if not (local_path.exists() and _cached_media_ok(local_path, "video")):
+            if not (local_path.exists() and media_policy.cached_media_ok(local_path, "video")):
                 tmp_path = _tmp_path_for(local_path)
-                now = _monotonic()
+                now = safe_fetch.now()
                 if now >= search_deadline:
                     continue                        # budget spent: no more downloads, but a later hit may be cached
                 try:
                     deadline_at = min(now + _VIDEO_DEADLINE_S, search_deadline)
-                    with _open_download(link, _pexels_url_ok, timeout=120.0,
+                    with safe_fetch.open_download(link, _pexels_url_ok, timeout=120.0,
                                         deadline_at=deadline_at) as r:
                         r.raise_for_status()
                         with open(tmp_path, "wb") as fh:
-                            for chunk in _iter_capped(r, _MAX_VIDEO_BYTES, deadline_at):
+                            for chunk in safe_fetch.iter_capped(r, _MAX_VIDEO_BYTES, deadline_at):
                                 fh.write(chunk)
                     with open(tmp_path, "rb") as fh:
-                        _require_media("video", fh.read(16))
+                        media_policy.require_media("video", fh.read(16))
                     os.replace(tmp_path, local_path)
                 except SoftTimeLimitExceeded:
                     tmp_path.unlink(missing_ok=True)
@@ -1302,13 +502,13 @@ class HuggingFaceImageSource:
         fp = hashlib.sha256(full_prompt.encode()).hexdigest()[:16]
         local_path = self.store_dir / f"hf_{fp}.png"
 
-        if not (local_path.exists() and _cached_media_ok(local_path, "image")):
-            if _asset_budget_spent():                # after the cache lookup: a cached asset is free
+        if not (local_path.exists() and media_policy.cached_media_ok(local_path, "image")):
+            if safe_fetch.asset_budget_spent():                # after the cache lookup: a cached asset is free
                 _log.warning("Skipping HuggingFace image generation: the render's asset budget is spent")
                 self.last_call_skipped = True
                 return None
             try:
-                resp = _api_post(
+                resp = safe_fetch.api_post(
                     f"{self._API}/{self.model}",
                     headers={"Authorization": f"Bearer {self.api_key}"},
                     json={"inputs": full_prompt},
@@ -1319,20 +519,20 @@ class HuggingFaceImageSource:
                 content_type = resp.headers.get("content-type", "")
                 if not content_type.startswith("image/"):
                     return None
-                if _body_too_large(resp, _MAX_IMAGE_BYTES):
+                if safe_fetch.body_too_large(resp, _MAX_IMAGE_BYTES):
                     _log.warning("Discarding a HuggingFace download that is too large for an image")
                     return None
-                if not _sniff_ok("image", resp.content[:16]):
+                if not media_policy.sniff_ok("image", resp.content[:16]):
                     _log.warning("Discarding a HuggingFace download that is not a valid image")
                     return None
-                if not _image_ok(resp.content):
+                if not media_policy.image_ok(resp.content):
                     _log.warning("Discarding a HuggingFace download that is not a readable image of a reasonable size")
                     return None
                 _atomic_write(local_path, resp.content)
                 self.last_call_was_generated = True
             except SoftTimeLimitExceeded:
                 raise                               # out of time: do not log it as a model failure
-            except _TooLarge:
+            except safe_fetch.TooLarge:
                 _log.warning("Discarding a HuggingFace download that is too large for an image")
                 return None
             except Exception:
@@ -1385,16 +585,16 @@ class HuggingFaceVideoSource:
 
         # Check both possible cached extensions before making an API call
         for cached in (self.store_dir / f"hfvid_{fp}.mp4", self.store_dir / f"hfvid_{fp}.gif"):
-            if cached.exists() and _cached_media_ok(cached, "video"):
+            if cached.exists() and media_policy.cached_media_ok(cached, "video"):
                 local_path = cached
                 break
         else:
-            if _asset_budget_spent():                # after the cache lookup: a cached asset is free
+            if safe_fetch.asset_budget_spent():                # after the cache lookup: a cached asset is free
                 _log.warning("Skipping HuggingFace video generation: the render's asset budget is spent")
                 self.last_call_skipped = True
                 return None
             try:
-                resp = _api_post(
+                resp = safe_fetch.api_post(
                     f"{self._API}/{self.model}",
                     headers={"Authorization": f"Bearer {self.api_key}"},
                     json={"inputs": full_prompt},
@@ -1405,17 +605,17 @@ class HuggingFaceVideoSource:
                 content_type = resp.headers.get("content-type", "video/mp4")
                 ext = "gif" if "gif" in content_type else "mp4"
                 local_path = self.store_dir / f"hfvid_{fp}.{ext}"
-                if _body_too_large(resp, _MAX_VIDEO_BYTES):
+                if safe_fetch.body_too_large(resp, _MAX_VIDEO_BYTES):
                     _log.warning("Discarding a HuggingFace download that is too large for a video")
                     return None
-                if not _sniff_ok("video", resp.content[:16]):
+                if not media_policy.sniff_ok("video", resp.content[:16]):
                     _log.warning("Discarding a HuggingFace download that is not a valid video")
                     return None
                 _atomic_write(local_path, resp.content)
                 self.last_call_was_generated = True
             except SoftTimeLimitExceeded:
                 raise                               # out of time: do not log it as a model failure
-            except _TooLarge:
+            except safe_fetch.TooLarge:
                 _log.warning("Discarding a HuggingFace download that is too large for a video")
                 return None
             except Exception:
@@ -1771,3 +971,102 @@ def resolve_or_reuse(
             ))
     db.commit()   # the caller goes on to TTS/ffmpeg; don't leave the pins uncommitted and idle
     return results
+
+
+# ── TEMPORARY forwarding bridge (commit 1 of the safe_fetch / media_policy split; deleted in commit 2) ────
+# Tests still say `AS._image_ok`, `AS._monotonic`, `AS.httpx`, ... (AS = this module). The moved code lives in
+# `safe_fetch` / `media_policy` and reads ITS OWN globals, so a bare re-export here could not keep those
+# patches working: `monkeypatch.setattr(AS, "_image_ok", fake)` would rebind only the re-exported name.
+# This module's class is therefore swapped for one that forwards reads, writes and deletes of the old names
+# to the module that owns them now. `httpx`, `threading` and `socket` forward to `safe_fetch`'s imports.
+# The moved names are deliberately NOT in this module's __dict__ (a copy would shadow __getattr__).
+# Table: old name -> (owning module, name there). Hand-written on purpose; tests/test_bridge_forwarding.py
+# checks it against tests/_seam_oracle.py.
+_BRIDGE_TABLE = {
+    "_HOP_TIMEOUT_GRACE_S": ("safe_fetch", "_HOP_TIMEOUT_GRACE_S"),
+    "_HOST_RE": ("safe_fetch", "_HOST_RE"),
+    "_https_host": ("safe_fetch", "https_host"),
+    "_host_for_log": ("safe_fetch", "_host_for_log"),
+    "_any_https_host": ("safe_fetch", "_any_https_host"),
+    "_http_stream": ("safe_fetch", "_http_stream"),
+    "_Watchdog": ("safe_fetch", "_Watchdog"),
+    "_dns_in_time": ("safe_fetch", "_dns_in_time"),
+    "_decode_bounded": ("safe_fetch", "_decode_bounded"),
+    "_content_encoding": ("safe_fetch", "_content_encoding"),
+    "_api_call": ("safe_fetch", "_api_call"),
+    "_API_MIN_DEADLINE_S": ("safe_fetch", "_API_MIN_DEADLINE_S"),
+    "_API_DECODABLE_ENCODINGS": ("safe_fetch", "_API_DECODABLE_ENCODINGS"),
+    "_API_DROPPED_HEADERS": ("safe_fetch", "_API_DROPPED_HEADERS"),
+    "_open_download": ("safe_fetch", "open_download"),
+    "_api_get": ("safe_fetch", "api_get"),
+    "_api_post": ("safe_fetch", "api_post"),
+    "_iter_capped": ("safe_fetch", "iter_capped"),
+    "_body_too_large": ("safe_fetch", "body_too_large"),
+    "_TooLarge": ("safe_fetch", "TooLarge"),
+    "_MAX_API_JSON_BYTES": ("safe_fetch", "MAX_API_JSON_BYTES"),
+    "_MAX_REDIRECTS": ("safe_fetch", "_MAX_REDIRECTS"),
+    "_REDIRECT_STATUSES": ("safe_fetch", "_REDIRECT_STATUSES"),
+    "_monotonic": ("safe_fetch", "_monotonic"),
+    "RENDER_ASSET_BUDGET_S": ("safe_fetch", "RENDER_ASSET_BUDGET_S"),
+    "asset_budget": ("safe_fetch", "asset_budget"),
+    "_asset_deadline_at": ("safe_fetch", "_asset_deadline_at"),
+    "_clip_to_asset_budget": ("safe_fetch", "clip_to_asset_budget"),
+    "_asset_budget_spent": ("safe_fetch", "asset_budget_spent"),
+    "_IMAGE_MAGIC": ("media_policy", "_IMAGE_MAGIC"),
+    "_VIDEO_MAGIC": ("media_policy", "_VIDEO_MAGIC"),
+    "_MP4_BOXES": ("media_policy", "_MP4_BOXES"),
+    "_sniff_ok": ("media_policy", "sniff_ok"),
+    "_MAX_IMAGE_PIXELS": ("media_policy", "_MAX_IMAGE_PIXELS"),
+    "_MAX_FULL_DECODE_PIXELS": ("media_policy", "_MAX_FULL_DECODE_PIXELS"),
+    "_MAX_DECODE_BYTES": ("media_policy", "_MAX_DECODE_BYTES"),
+    "_MAX_DOWNSCALE_DECODE_BYTES": ("media_policy", "_MAX_DOWNSCALE_DECODE_BYTES"),
+    "_DECODE_BYTES_PER_PIXEL": ("media_policy", "_DECODE_BYTES_PER_PIXEL"),
+    "_DEFAULT_DECODE_BYTES_PER_PIXEL": ("media_policy", "_DEFAULT_DECODE_BYTES_PER_PIXEL"),
+    "_JPEG_FORMATS": ("media_policy", "_JPEG_FORMATS"),
+    "_MAX_TIFF_TILE_SIDE": ("media_policy", "_MAX_TIFF_TILE_SIDE"),
+    "_bytes_per_pixel": ("media_policy", "_bytes_per_pixel"),
+    "_pixel_cap": ("media_policy", "_pixel_cap"),
+    "_decode_window": ("media_policy", "_decode_window"),
+    "_tiff_tiles_ok": ("media_policy", "_tiff_tiles_ok"),
+    "_is_transient": ("media_policy", "_is_transient"),
+    "_image_ok": ("media_policy", "image_ok"),
+    "_downscale_jpeg": ("media_policy", "_downscale_jpeg"),
+    "_beyond_downscale_window": ("media_policy", "_beyond_downscale_window"),
+    "_ORIENTATION_TRANSPOSE": ("media_policy", "_ORIENTATION_TRANSPOSE"),
+    "_downscale_decoded": ("media_policy", "_downscale_decoded"),
+    "_OversizedImage": ("media_policy", "OversizedImage"),
+    "_fit_image": ("media_policy", "fit_image"),
+    "_refusal_marker": ("media_policy", "refusal_marker"),
+    "_refusal_stamp": ("media_policy", "refusal_stamp"),
+    "_refusal_recorded": ("media_policy", "refusal_recorded"),
+    "_require_media": ("media_policy", "require_media"),
+    "_cached_media_ok": ("media_policy", "cached_media_ok"),
+    "httpx": ("safe_fetch", "httpx"),
+    "socket": ("safe_fetch", "socket"),
+    "threading": ("safe_fetch", "threading"),
+}
+
+
+class _BridgeModule(types.ModuleType):
+    def __getattr__(self, name):                 # reached only when normal lookup fails
+        target = _BRIDGE_TABLE.get(name)
+        if target is None:
+            raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+        return getattr(sys.modules["engine.render." + target[0]], target[1])
+
+    def __setattr__(self, name, value):
+        target = _BRIDGE_TABLE.get(name)
+        if target is None:
+            super().__setattr__(name, value)
+        else:
+            setattr(sys.modules["engine.render." + target[0]], target[1], value)
+
+    def __delattr__(self, name):
+        target = _BRIDGE_TABLE.get(name)
+        if target is None:
+            super().__delattr__(name)
+        else:
+            delattr(sys.modules["engine.render." + target[0]], target[1])
+
+
+sys.modules[__name__].__class__ = _BridgeModule
