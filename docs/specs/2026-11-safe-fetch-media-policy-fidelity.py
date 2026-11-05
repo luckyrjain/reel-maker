@@ -10,8 +10,10 @@ Run from the repo root (it inserts the repo root into sys.path itself):
     --stage N       0 = oracle self-checks only (nothing but the baseline and tests/_seam_oracle.py is needed);
                     1 = after commit 1 (modules exist, bridge allowed and required, loggers use the literal old name);
                     2 = after commit 2 (bridge gone, loggers use __name__, worker/tasks/render.py is compared too);
-                    3 = after commit 3 (same as 2; the G1 resolver mode is still to be added).
+                    3 = after commit 3 (same as 2, plus the G1 resolver mode).
     --no-collect    (stage >= 2) skip the pytest --collect-only comparison of node ids.
+    --cross-check-baseline
+                    (stage 3) also run the resolver on the baseline test tree and compare it with the counting script.
     --tree DIR      where the files under test live (default: the repo root). Used to test the script itself on a
                     synthetic tree.
 
@@ -33,7 +35,12 @@ Checks
            oracle, equals the retargeted file (ast.dump) except for the exhaustive residual list in the spec; plus
            per-file counts of assert / raises / approx, the test-function name set, the pytest node-id set
            (collected from an export of the baseline, `--no-collect` skips only this part) and the set of test files.
-  G1       not implemented yet (stage 3, resolver mode): printed as SKIP.
+  G1       stage 3, resolver mode: tests/_seam_ast.py (the resolver the guards in tests/test_module_seams.py use, loaded
+           by path; it is standard library only) resolves every patch target of the real test tree; the script prints
+           the per-form, per-owning-module figures, requires zero stale access / unresolved targets and requires the
+           figures to equal G1_EXPECTED_COUNTS recorded in tests/test_module_seams.py. With --cross-check-baseline
+           the same resolver is run on the BASELINE test tree and its per-form totals must equal the independent
+           regex totals of docs/specs/2026-11-safe-fetch-media-policy-counts.py (152 / 17 / 6 / 9 ...).
 
 To allow another deliberate docstring edit, add the BASELINE name of the node (or "<module:NAME>" for a new module
 docstring) to EDIT_ALLOWLIST below, with the reason; it is compared with its docstring removed on both sides.
@@ -783,7 +790,7 @@ CLOCK_TARGET = "worker.tasks.render._asset_clock"
 TEST_EXTRA_FILES = {
     1: {"tests/_seam_oracle.py", "tests/test_bridge_forwarding.py"},
     2: {"tests/_seam_oracle.py"},
-    3: {"tests/_seam_oracle.py", "tests/test_module_seams.py"},
+    3: {"tests/_seam_oracle.py", "tests/_seam_ast.py", "tests/test_module_seams.py"},
 }
 SETATTR_FUNCS = frozenset({"setattr", "delattr", "getattr"})
 
@@ -1195,12 +1202,120 @@ def check_c(R, baseline, tree_root, stage, collect):
             f"{len(base_ids)} ids, baseline collected from a git archive export")
 
 
+# --------------------------------------------------------------------------------------------------- G1 resolver mode
+COUNTS_SCRIPT = "docs/specs/2026-11-safe-fetch-media-policy-counts.py"
+
+
+def load_seam_ast(tree_root):
+    """tests/_seam_ast.py of `tree_root`, loaded by path (it needs only the standard library and the oracle)."""
+    path = Path(tree_root) / "tests" / "_seam_ast.py"
+    spec = importlib.util.spec_from_file_location("seam_ast_for_fidelity", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module               # dataclasses looks its own module up in sys.modules
+    spec.loader.exec_module(module)
+    return module
+
+
+def current_test_sources(tree_root):
+    return {p.relative_to(tree_root).as_posix(): p.read_text(encoding="utf-8")
+            for p in sorted((Path(tree_root) / "tests").glob("**/*.py"))}
+
+
+def baseline_test_sources(rev):
+    listing = subprocess.run(["git", "ls-tree", "-r", "--name-only", rev, "tests/"], cwd=ROOT,
+                             capture_output=True, text=True)
+    if listing.returncode != 0:
+        raise SystemExit(f"git ls-tree {rev} tests/ failed: {listing.stderr.strip()}")
+    return {name: git_show(rev, name) for name in listing.stdout.split() if name.endswith(".py")}
+
+
+def recorded_g1_counts(tree_root):
+    """G1_EXPECTED_COUNTS as written in tests/test_module_seams.py (read from its AST, nothing is imported)."""
+    path = Path(tree_root) / "tests" / "test_module_seams.py"
+    if not path.exists():
+        return None
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "G1_EXPECTED_COUNTS" for t in node.targets):
+            return ast.literal_eval(node.value)
+    return None
+
+
+def print_g1_figures(label, counts):
+    print(f"  {label}: resolved patch targets per owning module and form")
+    by_owner = collections.defaultdict(list)
+    for (owner, form), n in sorted(counts.items()):
+        by_owner[owner].append((form, n))
+    for owner in sorted(by_owner):
+        total = sum(n for _f, n in by_owner[owner])
+        print(f"    {owner:14s} {total:4d}   " + "  ".join(f"{form}={n}" for form, n in by_owner[owner]))
+    print(f"    {'all':14s} {sum(counts.values()):4d}")
+
+
+def check_g1_resolver(R, tree_root):
+    seam = load_seam_ast(tree_root)
+    sources = current_test_sources(tree_root)
+    problems = [str(p) for p in seam.g1_problems(sources)]
+    R.check("G1 resolver: no stale access through asset_sourcer, nothing unresolved, safe_fetch.now never patched", problems,
+            f"{len(sources)} test files")
+    counts = seam.g1_counts(sources)
+    print_g1_figures("real tree", counts)
+    recorded = recorded_g1_counts(tree_root)
+    if recorded is None:
+        R.skip("G1 recorded figures", "tests/test_module_seams.py not found or has no G1_EXPECTED_COUNTS")
+        return
+    probs = [f"{k}: resolver {counts.get(k, 0)} != recorded {recorded.get(k, 0)}"
+             for k in sorted(set(counts) | set(recorded)) if counts.get(k, 0) != recorded.get(k, 0)]
+    R.check("G1 resolver figures equal G1_EXPECTED_COUNTS in tests/test_module_seams.py", probs)
+
+
+def check_g1_baseline(R, baseline, tree_root):
+    """The resolver on the baseline test tree must agree with the counting script's independent regex totals."""
+    seam = load_seam_ast(tree_root)
+    sources = baseline_test_sources(baseline)
+    counts = seam.g1_counts(sources, exclude=())
+    _targets, unresolved = seam.collect_targets(seam.Project(sources))
+    print_g1_figures(f"baseline {baseline}", counts)
+    with tempfile.TemporaryDirectory() as tmp:
+        export_revision(baseline, Path(tmp))
+        proc = subprocess.run([sys.executable, str(ROOT / COUNTS_SCRIPT)], cwd=tmp, capture_output=True, text=True)
+    if proc.returncode != 0:
+        R.fail("G1 baseline cross-check: the counting script ran", proc.stderr[-300:] or proc.stdout[-300:])
+        return
+    regex = {}
+    for line in proc.stdout.splitlines():
+        m = re.match(r"^(.*): (\d+)$", line.strip())
+        if m:
+            regex[m.group(1)] = int(m.group(2))
+        m = re.match(r"^setattr/patch.object\(AS, '<literal>'\) calls: (\d+);", line.strip())
+        if m:
+            regex["setattr/patch.object(AS, '<literal>') calls"] = int(m.group(1))
+    pairs = [
+        ("literal 'engine.render.asset_sourcer.<x>' strings", ("asset_sourcer", "literal")),
+        ("f'{_MOD}.<x>' targets", ("asset_sourcer", "f{_MOD}")),
+        ("f'{_LOG}.<x>' targets", ("asset_sourcer", "f{_LOG}")),
+        ("f'{AS.__name__}.<x>' targets", ("asset_sourcer", "f{AS.__name__}")),
+        ("setattr/patch.object(AS, '<literal>') calls", ("asset_sourcer", "object:literal")),
+    ]
+    probs = [str(p) for p in unresolved]
+    for key, form in pairs:
+        if key not in regex:
+            probs.append(f"the counting script printed no line for {key!r}")
+        elif regex[key] != counts.get(form, 0):
+            probs.append(f"{key}: regex {regex[key]} != resolver {counts.get(form, 0)} ({form[1]})")
+    other = sorted(set(counts) - {f for _k, f in pairs} - {("asset_sourcer", "object:name")})
+    if other:
+        probs.append(f"the resolver found forms the counting script does not know: {other}")
+    R.check("G1 resolver on the baseline tree equals the counting script's regex totals", probs,
+            "; ".join(f"{k.split(' ')[0]}={regex.get(k)}" for k, _f in pairs))
+
+
 # --------------------------------------------------------------------------------------------------- main
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--baseline", default="d096524")
     ap.add_argument("--stage", type=int, choices=(0, 1, 2, 3), default=0)
     ap.add_argument("--no-collect", action="store_true")
+    ap.add_argument("--cross-check-baseline", action="store_true")
     ap.add_argument("--tree", type=Path, default=ROOT)
     args = ap.parse_args(argv)
     R = Report()
@@ -1243,8 +1358,11 @@ def main(argv=None):
     if args.stage >= 2:
         check_c(R, args.baseline, tree_root, args.stage, not args.no_collect)
     if args.stage >= 3:
-        # TODO(T4): the G1 resolver mode (per-form counts of resolved patch targets) is added by the commit-3 task.
-        R.skip("G1 resolver", "not implemented in T1")
+        check_g1_resolver(R, tree_root)
+        if args.cross_check_baseline:
+            check_g1_baseline(R, args.baseline, tree_root)
+        else:
+            R.skip("G1 baseline cross-check", "pass --cross-check-baseline")
     return 1 if R.fails else 0
 
 

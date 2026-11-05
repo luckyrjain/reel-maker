@@ -1,6 +1,6 @@
 # `safe_fetch` and `media_policy` — splitting the hardened fetch and the media check out of `asset_sourcer`
 
-Status: final draft, revision 7 (after six spec-review rounds; round 6 left only the wording items fixed here: four personas each, all NOT CLEAN; findings and what
+Status: implemented (Phase 8g, branch `c2-safe-fetch-media-policy`; §10 is the implementation record). Spec revision 7 (after six spec-review rounds; round 6 left only the wording items fixed here: four personas each, all NOT CLEAN; findings and what
 changed are in §11). Source: candidate C2 of the 2026-11-03 full-codebase architecture review (strength "Worth
 exploring", medium confidence), grilled and settled in a twelve-question session (Q1–Q12, §3). Scope:
 `engine/render/asset_sourcer.py` (split), two new modules, `worker/tasks/render.py` (its import and three use
@@ -665,8 +665,99 @@ AS.httpx 2   AS.threading 9   AS.socket 1   AS.settings 5   AS.os 2   AS.Path 1 
 setattr/patch.object(AS, '<literal>') calls: 182; targeting moved names: 129
 ```
 
-(To be filled in as the work proceeds: fidelity-check output at each commit including the listed docstring/comment
-edits, the per-form G1 figures after commit 2, mutation results per numbered mutant, review rounds.)
+### Commits and runs (`.venv/bin/python -m pytest`, repo root; baseline `main` = `d096524`)
+
+| Commit | Hash | Full default run |
+|---|---|---|
+| 0 spec, plan | `bd26ee9`, `37393ce` | baseline 2760 passed, 3 skipped, 1 deselected |
+| 1 move behind the bridge, no existing test edited | `333458b` | 3133 passed = 2760 + 373 bridge tests, 3 skipped |
+| 2 retarget, bridge deleted | `401b376` | 2760 passed, 3 skipped, 1 deselected |
+| 3 guards, probes, docs | (hash pending) | 3068 passed = 2760 + 308 (`tests/test_module_seams.py`), 3 skipped, 1 deselected; 3071 selected (3072 collected) |
+
+Test files: 77 `test_*.py` become 78 (`test_module_seams.py`); `tests/_seam_oracle.py` and `tests/_seam_ast.py` are helper
+modules, not test files, and `conftest.py` is counted as before (outside the figure).
+
+### Fidelity script (`python docs/specs/2026-11-safe-fetch-media-policy-fidelity.py --baseline d096524 --stage N`)
+
+Checks printed OK at each stage: **stage 1: 17**, **stage 2: 22**, **stage 3: 25** (with `--cross-check-baseline`;
+24 without, the cross-check is skipped). The stage-3 run, abridged:
+
+```
+OK ORACLE  baseline defines each top-level name once; MOVED keys == baseline definitions minus STAYS; MOVED and STAYS
+           disjoint; 58 moved names, 29 per owner; kinds derived (36 callable, 2 constant, 20 data); NEW and BRIDGE_EXTRAS;
+           every STAYS name exists in the baseline (49); 22 public names (13 + 9), new names unique; owners define them
+OK A safe_fetch     29 moved nodes; docstring edits allowed: _any_https_host, _api_get, _api_post
+OK A media_policy   29 moved nodes
+OK B asset_sourcer.py  44 staying nodes equal the inverse-transformed baseline; 10 planned import removals == the baseline
+                       imports with no staying-code user; imports are the baseline's minus removals plus additions
+OK B worker/tasks/render.py  3 nodes equal the inverse-transformed baseline; imports as planned
+OK DEP safe_fetch and media_policy reference nothing from asset_sourcer or from each other; every public name has an
+       outside caller (22); no private name has one
+OK C   78 baseline test files == their deterministic rewrite (loggers: asset_sourcer 8, media_policy 8, safe_fetch 6;
+       asserts 3072, raises 270, approx 35, test functions 1771); sorted pytest node ids identical (2763)
+OK G1 resolver (81 test files): no stale access, nothing unresolved, safe_fetch.now never patched; figures equal
+       G1_EXPECTED_COUNTS; on the baseline tree the resolver equals the counting script's regex totals
+```
+
+Allowed docstring edits (the `EDIT_ALLOWLIST`, each compared with its docstring removed): `_any_https_host` (the
+"hosts are constants in this module" sentence, false in `safe_fetch`, now says the host set is the caller's),
+`_api_get` and `_api_post` (a sentence that the default `url_ok` is not an allowlist), `<module:safe_fetch>` and
+`<module:media_policy>` (new module docstrings). Comment blocks (not in the AST, reviewed by hand): baseline lines
+90-94 -> `safe_fetch` lines 37-42 ("https-only to an expected host" -> "to hosts the caller's `url_ok` allows");
+124-135 -> lines 47-59 ("each search() has one overall budget (below)" -> "the adapters choose their own per-search
+budgets (and pass the resulting deadline in)"; "ANY network call of this module" -> "of this fetch layer", with a
+sentence that the adapters keep their own `except SoftTimeLimitExceeded` clauses); 145-151 -> lines 67-73 ("the per-search
+budgets above" -> "the adapters' per-search budgets"). The six D1 constants stay in `asset_sourcer.py` (lines 80-93) in three
+groups (byte limits, per-download deadlines, per-search budgets), each with a one-line pointer comment to `safe_fetch`.
+
+### G1 positive control: per-form figures (resolver on the retargeted tree, asserted exactly by `test_module_seams.py`)
+
+| Owning module | Total | Forms |
+|---|---|---|
+| `asset_sourcer` | 84 | `f{_LOG}`=6, `f{_MOD}`=18, literal=5, `object:literal`=53, `object:name`=2 |
+| `media_policy` | 82 | literal=2, `object:literal`=80 |
+| `safe_fetch` | 76 | `f{_FETCH_MOD}`=24, literal=3, `object:literal`=49 |
+| all | 242 | |
+
+Cross-check on the BASELINE test tree: the resolver gives 368 = `f{AS.__name__}`=9, `f{_LOG}`=6, `f{_MOD}`=152,
+literal=17, `object:literal`=182, `object:name`=2, which equals the counting script's independent regex totals (152 / 17 / 6
+/ 9 / 182; the two `object:name` are the parametrized `limit_name` case, not in the script's regex).
+
+### The 22 `caplog.set_level(..., logger=AS.__name__)` uses (retargeted by hand in commit 2, hand-review list for the PR)
+
+| Now | Count | Where |
+|---|---|---|
+| `safe_fetch.__name__` | 6 | `test_sourcer_dns.py` (1), `test_sourcer_download_guards.py` (4), `test_sourcer_watchdog.py` (1): the records of `open_download` |
+| `media_policy.__name__` | 8 | `test_sourcer_image_check.py` (4, incl. the one INFO "Downscaled" test of `fit_image`), `test_sourcer_sniffing.py` (4): `fit_image`, `require_media`, `cached_media_ok` |
+| `AS.__name__` (stays) | 8 | `test_sourcer_api_streaming.py` (1), `test_sourcer_download_guards.py` (1), `test_sourcer_render_budget.py` (2), `test_sourcer_api_limits.py` (1), `test_sourcer_image_check.py` (1), `test_sourcer_sniffing.py` (2): records emitted by the adapters themselves (the HuggingFace "too large" / "asset budget" / "not a valid image|video" / "not a readable image" warnings, the "malformed Pexels" hit) |
+
+The one `caplog.at_level(DEBUG, logger=_LOG)` (HF adapter) stays on `asset_sourcer`. Logger-name tests in
+`test_module_seams.py` pin `engine.render.safe_fetch` for `open_download` and `engine.render.media_policy` for
+`fit_image` / `require_media`, and that each new module uses `getLogger(__name__)`.
+
+### Mutations (apply, the named check or test must fail, revert)
+
+- **B1-B8 (bridge and oracle, commit 1):** all eight failed `tests/test_bridge_forwarding.py`.
+- **C1-C24 (control wiring):** a first set of representatives (C11, one of each of C5, C9, C10, C12-C16) was killed by an existing test
+  against the bridge tree in commit 1; the full set was re-run on the retargeted tree after commit 2: 53 variants across
+  the 24 mutants (the per-site variants of 4, 12, 20 and 21 included), every one turned at least one existing test red.
+- **F1-F20 (fidelity):** each failed the expected check (A, B or C) of the script.
+- **Gm1-Gm8 (guards) and Pm1-Pm8 (probes), commit 3:** every one turned a named `test_module_seams.py` test red; the
+  oracle kind flip (`callable` <-> `constant`) and the wrong `getLogger("x")` in each new module are among them.
+
+### Deviations from the spec text (none changes the design)
+
+- `tests/test_sourcer_sniffing.py` keeps its `from engine.render import asset_sourcer as AS` import: its HuggingFace-adapter record
+  tests still use `AS.__name__` (they were not part of the "remove unused `AS` import" set).
+- `tests/_seam_ast.py` is an added helper file (spec §4.5 names only `_seam_oracle.py` and `test_module_seams.py`): the AST checkers
+  live there so the fidelity script's resolver mode can load them by path with a bare `python3` (standard library only), and the
+  guard file stays readable. Fidelity stage 3 allows it as a new test-tree file.
+- G1, G2, G3, G5 and G6 are stricter or more precise than the spec text, each extra rule with its own synthetic-violation or
+  positive-control test. Examples: G2 also rejects positional `raising` / `create` flags; G3 additionally pins that the public
+  surface is exactly the 22 names and that the oracle's kinds match the real objects (a callable labelled `constant` is caught); G5
+  distinguishes a module-level `__getattr__` from a method of that name inside a class and pins `MOVED` disjoint from `STAYS`;
+  G6b flags a valid predicate name used outside `asset_sourcer`, G6c resolves `self.<ATTR>` against the enclosing class only.
+- Spec review history is in §11; code review of the implementation: see the pull request.
 
 ## 11. Spec-review history
 
