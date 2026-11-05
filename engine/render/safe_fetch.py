@@ -50,8 +50,8 @@ _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 # shuts the socket down when the budget runs out -- the only thing that can interrupt a read blocked
 # on a server dripping response headers or a chunked-encoding size line, where httpx yields nothing for
 # the other two to check. Each hop's httpx timeout is also clamped to the time left (see
-# `_HOP_TIMEOUT_GRACE_S`), which bounds the TCP connect / TLS handshake before the watchdog exists, the
-# adapters choose their own per-search budgets (and pass the resulting deadline in), and the host's DNS
+# `_HOP_TIMEOUT_GRACE_S`), which bounds the TCP connect / TLS handshake before the watchdog exists; the
+# adapters choose their own per-search budgets (and pass the resulting deadline in); and the host's DNS
 # lookup is given at most that long (`_dns_in_time`; getaddrinfo takes no timeout). The API calls are
 # streamed and capped while they are read (`_api_call`), and a render's total is bounded by
 # `asset_budget()` (below). SoftTimeLimitExceeded raised in ANY network call of this fetch layer is

@@ -72,6 +72,8 @@ PRODUCTION_DIRS = ("api", "engine", "worker")
 # docstring of a new module. The node is compared with its (top-level) docstring removed on both sides.
 EDIT_ALLOWLIST = {
     "_any_https_host": "docstring said the hosts are constants in this module; false in safe_fetch (the host set is the caller's)",
+    "_pixel_cap": "docstring said WebP is capped at 25 Mpx; the code gives _MAX_DECODE_BYTES // 20 = 20 Mpx (baseline inaccuracy)",
+    "_image_ok": "docstring said WebP is capped at 25 Mpx; the code gives _MAX_DECODE_BYTES // 20 = 20 Mpx (baseline inaccuracy)",
     "_api_get": "docstring gains a sentence: the default url_ok is not an allowlist",
     "_api_post": "docstring gains a sentence: the default url_ok is not an allowlist",
     "<module:safe_fetch>": "new module docstring",

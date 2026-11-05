@@ -96,7 +96,7 @@ of `engine/render/asset_sourcer.py` (Phase 8g, `docs/specs/2026-11-safe-fetch-me
   asset: Pexels (video), Wikipedia (player photos), HuggingFace image, HuggingFace video. `LocalMusicSource` and
   the id/selection helpers stay with them in `asset_sourcer.py`. An adapter chooses its own limits and URL
   allowlist and asks `safe_fetch` and `media_policy` to enforce them; the policy modules know no upstream.
-- **Seam** — a moved function or constant that another module calls or that tests patch (the 22 public names
-  of `safe_fetch` and `media_policy`). A seam is reached as a module attribute (`safe_fetch.open_download(...)`),
+- **Seam** — a moved function or constant that another module calls or that tests patch (22 of them public,
+  in `safe_fetch` and `media_policy`; tests also patch private ones such as `safe_fetch._http_stream`). A seam is reached as a module attribute (`safe_fetch.open_download(...)`),
   never imported by name, aliased or held in a default argument, so a test that patches the owning module is
   seen by every caller; `tests/test_module_seams.py` enforces that.

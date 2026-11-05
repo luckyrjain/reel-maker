@@ -541,10 +541,6 @@ def collect_targets(project, only=None):
     return targets, problems
 
 
-def project_from(sources, exclude=()):
-    return Project({p: s for p, s in sources.items() if p not in exclude})
-
-
 # --------------------------------------------------------------------------------------------------- G1
 def g1_problems(sources, exclude=G1_EXCLUDED):
     """Stale or moved-name access through asset_sourcer, and patching `safe_fetch.now`, in the given test sources.

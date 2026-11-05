@@ -845,6 +845,22 @@ def test_now_follows_a_patched_monotonic(monkeypatch):
     assert safe_fetch.now() == 7.0
 
 
+def test_the_watchdog_timer_interval_follows_the_patched_clock(monkeypatch):
+    """`_Watchdog.trace` computes its Timer delay from the module clock: the one `_monotonic()` reader no other
+    probe drives (a `time.monotonic()` there would arm the Timer from the real clock under a fake one)."""
+    from tests.test_sourcer_watchdog import _FakeNetworkStream
+    monkeypatch.setattr(safe_fetch, "_monotonic", lambda: 1e9)
+    a, b = socket.socketpair()
+    try:
+        with patch.object(safe_fetch.threading, "Timer") as timer:
+            safe_fetch._Watchdog(1e9 + 10.0).trace("connection.connect_tcp.complete",
+                                                   {"return_value": _FakeNetworkStream(a)})
+        assert timer.call_args.args[0] == 10.0
+    finally:
+        a.close()
+        b.close()
+
+
 def test_the_unpatched_clock_is_the_real_monotonic_clock():
     before = safe_fetch.now()
     assert isinstance(before, float) and safe_fetch.now() >= before

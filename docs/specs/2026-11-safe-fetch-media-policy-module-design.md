@@ -1,6 +1,6 @@
 # `safe_fetch` and `media_policy` — splitting the hardened fetch and the media check out of `asset_sourcer`
 
-Status: implemented (Phase 8g, branch `c2-safe-fetch-media-policy`; §10 is the implementation record). Spec revision 7 (after six spec-review rounds; rounds 1–5 were NOT CLEAN for all four personas, round 6 left only the wording items fixed in revision 7; findings and what
+Status: implemented (Phase 8g, branch `c2-safe-fetch-media-policy`; §10 is the implementation record). Spec revision 7 (after six spec-review rounds; rounds 1–5 were NOT CLEAN for all four personas; round 6 found one MEDIUM (the oracle `kind` rule) and wording items, all fixed in revision 7; findings and what
 changed are in §11). Source: candidate C2 of the 2026-11-03 full-codebase architecture review (strength "Worth
 exploring", medium confidence), grilled and settled in a twelve-question session (Q1–Q12, §3). Scope:
 `engine/render/asset_sourcer.py` (split), two new modules, `worker/tasks/render.py` (its import and three use
@@ -672,7 +672,7 @@ setattr/patch.object(AS, '<literal>') calls: 182; targeting moved names: 129
 | 0 spec, plan | `bd26ee9`, `37393ce` | baseline 2760 passed, 3 skipped, 1 deselected |
 | 1 move behind the bridge, no existing test edited | `333458b` | 3133 passed = 2760 + 373 bridge tests, 3 skipped |
 | 2 retarget, bridge deleted | `401b376` | 2760 passed, 3 skipped, 1 deselected |
-| 3 guards, probes, docs | `e9968b2` | 3071 passed = 2760 + 311 (`tests/test_module_seams.py`, 308 at `e9968b2` plus 3 added by code-review round 1), 3 skipped, 1 deselected; 3074 selected (3075 collected) |
+| 3 guards, probes, docs | `e9968b2` | 3072 passed = 2760 + 312 (`tests/test_module_seams.py`: 308 at `e9968b2`, +3 G1 alias cases in review round 1 (`1b4ca75`), +1 watchdog-clock pin in round 2), 3 skipped, 1 deselected; 3075 selected (3076 collected) |
 
 Test files: 77 `test_*.py` become 78 (`test_module_seams.py`); `tests/_seam_oracle.py` and `tests/_seam_ast.py` are helper
 modules, not test files, and `conftest.py` is counted as before (outside the figure).
@@ -686,7 +686,7 @@ Checks printed OK at each stage: **stage 1: 17**, **stage 2: 22**, **stage 3: 25
 OK ORACLE  baseline defines each top-level name once; MOVED keys == baseline definitions minus STAYS; MOVED and STAYS
            disjoint; 58 moved names, 29 per owner; kinds derived (36 callable, 2 constant, 20 data); NEW and BRIDGE_EXTRAS;
            every STAYS name exists in the baseline (49); 22 public names (13 + 9), new names unique; owners define them
-OK A safe_fetch     29 moved nodes; docstring edits allowed: _any_https_host, _api_get, _api_post
+OK A safe_fetch     29 moved nodes; docstring edits allowed: _any_https_host, _api_get, _api_post (commit 3 time; `_pixel_cap`/`_image_ok` added in review round 2)
 OK A media_policy   29 moved nodes
 OK B asset_sourcer.py  44 staying nodes equal the inverse-transformed baseline; 10 planned import removals == the baseline
                        imports with no staying-code user; imports are the baseline's minus removals plus additions
@@ -701,7 +701,8 @@ OK G1 resolver (81 test files): no stale access, nothing unresolved, safe_fetch.
 
 Allowed docstring edits (the `EDIT_ALLOWLIST`, each compared with its docstring removed): `_any_https_host` (the
 "hosts are constants in this module" sentence, false in `safe_fetch`, now says the host set is the caller's),
-`_api_get` and `_api_post` (a sentence that the default `url_ok` is not an allowlist), `<module:safe_fetch>` and
+`_api_get` and `_api_post` (a sentence that the default `url_ok` is not an allowlist), `_pixel_cap` and `_image_ok` (the
+inherited "25 Mpx for WebP" statements, corrected to the 20 Mpx the code gives; added in review round 2), `<module:safe_fetch>` and
 `<module:media_policy>` (new module docstrings). Comment blocks (not in the AST, reviewed by hand): baseline lines
 90-94 -> `safe_fetch` lines 37-42 ("https-only to an expected host" -> "to hosts the caller's `url_ok` allows");
 124-135 -> lines 47-59 ("each search() has one overall budget (below)" -> "the adapters choose their own per-search
@@ -742,7 +743,8 @@ The one `caplog.at_level(DEBUG, logger=_LOG)` (HF adapter) stays on `asset_sourc
   against the bridge tree in commit 1; the full set was re-run on the retargeted tree after commit 2: 53 variants across
   the 24 mutants (the per-site variants of 4, 12, 20 and 21 included), every one turned at least one existing test red.
 - **F1-F20 (fidelity):** each failed the expected check (A, B or C) of the script.
-- **Gm1-Gm8 (guards) and Pm1-Pm8 (probes), commit 3:** every one turned a named `test_module_seams.py` test red; the
+- **Gm1-Gm8 (guards) and Pm1-Pm8 (probes), commit 3:** every one turned a named `test_module_seams.py` test red (the subset recorded here; the longer lists of §6 were
+  run as part of the same batteries); the
   oracle kind flip (`callable` <-> `constant`) and the wrong `getLogger("x")` in each new module are among them.
 
 ### Deviations from the spec text (none changes the design)

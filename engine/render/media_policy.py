@@ -84,7 +84,7 @@ def _bytes_per_pixel(fmt) -> int:
 
 def _pixel_cap(fmt) -> int:
     """The most pixels an image of Pillow format `fmt` may declare: `_MAX_IMAGE_PIXELS`, and for a format
-    that is decoded in full also what fits in `_MAX_DECODE_BYTES` (WebP: 25 Mpx; PNG / TIFF / GIF: 50 Mpx)."""
+    that is decoded in full also what fits in `_MAX_DECODE_BYTES` (WebP: 20 Mpx; PNG / TIFF / GIF: 50 Mpx)."""
     if fmt in _JPEG_FORMATS:
         return _MAX_IMAGE_PIXELS                # decoded at 1/8 scale: far less than a full-size buffer
     return min(_MAX_IMAGE_PIXELS, _MAX_DECODE_BYTES // _bytes_per_pixel(fmt))
@@ -126,7 +126,7 @@ def _is_transient(exc: BaseException) -> bool:
 
 def image_ok(source) -> bool:
     """True if Pillow can decode `source` (image bytes or a Path) and it declares <= `_pixel_cap(format)`
-    pixels (`_MAX_IMAGE_PIXELS`, and for a non-JPEG also what fits in `_MAX_DECODE_BYTES`: 25 Mpx for WebP).
+    pixels (`_MAX_IMAGE_PIXELS`, and for a non-JPEG also what fits in `_MAX_DECODE_BYTES`: 20 Mpx for WebP).
 
     The declared size is read from the header first, and the pixels are decoded (`load()`) only when it
     is within the cap, so the decode is bounded (by the per-format byte budget, `_MAX_DECODE_BYTES`; a JPEG is decoded at 1/8

@@ -83,7 +83,7 @@ Files: edit `tests/**` (the 15 `AS.`-using files plus `conftest.py` and the `_MO
   (except the bridge test).
 - Verify: full suite = **2760 passed, 3 skipped**; ruff clean; fidelity `--stage 2` A, B (now including
   `render.py`) and C pass; sorted node-id set equal to the baseline's; per-file `assert`/`raises`/`approx` counts
-  equal; no `AS.<moved name>` left (`grep`); re-run control-wiring mutants C1–C24 and fidelity mutants F1–F10 on the
+  equal; no `AS.<moved name>` left (`grep`); re-run control-wiring mutants C1–C24 and fidelity mutants F1–F20 on the
   retargeted tree and record each result.
 - Commit: `test: retarget the sourcer tests to safe_fetch and media_policy, drop the bridge`.
 
@@ -122,4 +122,4 @@ summary. Check CI, offer Auto-fix per the ccd_pr tools. **Do not merge** (merge 
 | Fidelity A / B / C | A, B | A, B (+`render.py`), C | all re-run |
 | Bridge present | yes | no | no |
 | Existing tests edited | none | exactly the §6 allow-list | none further |
-| Mutants | B1–B8, part of C | C1–C24, F1–F10 | Gm1…, kind flip |
+| Mutants | B1–B8, part of C | C1–C24, F1–F20 | Gm1…, kind flip |
