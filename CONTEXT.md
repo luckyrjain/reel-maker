@@ -66,3 +66,28 @@ a signature, a behavioral ledger and an AST guard) and `docs/design.md` §3 for 
 against a stale video/guide via fingerprint comparison, a different problem (data staleness after a
 guide edit) from job-claim ownership. Both are called "staleness" informally in conversation; they are
 unrelated mechanisms solving unrelated problems.
+
+---
+
+## Asset fetching & media policy
+
+Surfaced via the C2 architecture-review grilling session (hardened fetch + image check split out of
+`engine/render/asset_sourcer.py`). Module names below are the agreed targets; the code still lives in
+`asset_sourcer.py` until that change lands.
+
+- **Fetch budget** — the wall-clock limits that bound remote asset I/O, nested from small to large: a
+  per-download deadline (`_VIDEO_DEADLINE_S` / `_IMAGE_DEADLINE_S`, shared by that download's redirect hops
+  and 429 retry), a per-`search()` budget (`_PEXELS_SEARCH_BUDGET_S` / `_WIKI_SEARCH_BUDGET_S`), and the
+  render-wide **asset budget** (`asset_budget()`, `RENDER_ASSET_BUDGET_S`, a `ContextVar` deadline for the
+  asset time of one `render_cut`; TTS time is not charged to it). Inner budgets are clipped to the outer
+  one. It gates the *start* of downloads and paid HuggingFace calls only; a call already in flight and the
+  small API lookups are not interrupted. The mechanism (hop/read deadlines, the watchdog, the asset budget)
+  lives in `engine/render/safe_fetch.py` (target module); the per-download and per-search limits are chosen by
+  the adapters in `asset_sourcer.py` and passed in.
+- **Media policy** — the decision applied to a downloaded (or already-cached) asset before it is trusted:
+  admit it, downscale it, or refuse it. Covers the magic-byte sniff, the Pillow decode and pixel cap, the
+  downscale windows, and the URL-keyed `.refused` markers for images that cannot be shrunk. A refused asset
+  is never cached and, for the paid HuggingFace tiers, never billed. Lives in
+  `engine/render/media_policy.py` (target module). Distinct from **safe_to_publish**, which is a *licence*
+  decision enforced at publish time (`engine/publish/gate.py`), not a decision about whether the bytes are
+  usable media.
