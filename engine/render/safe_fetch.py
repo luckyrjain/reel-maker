@@ -1,10 +1,10 @@
 """The hardened fetch layer: bounded, deadline-driven access to remote assets and APIs.
 
 `open_download` enforces https on the default port, re-checks every redirect hop (httpx is never asked to
-follow redirects), caps the size by Content-Length and by bytes read, applies per-hop and wall-clock
-deadlines (a `_Watchdog` shuts the connection down at the deadline, a DNS gate bounds the lookup) and
-refuses encoded bodies. It does NOT decide which hosts are acceptable: the host allowlist is the caller's
-`url_ok`, applied to the first URL and to every redirect target. `api_get` / `api_post` are the same
+follow redirects), applies per-hop and wall-clock deadlines (a `_Watchdog` shuts the connection down at the
+deadline, a DNS gate bounds the lookup) and refuses encoded bodies; `iter_capped` caps the size by
+Content-Length and by bytes read. It does NOT decide which hosts are acceptable: the host allowlist is the
+caller's `url_ok`, applied to the first URL and to every redirect target. `api_get` / `api_post` are the same
 machinery for small JSON calls and default to `url_ok=_any_https_host`, which means "any https host except
 IP literals and localhost" and is NOT an allowlist.
 

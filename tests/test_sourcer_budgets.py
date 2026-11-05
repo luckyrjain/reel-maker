@@ -1,4 +1,4 @@
-"""The wall-clock budgets of the sourcers' downloads (engine/render/asset_sourcer.py).
+"""The wall-clock budgets of the sourcers' downloads (engine/render/safe_fetch.py).
 
 * Per hop: httpx's own timeout is clamped to the time left in the download's budget (plus a small
   grace so the watchdog, which is exact, wins once the connection exists). That bounds the TCP

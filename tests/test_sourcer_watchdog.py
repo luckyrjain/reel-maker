@@ -1,4 +1,4 @@
-"""The download watchdog and the Celery soft-limit pass-through (engine/render/asset_sourcer.py).
+"""The download watchdog and the Celery soft-limit pass-through (engine/render/safe_fetch.py).
 
 httpx timeouts are per read and `iter_capped`'s deadline runs only when httpx yields a body chunk,
 so a hostile host that drips response *headers*, or a chunked-encoding size line / extension, held

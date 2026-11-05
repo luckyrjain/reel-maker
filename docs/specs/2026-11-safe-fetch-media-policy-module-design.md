@@ -1,6 +1,6 @@
 # `safe_fetch` and `media_policy` — splitting the hardened fetch and the media check out of `asset_sourcer`
 
-Status: implemented (Phase 8g, branch `c2-safe-fetch-media-policy`; §10 is the implementation record). Spec revision 7 (after six spec-review rounds; round 6 left only the wording items fixed here: four personas each, all NOT CLEAN; findings and what
+Status: implemented (Phase 8g, branch `c2-safe-fetch-media-policy`; §10 is the implementation record). Spec revision 7 (after six spec-review rounds; rounds 1–5 were NOT CLEAN for all four personas, round 6 left only the wording items fixed in revision 7; findings and what
 changed are in §11). Source: candidate C2 of the 2026-11-03 full-codebase architecture review (strength "Worth
 exploring", medium confidence), grilled and settled in a twelve-question session (Q1–Q12, §3). Scope:
 `engine/render/asset_sourcer.py` (split), two new modules, `worker/tasks/render.py` (its import and three use
@@ -672,7 +672,7 @@ setattr/patch.object(AS, '<literal>') calls: 182; targeting moved names: 129
 | 0 spec, plan | `bd26ee9`, `37393ce` | baseline 2760 passed, 3 skipped, 1 deselected |
 | 1 move behind the bridge, no existing test edited | `333458b` | 3133 passed = 2760 + 373 bridge tests, 3 skipped |
 | 2 retarget, bridge deleted | `401b376` | 2760 passed, 3 skipped, 1 deselected |
-| 3 guards, probes, docs | (hash pending) | 3068 passed = 2760 + 308 (`tests/test_module_seams.py`), 3 skipped, 1 deselected; 3071 selected (3072 collected) |
+| 3 guards, probes, docs | `e9968b2` | 3071 passed = 2760 + 311 (`tests/test_module_seams.py`, 308 at `e9968b2` plus 3 added by code-review round 1), 3 skipped, 1 deselected; 3074 selected (3075 collected) |
 
 Test files: 77 `test_*.py` become 78 (`test_module_seams.py`); `tests/_seam_oracle.py` and `tests/_seam_ast.py` are helper
 modules, not test files, and `conftest.py` is counted as before (outside the figure).

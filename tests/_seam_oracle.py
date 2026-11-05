@@ -1,8 +1,9 @@
 """Oracle for the safe_fetch / media_policy split (spec 2026-11-safe-fetch-media-policy-module-design.md, 4.5).
 
 Exact literals, no globs, nothing computed from the new modules. Imported by the fidelity script
-(docs/specs/2026-11-safe-fetch-media-policy-fidelity.py), by the temporary bridge test (commit 1) and by the
-guards in tests/test_module_seams.py (commit 3). The names are those of the baseline revision d096524.
+(docs/specs/2026-11-safe-fetch-media-policy-fidelity.py) and by the guards in tests/test_module_seams.py and
+tests/_seam_ast.py (the temporary bridge test of commit 1 used it too and was deleted in commit 2). The names
+are those of the baseline revision d096524.
 
 MOVED maps each of the 58 baseline top-level names of engine/render/asset_sourcer.py that leave it to
 (owner module name, new name, kind). kind is "callable" (functions, classes and _monotonic: a seam may only be
@@ -76,7 +77,7 @@ MOVED = {
 # The one public name with no baseline counterpart.
 NEW = {"now": ("safe_fetch", "callable")}
 
-# Stdlib modules the bridge of commit 1 forwards to safe_fetch (tests reach them as AS.<x>).
+# Stdlib modules tests used to reach as AS.<x> (the commit-1 bridge forwarded them to safe_fetch); G1 now flags that.
 BRIDGE_EXTRAS = frozenset({"httpx", "threading", "socket"})
 
 # Every non-moved baseline top-level definition of asset_sourcer, plus the imported names tests reach on it.

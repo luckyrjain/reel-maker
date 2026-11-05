@@ -1,4 +1,4 @@
-"""An image must be readable and not enormous before it is cached (engine/render/asset_sourcer.py).
+"""An image must be readable and not enormous before it is cached (engine/render/media_policy.py).
 
 The byte cap (50 MB) says nothing about how many PIXELS a file declares: a 140 KB PNG declaring
 12000x12000 px is "small" and passes the magic-byte sniff, yet the compositor's

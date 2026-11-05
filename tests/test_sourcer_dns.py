@@ -1,4 +1,4 @@
-"""DNS resolution time of the sourcers' downloads (engine/render/asset_sourcer.py).
+"""DNS resolution time of the sourcers' downloads (engine/render/safe_fetch.py).
 
 `socket.getaddrinfo` takes no timeout, so the per-hop httpx timeout (which bounds the TCP connect and
 every read) does not bound the lookup, and the watchdog only exists once there is a connection. A

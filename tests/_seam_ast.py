@@ -179,8 +179,22 @@ def dotted(node, bindings):
     return set()
 
 
+def alias_path(path):
+    """`engine.render.asset_sourcer.safe_fetch.x` -> `engine.render.safe_fetch.x` (and media_policy).
+
+    asset_sourcer imports both modules, so `AS.safe_fetch` IS safe_fetch: reaching a patch target that way must
+    be judged like the direct spelling."""
+    asset = MODULE_PATHS["asset_sourcer"]
+    for owner in POLICY:
+        prefix = f"{asset}.{owner}"
+        if path == prefix or path.startswith(prefix + "."):
+            return MODULE_PATHS[owner] + path[len(prefix):]
+    return path
+
+
 def owner_of_path(path):
     """The module (asset_sourcer / safe_fetch / media_policy) a dotted string lives under, else None."""
+    path = alias_path(path)
     for module_path, owner in PATH_OWNER.items():
         if path == module_path or path.startswith(module_path + "."):
             return owner
@@ -190,7 +204,7 @@ def owner_of_path(path):
 def module_owner(node, bindings, only=None):
     """The owner module if `node` IS one of the three modules (a bound name or a dotted chain), else None."""
     for p in dotted(node, bindings):
-        owner = PATH_OWNER.get(p)
+        owner = PATH_OWNER.get(alias_path(p))
         if owner is not None and (only is None or owner in only):
             return owner
     return None
@@ -547,7 +561,8 @@ def g1_problems(sources, exclude=G1_EXCLUDED):
                 if first in STALE_NAMES:
                     problems.append(Problem(t.path, t.line, "G1", f"patch target {t.target!r}: `{first}` no longer lives "
                                             "on asset_sourcer"))
-            if t.target == MODULE_PATHS["safe_fetch"] + ".now" or t.target.startswith(MODULE_PATHS["safe_fetch"] + ".now."):
+            target = alias_path(t.target)
+            if target == MODULE_PATHS["safe_fetch"] + ".now" or target.startswith(MODULE_PATHS["safe_fetch"] + ".now."):
                 problems.append(Problem(t.path, t.line, "G1", f"patch target {t.target!r}: patch safe_fetch._monotonic, "
                                         "never safe_fetch.now (D2)"))
         else:

@@ -1,4 +1,4 @@
-"""Downloaded bytes must look like what they claim to be (engine/render/asset_sourcer.py).
+"""Downloaded bytes must look like what they claim to be (engine/render/media_policy.py).
 
 The download guards bound WHERE bytes come from, how many and how long; they say nothing about
 WHAT arrives. A 200 `text/html`/JSON body (a CDN error page, a captive portal, a compromised

@@ -1,4 +1,4 @@
-"""The sourcers' API calls are streamed and capped while they are read (engine/render/asset_sourcer.py).
+"""The sourcers' API calls are streamed and capped while they are read (engine/render/safe_fetch.py).
 
 Pexels search, the Wikipedia opensearch / summary / imageinfo lookups and both HuggingFace generations
 used `httpx.get` / `httpx.post`, which read the WHOLE body before returning: a hostile or broken

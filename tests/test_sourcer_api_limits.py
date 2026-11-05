@@ -1,4 +1,4 @@
-"""Size limits on the sourcers' API responses (engine/render/asset_sourcer.py).
+"""Size limits on the sourcers' API responses (engine/render/safe_fetch.py).
 
 The Pexels search, the Wikipedia opensearch / summary / imageinfo lookups and the two HuggingFace
 generation calls go through `httpx.get` / `httpx.post`, which read the whole body. Unlike the

@@ -258,6 +258,10 @@ def test_G1_ignores_a_patch_that_is_not_unittest_mock_patch():
     "def t():\n    with patch.object(safe_fetch, 'now'):\n        pass\n",
     "def t(monkeypatch):\n    sf = safe_fetch\n    monkeypatch.setattr(sf, 'now', lambda: 0.0)\n",
     "def t():\n    with patch(TARGET):\n        pass\n",
+    # the same mistake spelled through asset_sourcer, which imports safe_fetch
+    "def t():\n    with patch('engine.render.asset_sourcer.safe_fetch.now'):\n        pass\n",
+    "def t(monkeypatch):\n    monkeypatch.setattr(AS.safe_fetch, 'now', lambda: 0.0)\n",
+    "def t():\n    with patch.object(AS.safe_fetch, 'now'):\n        pass\n",
 ])
 def test_G1_fires_on_patching_safe_fetch_now_directly_or_through_an_alias(body):
     head = _G1_HEAD + "_FETCH = 'engine.render.safe_fetch'\nTARGET = _FETCH + '.now'\n"

@@ -1,4 +1,4 @@
-"""One wall-clock budget across a whole render's asset sourcing (engine/render/asset_sourcer.py).
+"""One wall-clock budget across a whole render's asset sourcing (engine/render/safe_fetch.py).
 
 Each search() has its own budget (900 s Pexels / 240 s Wikipedia), but a render resolves assets for every
 beat, so those add up to hours. `asset_budget(seconds)` sets one deadline for everything inside it

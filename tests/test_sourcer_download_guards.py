@@ -1,4 +1,4 @@
-"""Download guards of the asset sourcers (engine/render/asset_sourcer.py).
+"""Download guards of the asset sourcers (engine/render/safe_fetch.py).
 
 The download URLs (`chosen["link"]` for Pexels, `originalimage` / `thumbnail` `source` for
 Wikipedia) come straight from remote JSON. Before these guards they were fetched with
