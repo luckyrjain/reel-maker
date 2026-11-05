@@ -31,7 +31,7 @@ from contextvars import ContextVar
 import httpx
 from celery.exceptions import SoftTimeLimitExceeded
 
-_log = logging.getLogger("engine.render.asset_sourcer")   # temporary: switches to __name__ in commit 2 (spec D4)
+_log = logging.getLogger(__name__)
 
 
 # ── guarded downloads ────────────────────────────────────────────────────────

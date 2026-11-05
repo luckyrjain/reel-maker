@@ -555,7 +555,7 @@ def test_no_music_cue_passes_none_without_querying_sourcer():
 
 def test_the_beat_loop_runs_inside_the_render_asset_budget():
     """Per-search budgets add up across beats; render_cut bounds the whole asset-sourcing loop."""
-    from engine.render import asset_sourcer as AS
+    from engine.render import safe_fetch
     from worker.tasks.render import render_cut
 
     job, cut, reel = _job(), _cut(), _reel()
@@ -566,7 +566,7 @@ def test_the_beat_loop_runs_inside_the_render_asset_budget():
     seen = []
 
     def resolve(*a, **kw):
-        seen.append(AS._asset_deadline_at.get())
+        seen.append(safe_fetch._asset_deadline_at.get())
         return [(MagicMock(), None)]
 
     with (
@@ -579,17 +579,16 @@ def test_the_beat_loop_runs_inside_the_render_asset_budget():
         patch("worker.tasks.render.resolve_or_reuse", side_effect=resolve),
         patch("worker.tasks.render.record_stage"),
         patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"], _FAKE_SRT_PATH)),
-        patch.object(AS, "_monotonic", return_value=1000.0),
-        patch("worker.tasks.render._asset_clock", return_value=1000.0),
+        patch.object(safe_fetch, "_monotonic", return_value=1000.0),
     ):
         render_cut(1)
 
-    assert seen == [1000.0 + AS.RENDER_ASSET_BUDGET_S] * 3          # one deadline, every beat
-    assert AS._asset_deadline_at.get() is None                      # and gone after the loop
+    assert seen == [1000.0 + safe_fetch.RENDER_ASSET_BUDGET_S] * 3          # one deadline, every beat
+    assert safe_fetch._asset_deadline_at.get() is None                      # and gone after the loop
 
 
 def test_the_budget_is_released_when_a_beat_fails():
-    from engine.render import asset_sourcer as AS
+    from engine.render import safe_fetch
     from worker.tasks.render import render_cut
 
     job, cut, reel = _job(), _cut(), _reel()
@@ -609,12 +608,12 @@ def test_the_budget_is_released_when_a_beat_fails():
     ):
         with pytest.raises(RuntimeError):
             render_cut(1)
-    assert AS._asset_deadline_at.get() is None
+    assert safe_fetch._asset_deadline_at.get() is None
 
 
 def test_only_asset_time_counts_against_the_render_budget_not_tts():
     """TTS can be slow (60 s timeout + retry per beat); it must not starve later beats of footage."""
-    from engine.render import asset_sourcer as AS
+    from engine.render import safe_fetch
     from worker.tasks.render import render_cut
 
     job, cut, reel = _job(), _cut(), _reel()
@@ -627,7 +626,7 @@ def test_only_asset_time_counts_against_the_render_budget_not_tts():
     seen = []
 
     def resolve(*a, **kw):
-        seen.append(AS._asset_deadline_at.get())
+        seen.append(safe_fetch._asset_deadline_at.get())
         t[0] += 100.0                                    # 100 s of asset work per beat
         return [(MagicMock(), None)]
 
@@ -644,11 +643,10 @@ def test_only_asset_time_counts_against_the_render_budget_not_tts():
         patch("worker.tasks.render.resolve_or_reuse", side_effect=resolve),
         patch("worker.tasks.render.record_stage"),
         patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"], _FAKE_SRT_PATH)),
-        patch.object(AS, "_monotonic", lambda: t[0]),
-        patch("worker.tasks.render._asset_clock", lambda: t[0]),
+        patch.object(safe_fetch, "_monotonic", lambda: t[0]),
     ):
         render_cut(1)
 
-    B = AS.RENDER_ASSET_BUDGET_S
+    B = safe_fetch.RENDER_ASSET_BUDGET_S
     # beat k starts at 1000 + 600*k; its deadline is that + (B - 100*k) -- the earlier beats' TTS is not charged
     assert seen == [1000.0 + B, 1600.0 + (B - 100.0), 2200.0 + (B - 200.0)]

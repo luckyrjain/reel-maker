@@ -2,14 +2,14 @@
 
 Pexels search, the Wikipedia opensearch / summary / imageinfo lookups and both HuggingFace generations
 used `httpx.get` / `httpx.post`, which read the WHOLE body before returning: a hostile or broken
-upstream could make the worker buffer gigabytes before any size check ran. `_api_get` / `_api_post`
+upstream could make the worker buffer gigabytes before any size check ran. `api_get` / `api_post`
 mirror those functions' signatures (so call sites and their tests are unchanged) but go through the
-`_open_download` / `_http_stream` seam: `Accept-Encoding: identity`, no redirects, at most `limit` bytes
+`open_download` / `_http_stream` seam: `Accept-Encoding: identity`, no redirects, at most `limit` bytes
 read, a wall-clock deadline with the DNS gate and the connection watchdog, and a real `httpx.Response`
 built from what was read. A host that ignores the identity request and answers gzip / deflate is decoded
 from the raw stream under the same cap (`_decode_bounded`); other encodings are refused.
 
-These tests carry the `real_api` marker: every other test gets `_api_get` / `_api_post` wired back to
+These tests carry the `real_api` marker: every other test gets `api_get` / `api_post` wired back to
 `httpx.get` / `httpx.post` (tests/conftest.py), which is what the older fakes patch.
 """
 import json as jsonlib
@@ -19,6 +19,7 @@ import httpx
 import pytest
 
 from engine.render import asset_sourcer as AS
+from engine.render import safe_fetch
 from engine.render.asset_sourcer import (
     HuggingFaceImageSource, HuggingFaceVideoSource, PexelsVideoSource, WikipediaImageSource,
 )
@@ -37,15 +38,15 @@ def _json_bytes(obj):
 
 
 def _with(stream, monkeypatch):
-    monkeypatch.setattr(AS, "_http_stream", stream)
+    monkeypatch.setattr(safe_fetch, "_http_stream", stream)
     return stream
 
 
-# ── _api_get / _api_post themselves ──────────────────────────────────────────────────────────
+# ── api_get / api_post themselves ──────────────────────────────────────────────────────────
 
 def test_a_response_is_a_real_httpx_response_built_from_what_was_read(monkeypatch):
     _with(_Stream({URL: _Resp(chunks=(b'{"a":', b' 1}'), headers={"content-type": "application/json"})}), monkeypatch)
-    resp = AS._api_get(URL, timeout=5.0)
+    resp = safe_fetch.api_get(URL, timeout=5.0)
     assert isinstance(resp, httpx.Response) and resp.status_code == 200
     assert resp.json() == {"a": 1} and resp.content == b'{"a": 1}'
     assert resp.headers["Content-Type"] == "application/json"       # case-insensitive, a real Headers
@@ -54,7 +55,7 @@ def test_a_response_is_a_real_httpx_response_built_from_what_was_read(monkeypatc
 @pytest.mark.parametrize("status", [400, 404, 429, 500, 503])
 def test_an_error_status_is_a_response_that_raise_for_status_rejects(monkeypatch, status):
     _with(_Stream({URL: _Resp(status=status, chunks=(b"{}",))}), monkeypatch)
-    resp = AS._api_get(URL, timeout=5.0)
+    resp = safe_fetch.api_get(URL, timeout=5.0)
     assert resp.status_code == status
     with pytest.raises(httpx.HTTPStatusError):
         resp.raise_for_status()
@@ -62,7 +63,7 @@ def test_an_error_status_is_a_response_that_raise_for_status_rejects(monkeypatch
 
 def test_the_request_is_get_with_identity_encoding_no_redirects_and_the_callers_arguments(monkeypatch):
     stream = _with(_Stream({URL: _Resp(chunks=(b"{}",))}), monkeypatch)
-    AS._api_get(URL, params={"q": "messi"}, headers={"Authorization": "k"}, timeout=7.0)
+    safe_fetch.api_get(URL, params={"q": "messi"}, headers={"Authorization": "k"}, timeout=7.0)
     (url, kw), = stream.requests
     assert url == URL and kw["params"] == {"q": "messi"} and kw["timeout"] == 7.0
     assert kw["headers"] == {"Authorization": "k", "Accept-Encoding": "identity"}
@@ -71,7 +72,7 @@ def test_the_request_is_get_with_identity_encoding_no_redirects_and_the_callers_
 
 def test_a_post_carries_its_json_body(monkeypatch):
     stream = _with(_Stream({URL: _Resp(chunks=(b"{}",))}), monkeypatch)
-    AS._api_post(URL, json={"inputs": "a prompt"}, headers={"Authorization": "Bearer k"}, timeout=60.0)
+    safe_fetch.api_post(URL, json={"inputs": "a prompt"}, headers={"Authorization": "Bearer k"}, timeout=60.0)
     (url, kw), = stream.requests
     assert kw["json"] == {"inputs": "a prompt"} and kw["headers"]["Authorization"] == "Bearer k"
 
@@ -85,55 +86,55 @@ def test_the_method_is_get_or_post(monkeypatch):
         methods.append(method)
         yield _Resp(chunks=(b"{}",))
 
-    monkeypatch.setattr(AS, "_http_stream", fake)
-    AS._api_get(URL, timeout=1.0)
-    AS._api_post(URL, timeout=1.0)
+    monkeypatch.setattr(safe_fetch, "_http_stream", fake)
+    safe_fetch.api_get(URL, timeout=1.0)
+    safe_fetch.api_post(URL, timeout=1.0)
     assert methods == ["GET", "POST"]
 
 
 def test_a_body_over_the_limit_is_not_read_to_the_end(monkeypatch):
     resp = _Resp(chunks=tuple(b"x" * 10 for _ in range(1000)))
     _with(_Stream({URL: resp}), monkeypatch)
-    with pytest.raises(AS._TooLarge):
-        AS._api_get(URL, timeout=5.0, limit=25)
+    with pytest.raises(safe_fetch.TooLarge):
+        safe_fetch.api_get(URL, timeout=5.0, limit=25)
     assert resp.chunks_read == 3                                    # 10, 20, 30 > 25: stopped, 997 chunks unread
 
 
 def test_a_declared_length_over_the_limit_is_refused_before_reading(monkeypatch):
     resp = _Resp(chunks=(b"x",), headers={"content-length": "26"})
     _with(_Stream({URL: resp}), monkeypatch)
-    with pytest.raises(AS._TooLarge):
-        AS._api_get(URL, timeout=5.0, limit=25)
+    with pytest.raises(safe_fetch.TooLarge):
+        safe_fetch.api_get(URL, timeout=5.0, limit=25)
     assert resp.chunks_read == 0
 
 
 def test_a_body_exactly_at_the_limit_is_returned(monkeypatch):
     _with(_Stream({URL: _Resp(chunks=(b"x" * 25,), headers={"content-length": "25"})}), monkeypatch)
-    assert len(AS._api_get(URL, timeout=5.0, limit=25).content) == 25
+    assert len(safe_fetch.api_get(URL, timeout=5.0, limit=25).content) == 25
 
 
 def test_the_default_limit_is_the_json_one(monkeypatch):
-    monkeypatch.setattr(AS, "_MAX_API_JSON_BYTES", 10)
+    monkeypatch.setattr(safe_fetch, "MAX_API_JSON_BYTES", 10)
     _with(_Stream({URL: _Resp(chunks=(b"x" * 11,))}), monkeypatch)
-    with pytest.raises(AS._TooLarge):
-        AS._api_get(URL, timeout=5.0)
+    with pytest.raises(safe_fetch.TooLarge):
+        safe_fetch.api_get(URL, timeout=5.0)
 
 
 @pytest.mark.parametrize("enc", ["br", "zstd", "compress", "gzip, gzip", "deflate, gzip", "bogus"])
 def test_an_unsupported_encoding_is_refused(monkeypatch, enc):
     _with(_Stream({URL: _Resp(chunks=(b"x",), headers={"content-encoding": enc})}), monkeypatch)
     with pytest.raises(ValueError, match="Content-Encoding"):
-        AS._api_get(URL, timeout=5.0)
+        safe_fetch.api_get(URL, timeout=5.0)
 
 
 def test_too_large_is_a_value_error_so_existing_handlers_degrade_it():
-    assert issubclass(AS._TooLarge, ValueError)
+    assert issubclass(safe_fetch.TooLarge, ValueError)
 
 
 def test_a_failing_request_propagates_its_error(monkeypatch):
     _with(_Stream({URL: httpx.ConnectError("down")}), monkeypatch)
     with pytest.raises(httpx.ConnectError):
-        AS._api_get(URL, timeout=5.0)
+        safe_fetch.api_get(URL, timeout=5.0)
 
 
 # ── through real httpx objects (not just the dict-based fakes) ───────────────────────────────
@@ -157,9 +158,9 @@ def test_real_httpx_a_huge_body_is_cut_off_without_being_buffered(monkeypatch):
             produced.append(i)
             yield b"x" * 1024
 
-    monkeypatch.setattr(AS, "_http_stream", _real_stream(lambda req: httpx.Response(200, content=body())))
-    with pytest.raises(AS._TooLarge):
-        AS._api_get(URL, timeout=5.0, limit=4096)
+    monkeypatch.setattr(safe_fetch, "_http_stream", _real_stream(lambda req: httpx.Response(200, content=body())))
+    with pytest.raises(safe_fetch.TooLarge):
+        safe_fetch.api_get(URL, timeout=5.0, limit=4096)
     assert len(produced) < 10                                       # ~10 MB offered, ~5 KB pulled
 
 
@@ -171,8 +172,8 @@ def test_real_httpx_headers_params_and_json_reach_the_wire(monkeypatch):
                     auth=req.headers.get("authorization"), body=req.content)
         return httpx.Response(200, json={"ok": True})
 
-    monkeypatch.setattr(AS, "_http_stream", _real_stream(handler))
-    resp = AS._api_post(URL, params={"a": "1"}, headers={"Authorization": "Bearer k"}, json={"inputs": "p"}, timeout=5.0)
+    monkeypatch.setattr(safe_fetch, "_http_stream", _real_stream(handler))
+    resp = safe_fetch.api_post(URL, params={"a": "1"}, headers={"Authorization": "Bearer k"}, json={"inputs": "p"}, timeout=5.0)
     assert resp.json() == {"ok": True}
     assert seen["method"] == "POST" and seen["url"] == URL + "?a=1"
     assert seen["accept"] == "identity" and seen["auth"] == "Bearer k" and jsonlib.loads(seen["body"]) == {"inputs": "p"}
@@ -182,8 +183,8 @@ def test_real_httpx_a_redirect_is_not_followed(monkeypatch):
     def handler(req):
         return httpx.Response(302, headers={"Location": "https://elsewhere.example/"})
 
-    monkeypatch.setattr(AS, "_http_stream", _real_stream(handler))
-    resp = AS._api_get(URL, timeout=5.0)
+    monkeypatch.setattr(safe_fetch, "_http_stream", _real_stream(handler))
+    resp = safe_fetch.api_get(URL, timeout=5.0)
     assert resp.status_code == 302
     with pytest.raises(httpx.HTTPStatusError):
         resp.raise_for_status()
@@ -202,7 +203,7 @@ def test_pexels_a_whole_search_and_download_go_through_the_streaming_path(tmp_pa
 
 
 def test_pexels_an_oversized_search_response_is_never_buffered_or_parsed(tmp_path, monkeypatch):
-    monkeypatch.setattr(AS, "_MAX_API_JSON_BYTES", 64)
+    monkeypatch.setattr(safe_fetch, "MAX_API_JSON_BYTES", 64)
     api = "https://api.pexels.com/videos/search"
     resp = _Resp(chunks=tuple(b'{"videos": []}' for _ in range(500)))
     _with(_Stream({api: resp}), monkeypatch)
@@ -281,13 +282,13 @@ def test_a_soft_time_limit_in_an_api_call_still_propagates(tmp_path, monkeypatch
 def test_a_post_never_follows_redirects_either(monkeypatch):
     """The HuggingFace POSTs carry a Bearer token: following a redirect would send it elsewhere."""
     stream = _with(_Stream({URL: _Resp(chunks=(b"{}",))}), monkeypatch)
-    AS._api_post(URL, json={"inputs": "p"}, headers={"Authorization": "Bearer k"}, timeout=1.0)
+    safe_fetch.api_post(URL, json={"inputs": "p"}, headers={"Authorization": "Bearer k"}, timeout=1.0)
     assert stream.requests[0][1]["follow_redirects"] is False
 
 
 def test_a_caller_cannot_override_identity_encoding(monkeypatch):
     stream = _with(_Stream({URL: _Resp(chunks=(b"{}",))}), monkeypatch)
-    AS._api_get(URL, headers={"Accept-Encoding": "gzip"}, timeout=1.0)
+    safe_fetch.api_get(URL, headers={"Accept-Encoding": "gzip"}, timeout=1.0)
     assert stream.requests[0][1]["headers"]["Accept-Encoding"] == "identity"
 
 
@@ -307,24 +308,24 @@ def test_a_hostile_api_host_is_cut_off_near_the_deadline(behavior):
     started = _time.monotonic()
     with _serve(behavior) as server:
         with pytest.raises(ValueError, match="too slow"):
-            AS._api_get(server.url, timeout=30.0, deadline_s=0.6, url_ok=_allow_any)
+            safe_fetch.api_get(server.url, timeout=30.0, deadline_s=0.6, url_ok=_allow_any)
     assert 0.5 <= _time.monotonic() - started < 5.0                   # not the 30 s read timeout
 
 
 def test_a_fast_api_host_is_unaffected():
     with _serve("fast_ok") as server:
-        resp = AS._api_get(server.url, timeout=5.0, url_ok=_allow_any)
+        resp = safe_fetch.api_get(server.url, timeout=5.0, url_ok=_allow_any)
     assert resp.content == b"hello"
 
 
 def test_a_post_has_the_same_deadline():
     with _serve("header_drip") as server:
         with pytest.raises(ValueError, match="too slow"):
-            AS._api_post(server.url, json={"a": 1}, timeout=30.0, deadline_s=0.6, url_ok=_allow_any)
+            safe_fetch.api_post(server.url, json={"a": 1}, timeout=30.0, deadline_s=0.6, url_ok=_allow_any)
 
 
 def test_the_default_budget_is_twice_the_timeout_with_a_floor_of_thirty_seconds(monkeypatch):
-    monkeypatch.setattr(AS, "_monotonic", lambda: 100.0)
+    monkeypatch.setattr(safe_fetch, "_monotonic", lambda: 100.0)
     seen = []
 
     from contextlib import contextmanager
@@ -334,26 +335,26 @@ def test_the_default_budget_is_twice_the_timeout_with_a_floor_of_thirty_seconds(
         seen.append(kw["deadline_at"])
         yield _Resp(chunks=(b"{}",))
 
-    monkeypatch.setattr(AS, "_open_download", fake_open)
-    AS._api_get(URL, timeout=5.0)
-    AS._api_get(URL, timeout=20.0)
-    AS._api_get(URL, timeout=20.0, deadline_s=7.0)
+    monkeypatch.setattr(safe_fetch, "open_download", fake_open)
+    safe_fetch.api_get(URL, timeout=5.0)
+    safe_fetch.api_get(URL, timeout=20.0)
+    safe_fetch.api_get(URL, timeout=20.0, deadline_s=7.0)
     assert seen == [130.0, 140.0, 107.0]
 
 
 def test_the_api_budget_is_not_clipped_to_the_render_asset_budget(monkeypatch):
     """The searches must still run once the asset budget is spent, to find cached files."""
     stream = _with(_Stream({URL: _Resp(chunks=(b'{"a": 1}',))}), monkeypatch)
-    with AS.asset_budget(-1.0):
-        assert AS._api_get(URL, timeout=5.0).json() == {"a": 1}
+    with safe_fetch.asset_budget(-1.0):
+        assert safe_fetch.api_get(URL, timeout=5.0).json() == {"a": 1}
     assert len(stream.requests) == 1
 
 
 def test_a_stalled_dns_lookup_fails_the_call_before_any_request(monkeypatch):
     stream = _with(_Stream({URL: _Resp(chunks=(b"{}",))}), monkeypatch)
-    monkeypatch.setattr(AS, "_dns_in_time", lambda host, port, timeout: False)
+    monkeypatch.setattr(safe_fetch, "_dns_in_time", lambda host, port, timeout: False)
     with pytest.raises(ValueError, match="DNS"):
-        AS._api_get(URL, timeout=5.0)
+        safe_fetch.api_get(URL, timeout=5.0)
     assert stream.requests == []
 
 
@@ -361,15 +362,15 @@ def test_a_plain_http_or_odd_api_url_is_refused_before_any_request(monkeypatch):
     stream = _with(_Stream({}), monkeypatch)
     for bad in ("http://api.example/x", "https://user:pw@api.example/x", "https://api.example:8443/x", "ftp://x/y"):
         with pytest.raises(ValueError, match="not allowed"):
-            AS._api_get(bad, timeout=5.0)
+            safe_fetch.api_get(bad, timeout=5.0)
     assert stream.requests == []
 
 
 def test_a_redirect_is_still_returned_not_followed(monkeypatch):
     from tests.test_sourcer_download_guards import _redirect
     stream = _with(_Stream({URL: _redirect("https://api.example/elsewhere")}), monkeypatch)
-    resp = AS._api_get(URL, timeout=5.0)
-    assert resp.status_code in AS._REDIRECT_STATUSES and len(stream.requests) == 1
+    resp = safe_fetch.api_get(URL, timeout=5.0)
+    assert resp.status_code in safe_fetch._REDIRECT_STATUSES and len(stream.requests) == 1
     with pytest.raises(httpx.HTTPStatusError):
         resp.raise_for_status()
 
@@ -383,17 +384,17 @@ def test_a_soft_time_limit_in_an_api_call_passes_through(monkeypatch):
         raise SoftTimeLimitExceeded()
         yield
 
-    monkeypatch.setattr(AS, "_http_stream", boom)
+    monkeypatch.setattr(safe_fetch, "_http_stream", boom)
     with pytest.raises(SoftTimeLimitExceeded):
-        AS._api_get(URL, timeout=5.0)
+        safe_fetch.api_get(URL, timeout=5.0)
 
 
 def test_the_body_read_is_checked_against_the_deadline_chunk_by_chunk(monkeypatch):
     """Ticks: the budget's start, the hop's pre-check, then the first chunk's check -- already past it."""
     _with(_Stream({URL: _Resp(chunks=(b"{", b"}"))}), monkeypatch)
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(100.0, 100.0, after=999.0))
+    monkeypatch.setattr(safe_fetch, "_monotonic", _fake_clock(100.0, 100.0, after=999.0))
     with pytest.raises(ValueError, match="too slow"):
-        AS._api_get(URL, timeout=5.0)
+        safe_fetch.api_get(URL, timeout=5.0)
 
 
 # ── a host that ignores `Accept-Encoding: identity` and sends gzip / deflate anyway ───────────────
@@ -421,7 +422,7 @@ def test_a_gzip_or_deflate_response_is_decoded(monkeypatch, enc, pack):
     body = _json_bytes({"a": [1, 2, 3], "t": "x" * 500})
     _with(_Stream({URL: _Resp(chunks=(pack(body)[:10], pack(body)[10:]), headers={"content-encoding": enc,
                                                                                  "content-type": "application/json"})}), monkeypatch)
-    resp = AS._api_get(URL, timeout=5.0)
+    resp = safe_fetch.api_get(URL, timeout=5.0)
     assert resp.json() == {"a": [1, 2, 3], "t": "x" * 500} and resp.content == body
     assert resp.headers["content-type"] == "application/json"
     assert "content-encoding" not in resp.headers                   # it is decoded now
@@ -429,22 +430,22 @@ def test_a_gzip_or_deflate_response_is_decoded(monkeypatch, enc, pack):
 
 def test_the_decoded_size_is_capped_not_just_the_compressed_size(monkeypatch):
     """A 100 KB-of-zeros gzip is ~100 bytes on the wire: the cap must apply after inflating."""
-    monkeypatch.setattr(AS, "_MAX_API_JSON_BYTES", 1000)
+    monkeypatch.setattr(safe_fetch, "MAX_API_JSON_BYTES", 1000)
     bomb = _gz(b"\0" * 100_000)
     assert len(bomb) < 1000
     _with(_Stream({URL: _Resp(chunks=(bomb,), headers={"content-encoding": "gzip"})}), monkeypatch)
-    with pytest.raises(AS._TooLarge):
-        AS._api_get(URL, timeout=5.0)
+    with pytest.raises(safe_fetch.TooLarge):
+        safe_fetch.api_get(URL, timeout=5.0)
 
 
 def test_a_decoded_body_exactly_at_the_limit_is_accepted_and_one_over_is_not(monkeypatch):
     for size, ok in ((1000, True), (1001, False)):
         _with(_Stream({URL: _Resp(chunks=(_gz(b"x" * size),), headers={"content-encoding": "gzip"})}), monkeypatch)
         if ok:
-            assert len(AS._api_get(URL, timeout=5.0, limit=1000).content) == 1000
+            assert len(safe_fetch.api_get(URL, timeout=5.0, limit=1000).content) == 1000
         else:
-            with pytest.raises(AS._TooLarge):
-                AS._api_get(URL, timeout=5.0, limit=1000)
+            with pytest.raises(safe_fetch.TooLarge):
+                safe_fetch.api_get(URL, timeout=5.0, limit=1000)
 
 
 def test_the_compressed_size_is_capped_too(monkeypatch):
@@ -455,15 +456,15 @@ def test_the_compressed_size_is_capped_too(monkeypatch):
     limit = 510
     assert len(content) <= limit < len(packed)
     _with(_Stream({URL: _Resp(chunks=(packed,), headers={"content-encoding": "gzip"})}), monkeypatch)
-    with pytest.raises(AS._TooLarge):
-        AS._api_get(URL, timeout=5.0, limit=limit)
+    with pytest.raises(safe_fetch.TooLarge):
+        safe_fetch.api_get(URL, timeout=5.0, limit=limit)
 
 
 @pytest.mark.parametrize("data", [b"not gzip at all", _gz(b"hello world")[:-6]], ids=["garbage", "truncated"])
 def test_a_corrupt_or_truncated_encoded_body_is_refused(monkeypatch, data):
     _with(_Stream({URL: _Resp(chunks=(data,), headers={"content-encoding": "gzip"})}), monkeypatch)
     with pytest.raises(ValueError):
-        AS._api_get(URL, timeout=5.0)
+        safe_fetch.api_get(URL, timeout=5.0)
 
 
 def test_an_encoded_body_is_read_raw_not_through_httpxs_decoder(monkeypatch):
@@ -474,14 +475,14 @@ def test_an_encoded_body_is_read_raw_not_through_httpxs_decoder(monkeypatch):
     resp.iter_raw = lambda *a, **k: used.append("raw") or real_raw(*a, **k)
     resp.iter_bytes = lambda *a, **k: used.append("bytes") or real_bytes(*a, **k)
     _with(_Stream({URL: resp}), monkeypatch)
-    AS._api_get(URL, timeout=5.0)
+    safe_fetch.api_get(URL, timeout=5.0)
     assert used == ["raw"]
 
 
 def test_the_rebuilt_response_never_carries_stale_framing_headers(monkeypatch):
     _with(_Stream({URL: _Resp(chunks=(b'{"a": 1}',), headers={
         "content-length": "999", "transfer-encoding": "chunked", "content-type": "application/json"})}), monkeypatch)
-    resp = AS._api_get(URL, timeout=5.0)
+    resp = safe_fetch.api_get(URL, timeout=5.0)
     assert resp.json() == {"a": 1}
     assert "transfer-encoding" not in resp.headers and resp.headers.get("content-length") == str(len(resp.content))
 
@@ -502,8 +503,8 @@ def test_real_httpx_a_gzip_api_response_works_end_to_end(monkeypatch):
             with client.stream(method, url, **kw) as r:
                 yield r
 
-    monkeypatch.setattr(AS, "_http_stream", real)
-    assert AS._api_get(URL, timeout=5.0).json() == {"ok": True}
+    monkeypatch.setattr(safe_fetch, "_http_stream", real)
+    assert safe_fetch.api_get(URL, timeout=5.0).json() == {"ok": True}
     assert seen == ["identity"]                                      # still asked for identity first
 
 
@@ -524,13 +525,13 @@ def test_the_hf_image_call_takes_a_gzipped_response_through_to_its_cache_rules(t
 @pytest.mark.parametrize("enc", ["gzip", "deflate"])
 def test_a_bodyless_response_with_an_encoding_header_is_an_empty_response(monkeypatch, status, enc):
     _with(_Stream({URL: _Resp(status=status, chunks=(), headers={"content-encoding": enc})}), monkeypatch)
-    resp = AS._api_get(URL, timeout=5.0)
+    resp = safe_fetch.api_get(URL, timeout=5.0)
     assert resp.status_code == status and resp.content == b""
 
 
 def test_an_empty_body_with_an_encoding_header_is_not_a_truncated_stream_error(monkeypatch):
     _with(_Stream({URL: _Resp(chunks=(b"",), headers={"content-encoding": "gzip"})}), monkeypatch)
-    assert AS._api_get(URL, timeout=5.0).content == b""
+    assert safe_fetch.api_get(URL, timeout=5.0).content == b""
 
 
 # ── round-2 test-quality review ──────────────────────────────────────────────────────────────────
@@ -543,7 +544,7 @@ def test_a_gzip_body_that_inflates_past_one_mebibyte_is_decoded_whole(monkeypatc
     body = b'{"t": "' + b"x" * (3 << 20) + b'"}'
     packed = gzip.compress(body)
     _with(_Stream({URL: _Resp(chunks=(packed,), headers={"content-encoding": "gzip"})}), monkeypatch)
-    assert AS._api_get(URL, timeout=5.0, limit=8 << 20).content == body
+    assert safe_fetch.api_get(URL, timeout=5.0, limit=8 << 20).content == body
 
 
 def test_inflation_is_bounded_not_done_in_one_unbounded_step(monkeypatch):
@@ -551,8 +552,8 @@ def test_inflation_is_bounded_not_done_in_one_unbounded_step(monkeypatch):
     _with(_Stream({URL: _Resp(chunks=(bomb,), headers={"content-encoding": "gzip"})}), monkeypatch)
     tracemalloc.start()
     try:
-        with pytest.raises(AS._TooLarge):
-            AS._api_get(URL, timeout=5.0, limit=1 << 20)
+        with pytest.raises(safe_fetch.TooLarge):
+            safe_fetch.api_get(URL, timeout=5.0, limit=1 << 20)
         peak = tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
@@ -562,6 +563,6 @@ def test_inflation_is_bounded_not_done_in_one_unbounded_step(monkeypatch):
 def test_an_encoded_body_read_is_checked_against_the_deadline_per_chunk(monkeypatch):
     packed = gzip.compress(b'{"a": 1}')
     _with(_Stream({URL: _Resp(chunks=(packed[:6], packed[6:]), headers={"content-encoding": "gzip"})}), monkeypatch)
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(100.0, 100.0, after=999.0))
+    monkeypatch.setattr(safe_fetch, "_monotonic", _fake_clock(100.0, 100.0, after=999.0))
     with pytest.raises(ValueError, match="too slow"):
-        AS._api_get(URL, timeout=5.0)
+        safe_fetch.api_get(URL, timeout=5.0)

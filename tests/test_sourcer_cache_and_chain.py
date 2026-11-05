@@ -30,7 +30,7 @@ from engine.render.asset_sourcer import (
     resolve_beat_assets,
 )
 from tests.test_sourcer_selection import (  # noqa: F401  (the autouse fixture is re-exported on purpose)
-    _wikipedia_downloads_via_get_fakes,
+    _FETCH_MOD, _wikipedia_downloads_via_get_fakes,
     _MOD, _bytes_resp, _hf_resp, _json_resp, _pexels, _stream_factory, _summary, _vf, _video, _wiki,
 )
 from tests.test_asset_sourcer_cost import _FakeHFSource, _asset_result
@@ -179,7 +179,7 @@ def test_wikipedia_each_candidate_gets_its_own_extension_and_success_stops_the_l
 @pytest.mark.parametrize("cls", [HuggingFaceImageSource, HuggingFaceVideoSource])
 def test_hf_failure_logs_model_with_traceback_and_never_the_api_key(cls, tmp_path, caplog):
     with caplog.at_level(logging.DEBUG, logger=_LOG), \
-            patch(f"{_MOD}.httpx.post", side_effect=httpx.ConnectError("down")):
+            patch("httpx.post", side_effect=httpx.ConnectError("down")):
         assert cls("SECRET-KEY", "the-model", tmp_path).generate("p") is None
     recs = [r for r in caplog.records if r.name == _LOG]               # kills getLogger('x')
     assert len(recs) == 1 and recs[0].levelno == logging.ERROR
@@ -189,7 +189,7 @@ def test_hf_failure_logs_model_with_traceback_and_never_the_api_key(cls, tmp_pat
 
 def test_hf_image_flag_stays_false_when_the_write_fails(tmp_path):
     s = HuggingFaceImageSource("k", "m", tmp_path)
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("image/png")), \
+    with patch("httpx.post", return_value=_hf_resp("image/png")), \
             patch(f"{_MOD}._atomic_write", side_effect=OSError("disk")):
         assert s.generate("p") is None
     assert s.last_call_was_generated is False                          # kills flag-before-write reorder
@@ -197,7 +197,7 @@ def test_hf_image_flag_stays_false_when_the_write_fails(tmp_path):
 
 def test_hf_video_flag_stays_false_when_the_write_fails(tmp_path):
     s = HuggingFaceVideoSource("k", "m", tmp_path)
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("video/mp4")), \
+    with patch("httpx.post", return_value=_hf_resp("video/mp4")), \
             patch(f"{_MOD}._atomic_write", side_effect=OSError("disk")):
         assert s.generate("p") is None
     assert s.last_call_was_generated is False
@@ -460,7 +460,7 @@ def test_wikipedia_filename_with_encoded_question_mark_keeps_its_name_for_the_li
             return _json_resp(_summary(original="https://upload.wikimedia.org/a/ab/Who%3F_Photo.jpg", thumbnail=None))
         return _bytes_resp(b"img")
 
-    with patch(f"{_MOD}.httpx.get", side_effect=fake_get), patch(f"{_MOD}.time.sleep"):
+    with patch("httpx.get", side_effect=fake_get), patch(f"{_MOD}.time.sleep"):
         assert WikipediaImageSource(tmp_path).search("Who") is not None
     assert titles == ["File:Who?_Photo.jpg"]
 
@@ -506,8 +506,8 @@ def test_pexels_instances_use_their_own_store_dir(tmp_path):
     outs = []
     srcs = [PexelsVideoSource(api_key="k", store_dir=tmp_path / sub) for sub in ("a", "b")]   # both built first
     for src in srcs:
-        with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(7, [_vf(1080, 1920)])]})), \
-                patch(f"{_MOD}._http_stream", _stream_factory([])):
+        with patch("httpx.get", return_value=_json_resp({"videos": [_video(7, [_vf(1080, 1920)])]})), \
+                patch(f"{_FETCH_MOD}._http_stream", _stream_factory([])):
             outs.append(src.search("q", 1.0).local_path)
     assert outs[0].parent == tmp_path / "a" and outs[1].parent == tmp_path / "b"
 
@@ -547,6 +547,6 @@ def test_wikipedia_summary_url_escapes_percent_and_question_mark(tmp_path):
             return _json_resp(["x", ["100% Wolf?"], [], []])
         return _json_resp(_summary(original=None, thumbnail=None))
 
-    with patch(f"{_MOD}.httpx.get", side_effect=fake_get):
+    with patch("httpx.get", side_effect=fake_get):
         WikipediaImageSource(tmp_path).search("x")
     assert urls[-1] == f"{WikipediaImageSource._SUMMARY}/100%25_Wolf%3F"

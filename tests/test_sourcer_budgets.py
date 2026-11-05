@@ -15,6 +15,7 @@ import httpx
 import pytest
 
 from engine.render import asset_sourcer as AS
+from engine.render import media_policy, safe_fetch
 from tests.test_sourcer_download_guards import (
     PEXELS_OK, WIKI_OK, WIKI_THUMB, _Resp, _Stream, _fake_clock, _pexels, _wiki,
 )
@@ -24,24 +25,24 @@ from tests.test_sourcer_selection import _summary, _video, _vf
 # ── per-hop timeout clamp ─────────────────────────────────────────────────────────────────────
 
 def test_the_grace_is_one_second():
-    assert AS._HOP_TIMEOUT_GRACE_S == 1.0
+    assert safe_fetch._HOP_TIMEOUT_GRACE_S == 1.0
 
 
 def _open(stream, *, timeout, deadline_at):
-    with patch.object(AS, "_http_stream", stream):
-        with AS._open_download(PEXELS_OK, AS._pexels_url_ok, timeout=timeout, deadline_at=deadline_at):
+    with patch.object(safe_fetch, "_http_stream", stream):
+        with safe_fetch.open_download(PEXELS_OK, AS._pexels_url_ok, timeout=timeout, deadline_at=deadline_at):
             pass
 
 
 def test_the_hop_timeout_is_clamped_to_the_time_left_plus_the_grace(monkeypatch):
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(4.0))          # the one per-hop reading
+    monkeypatch.setattr(safe_fetch, "_monotonic", _fake_clock(4.0))          # the one per-hop reading
     stream = _Stream({PEXELS_OK: _Resp()})
     _open(stream, timeout=120.0, deadline_at=10.0)
     assert stream.requests[0][1]["timeout"] == pytest.approx(7.0)    # 10 - 4 + 1
 
 
 def test_a_shorter_configured_timeout_is_kept(monkeypatch):
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0))
+    monkeypatch.setattr(safe_fetch, "_monotonic", _fake_clock(0.0))
     stream = _Stream({PEXELS_OK: _Resp()})
     _open(stream, timeout=30.0, deadline_at=600.0)
     assert stream.requests[0][1]["timeout"] == 30.0
@@ -56,7 +57,7 @@ def test_no_budget_leaves_the_timeout_alone():
 def test_each_hop_is_clamped_to_what_is_left_at_that_hop(monkeypatch):
     other = "https://videos.pexels.com/video-files/2/b.mp4"
     from tests.test_sourcer_download_guards import _redirect
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(1.0, 6.0))     # hop 1 at t=1, hop 2 at t=6
+    monkeypatch.setattr(safe_fetch, "_monotonic", _fake_clock(1.0, 6.0))     # hop 1 at t=1, hop 2 at t=6
     stream = _Stream({PEXELS_OK: _redirect(other), other: _Resp()})
     _open(stream, timeout=120.0, deadline_at=10.0)
     assert [kw["timeout"] for _, kw in stream.requests] == [pytest.approx(10.0), pytest.approx(5.0)]
@@ -65,7 +66,7 @@ def test_each_hop_is_clamped_to_what_is_left_at_that_hop(monkeypatch):
 def test_the_clamp_costs_no_extra_clock_reading(monkeypatch):
     """The pre-hop deadline check and the clamp share one `_monotonic()` call per hop."""
     calls = []
-    monkeypatch.setattr(AS, "_monotonic", lambda: calls.append(1) or 0.0)
+    monkeypatch.setattr(safe_fetch, "_monotonic", lambda: calls.append(1) or 0.0)
     _open(_Stream({PEXELS_OK: _Resp()}), timeout=120.0, deadline_at=10.0)
     assert len(calls) == 1
 
@@ -79,9 +80,9 @@ def test_the_real_connect_timeout_is_the_clamped_one(monkeypatch):
         raise OSError("blocked by the test")
 
     monkeypatch.setattr(socket, "create_connection", spy)
-    deadline_at = AS._monotonic() + 2.0
+    deadline_at = safe_fetch._monotonic() + 2.0
     with pytest.raises(httpx.ConnectError):
-        with AS._open_download("https://videos.pexels.com/x.mp4", AS._pexels_url_ok,
+        with safe_fetch.open_download("https://videos.pexels.com/x.mp4", AS._pexels_url_ok,
                                timeout=120.0, deadline_at=deadline_at):
             pass
     assert 2.0 < seen["timeout"] <= 3.0 + 1e-6                       # ~2 s left + 1 s grace, not 120
@@ -96,7 +97,7 @@ def test_the_real_connect_timeout_is_untouched_without_a_budget(monkeypatch):
 
     monkeypatch.setattr(socket, "create_connection", spy)
     with pytest.raises(httpx.ConnectError):
-        with AS._open_download("https://videos.pexels.com/x.mp4", AS._pexels_url_ok, timeout=7.0):
+        with safe_fetch.open_download("https://videos.pexels.com/x.mp4", AS._pexels_url_ok, timeout=7.0):
             pass
     assert seen["timeout"] == 7.0
 
@@ -125,7 +126,7 @@ class _Ticking:
 @pytest.fixture
 def clock(monkeypatch):
     state = {"t": 0.0}
-    monkeypatch.setattr(AS, "_monotonic", lambda: state["t"])
+    monkeypatch.setattr(safe_fetch, "_monotonic", lambda: state["t"])
     return state
 
 
@@ -258,4 +259,4 @@ def test_wikipedia_a_fast_original_never_touches_the_budget(tmp_path, clock):
 
 def test_media_sniffing_is_permissive_in_unmarked_tests():
     """tests/conftest.py's autouse fixture: only tests marked real_media_sniffing get the real check."""
-    assert AS._sniff_ok("image", b"placeholder") is True and AS._sniff_ok("video", b"") is True
+    assert media_policy.sniff_ok("image", b"placeholder") is True and media_policy.sniff_ok("video", b"") is True

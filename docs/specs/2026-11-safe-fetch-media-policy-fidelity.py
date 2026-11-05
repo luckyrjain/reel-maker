@@ -11,6 +11,7 @@ Run from the repo root (it inserts the repo root into sys.path itself):
                     1 = after commit 1 (modules exist, bridge allowed and required, loggers use the literal old name);
                     2 = after commit 2 (bridge gone, loggers use __name__, worker/tasks/render.py is compared too);
                     3 = after commit 3 (same as 2; the G1 resolver mode is still to be added).
+    --no-collect    (stage >= 2) skip the pytest --collect-only comparison of node ids.
     --tree DIR      where the files under test live (default: the repo root). Used to test the script itself on a
                     synthetic tree.
 
@@ -28,7 +29,11 @@ Checks
            the bridge).
   DEP      the new modules reference nothing defined in asset_sourcer or in each other, every public name has an
            outside caller in production code and no private name has one.
-  C, G1    not implemented in T1: printed as SKIP.
+  C        tests (stage >= 2): every baseline test file, rewritten by a deterministic AST rewrite derived from the
+           oracle, equals the retargeted file (ast.dump) except for the exhaustive residual list in the spec; plus
+           per-file counts of assert / raises / approx, the test-function name set, the pytest node-id set
+           (collected from an export of the baseline, `--no-collect` skips only this part) and the set of test files.
+  G1       not implemented yet (stage 3, resolver mode): printed as SKIP.
 
 To allow another deliberate docstring edit, add the BASELINE name of the node (or "<module:NAME>" for a new module
 docstring) to EDIT_ALLOWLIST below, with the reason; it is compared with its docstring removed on both sides.
@@ -44,6 +49,7 @@ import importlib.util
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -765,11 +771,436 @@ def dependency_checks(R, base_tree, trees, asset_tree, tree_root):
     R.check("DEP no private name has an outside caller", probs)
 
 
+# --------------------------------------------------------------------------------------------------- check C (tests)
+ASSET_MOD = "engine.render.asset_sourcer"
+ASSET_PREFIX = ASSET_MOD + "."
+STDLIB_BARE = frozenset(BRIDGE_EXTRAS)
+SEL_MODULE = "tests.test_sourcer_selection"
+CONFTEST = "tests/conftest.py"
+RENDER_TEST = "tests/test_render_task.py"
+SEL_TEST = "tests/test_sourcer_selection.py"
+CLOCK_TARGET = "worker.tasks.render._asset_clock"
+TEST_EXTRA_FILES = {
+    1: {"tests/_seam_oracle.py", "tests/test_bridge_forwarding.py"},
+    2: {"tests/_seam_oracle.py"},
+    3: {"tests/_seam_oracle.py", "tests/test_module_seams.py"},
+}
+SETATTR_FUNCS = frozenset({"setattr", "delattr", "getattr"})
+
+
+def _is_str(node):
+    return isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+
+def asset_aliases(tree):
+    """Local names bound to the asset_sourcer module (`from engine.render import asset_sourcer as AS`)."""
+    out = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom) and n.module == "engine.render" and not n.level:
+            out |= {a.asname or a.name for a in n.names if a.name == "asset_sourcer"}
+    return out
+
+
+def retarget_string(value):
+    """The expected form of a plain string patch target, or None when it is not a moved/extra target."""
+    if not value.startswith(ASSET_PREFIX):
+        return None
+    rest = value[len(ASSET_PREFIX):]
+    comp = rest.split(".")[0]
+    if comp in MOVED:
+        owner, new, _k = MOVED[comp]
+        return f"engine.render.{owner}.{new}" + rest[len(comp):]
+    if comp in BRIDGE_EXTRAS:
+        return rest
+    return None
+
+
+class TestRewriter(ast.NodeTransformer):
+    """Check C: the deterministic transform of a baseline test tree into its expected retargeted form.
+
+    One rule per shape (spec section 6, check C), all driven by the oracle: `AS.x` attributes (Load/Store/Del), the
+    name string of setattr/delattr/getattr/patch.object on AS, plain and f-string patch targets, `AS.__name__` in an
+    f-string target, the conftest `raising` flag, the added `_FETCH_MOD` assignment and the two `_asset_clock`
+    with-items. Imports, docstrings and `logger=` values are NOT rewritten here: the Normalizer ignores them.
+    """
+
+    def __init__(self, rel, aliases):
+        self.rel, self.aliases = rel, aliases
+        self.removed_clock_items = 0
+        self.added_fetch_mod = False
+
+    # --- helpers
+    def _is_as(self, node):
+        return isinstance(node, ast.Name) and node.id in self.aliases
+
+    def _is_as_dunder_name(self, node):
+        return isinstance(node, ast.Attribute) and node.attr == "__name__" and self._is_as(node.value)
+
+    # --- attributes: AS.x
+    def visit_Attribute(self, node):
+        self.generic_visit(node)
+        if self._is_as(node.value):
+            if node.attr in MOVED:
+                owner, new, _k = MOVED[node.attr]
+                return ast.copy_location(ast.Attribute(value=ast.Name(id=owner, ctx=ast.Load()), attr=new, ctx=node.ctx), node)
+            if node.attr in BRIDGE_EXTRAS:
+                return ast.copy_location(ast.Name(id=node.attr, ctx=node.ctx), node)
+        return node
+
+    # --- calls: setattr/delattr/getattr/patch.object(AS, "name", ...), conftest raising flag
+    def visit_Call(self, node):
+        f = node.func
+        by_name = (isinstance(f, ast.Attribute) and f.attr in SETATTR_FUNCS) or (isinstance(f, ast.Name) and f.id in SETATTR_FUNCS)
+        patch_object = isinstance(f, ast.Attribute) and f.attr == "object" and isinstance(f.value, ast.Name) and f.value.id == "patch"
+        if (by_name or patch_object) and len(node.args) >= 2 and self._is_as(node.args[0]) and _is_str(node.args[1]) \
+                and node.args[1].value in MOVED:
+            owner, new, _k = MOVED[node.args[1].value]
+            node.args[0] = ast.Name(id=owner, ctx=ast.Load())
+            node.args[1] = ast.Constant(value=new)
+        conftest_target = self.rel == CONFTEST and isinstance(f, ast.Attribute) and f.attr == "setattr" and bool(node.args) \
+            and _is_str(node.args[0]) and node.args[0].value.startswith(ASSET_PREFIX)
+        self.generic_visit(node)
+        if conftest_target:
+            node.keywords = [k for k in node.keywords if not (
+                k.arg == "raising" and isinstance(k.value, ast.Constant) and k.value.value is False)]
+        return node
+
+    # --- plain string targets
+    def visit_Constant(self, node):
+        if isinstance(node.value, str):
+            new = retarget_string(node.value)
+            if new is not None:
+                return ast.copy_location(ast.Constant(value=new), node)
+        return node
+
+    # --- f-string targets
+    def visit_JoinedStr(self, node):
+        vals = node.values
+        if len(vals) >= 2 and isinstance(vals[0], ast.FormattedValue) and vals[0].conversion == -1 \
+                and vals[0].format_spec is None and _is_str(vals[1]) and vals[1].value.startswith("."):
+            head = vals[0].value
+            kind = None
+            if isinstance(head, ast.Name) and head.id in ("_MOD", "_LOG"):
+                kind = head.id
+            elif self._is_as_dunder_name(head):
+                kind = "AS.__name__"
+            if kind is not None:
+                tail = vals[1].value
+                comp = tail[1:].split(".")[0]
+                rest = vals[2:]
+                if comp in BRIDGE_EXTRAS:
+                    text = tail[1:]
+                    return ast.copy_location(
+                        ast.Constant(value=text) if not rest else ast.JoinedStr(values=[ast.Constant(value=text)] + rest), node)
+                if comp in MOVED:
+                    owner, new, _k = MOVED[comp]
+                    if owner != "safe_fetch" or kind == "_LOG":
+                        raise ValueError(f"{self.rel}: no expected form for an f-string target {kind}.{comp}")
+                    fv = ast.FormattedValue(value=ast.Name(id="_FETCH_MOD", ctx=ast.Load()), conversion=-1, format_spec=None)
+                    return ast.copy_location(ast.JoinedStr(values=[fv, ast.Constant(value="." + new + tail[1 + len(comp):])] + rest), node)
+                if kind == "AS.__name__":
+                    fv = ast.FormattedValue(value=ast.Name(id="_MOD", ctx=ast.Load()), conversion=-1, format_spec=None)
+                    return ast.copy_location(ast.JoinedStr(values=[fv] + vals[1:]), node)
+        self.generic_visit(node)
+        return node
+
+    # --- the two `worker.tasks.render._asset_clock` with-items (matched by shape)
+    def visit_With(self, node):
+        self.generic_visit(node)
+        if self.rel == RENDER_TEST:
+            keep = []
+            for item in node.items:
+                e = item.context_expr
+                if isinstance(e, ast.Call) and isinstance(e.func, ast.Name) and e.func.id == "patch" and e.args \
+                        and _is_str(e.args[0]) and e.args[0].value == CLOCK_TARGET and item.optional_vars is None:
+                    self.removed_clock_items += 1
+                else:
+                    keep.append(item)
+            node.items = keep
+        return node
+
+    # --- the one added `_FETCH_MOD` assignment, right after `_MOD = ...`
+    def visit_Module(self, node):
+        self.generic_visit(node)
+        if self.rel == SEL_TEST:
+            body = []
+            for n in node.body:
+                body.append(n)
+                if isinstance(n, ast.Assign) and [t.id for t in n.targets if isinstance(t, ast.Name)] == ["_MOD"]:
+                    body.append(ast.Assign(targets=[ast.Name(id="_FETCH_MOD", ctx=ast.Store())],
+                                           value=ast.Constant(value="engine.render.safe_fetch"), lineno=0))
+                    self.added_fetch_mod = True
+            node.body = body
+        return node
+
+
+class Normalizer(ast.NodeTransformer):
+    """Check C, applied to BOTH trees: erase exactly the residual differences the spec lists.
+
+    docstring text (presence is kept); `logger=<AS|safe_fetch|media_policy>.__name__` values; the whitelisted
+    `from engine.render import ...` / bare stdlib imports; the name list of the module-level
+    `from tests.test_sourcer_selection import ...`. Everything else is compared exactly.
+    """
+
+    def __init__(self, aliases):
+        self.aliases = set(aliases)
+        self.logger_names = []   # (lineno, module name) of every normalized logger value
+        self.dropped = []
+        self.sel_names = []      # (lineno, [names]) of module-level selection imports
+
+    @staticmethod
+    def _whitelisted_import(n):
+        if isinstance(n, ast.ImportFrom) and n.module == "engine.render" and not n.level:
+            return all(a.name in ("asset_sourcer", "safe_fetch", "media_policy") for a in n.names)
+        if isinstance(n, ast.Import):
+            return all(a.name in STDLIB_BARE and a.asname is None for a in n.names)
+        return False
+
+    def _strip_body(self, body):
+        out = []
+        for n in body:
+            if self._whitelisted_import(n):
+                self.dropped.append(n)
+                continue
+            out.append(n)
+        return out or [ast.Pass()]
+
+    def _docstring(self, node):
+        b = node.body
+        if b and isinstance(b[0], ast.Expr) and _is_str(b[0].value):
+            b[0] = ast.Expr(value=ast.Constant(value=""))
+
+    def _visit_scope(self, node, module_level=False):
+        self._docstring(node)
+        self.generic_visit(node)
+        node.body = self._strip_body(node.body) if node.body else node.body
+        if module_level:
+            for n in node.body:
+                if isinstance(n, ast.ImportFrom) and n.module == SEL_MODULE:
+                    self.sel_names.append((n.lineno, sorted(a.name for a in n.names)))
+                    n.names = []
+        return node
+
+    def visit_Module(self, node):
+        return self._visit_scope(node, module_level=True)
+
+    def visit_FunctionDef(self, node):
+        return self._visit_scope(node)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+    visit_ClassDef = visit_FunctionDef
+
+    def _strip_other_bodies(self, node):
+        for field in ("body", "orelse", "finalbody"):
+            if isinstance(getattr(node, field, None), list):
+                setattr(node, field, self._strip_body(getattr(node, field)))
+        return node
+
+    def visit_With(self, node):
+        self.generic_visit(node)
+        return self._strip_other_bodies(node)
+
+    visit_If = visit_Try = visit_For = visit_While = visit_With
+
+    def visit_keyword(self, node):
+        self.generic_visit(node)
+        v = node.value
+        if node.arg == "logger" and isinstance(v, ast.Attribute) and v.attr == "__name__" and isinstance(v.value, ast.Name) \
+                and (v.value.id in self.aliases or v.value.id in ("safe_fetch", "media_policy")):
+            self.logger_names.append((getattr(v, "lineno", 0), "asset_sourcer" if v.value.id in self.aliases else v.value.id))
+            node.value = ast.Constant(value="<module __name__>")
+        return node
+
+
+def _count(tree, pred):
+    return sum(1 for n in ast.walk(tree) if pred(n))
+
+
+def _is_call_named(n, names):
+    if not isinstance(n, ast.Call):
+        return False
+    f = n.func
+    return (isinstance(f, ast.Attribute) and f.attr in names) or (isinstance(f, ast.Name) and f.id in names)
+
+
+def test_function_names(tree):
+    out = []
+
+    def walk(body, prefix):
+        for n in body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test"):
+                out.append(prefix + n.name)
+            elif isinstance(n, ast.ClassDef):
+                walk(n.body, prefix + n.name + ".")
+    walk(tree.body, "")
+    return sorted(out)
+
+
+def _name_uses(tree, name):
+    return any(isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Load) for n in ast.walk(tree))
+
+
+def _top_level_diff(exp, act, limit=3):
+    lines = []
+    ea, aa = exp.body, act.body
+    if len(ea) != len(aa):
+        lines.append(f"top-level statement count: expected {len(ea)}, found {len(aa)}")
+    shown = 0
+    for i, (a, b) in enumerate(zip(ea, aa)):
+        if dump(a) != dump(b):
+            lines.append(f"statement {i} ({node_key(a)}) differs:")
+            lines += ["  " + ln for ln in unparse_diff(a, b)]
+            shown += 1
+            if shown >= limit:
+                break
+    if not lines:
+        lines.append("trees differ outside the top-level statements (module docstring / type_ignores)")
+    return lines
+
+
+def test_python():
+    """The interpreter that has the project's dependencies: the repo venv when present, else the running one."""
+    venv = ROOT / ".venv" / "bin" / "python"
+    return str(venv) if venv.exists() else sys.executable
+
+
+def collect_node_ids(root):
+    proc = subprocess.run([test_python(), "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider"],
+                          cwd=root, capture_output=True, text=True)
+    ids = sorted(ln.strip() for ln in proc.stdout.splitlines() if "::" in ln and not ln.startswith(" "))
+    return ids, proc.returncode, proc.stdout[-400:] + proc.stderr[-400:]
+
+
+def export_revision(rev, dest):
+    arch = subprocess.run(["git", "archive", rev], cwd=ROOT, capture_output=True)
+    if arch.returncode != 0:
+        raise SystemExit(f"git archive {rev} failed: {arch.stderr.decode()[:200]}")
+    subprocess.run(["tar", "-x", "-C", str(dest)], input=arch.stdout, check=True)
+
+
+def check_c(R, baseline, tree_root, stage, collect):
+    ls = subprocess.run(["git", "ls-tree", "-r", "--name-only", baseline, "--", "tests"], cwd=ROOT, capture_output=True, text=True)
+    base_files = sorted(f for f in ls.stdout.split() if f.endswith(".py"))
+    new_files = sorted(p.relative_to(tree_root).as_posix() for p in (tree_root / "tests").rglob("*.py")
+                       if "__pycache__" not in p.parts)
+    extra_ok = TEST_EXTRA_FILES.get(stage, TEST_EXTRA_FILES[3])
+
+    # --- the set of test files
+    probs = [f"baseline test file missing: {f}" for f in sorted(set(base_files) - set(new_files))]
+    probs += [f"unexpected new test file: {f}" for f in sorted(set(new_files) - set(base_files) - extra_ok)]
+    R.check("C the set of test files is the baseline's (plus the allowed new ones)", probs,
+            f"{len(base_files)} baseline files; allowed additions: {sorted(extra_ok)}")
+
+    # --- per-file AST equality after the deterministic rewrite
+    probs = []
+    totals = collections.Counter()
+    loggers = collections.Counter()
+    clock_removed = 0
+    added_fetch = False
+    for rel in base_files:
+        if rel not in new_files:
+            continue
+        base_src = git_show(baseline, rel)
+        new_src = (tree_root / rel).read_text(encoding="utf-8")
+        base_tree, new_tree = ast.parse(base_src), ast.parse(new_src)
+        aliases = asset_aliases(base_tree)
+        rewriter = TestRewriter(rel, aliases)
+        try:
+            expected = rewriter.visit(copy.deepcopy(base_tree))
+        except ValueError as exc:
+            probs.append(str(exc))
+            continue
+        clock_removed += rewriter.removed_clock_items
+        added_fetch = added_fetch or rewriter.added_fetch_mod
+        norm_exp, norm_act = Normalizer(aliases), Normalizer(aliases)
+        exp_n, act_n = norm_exp.visit(expected), norm_act.visit(copy.deepcopy(new_tree))
+        if dump(exp_n) != dump(act_n):
+            probs.append(f"{rel} differs from the rewritten baseline:")
+            probs += ["  " + ln for ln in _top_level_diff(exp_n, act_n)]
+        # residual checks that the normalizer erased
+        n_pre = [n for n in ast.walk(new_tree) if Normalizer._whitelisted_import(n)]
+        for n in n_pre:
+            if isinstance(n, ast.ImportFrom):
+                for a in n.names:
+                    if a.name == "asset_sourcer" and a.asname != "AS":
+                        probs.append(f"{rel}:{n.lineno}: asset_sourcer must be imported as AS")
+                    if a.name != "asset_sourcer" and a.asname is not None:
+                        probs.append(f"{rel}:{n.lineno}: {a.name} must be imported without an alias")
+        if norm_exp.sel_names or norm_act.sel_names:
+            old_names = set(sum((n for _l, n in norm_exp.sel_names), []))
+            new_names = set(sum((n for _l, n in norm_act.sel_names), []))
+            added, removed = new_names - old_names, old_names - new_names
+            if not added <= {"_FETCH_MOD"}:
+                probs.append(f"{rel}: names added to the {SEL_MODULE} import: {sorted(added - {'_FETCH_MOD'})}")
+            if not removed <= {"_MOD"}:
+                probs.append(f"{rel}: names dropped from the {SEL_MODULE} import: {sorted(removed - {'_MOD'})}")
+            if "_MOD" in removed and _name_uses(new_tree, "_MOD"):
+                probs.append(f"{rel}: _MOD is dropped from the import but still used")
+            if "_FETCH_MOD" in added and not _name_uses(new_tree, "_FETCH_MOD"):
+                probs.append(f"{rel}: _FETCH_MOD is imported but not used")
+            if "_MOD" not in removed and "_MOD" in old_names and not _name_uses(new_tree, "_MOD"):
+                probs.append(f"{rel}: _MOD is imported and no longer used (F401)")
+        for _ln, mod in norm_act.logger_names:
+            loggers[mod] += 1
+        if len(norm_exp.logger_names) != len(norm_act.logger_names):
+            probs.append(f"{rel}: logger= keyword count changed: {len(norm_exp.logger_names)} -> {len(norm_act.logger_names)}")
+        # counts
+        for label, pred in (("assert", lambda n: isinstance(n, ast.Assert)),
+                            ("raises", lambda n: _is_call_named(n, {"raises"})),
+                            ("approx", lambda n: _is_call_named(n, {"approx"}))):
+            before, after = _count(base_tree, pred), _count(new_tree, pred)
+            totals[label] += after
+            if before != after:
+                probs.append(f"{rel}: number of `{label}` changed: {before} -> {after}")
+        if test_function_names(base_tree) != test_function_names(new_tree):
+            probs.append(f"{rel}: the set of test function names changed")
+        totals["tests"] += len(test_function_names(new_tree))
+    if clock_removed != 2:
+        probs.append(f"expected exactly the two `{CLOCK_TARGET}` with-items to be removed in {RENDER_TEST}, found {clock_removed}")
+    if not added_fetch:
+        probs.append(f"{SEL_TEST}: no `_FETCH_MOD` assignment was expected/added")
+    if sum(loggers.values()) != 22:
+        probs.append(f"expected 22 `logger=<module>.__name__` keywords in the tests, found {sum(loggers.values())}")
+    R.check("C every baseline test file == its deterministic rewrite (residuals only: imports, docstrings, logger=, "
+            "name lists, conftest raising, _FETCH_MOD, 2 clock items)", probs,
+            f"{len(base_files)} files; loggers {dict(sorted(loggers.items()))}; asserts {totals['assert']}, "
+            f"raises {totals['raises']}, approx {totals['approx']}, test functions {totals['tests']}")
+
+    # --- pytest node ids
+    if not collect:
+        R.skip("C pytest node ids", "--no-collect")
+        return
+    with tempfile.TemporaryDirectory(prefix="fidelity-baseline-") as tmp:
+        tmp_path = Path(tmp)
+        export_revision(baseline, tmp_path)
+        where = subprocess.run([test_python(), "-c", "import engine; print(engine.__file__)"], cwd=tmp_path,
+                               capture_output=True, text=True).stdout.strip()
+        if not where.startswith(str(tmp_path.resolve())) and not where.startswith(str(tmp_path)):
+            R.fail("C pytest node ids", f"the exported baseline would import engine from {where}, not from the export")
+            return
+        base_ids, rc_b, tail_b = collect_node_ids(tmp_path)
+    new_ids, rc_n, tail_n = collect_node_ids(tree_root)
+    extra_prefixes = tuple(f + "::" for f in extra_ok)
+    new_core = [i for i in new_ids if not i.startswith(extra_prefixes)]
+    probs = []
+    if rc_b not in (0,) or rc_n not in (0,):
+        probs.append(f"collection failed (baseline rc {rc_b}, new rc {rc_n}): {tail_b!r} {tail_n!r}")
+    if base_ids != new_core:
+        sb, sn = set(base_ids), set(new_core)
+        probs += [f"missing after the change: {i}" for i in sorted(sb - sn)[:10]]
+        probs += [f"new after the change: {i}" for i in sorted(sn - sb)[:10]]
+        if sb == sn:
+            probs.append("same ids but different multiplicity (duplicate ids)")
+    R.check("C sorted pytest node ids are identical before and after (new allowed files excluded)", probs,
+            f"{len(base_ids)} ids, baseline collected from a git archive export")
+
+
 # --------------------------------------------------------------------------------------------------- main
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--baseline", default="d096524")
     ap.add_argument("--stage", type=int, choices=(0, 1, 2, 3), default=0)
+    ap.add_argument("--no-collect", action="store_true")
     ap.add_argument("--tree", type=Path, default=ROOT)
     args = ap.parse_args(argv)
     R = Report()
@@ -810,8 +1241,7 @@ def main(argv=None):
         dependency_checks(R, base_asset, trees, asset_tree, tree_root)
 
     if args.stage >= 2:
-        # TODO(T3): check C (test-AST equality, node ids, assert/raises/approx counts) is added by the commit-2 task.
-        R.skip("C", "not implemented in T1")
+        check_c(R, args.baseline, tree_root, args.stage, not args.no_collect)
     if args.stage >= 3:
         # TODO(T4): the G1 resolver mode (per-form counts of resolved patch targets) is added by the commit-3 task.
         R.skip("G1 resolver", "not implemented in T1")

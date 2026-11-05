@@ -6,7 +6,7 @@ URL wins and how it is cached, how a Wikimedia license string maps to
 Before this file none of this was tested: only the HF `last_call_was_generated` flag and
 Wikipedia's license-title decoding were. The `safe_to_publish` mapping in particular is
 the input to the publish gate, so a wrong branch here is a licensing bug, not a cosmetic
-one. HTTP is faked at `engine.render.asset_sourcer.httpx`; nothing touches the network.
+one. HTTP is faked at `httpx` (and `engine.render.safe_fetch._http_stream`); nothing touches the network.
 """
 import hashlib
 import logging
@@ -28,6 +28,7 @@ from engine.render.asset_sourcer import (
 )
 
 _MOD = "engine.render.asset_sourcer"
+_FETCH_MOD = "engine.render.safe_fetch"
 
 
 # ── fakes ────────────────────────────────────────────────────────────────────
@@ -78,15 +79,15 @@ def _pexels(tmp_path, videos, *, fail_urls=()):
     """Run PexelsVideoSource.search() against a fake API; returns (result, streamed, get)."""
     streamed: list[str] = []
     source = PexelsVideoSource(api_key="k", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": videos})) as get, \
-            patch(f"{_MOD}._http_stream", _stream_factory(streamed, fail_urls)):
+    with patch("httpx.get", return_value=_json_resp({"videos": videos})) as get, \
+            patch(f"{_FETCH_MOD}._http_stream", _stream_factory(streamed, fail_urls)):
         result = source.search("messi", min_duration_s=5.0)
     return result, streamed, get
 
 
 @pytest.fixture(autouse=True)
 def _wikipedia_downloads_via_get_fakes():
-    """Serve `_http_stream` from whatever `httpx.get` is patched to in these legacy fakes.
+    """Serve `safe_fetch._http_stream` from whatever `httpx.get` is patched to in these legacy fakes.
 
     Wikipedia image downloads used to be `httpx.get(...)`; they go through `_http_stream(...)` now (so
     the body can be size-capped), but these tests' URL-dispatching fakes still describe a download
@@ -103,7 +104,7 @@ def _wikipedia_downloads_via_get_fakes():
         resp.iter_bytes = lambda chunk_size=None: iter([content])
         yield resp
 
-    with patch(f"{_MOD}._http_stream", stream_from_get):
+    with patch(f"{_FETCH_MOD}._http_stream", stream_from_get):
         yield
 
 
@@ -111,16 +112,16 @@ def _wikipedia_downloads_via_get_fakes():
 
 def test_pexels_without_api_key_makes_no_request(tmp_path):
     source = PexelsVideoSource(api_key="", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.get") as get:
+    with patch("httpx.get") as get:
         assert source.search("messi", 5.0) is None
     get.assert_not_called()
 
 
 def test_pexels_request_failure_returns_none(tmp_path):
     source = PexelsVideoSource(api_key="k", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.get", side_effect=httpx.ConnectError("down")):
+    with patch("httpx.get", side_effect=httpx.ConnectError("down")):
         assert source.search("messi", 5.0) is None
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({}, status=500)):
+    with patch("httpx.get", return_value=_json_resp({}, status=500)):
         assert source.search("messi", 5.0) is None
 
 
@@ -280,7 +281,7 @@ def _wiki(tmp_path, *, summary, downloads=None, opensearch=None, license_meta=No
         return outcome
 
     source = WikipediaImageSource(tmp_path)
-    with patch(f"{_MOD}.httpx.get", side_effect=fake_get), \
+    with patch("httpx.get", side_effect=fake_get), \
             patch(f"{_MOD}.time.sleep") as sleep:
         result = source.search("Lionel Messi")
     if sleeps is not None:
@@ -423,7 +424,7 @@ def _license_for(short, tmp_path):
     meta = {"LicenseShortName": {"value": short}} if short is not None else {}
     source = WikipediaImageSource(tmp_path)
     payload = {"query": {"pages": {"1": {"imageinfo": [{"extmetadata": meta}]}}}}
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp(payload)):
+    with patch("httpx.get", return_value=_json_resp(payload)):
         return source._fetch_license("Messi.jpg")
 
 
@@ -456,14 +457,14 @@ def test_license_missing_short_name_defaults_to_unknown_and_unsafe(tmp_path):
 def test_license_page_without_imageinfo_is_unknown_and_unsafe(tmp_path):
     source = WikipediaImageSource(tmp_path)
     payload = {"query": {"pages": {"-1": {"missing": ""}}}}
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp(payload)):
+    with patch("httpx.get", return_value=_json_resp(payload)):
         info = source._fetch_license("Nope.jpg")
     assert info["license"] == "unknown" and info["safe_to_publish"] is False
 
 
 def test_license_lookup_failure_is_unknown_and_unsafe(tmp_path):
     source = WikipediaImageSource(tmp_path)
-    with patch(f"{_MOD}.httpx.get", side_effect=httpx.ConnectError("down")):
+    with patch("httpx.get", side_effect=httpx.ConnectError("down")):
         info = source._fetch_license("Messi.jpg")
     assert info == {"license": "unknown", "license_url": None, "attribution": None, "safe_to_publish": False}
 
@@ -481,7 +482,7 @@ def _hf_resp(content_type, content=b"bytes"):
 def test_hf_image_rejects_a_non_image_200_without_writing_or_charging(tmp_path):
     """HF answers 200 with a JSON body while a model is loading."""
     source = HuggingFaceImageSource(api_key="k", model="m", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("application/json", b'{"error":"loading"}')):
+    with patch("httpx.post", return_value=_hf_resp("application/json", b'{"error":"loading"}')):
         assert source.generate("a prompt") is None
     assert source.last_call_was_generated is False
     assert list(tmp_path.glob("hf_*")) == []
@@ -489,14 +490,14 @@ def test_hf_image_rejects_a_non_image_200_without_writing_or_charging(tmp_path):
 
 def test_hf_image_api_failure_returns_none(tmp_path):
     source = HuggingFaceImageSource(api_key="k", model="m", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.post", side_effect=httpx.ConnectError("down")):
+    with patch("httpx.post", side_effect=httpx.ConnectError("down")):
         assert source.generate("a prompt") is None
     assert source.last_call_was_generated is False
 
 
 def test_hf_image_request_shape_and_result_fields(tmp_path):
     source = HuggingFaceImageSource(api_key="k", model="org/flux", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("image/png")) as post:
+    with patch("httpx.post", return_value=_hf_resp("image/png")) as post:
         result = source.generate("a prompt")
     assert post.call_args.args[0].endswith("/org/flux")
     assert post.call_args.kwargs["headers"] == {"Authorization": "Bearer k"}
@@ -510,7 +511,7 @@ def test_hf_image_request_shape_and_result_fields(tmp_path):
 
 def test_hf_image_cache_key_follows_the_prompt(tmp_path):
     source = HuggingFaceImageSource(api_key="k", model="m", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("image/png")) as post:
+    with patch("httpx.post", return_value=_hf_resp("image/png")) as post:
         a = source.generate("one")
         b = source.generate("two")
     assert a.local_path != b.local_path
@@ -525,7 +526,7 @@ def test_hf_image_cache_key_follows_the_prompt(tmp_path):
 ])
 def test_hf_video_extension_follows_the_content_type(tmp_path, content_type, ext):
     source = HuggingFaceVideoSource(api_key="k", model="m", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp(content_type)):
+    with patch("httpx.post", return_value=_hf_resp(content_type)):
         result = source.generate("a prompt")
     assert result.local_path.suffix == f".{ext}"
     assert result.source == "huggingface_video"
@@ -535,7 +536,7 @@ def test_hf_video_extension_follows_the_content_type(tmp_path, content_type, ext
 
 def test_hf_video_a_cached_gif_counts_as_a_cache_hit(tmp_path):
     source = HuggingFaceVideoSource(api_key="k", model="m", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("image/gif")) as post:
+    with patch("httpx.post", return_value=_hf_resp("image/gif")) as post:
         first = source.generate("a prompt")
         second = source.generate("a prompt")
     assert first.local_path == second.local_path
@@ -546,14 +547,14 @@ def test_hf_video_a_cached_gif_counts_as_a_cache_hit(tmp_path):
 
 def test_hf_video_api_failure_returns_none(tmp_path):
     source = HuggingFaceVideoSource(api_key="k", model="m", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.post", side_effect=httpx.ReadTimeout("slow")):
+    with patch("httpx.post", side_effect=httpx.ReadTimeout("slow")):
         assert source.generate("a prompt") is None
     assert source.last_call_was_generated is False
 
 
 def test_hf_video_without_api_key_makes_no_request(tmp_path):
     source = HuggingFaceVideoSource(api_key="", model="m", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.post") as post:
+    with patch("httpx.post") as post:
         assert source.generate("a prompt") is None
     post.assert_not_called()
 
@@ -649,8 +650,8 @@ def test_pexels_endpoint_timeouts_and_redirect_options(tmp_path):
         r = MagicMock(); r.iter_bytes.return_value = iter([b"v"]); yield r
 
     source = PexelsVideoSource(api_key="k", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]})) as get, \
-            patch(f"{_MOD}._http_stream", fake_stream):
+    with patch("httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]})) as get, \
+            patch(f"{_FETCH_MOD}._http_stream", fake_stream):
         source.search("q", 1.0)
     assert get.call_args.args[0] == "https://api.pexels.com/videos/search"
     assert get.call_args.kwargs["timeout"] == 30.0
@@ -669,8 +670,8 @@ def test_pexels_partial_download_leaves_no_tmp_file(tmp_path):
             raise httpx.ReadError("cut")
         r.iter_bytes.return_value = gen(); yield r
     source = PexelsVideoSource(api_key="k", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]})), \
-            patch(f"{_MOD}._http_stream", fake_stream):
+    with patch("httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]})), \
+            patch(f"{_FETCH_MOD}._http_stream", fake_stream):
         assert source.search("q", 1.0) is None
     assert list(tmp_path.iterdir()) == []
 
@@ -688,7 +689,7 @@ def test_wikipedia_every_request_carries_the_user_agent_params_and_timeouts(tmp_
             if "/page/summary/" in url:
                 return _json_resp({"pageid": 5, "originalimage": {"source": "https://upload.wikimedia.org/a/Mes%C3%A9_%28x%29.jpg?uselang=en"}})
             return _bytes_resp(b"x")
-        with patch(f"{_MOD}.httpx.get", side_effect=fake_get):
+        with patch("httpx.get", side_effect=fake_get):
             WikipediaImageSource(tmp_path).search("Leo Messi")
     run()
     ua = {"User-Agent": "reel-maker/1.0"}
@@ -714,7 +715,7 @@ def test_wikipedia_429_retry_keeps_headers_redirects_and_timeout(tmp_path):
         if kw.get("params", {}).get("action") == "query": return _json_resp({})
         seen.append(kw)
         return _bytes_resp(status=429)
-    with patch(f"{_MOD}.httpx.get", side_effect=fake_get), patch(f"{_MOD}.time.sleep"):
+    with patch("httpx.get", side_effect=fake_get), patch(f"{_MOD}.time.sleep"):
         assert WikipediaImageSource(tmp_path).search("Lionel Messi") is None
     assert len(seen) == 2 and all(k["headers"] == {"User-Agent": "reel-maker/1.0", "Accept-Encoding": "identity"} and k["follow_redirects"] is False and k["timeout"] == 30.0 for k in seen)
 
@@ -728,7 +729,7 @@ def test_wikipedia_download_is_written_atomically(tmp_path):
 
 def test_hf_image_cache_hit_filename_and_timeout(tmp_path):
     source = HuggingFaceImageSource(api_key="k", model="m", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("image/png")) as post:
+    with patch("httpx.post", return_value=_hf_resp("image/png")) as post:
         a = source.generate("p")
         b = source.generate("p")
     assert post.call_count == 1 and source.last_call_was_generated is False
@@ -740,7 +741,7 @@ def test_hf_image_cache_hit_filename_and_timeout(tmp_path):
 
 def test_hf_video_fingerprint_filename_timeout_headers_and_flag(tmp_path):
     source = HuggingFaceVideoSource(api_key="k", model="org/ltx", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("video/mp4")) as post:
+    with patch("httpx.post", return_value=_hf_resp("video/mp4")) as post:
         r = source.generate("p")
     full = "p, portrait orientation, vertical format, cinematic, high quality"
     fp = hashlib.sha256(full.encode()).hexdigest()[:16]
@@ -755,26 +756,26 @@ def test_hf_video_fingerprint_filename_timeout_headers_and_flag(tmp_path):
 def test_hf_video_missing_content_type_defaults_to_mp4(tmp_path):
     resp = MagicMock(); resp.raise_for_status.return_value = None; resp.headers = {}; resp.content = b"x"
     source = HuggingFaceVideoSource(api_key="k", model="m", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.post", return_value=resp):
+    with patch("httpx.post", return_value=resp):
         assert source.generate("p").local_path.suffix == ".mp4"
 
 
 def test_hf_image_missing_content_type_is_rejected(tmp_path):
     resp = MagicMock(); resp.raise_for_status.return_value = None; resp.headers = {}; resp.content = b"x"
     source = HuggingFaceImageSource(api_key="k", model="m", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.post", return_value=resp):
+    with patch("httpx.post", return_value=resp):
         assert source.generate("p") is None
 
 
 def test_hf_image_content_type_must_start_with_image(tmp_path):
     source = HuggingFaceImageSource(api_key="k", model="m", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("text/image/png")):
+    with patch("httpx.post", return_value=_hf_resp("text/image/png")):
         assert source.generate("p") is None
 
 
 def test_hf_failures_are_logged(tmp_path, caplog):
     with caplog.at_level(logging.ERROR):
-        with patch(f"{_MOD}.httpx.post", side_effect=httpx.ConnectError("d")):
+        with patch("httpx.post", side_effect=httpx.ConnectError("d")):
             HuggingFaceImageSource("k", "m", tmp_path).generate("p")
             HuggingFaceVideoSource("k", "m", tmp_path).generate("p")
     assert sum("generation failed" in r.message for r in caplog.records) == 2
@@ -782,10 +783,10 @@ def test_hf_failures_are_logged(tmp_path, caplog):
 
 def test_hf_writes_are_atomic(tmp_path):
     with patch(f"{_MOD}._atomic_write", side_effect=OSError("disk")), \
-            patch(f"{_MOD}.httpx.post", return_value=_hf_resp("image/png")):
+            patch("httpx.post", return_value=_hf_resp("image/png")):
         assert HuggingFaceImageSource("k", "m", tmp_path).generate("p") is None
     with patch(f"{_MOD}._atomic_write", side_effect=OSError("disk")), \
-            patch(f"{_MOD}.httpx.post", return_value=_hf_resp("video/mp4")):
+            patch("httpx.post", return_value=_hf_resp("video/mp4")):
         assert HuggingFaceVideoSource("k", "m", tmp_path).generate("p") is None
 
 
@@ -799,7 +800,7 @@ def test_wikipedia_plus_in_a_filename_reaches_the_license_lookup_unchanged(tmp_p
         if a == "query": return _json_resp({})
         if "/page/summary/" in url: return _json_resp({"pageid": 1, "originalimage": {"source": "https://u/C++_conf.jpg"}})
         return _bytes_resp()
-    with patch(f"{_MOD}.httpx.get", side_effect=fake_get):
+    with patch("httpx.get", side_effect=fake_get):
         WikipediaImageSource(tmp_path).search("Bjarne")
     assert seen[1][1]["timeout"] == 10.0
     assert seen[2][1]["params"]["titles"] == "File:C++_conf.jpg"
@@ -816,8 +817,8 @@ def test_pexels_download_goes_through_a_tmp_file_and_reads_per_network_chunk(tmp
             yield b"x"
         r.iter_bytes.side_effect = it
         yield r
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]})), \
-            patch(f"{_MOD}._http_stream", fake_stream):
+    with patch("httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]})), \
+            patch(f"{_FETCH_MOD}._http_stream", fake_stream):
         assert PexelsVideoSource("k", tmp_path).search("q", 1.0) is not None
     # chunk_size is deliberately NOT passed (httpx would buffer 64 KB before the deadline check runs)
     assert state == {"chunk": None, "final_exists_mid_write": False}
@@ -828,13 +829,13 @@ def test_pexels_http_error_status_on_the_download_is_a_failure(tmp_path):
     def fake_stream(method, url, **kw):
         r = MagicMock(); r.raise_for_status.side_effect = httpx.HTTPStatusError("404", request=MagicMock(), response=MagicMock())
         yield r
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]})), \
-            patch(f"{_MOD}._http_stream", fake_stream):
+    with patch("httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]})), \
+            patch(f"{_FETCH_MOD}._http_stream", fake_stream):
         assert PexelsVideoSource("k", tmp_path).search("q", 1.0) is None
     assert list(tmp_path.iterdir()) == []
 
 
 def test_hf_image_without_api_key_makes_no_request(tmp_path):
-    with patch(f"{_MOD}.httpx.post") as post:
+    with patch("httpx.post") as post:
         assert HuggingFaceImageSource("", "m", tmp_path).generate("p") is None
     post.assert_not_called()

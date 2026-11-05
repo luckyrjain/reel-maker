@@ -58,7 +58,7 @@ def test_fetch_license_forwards_an_already_decoded_title_verbatim():
 
     decoded = "Lionel_Messi_-_2022146154227 (cropped).jpg"
 
-    with patch("engine.render.asset_sourcer.httpx.get", return_value=_license_response()) as mock_get:
+    with patch("httpx.get", return_value=_license_response()) as mock_get:
         source._fetch_license(decoded)
 
     _, kwargs = mock_get.call_args
@@ -92,7 +92,7 @@ def test_search_decodes_the_originalimage_filename_before_the_license_lookup(tmp
     image_resp.content = b"fake-image-bytes"
 
     with patch(
-        "engine.render.asset_sourcer.httpx.get",
+        "httpx.get",
         side_effect=[opensearch_resp, summary_resp, license_resp, image_resp],
     ) as mock_get:
         result = source.search("Lionel Messi")
@@ -111,7 +111,7 @@ def test_fetch_license_passes_through_an_already_plain_filename_unchanged():
     source._HEADERS = WikipediaImageSource._HEADERS
 
     plain = "Diego_Maradona_1986.jpg"
-    with patch("engine.render.asset_sourcer.httpx.get", return_value=_license_response()) as mock_get:
+    with patch("httpx.get", return_value=_license_response()) as mock_get:
         source._fetch_license(plain)
 
     assert mock_get.call_args.kwargs["params"]["titles"] == f"File:{plain}"

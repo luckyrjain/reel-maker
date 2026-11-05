@@ -3,9 +3,7 @@ import logging
 import math
 import os
 import re
-import sys
 import time
-import types
 import urllib.parse
 import uuid
 from dataclasses import dataclass
@@ -971,102 +969,3 @@ def resolve_or_reuse(
             ))
     db.commit()   # the caller goes on to TTS/ffmpeg; don't leave the pins uncommitted and idle
     return results
-
-
-# ── TEMPORARY forwarding bridge (commit 1 of the safe_fetch / media_policy split; deleted in commit 2) ────
-# Tests still say `AS._image_ok`, `AS._monotonic`, `AS.httpx`, ... (AS = this module). The moved code lives in
-# `safe_fetch` / `media_policy` and reads ITS OWN globals, so a bare re-export here could not keep those
-# patches working: `monkeypatch.setattr(AS, "_image_ok", fake)` would rebind only the re-exported name.
-# This module's class is therefore swapped for one that forwards reads, writes and deletes of the old names
-# to the module that owns them now. `httpx`, `threading` and `socket` forward to `safe_fetch`'s imports.
-# The moved names are deliberately NOT in this module's __dict__ (a copy would shadow __getattr__).
-# Table: old name -> (owning module, name there). Hand-written on purpose; tests/test_bridge_forwarding.py
-# checks it against tests/_seam_oracle.py.
-_BRIDGE_TABLE = {
-    "_HOP_TIMEOUT_GRACE_S": ("safe_fetch", "_HOP_TIMEOUT_GRACE_S"),
-    "_HOST_RE": ("safe_fetch", "_HOST_RE"),
-    "_https_host": ("safe_fetch", "https_host"),
-    "_host_for_log": ("safe_fetch", "_host_for_log"),
-    "_any_https_host": ("safe_fetch", "_any_https_host"),
-    "_http_stream": ("safe_fetch", "_http_stream"),
-    "_Watchdog": ("safe_fetch", "_Watchdog"),
-    "_dns_in_time": ("safe_fetch", "_dns_in_time"),
-    "_decode_bounded": ("safe_fetch", "_decode_bounded"),
-    "_content_encoding": ("safe_fetch", "_content_encoding"),
-    "_api_call": ("safe_fetch", "_api_call"),
-    "_API_MIN_DEADLINE_S": ("safe_fetch", "_API_MIN_DEADLINE_S"),
-    "_API_DECODABLE_ENCODINGS": ("safe_fetch", "_API_DECODABLE_ENCODINGS"),
-    "_API_DROPPED_HEADERS": ("safe_fetch", "_API_DROPPED_HEADERS"),
-    "_open_download": ("safe_fetch", "open_download"),
-    "_api_get": ("safe_fetch", "api_get"),
-    "_api_post": ("safe_fetch", "api_post"),
-    "_iter_capped": ("safe_fetch", "iter_capped"),
-    "_body_too_large": ("safe_fetch", "body_too_large"),
-    "_TooLarge": ("safe_fetch", "TooLarge"),
-    "_MAX_API_JSON_BYTES": ("safe_fetch", "MAX_API_JSON_BYTES"),
-    "_MAX_REDIRECTS": ("safe_fetch", "_MAX_REDIRECTS"),
-    "_REDIRECT_STATUSES": ("safe_fetch", "_REDIRECT_STATUSES"),
-    "_monotonic": ("safe_fetch", "_monotonic"),
-    "RENDER_ASSET_BUDGET_S": ("safe_fetch", "RENDER_ASSET_BUDGET_S"),
-    "asset_budget": ("safe_fetch", "asset_budget"),
-    "_asset_deadline_at": ("safe_fetch", "_asset_deadline_at"),
-    "_clip_to_asset_budget": ("safe_fetch", "clip_to_asset_budget"),
-    "_asset_budget_spent": ("safe_fetch", "asset_budget_spent"),
-    "_IMAGE_MAGIC": ("media_policy", "_IMAGE_MAGIC"),
-    "_VIDEO_MAGIC": ("media_policy", "_VIDEO_MAGIC"),
-    "_MP4_BOXES": ("media_policy", "_MP4_BOXES"),
-    "_sniff_ok": ("media_policy", "sniff_ok"),
-    "_MAX_IMAGE_PIXELS": ("media_policy", "_MAX_IMAGE_PIXELS"),
-    "_MAX_FULL_DECODE_PIXELS": ("media_policy", "_MAX_FULL_DECODE_PIXELS"),
-    "_MAX_DECODE_BYTES": ("media_policy", "_MAX_DECODE_BYTES"),
-    "_MAX_DOWNSCALE_DECODE_BYTES": ("media_policy", "_MAX_DOWNSCALE_DECODE_BYTES"),
-    "_DECODE_BYTES_PER_PIXEL": ("media_policy", "_DECODE_BYTES_PER_PIXEL"),
-    "_DEFAULT_DECODE_BYTES_PER_PIXEL": ("media_policy", "_DEFAULT_DECODE_BYTES_PER_PIXEL"),
-    "_JPEG_FORMATS": ("media_policy", "_JPEG_FORMATS"),
-    "_MAX_TIFF_TILE_SIDE": ("media_policy", "_MAX_TIFF_TILE_SIDE"),
-    "_bytes_per_pixel": ("media_policy", "_bytes_per_pixel"),
-    "_pixel_cap": ("media_policy", "_pixel_cap"),
-    "_decode_window": ("media_policy", "_decode_window"),
-    "_tiff_tiles_ok": ("media_policy", "_tiff_tiles_ok"),
-    "_is_transient": ("media_policy", "_is_transient"),
-    "_image_ok": ("media_policy", "image_ok"),
-    "_downscale_jpeg": ("media_policy", "_downscale_jpeg"),
-    "_beyond_downscale_window": ("media_policy", "_beyond_downscale_window"),
-    "_ORIENTATION_TRANSPOSE": ("media_policy", "_ORIENTATION_TRANSPOSE"),
-    "_downscale_decoded": ("media_policy", "_downscale_decoded"),
-    "_OversizedImage": ("media_policy", "OversizedImage"),
-    "_fit_image": ("media_policy", "fit_image"),
-    "_refusal_marker": ("media_policy", "refusal_marker"),
-    "_refusal_stamp": ("media_policy", "refusal_stamp"),
-    "_refusal_recorded": ("media_policy", "refusal_recorded"),
-    "_require_media": ("media_policy", "require_media"),
-    "_cached_media_ok": ("media_policy", "cached_media_ok"),
-    "httpx": ("safe_fetch", "httpx"),
-    "socket": ("safe_fetch", "socket"),
-    "threading": ("safe_fetch", "threading"),
-}
-
-
-class _BridgeModule(types.ModuleType):
-    def __getattr__(self, name):                 # reached only when normal lookup fails
-        target = _BRIDGE_TABLE.get(name)
-        if target is None:
-            raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-        return getattr(sys.modules["engine.render." + target[0]], target[1])
-
-    def __setattr__(self, name, value):
-        target = _BRIDGE_TABLE.get(name)
-        if target is None:
-            super().__setattr__(name, value)
-        else:
-            setattr(sys.modules["engine.render." + target[0]], target[1], value)
-
-    def __delattr__(self, name):
-        target = _BRIDGE_TABLE.get(name)
-        if target is None:
-            super().__delattr__(name)
-        else:
-            delattr(sys.modules["engine.render." + target[0]], target[1])
-
-
-sys.modules[__name__].__class__ = _BridgeModule

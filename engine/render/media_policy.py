@@ -16,7 +16,7 @@ from pathlib import Path
 
 from celery.exceptions import SoftTimeLimitExceeded
 
-_log = logging.getLogger("engine.render.asset_sourcer")   # temporary: switches to __name__ in commit 2 (spec D4)
+_log = logging.getLogger(__name__)
 
 
 # The byte cap says nothing about declared PIXELS: a 140 KB PNG can declare 12000x12000, and the compositor's
