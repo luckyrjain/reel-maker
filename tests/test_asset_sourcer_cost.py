@@ -24,7 +24,7 @@ def test_hf_image_marks_generated_on_real_api_call(tmp_path):
     resp.raise_for_status.return_value = None
     resp.headers = {"content-type": "image/png"}
     resp.content = b"fake-png-bytes"
-    with patch("engine.render.asset_sourcer.httpx.post", return_value=resp):
+    with patch("httpx.post", return_value=resp):
         result = source.generate("a prompt")
     assert result is not None
     assert source.last_call_was_generated is True
@@ -36,7 +36,7 @@ def test_hf_image_does_not_mark_generated_on_cache_hit(tmp_path):
     resp.raise_for_status.return_value = None
     resp.headers = {"content-type": "image/png"}
     resp.content = b"fake-png-bytes"
-    with patch("engine.render.asset_sourcer.httpx.post", return_value=resp) as mock_post:
+    with patch("httpx.post", return_value=resp) as mock_post:
         source.generate("a prompt")  # first call — real API hit, caches the file
         assert source.last_call_was_generated is True
         source.generate("a prompt")  # second call — same fingerprint, cache hit
@@ -56,7 +56,7 @@ def test_hf_video_marks_generated_on_real_api_call(tmp_path):
     resp.raise_for_status.return_value = None
     resp.headers = {"content-type": "video/mp4"}
     resp.content = b"fake-mp4-bytes"
-    with patch("engine.render.asset_sourcer.httpx.post", return_value=resp):
+    with patch("httpx.post", return_value=resp):
         result = source.generate("a prompt")
     assert result is not None
     assert source.last_call_was_generated is True
@@ -68,7 +68,7 @@ def test_hf_video_does_not_mark_generated_on_cache_hit(tmp_path):
     resp.raise_for_status.return_value = None
     resp.headers = {"content-type": "video/mp4"}
     resp.content = b"fake-mp4-bytes"
-    with patch("engine.render.asset_sourcer.httpx.post", return_value=resp) as mock_post:
+    with patch("httpx.post", return_value=resp) as mock_post:
         source.generate("a prompt")
         assert source.last_call_was_generated is True
         source.generate("a prompt")

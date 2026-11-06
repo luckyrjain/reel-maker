@@ -33,7 +33,7 @@ from engine.render.asset_sourcer import (
     get_wiki_sourcer,
 )
 from tests.test_sourcer_selection import (  # noqa: F401  (the autouse fixture is re-exported on purpose)
-    _wikipedia_downloads_via_get_fakes,
+    _FETCH_MOD, _wikipedia_downloads_via_get_fakes,
     _MOD, _ORIG, _THUMB, _bytes_resp, _hf_resp, _json_resp, _pexels, _stream_factory, _summary, _vf,
     _video, _wiki,
 )
@@ -68,7 +68,7 @@ def test_atomic_write_writes_through_a_tmp_and_leaves_none(tmp_path):
 def test_atomic_write_never_exposes_a_partial_final_file_and_cleans_up_on_failure(tmp_path):
     target = tmp_path / "x.bin"
     target.write_bytes(b"old")
-    with patch(f"{AS.__name__}.os.replace", side_effect=RuntimeError("boom")):
+    with patch(f"{_MOD}.os.replace", side_effect=RuntimeError("boom")):
         with pytest.raises(RuntimeError):                    # the failure is re-raised, not swallowed
             _atomic_write(target, b"new")
     assert target.read_bytes() == b"old"                     # final path untouched
@@ -80,7 +80,7 @@ def test_atomic_write_distinguishes_tmp_from_target(tmp_path):
     real = AS.os.replace
     def spy(a, b):
         seen["a"], seen["b"] = str(a), str(b); real(a, b)
-    with patch(f"{AS.__name__}.os.replace", side_effect=spy):
+    with patch(f"{_MOD}.os.replace", side_effect=spy):
         _atomic_write(tmp_path / "y.png", b"z")
     assert seen["a"] != seen["b"] and seen["a"].endswith(".tmp")
 
@@ -119,7 +119,7 @@ def _wiki_routes(tmp_path, *, opensearch=None, summary=None, license_=None):
         if url.startswith(WikipediaImageSource._SUMMARY):
             return summary if summary is not None else _json_resp(_summary())
         return _bytes_resp(b"i")
-    with patch(f"{_MOD}.httpx.get", side_effect=fake_get):
+    with patch("httpx.get", side_effect=fake_get):
         return WikipediaImageSource(tmp_path).search("Lionel Messi")
 
 
@@ -155,7 +155,7 @@ def test_wikipedia_license_uses_the_first_imageinfo_entry(tmp_path):
     meta = lambda s: {"extmetadata": {"LicenseShortName": {"value": s}}}
     payload = {"query": {"pages": {"1": {"imageinfo": [meta("CC0"), meta("Fair use")]}}}}
     source = WikipediaImageSource(tmp_path)
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp(payload)):
+    with patch("httpx.get", return_value=_json_resp(payload)):
         assert source._fetch_license("a.jpg")["license"] == "CC0"
 
 
@@ -167,7 +167,7 @@ def test_wikipedia_slash_in_a_title_is_percent_encoded_in_the_summary_url(tmp_pa
         if a == "opensearch": return _json_resp(["x", ["AC/DC"], [], []])
         if "/page/summary/" in url: return _json_resp({"pageid": 1})
         return _json_resp({})
-    with patch(f"{_MOD}.httpx.get", side_effect=fake_get):
+    with patch("httpx.get", side_effect=fake_get):
         WikipediaImageSource(tmp_path).search("AC/DC")
     assert seen[1][1]["timeout"] == 10.0
     assert seen[1][0].endswith("/page/summary/AC%2FDC")
@@ -224,33 +224,33 @@ def test_pexels_http_error_with_a_valid_body_is_none(tmp_path):
     from tests.test_sourcer_selection import _stream_factory
     src = PexelsVideoSource("k", tmp_path)
     streamed = []
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]}, status=500)), \
-            patch(f"{_MOD}._http_stream", _stream_factory(streamed)):
+    with patch("httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]}, status=500)), \
+            patch(f"{_FETCH_MOD}._http_stream", _stream_factory(streamed)):
         assert src.search("q", 1.0) is None
     assert streamed == []        # a 5xx search response must never lead to a download
 
 
 def test_pexels_non_http_search_errors_return_none(tmp_path):
-    with patch(f"{_MOD}.httpx.get", side_effect=RuntimeError("weird")):
+    with patch("httpx.get", side_effect=RuntimeError("weird")):
         assert PexelsVideoSource("k", tmp_path).search("q", 1.0) is None
 
 
 def test_pexels_200_without_a_videos_key_is_none(tmp_path):
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({})):
+    with patch("httpx.get", return_value=_json_resp({})):
         assert PexelsVideoSource("k", tmp_path).search("q", 1.0) is None
 
 
 def test_pexels_malformed_search_json_is_none(tmp_path):
     bad = _json_resp(None); bad.json.side_effect = ValueError("x")
-    with patch(f"{_MOD}.httpx.get", return_value=bad):
+    with patch("httpx.get", return_value=bad):
         assert PexelsVideoSource("k", tmp_path).search("q", 1.0) is None
 
 
 @pytest.mark.parametrize("body", [[], "oops", 7, None, {"videos": None}, {"videos": "x"}, {"videos": {"a": 1}}])
 def test_pexels_wrong_shape_search_body_is_none(tmp_path, body):
     streamed = []
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp(body)), \
-            patch(f"{_MOD}._http_stream", _stream_factory(streamed)):
+    with patch("httpx.get", return_value=_json_resp(body)), \
+            patch(f"{_FETCH_MOD}._http_stream", _stream_factory(streamed)):
         assert PexelsVideoSource("k", tmp_path).search("q", 1.0) is None
     assert streamed == []
 
@@ -289,8 +289,8 @@ def test_pexels_a_malformed_video_entry_is_skipped_not_raised(tmp_path, bad):
 def test_pexels_a_cached_file_is_not_served_for_a_hit_with_an_unusable_link(tmp_path, bad_link):
     (tmp_path / "pexels_1.mp4").write_bytes(b"cached")
     vid = {"id": 1, "duration": 10, "video_files": [{"width": 1080, "height": 1920, "link": bad_link}]}
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [vid]})), \
-            patch(f"{_MOD}._http_stream", _stream_factory([])):
+    with patch("httpx.get", return_value=_json_resp({"videos": [vid]})), \
+            patch(f"{_FETCH_MOD}._http_stream", _stream_factory([])):
         assert PexelsVideoSource("k", tmp_path).search("q", 1.0) is None
 
 
@@ -298,8 +298,8 @@ def test_pexels_a_cached_file_is_not_served_for_a_hit_with_an_unusable_link(tmp_
 def test_pexels_a_bool_duration_is_not_a_number_even_when_it_would_pass_the_minimum(tmp_path, dur):
     """`True` == 1, so with a 0.5 s minimum only the bool guard can reject it."""
     vids = [{"id": 1, "duration": dur, "video_files": [_vf(1080, 1920)]}]
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": vids})), \
-            patch(f"{_MOD}._http_stream", _stream_factory([])):
+    with patch("httpx.get", return_value=_json_resp({"videos": vids})), \
+            patch(f"{_FETCH_MOD}._http_stream", _stream_factory([])):
         assert PexelsVideoSource("k", tmp_path).search("q", 0.0 if dur is False else 0.5) is None
 
 
@@ -307,8 +307,8 @@ def test_pexels_missing_duration_is_skipped_even_with_no_minimum(tmp_path):
     """No `duration` is not "0 seconds": with min_duration_s=0 it used to KeyError at the end."""
     src = PexelsVideoSource(api_key="k", store_dir=tmp_path)
     vids = [{"id": 1, "video_files": [_vf(1080, 1920)]}]
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": vids})), \
-            patch(f"{_MOD}._http_stream", _stream_factory([])):
+    with patch("httpx.get", return_value=_json_resp({"videos": vids})), \
+            patch(f"{_FETCH_MOD}._http_stream", _stream_factory([])):
         assert src.search("q", 0.0) is None
 
 
@@ -322,8 +322,8 @@ def test_pexels_download_uses_a_get_stream(tmp_path):
     @contextmanager
     def fake_stream(method, url, **kw):
         methods.append(method); r = MagicMock(); r.iter_bytes.return_value = iter([b"v"]); yield r
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]})), \
-            patch(f"{_MOD}._http_stream", fake_stream):
+    with patch("httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]})), \
+            patch(f"{_FETCH_MOD}._http_stream", fake_stream):
         PexelsVideoSource("k", tmp_path).search("q", 1.0)
     assert methods == ["GET"]
 
@@ -340,13 +340,13 @@ def test_pexels_non_http_download_errors_still_skip_to_next(tmp_path):
         if "bad" in url: raise OSError("disk full")
         r = MagicMock(); r.iter_bytes.return_value = iter([b"v"]); yield r
     vids = [_video(1, [_vf(1080, 1920, link="https://videos.pexels.com/video-files/bad.mp4")]), _video(2, [_vf(1080, 1920)])]
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": vids})), patch(f"{_MOD}._http_stream", fake_stream):
+    with patch("httpx.get", return_value=_json_resp({"videos": vids})), patch(f"{_FETCH_MOD}._http_stream", fake_stream):
         assert PexelsVideoSource("k", tmp_path).search("q", 1.0).source_ref == "2"
 
 
 def test_pexels_empty_string_key_and_none_key_both_skip(tmp_path):
     for key in ("", None):
-        with patch(f"{_MOD}.httpx.get") as get:
+        with patch("httpx.get") as get:
             assert PexelsVideoSource(key, tmp_path).search("q", 1.0) is None
         get.assert_not_called()
 
@@ -359,18 +359,18 @@ def test_pexels_api_base_url_literal():
 def test_hf_urls_and_auth_scheme(tmp_path):
     for cls in (HuggingFaceImageSource, HuggingFaceVideoSource):
         assert cls._API == "https://api-inference.huggingface.co/models"
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("image/png")) as post:
+    with patch("httpx.post", return_value=_hf_resp("image/png")) as post:
         HuggingFaceImageSource("k", "org/m", tmp_path).generate("p")
     assert post.call_args.args[0] == "https://api-inference.huggingface.co/models/org/m"
     assert post.call_args.kwargs["headers"] == {"Authorization": "Bearer k"}
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("video/mp4")) as post:
+    with patch("httpx.post", return_value=_hf_resp("video/mp4")) as post:
         HuggingFaceVideoSource("k", "org/m", tmp_path).generate("p")
     assert post.call_args.args[0] == "https://api-inference.huggingface.co/models/org/m"
     assert post.call_args.kwargs["headers"] == {"Authorization": "Bearer k"}
 
 
 def test_hf_image_request_json_key_and_bytes_written(tmp_path):
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("image/png", b"PNGDATA")) as post:
+    with patch("httpx.post", return_value=_hf_resp("image/png", b"PNGDATA")) as post:
         r = HuggingFaceImageSource("k", "m", tmp_path).generate("p")
     assert list(post.call_args.kwargs["json"]) == ["inputs"]
     assert r.local_path.read_bytes() == b"PNGDATA"
@@ -381,9 +381,9 @@ def test_hf_http_error_status_is_a_failure_for_image_and_video(tmp_path):
         resp = _hf_resp(ct, b"<html>oops</html>")
         resp.raise_for_status.side_effect = httpx.HTTPStatusError("500", request=MagicMock(), response=resp)
         return resp
-    with patch(f"{_MOD}.httpx.post", return_value=err("image/png")):
+    with patch("httpx.post", return_value=err("image/png")):
         assert HuggingFaceImageSource("k", "m", tmp_path).generate("p") is None
-    with patch(f"{_MOD}.httpx.post", return_value=err("video/mp4")):
+    with patch("httpx.post", return_value=err("video/mp4")):
         v = HuggingFaceVideoSource("k", "m", tmp_path)
         assert v.generate("p") is None
         assert v.last_call_was_generated is False
@@ -391,15 +391,15 @@ def test_hf_http_error_status_is_a_failure_for_image_and_video(tmp_path):
 
 
 def test_hf_non_http_errors_return_none_not_raise(tmp_path):
-    with patch(f"{_MOD}.httpx.post", side_effect=ValueError("boom")):
+    with patch("httpx.post", side_effect=ValueError("boom")):
         assert HuggingFaceImageSource("k", "m", tmp_path).generate("p") is None
         assert HuggingFaceVideoSource("k", "m", tmp_path).generate("p") is None
 
 
 def test_hf_generated_assets_carry_no_license_url_or_attribution_and_video_license_str(tmp_path):
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("image/png")):
+    with patch("httpx.post", return_value=_hf_resp("image/png")):
         i = HuggingFaceImageSource("k", "m", tmp_path).generate("p")
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("video/mp4")):
+    with patch("httpx.post", return_value=_hf_resp("video/mp4")):
         v = HuggingFaceVideoSource("k", "m", tmp_path).generate("p")
     for a in (i, v):
         assert (a.license_str, a.license_url, a.attribution, a.safe_to_publish) == ("generated", None, None, True)
@@ -409,27 +409,27 @@ def test_hf_video_prefers_a_cached_mp4_over_a_cached_gif(tmp_path):
     full = "p, portrait orientation, vertical format, cinematic, high quality"
     fp = hashlib.sha256(full.encode()).hexdigest()[:16]
     (tmp_path / f"hfvid_{fp}.mp4").write_bytes(b"m"); (tmp_path / f"hfvid_{fp}.gif").write_bytes(b"g")
-    with patch(f"{_MOD}.httpx.post") as post:
+    with patch("httpx.post") as post:
         r = HuggingFaceVideoSource("k", "m", tmp_path).generate("p")
     post.assert_not_called()
     assert r.local_path.suffix == ".mp4"
 
 
 def test_hf_video_gif_detection_is_case_sensitive_characterization(tmp_path):
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("image/GIF")):          # upper-case: pin current behavior
+    with patch("httpx.post", return_value=_hf_resp("image/GIF")):          # upper-case: pin current behavior
         assert HuggingFaceVideoSource("k", "m", tmp_path).generate("p").local_path.suffix == ".mp4"
 
 
 def test_hf_fingerprint_is_over_the_full_prompt_for_both(tmp_path):
     full = lambda p: f"{p}, portrait orientation, vertical format, cinematic, high quality"
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("image/png")):
+    with patch("httpx.post", return_value=_hf_resp("image/png")):
         i = HuggingFaceImageSource("k", "m", tmp_path).generate("p")
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("video/mp4")):
+    with patch("httpx.post", return_value=_hf_resp("video/mp4")):
         v = HuggingFaceVideoSource("k", "m", tmp_path).generate("p")
     exp = hashlib.sha256(full("p").encode()).hexdigest()[:16]
     assert i.source_ref == v.source_ref == exp
     assert v.local_path.name == f"hfvid_{exp}.mp4"
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("video/mp4")) as post:
+    with patch("httpx.post", return_value=_hf_resp("video/mp4")) as post:
         HuggingFaceVideoSource("k", "m", tmp_path / "v2").generate("p")
     assert post.call_args.kwargs["json"]["inputs"] == full("p")
 
@@ -463,12 +463,12 @@ def test_license_string_is_returned_verbatim_not_normalized():
 
 
 def test_hf_video_gif_detection_is_a_substring_match(tmp_path):
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("image/gif; charset=binary")):
+    with patch("httpx.post", return_value=_hf_resp("image/gif; charset=binary")):
         assert HuggingFaceVideoSource("k", "m", tmp_path).generate("p").local_path.suffix == ".gif"
 
 
 def test_hf_image_content_type_needs_the_slash(tmp_path):
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("imagey")):
+    with patch("httpx.post", return_value=_hf_resp("imagey")):
         assert HuggingFaceImageSource("k", "m", tmp_path).generate("p") is None
 
 
@@ -587,15 +587,15 @@ def test_only_429_triggers_the_sleep_and_retry(tmp_path):
 
 def test_pexels_query_is_sent_verbatim_case_preserved(tmp_path):
     src = PexelsVideoSource("k", tmp_path)
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": []})) as get:
+    with patch("httpx.get", return_value=_json_resp({"videos": []})) as get:
         src.search("Lionel MESSI Goal", 5.0)
     assert get.call_args.kwargs["params"]["query"] == "Lionel MESSI Goal"
 
 
 def _pexels_min(tmp_path, videos, min_d):
     src = PexelsVideoSource("k", tmp_path)
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": videos})), \
-            patch(f"{_MOD}._http_stream", _stream_factory([])):
+    with patch("httpx.get", return_value=_json_resp({"videos": videos})), \
+            patch(f"{_FETCH_MOD}._http_stream", _stream_factory([])):
         return src.search("q", min_d)
 
 
@@ -618,14 +618,14 @@ def test_pexels_multi_digit_video_id_is_kept_whole(tmp_path):
                                       (HuggingFaceVideoSource, _hf_resp("video/mp4"))])
 def test_hf_model_id_is_used_case_preserved_in_the_url(cls, resp, tmp_path):
     src = cls(api_key="k", model="Org/Model-X.1", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.post", return_value=resp) as post:
+    with patch("httpx.post", return_value=resp) as post:
         src.generate("p")
     assert post.call_args.args[0].endswith("/Org/Model-X.1")
 
 
 def test_hf_image_accepts_any_image_content_type(tmp_path):
     src = HuggingFaceImageSource(api_key="k", model="m", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.post", return_value=_hf_resp("image/jpeg")):
+    with patch("httpx.post", return_value=_hf_resp("image/jpeg")):
         assert src.generate("p") is not None
     assert src.last_call_was_generated is True
 
@@ -680,7 +680,7 @@ def test_wikipedia_license_wrong_shape_json_is_unknown_and_unsafe(tmp_path, body
         if url.startswith(WikipediaImageSource._SUMMARY):
             return _json_resp(_summary())
         return _bytes_resp(b"i")
-    with patch(f"{_MOD}.httpx.get", side_effect=fake_get):
+    with patch("httpx.get", side_effect=fake_get):
         r = WikipediaImageSource(tmp_path).search("Lionel Messi")
     assert r is not None and r.license_str == "unknown" and r.safe_to_publish is False
 
@@ -688,7 +688,7 @@ def test_wikipedia_license_wrong_shape_json_is_unknown_and_unsafe(tmp_path, body
 def test_wikipedia_opensearch_null_body_is_a_miss(tmp_path):
     def fake_get(url, **kw):
         return _json_resp(None)
-    with patch(f"{_MOD}.httpx.get", side_effect=fake_get):
+    with patch("httpx.get", side_effect=fake_get):
         assert WikipediaImageSource(tmp_path).search("Lionel Messi") is None
 
 
@@ -713,8 +713,8 @@ def test_pexels_first_qualifying_video_wins_not_sorted_by_duration(tmp_path, dur
 # 5. Pexels: fractional min duration is not truncated
 def test_pexels_fractional_minimum_is_not_truncated(tmp_path):
     src = PexelsVideoSource("k", tmp_path)
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)], duration=5.2)]})), \
-            patch(f"{_MOD}._http_stream", _stream_factory([])):
+    with patch("httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)], duration=5.2)]})), \
+            patch(f"{_FETCH_MOD}._http_stream", _stream_factory([])):
         assert src.search("q", 5.5) is None
 
 
@@ -723,8 +723,8 @@ def test_pexels_long_query_verbatim_and_filename_uses_video_id(tmp_path):
     q = "Lionel Messi celebrating a last-minute winner in front of a roaring Buenos Aires crowd, café"
     vid = _video(7, [{"id": 999, "width": 1080, "height": 1920, "link": "https://videos.pexels.com/video-files/a.mp4"}])
     src = PexelsVideoSource("k", tmp_path)
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [vid]})) as get, \
-            patch(f"{_MOD}._http_stream", _stream_factory([])):
+    with patch("httpx.get", return_value=_json_resp({"videos": [vid]})) as get, \
+            patch(f"{_FETCH_MOD}._http_stream", _stream_factory([])):
         r = src.search(q, 5.0)
     assert get.call_args.kwargs["params"]["query"] == q
     assert r.local_path.name == "pexels_7.mp4"
@@ -733,8 +733,8 @@ def test_pexels_long_query_verbatim_and_filename_uses_video_id(tmp_path):
 # 7. Pexels: a failing final rename must be skipped like any other download failure, tmp cleaned
 def test_pexels_failed_rename_is_a_skip_not_a_crash_and_leaves_no_tmp(tmp_path):
     src = PexelsVideoSource("k", tmp_path)
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]})), \
-            patch(f"{_MOD}._http_stream", _stream_factory([])), \
+    with patch("httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920)])]})), \
+            patch(f"{_FETCH_MOD}._http_stream", _stream_factory([])), \
             patch(f"{_MOD}.os.replace", side_effect=OSError("exdev")):
         assert src.search("q", 5.0) is None
     assert list(tmp_path.iterdir()) == []

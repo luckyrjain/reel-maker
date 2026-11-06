@@ -5,7 +5,8 @@ from api.config import settings
 from api.state import CUT_TRANSITIONS, transition
 from engine.generation.guide_schema import PlatformGuide, compute_guide_fingerprint
 from engine.observability import record_stage
-from engine.render.asset_sourcer import RENDER_ASSET_BUDGET_S, asset_budget, _monotonic as _asset_clock, compute_pins_fingerprint_for_render, get_asset_sourcer, get_hf_sourcer, get_hf_video_sourcer, get_music_sourcer, get_wiki_sourcer, resolve_or_reuse
+from engine.render import safe_fetch
+from engine.render.asset_sourcer import compute_pins_fingerprint_for_render, get_asset_sourcer, get_hf_sourcer, get_hf_video_sourcer, get_music_sourcer, get_wiki_sourcer, resolve_or_reuse
 from engine.render.compositor import DEFAULT_TEXT_COLOR, composite_cut
 from engine.render.tts import SilentProvider, _audio_duration, get_tts_provider
 from worker.celery_app import celery_app
@@ -63,8 +64,8 @@ def render_cut(self, db, job, ctx):
     for i, beat in enumerate(beats):
         # resolve_or_reuse: reuses pinned assets when visual_direction hasn't
         # changed; re-resolves (and re-pins) only when the direction changed.
-        started = _asset_clock()
-        with asset_budget(RENDER_ASSET_BUDGET_S - asset_time_s):
+        started = safe_fetch.now()
+        with safe_fetch.asset_budget(safe_fetch.RENDER_ASSET_BUDGET_S - asset_time_s):
             pairs = resolve_or_reuse(
                 db,
                 cut=cut,
@@ -76,7 +77,7 @@ def render_cut(self, db, job, ctx):
                 hf_video=hf_video,
                 hf=hf,
             )
-        asset_time_s += _asset_clock() - started
+        asset_time_s += safe_fetch.now() - started
         beat_asset_pairs.append(pairs)
         paths = [p for _, p in pairs]
         beat_video_paths.append(paths)

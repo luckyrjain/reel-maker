@@ -1,4 +1,4 @@
-"""Download guards of the asset sourcers (engine/render/asset_sourcer.py).
+"""Download guards of the asset sourcers (engine/render/safe_fetch.py).
 
 The download URLs (`chosen["link"]` for Pexels, `originalimage` / `thumbnail` `source` for
 Wikipedia) come straight from remote JSON. Before these guards they were fetched with
@@ -9,7 +9,7 @@ make the worker request an arbitrary URL (blind SSRF) or fill the disk. A downlo
 * redirect-checked hop by hop (never `follow_redirects=True`), at most `_MAX_REDIRECTS` hops;
 * size-capped (`_MAX_VIDEO_BYTES` / `_MAX_IMAGE_BYTES`), both by `Content-Length` and by bytes read.
 
-HTTP is faked at `engine.render.asset_sourcer.httpx`; nothing touches the network.
+HTTP is faked at `httpx` (and `engine.render.safe_fetch._http_stream`); nothing touches the network.
 """
 import time
 from contextlib import contextmanager
@@ -19,8 +19,9 @@ import httpx
 import pytest
 
 from engine.render import asset_sourcer as AS
+from engine.render import safe_fetch
 from engine.render.asset_sourcer import PexelsVideoSource, WikipediaImageSource
-from tests.test_sourcer_selection import _MOD, _json_resp, _summary, _video, _vf
+from tests.test_sourcer_selection import _FETCH_MOD, _MOD, _json_resp, _summary, _video, _vf
 
 PEXELS_OK = "https://videos.pexels.com/video-files/856973/856973-hd_1080_1920_25fps.mp4"
 WIKI_OK = "https://upload.wikimedia.org/wikipedia/commons/a/ab/Messi.jpg"
@@ -156,8 +157,8 @@ class _Stream:
 
 def _pexels(tmp_path, videos, stream):
     src = PexelsVideoSource(api_key="k", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": videos})), \
-            patch(f"{_MOD}._http_stream", stream):
+    with patch("httpx.get", return_value=_json_resp({"videos": videos})), \
+            patch(f"{_FETCH_MOD}._http_stream", stream):
         return src.search("q", 1.0)
 
 
@@ -174,7 +175,7 @@ def _wiki(tmp_path, summary, stream, sleeps=None, title="Lionel Messi"):
         misrouted.append(url)       # search() swallows exceptions, so record instead of raising
         return _json_resp({})
 
-    with patch(f"{_MOD}.httpx.get", side_effect=fake_get), patch(f"{_MOD}._http_stream", stream), \
+    with patch("httpx.get", side_effect=fake_get), patch(f"{_FETCH_MOD}._http_stream", stream), \
             patch(f"{_MOD}.time.sleep") as sleep:
         result = WikipediaImageSource(tmp_path).search("Lionel Messi")
     if sleeps is not None:
@@ -279,11 +280,11 @@ def test_pexels_a_redirect_without_a_location_fails_the_candidate(tmp_path):
 
 
 def test_the_redirect_limit_is_three_hops():
-    assert AS._MAX_REDIRECTS == 3
+    assert safe_fetch._MAX_REDIRECTS == 3
 
 
 def test_pexels_redirect_chain_is_bounded(tmp_path):
-    hops = [f"https://videos.pexels.com/h{i}.mp4" for i in range(AS._MAX_REDIRECTS + 3)]
+    hops = [f"https://videos.pexels.com/h{i}.mp4" for i in range(safe_fetch._MAX_REDIRECTS + 3)]
     script = {PEXELS_OK: _redirect(hops[0])}
     script.update({h: _redirect(n) for h, n in zip(hops, hops[1:])})
     script[hops[-1]] = _Resp()
@@ -517,14 +518,14 @@ def test_the_guard_and_httpx_agree_on_the_host_of_every_accepted_pexels_url(url)
 def test_a_compressed_response_is_rejected(enc):
     r = _Resp(chunks=(b"x",), headers={"content-encoding": enc})
     with pytest.raises(ValueError):
-        list(AS._iter_capped(r, 10))
+        list(safe_fetch.iter_capped(r, 10))
     assert r.chunks_read == 0
 
 
 @pytest.mark.parametrize("headers", [{}, {"content-encoding": ""}, {"content-encoding": "identity"},
                                      {"content-encoding": " Identity "}])
 def test_an_uncompressed_response_is_read(headers):
-    assert list(AS._iter_capped(_Resp(chunks=(b"abc",), headers=headers), 10)) == [b"abc"]
+    assert list(safe_fetch.iter_capped(_Resp(chunks=(b"abc",), headers=headers), 10)) == [b"abc"]
 
 
 def test_pexels_a_gzip_response_is_discarded_and_the_next_hit_used(tmp_path):
@@ -540,12 +541,12 @@ def test_wikipedia_a_gzip_original_falls_back_to_the_thumbnail(tmp_path):
     assert _wiki(tmp_path, _summary(), stream).local_path.read_bytes() == b"thumb"
 
 
-# ── _iter_capped directly ─────────────────────────────────────────────────────────────────────
+# ── iter_capped directly ─────────────────────────────────────────────────────────────────────
 
 def test_iter_capped_never_yields_a_chunk_past_the_cap():
     got = []
     with pytest.raises(ValueError):
-        for c in AS._iter_capped(_Resp(chunks=(b"123456", b"789012")), 10):
+        for c in safe_fetch.iter_capped(_Resp(chunks=(b"123456", b"789012")), 10):
             got.append(c)
     assert got == [b"123456"]
 
@@ -557,7 +558,7 @@ def test_iter_capped_does_not_ask_for_a_fixed_chunk_size():
         def iter_bytes(self, chunk_size=None):
             seen["n"] = chunk_size
             return iter([b"a"])
-    list(AS._iter_capped(R(), 10))
+    list(safe_fetch.iter_capped(R(), 10))
     assert seen["n"] is None
 
 
@@ -569,14 +570,14 @@ def test_real_httpx_the_deadline_is_checked_on_every_network_read():
     with httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(200, content=body()))) as c:
         with c.stream("GET", "https://videos.pexels.com/x.mp4") as r:
             clock = _fake_clock(1.0, 2.0, 999.0)
-            AS._monotonic, saved = clock, AS._monotonic
+            safe_fetch._monotonic, saved = clock, safe_fetch._monotonic
             try:
                 got = []
                 with pytest.raises(ValueError, match="too slow|deadline"):
-                    for chunk in AS._iter_capped(r, 1000, deadline_at=100.0):
+                    for chunk in safe_fetch.iter_capped(r, 1000, deadline_at=100.0):
                         got.append(chunk)
             finally:
-                AS._monotonic = saved
+                safe_fetch._monotonic = saved
     assert len(got) == 2
 
 
@@ -594,30 +595,30 @@ def _fake_clock(*ticks, after=999.0):
 
 
 def test_a_body_that_takes_too_long_is_cut_off_even_if_each_read_is_fast(monkeypatch):
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(5.0, 50.0, 500.0))
+    monkeypatch.setattr(safe_fetch, "_monotonic", _fake_clock(5.0, 50.0, 500.0))
     got = []
     with pytest.raises(ValueError, match="too slow|deadline"):
-        for c in AS._iter_capped(_Resp(chunks=(b"a", b"b", b"c")), 100, deadline_at=100.0):
+        for c in safe_fetch.iter_capped(_Resp(chunks=(b"a", b"b", b"c")), 100, deadline_at=100.0):
             got.append(c)
     assert got == [b"a", b"b"]
 
 
 def test_a_body_within_the_deadline_is_read_in_full(monkeypatch):
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(1.0, 2.0, 3.0))
-    assert list(AS._iter_capped(_Resp(chunks=(b"a", b"b", b"c")), 100, deadline_at=100.0)) == [b"a", b"b", b"c"]
+    monkeypatch.setattr(safe_fetch, "_monotonic", _fake_clock(1.0, 2.0, 3.0))
+    assert list(safe_fetch.iter_capped(_Resp(chunks=(b"a", b"b", b"c")), 100, deadline_at=100.0)) == [b"a", b"b", b"c"]
 
 
 def test_reaching_the_deadline_exactly_is_still_allowed(monkeypatch):
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(100.0, 100.5))
+    monkeypatch.setattr(safe_fetch, "_monotonic", _fake_clock(100.0, 100.5))
     got = []
     with pytest.raises(ValueError):
-        for c in AS._iter_capped(_Resp(chunks=(b"a", b"b")), 100, deadline_at=100.0):
+        for c in safe_fetch.iter_capped(_Resp(chunks=(b"a", b"b")), 100, deadline_at=100.0):
             got.append(c)
     assert got == [b"a"]                                        # `>` not `>=`: the 100.0 tick passes
 
 
 def test_the_budget_uses_a_monotonic_clock():
-    assert AS._monotonic is time.monotonic          # a wall clock can jump; the budget must not
+    assert safe_fetch._monotonic is time.monotonic          # a wall clock can jump; the budget must not
 
 
 def test_the_deadlines_are_sane_numbers():
@@ -628,7 +629,7 @@ def test_pexels_uses_the_video_deadline_and_not_the_image_one(tmp_path, monkeypa
     monkeypatch.setattr(AS, "_VIDEO_DEADLINE_S", 10.0)
     monkeypatch.setattr(AS, "_IMAGE_DEADLINE_S", 1e9)
     # readings: search start 0; this hit's deadline_at = 0 + 10; hop check 0; chunk a 1; chunk b 999 (> 10)
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 0.0, 1.0, 999.0))
+    monkeypatch.setattr(safe_fetch, "_monotonic", _fake_clock(0.0, 0.0, 0.0, 1.0, 999.0))
     stream = _Stream({PEXELS_OK: _Resp(chunks=(b"a", b"b"))})
     assert _pexels(tmp_path, [_video(1, [_vf(1080, 1920, link=PEXELS_OK)])], stream) is None
     assert list(tmp_path.iterdir()) == []
@@ -638,7 +639,7 @@ def test_pexels_a_download_inside_the_video_deadline_is_kept_even_past_the_image
     monkeypatch.setattr(AS, "_VIDEO_DEADLINE_S", 1e9)
     monkeypatch.setattr(AS, "_IMAGE_DEADLINE_S", 10.0)
     monkeypatch.setattr(AS, "_PEXELS_SEARCH_BUDGET_S", 1e9)         # the search budget must not clip it
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 0.0, 1.0, 999.0))
+    monkeypatch.setattr(safe_fetch, "_monotonic", _fake_clock(0.0, 0.0, 0.0, 1.0, 999.0))
     stream = _Stream({PEXELS_OK: _Resp(chunks=(b"a", b"b"))})
     assert _pexels(tmp_path, [_video(1, [_vf(1080, 1920, link=PEXELS_OK)])], stream).local_path.read_bytes() == b"ab"
 
@@ -648,7 +649,7 @@ def test_wikipedia_uses_the_image_deadline_and_not_the_video_one(tmp_path, monke
     monkeypatch.setattr(AS, "_VIDEO_DEADLINE_S", 1e9)
     # search start 0; original: _download reading 0 (deadline_at 10), hop 0, chunk a 1, chunk b 999 -> cut off.
     # thumbnail: _download reading 0 (deadline_at 10), hop 0, chunk 1 -> kept.
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 0.0, 1.0, 999.0, 0.0, 0.0, 1.0))
+    monkeypatch.setattr(safe_fetch, "_monotonic", _fake_clock(0.0, 0.0, 0.0, 1.0, 999.0, 0.0, 0.0, 1.0))
     stream = _Stream({WIKI_OK: _Resp(chunks=(b"a", b"b")), WIKI_THUMB: _Resp(chunks=(b"t",))})
     result = _wiki(tmp_path, _summary(), stream)
     assert stream.urls == [WIKI_OK, WIKI_THUMB] and result.local_path.read_bytes() == b"t"
@@ -658,7 +659,7 @@ def test_wikipedia_a_download_inside_the_image_deadline_is_kept_even_past_the_vi
     monkeypatch.setattr(AS, "_IMAGE_DEADLINE_S", 1e9)
     monkeypatch.setattr(AS, "_VIDEO_DEADLINE_S", 10.0)
     monkeypatch.setattr(AS, "_WIKI_SEARCH_BUDGET_S", 1e9)           # the search budget must not clip it
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 0.0, 1.0, 999.0))
+    monkeypatch.setattr(safe_fetch, "_monotonic", _fake_clock(0.0, 0.0, 0.0, 1.0, 999.0))
     stream = _Stream({WIKI_OK: _Resp(chunks=(b"a", b"b"))})
     assert _wiki(tmp_path, _summary(thumbnail=None), stream).local_path.read_bytes() == b"ab"
 
@@ -668,7 +669,7 @@ def test_the_budget_covers_the_redirect_hops_too(tmp_path, monkeypatch):
     other = "https://videos.pexels.com/video-files/2/b.mp4"
     monkeypatch.setattr(AS, "_VIDEO_DEADLINE_S", 10.0)
     # search start 0; deadline_at 10; first hop at 0 (ok); second hop at 999 -> refused before it is requested
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 0.0, 999.0))
+    monkeypatch.setattr(safe_fetch, "_monotonic", _fake_clock(0.0, 0.0, 0.0, 999.0))
     stream = _Stream({PEXELS_OK: _redirect(other), other: _Resp()})
     assert _pexels(tmp_path, [_video(1, [_vf(1080, 1920, link=PEXELS_OK)])], stream) is None
     assert stream.urls == [PEXELS_OK]
@@ -677,7 +678,7 @@ def test_the_budget_covers_the_redirect_hops_too(tmp_path, monkeypatch):
 def test_the_budget_covers_the_429_retry_too(tmp_path, monkeypatch):
     monkeypatch.setattr(AS, "_IMAGE_DEADLINE_S", 10.0)
     # search start 0; _download reading 0 (deadline_at 10); hop 1 at 0; hop 2 (after the 429) at 999
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 0.0, 999.0))
+    monkeypatch.setattr(safe_fetch, "_monotonic", _fake_clock(0.0, 0.0, 0.0, 999.0))
     stream = _Stream({WIKI_OK: [_Resp(status=429), _Resp(chunks=(b"ok",))]})
     assert _wiki(tmp_path, _summary(thumbnail=None), stream) is None
     assert stream.urls == [WIKI_OK]                             # the retry was refused: budget spent
@@ -686,7 +687,7 @@ def test_the_budget_covers_the_429_retry_too(tmp_path, monkeypatch):
 # ── guard rejections are logged (host only), not silent ───────────────────────────────────────
 
 def test_a_disallowed_url_is_logged_with_its_host_but_not_the_full_url(tmp_path, caplog):
-    caplog.set_level("WARNING", logger=AS.__name__)
+    caplog.set_level("WARNING", logger=safe_fetch.__name__)
     secret_url = "https://evil.example/secret/path?token=abc"
     _pexels(tmp_path, [_video(1, [_vf(1080, 1920, link=secret_url)])], _Stream({}))
     text = caplog.text
@@ -694,7 +695,7 @@ def test_a_disallowed_url_is_logged_with_its_host_but_not_the_full_url(tmp_path,
 
 
 def test_a_redirect_off_the_allowlist_is_logged_with_its_host(tmp_path, caplog):
-    caplog.set_level("WARNING", logger=AS.__name__)
+    caplog.set_level("WARNING", logger=safe_fetch.__name__)
     stream = _Stream({PEXELS_OK: _redirect("https://169.254.169.254/latest/meta-data/")})
     _pexels(tmp_path, [_video(1, [_vf(1080, 1920, link=PEXELS_OK)])], stream)
     assert "169.254.169.254" in caplog.text and "meta-data" not in caplog.text
@@ -720,8 +721,8 @@ def test_real_httpx_redirect_header_name_is_case_insensitive_and_relative_urls_r
         return httpx.Response(200, content=b"final-bytes")
     seen = []
     src = PexelsVideoSource(api_key="k", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920, link="https://videos.pexels.com/video-files/1/a.mp4")])]})), \
-            patch(f"{_MOD}._http_stream", _real_stream(handler, seen)):
+    with patch("httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920, link="https://videos.pexels.com/video-files/1/a.mp4")])]})), \
+            patch(f"{_FETCH_MOD}._http_stream", _real_stream(handler, seen)):
         result = src.search("q", 1.0)
     assert result.local_path.read_bytes() == b"final-bytes"
     assert [u for u, _ in seen] == ["https://videos.pexels.com/video-files/1/a.mp4",
@@ -735,8 +736,8 @@ def test_real_httpx_a_gzip_response_is_rejected_and_identity_was_requested(tmp_p
         requested.append(request.headers.get("accept-encoding"))
         return httpx.Response(200, content=gzip.compress(b"\0" * 100000), headers={"content-encoding": "gzip"})
     src = PexelsVideoSource(api_key="k", store_dir=tmp_path)
-    with patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920, link=PEXELS_OK)])]})), \
-            patch(f"{_MOD}._http_stream", _real_stream(handler)):
+    with patch("httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920, link=PEXELS_OK)])]})), \
+            patch(f"{_FETCH_MOD}._http_stream", _real_stream(handler)):
         assert src.search("q", 1.0) is None
     assert requested == ["identity"] and list(tmp_path.iterdir()) == []
 
@@ -767,7 +768,7 @@ def test_wikipedia_a_malformed_original_does_not_stop_a_valid_thumbnail(tmp_path
 
 
 def test_userinfo_in_a_rejected_url_is_never_logged(tmp_path, caplog):
-    caplog.set_level("WARNING", logger=AS.__name__)
+    caplog.set_level("WARNING", logger=safe_fetch.__name__)
     _pexels(tmp_path, [_video(1, [_vf(1080, 1920, link="https://user:secret@evil.example/a.mp4")])], _Stream({}))
     assert "(host evil.example)" in caplog.text
     assert "secret" not in caplog.text and "user:" not in caplog.text and "@" not in caplog.text
@@ -786,7 +787,7 @@ def test_userinfo_in_a_rejected_url_is_never_logged(tmp_path, caplog):
     (None, "?"),
 ])
 def test_host_for_log_returns_a_short_plain_host_or_a_placeholder(url, expected):
-    assert AS._host_for_log(url) == expected
+    assert safe_fetch._host_for_log(url) == expected
 
 
 def test_a_malformed_pexels_hit_is_logged_with_its_traceback(tmp_path, caplog):
@@ -804,13 +805,13 @@ def test_a_declared_content_length_over_the_cap_is_rejected_on_its_own():
     """The body is within the cap, so only the Content-Length check can reject this one."""
     r = httpx.Response(200, content=b"x" * 10, headers={"Content-Length": "11"})
     with pytest.raises(ValueError, match="Content-Length"):
-        list(AS._iter_capped(r, 10))
+        list(safe_fetch.iter_capped(r, 10))
 
 
 # ── round 3 gaps ──────────────────────────────────────────────────────────────────────────────
 
 def test_a_hostile_host_never_reaches_the_log_raw_through_the_download_path(tmp_path, caplog):
-    caplog.set_level("WARNING", logger=AS.__name__)
+    caplog.set_level("WARNING", logger=safe_fetch.__name__)
     link = "https://evil\x1b[31m.example/a.mp4"
     _pexels(tmp_path, [_video(1, [_vf(1080, 1920, link=link)])], _Stream({}))
     assert "\x1b" not in caplog.text and "(host ?)" in caplog.text
@@ -820,7 +821,7 @@ def test_pexels_the_body_shares_the_budget_started_before_the_connection(tmp_pat
     """Past the shared budget (10 s from t=0) but inside a fresh one started when the body begins."""
     monkeypatch.setattr(AS, "_VIDEO_DEADLINE_S", 10.0)
     # search start 0; this hit's deadline_at = 0 + 10; hop check at 0 (ok); then every body read is at 11
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 0.0, after=11.0))
+    monkeypatch.setattr(safe_fetch, "_monotonic", _fake_clock(0.0, 0.0, 0.0, after=11.0))
     stream = _Stream({PEXELS_OK: _Resp(chunks=(b"a", b"b"))})
     assert _pexels(tmp_path, [_video(1, [_vf(1080, 1920, link=PEXELS_OK)])], stream) is None
 
@@ -829,7 +830,7 @@ def test_the_pre_hop_check_allows_exactly_the_deadline(tmp_path, monkeypatch):
     other = "https://videos.pexels.com/video-files/2/b.mp4"
     monkeypatch.setattr(AS, "_VIDEO_DEADLINE_S", 10.0)
     # search start 0; deadline_at 10; hop 1 at 0; hop 2 at exactly 10 (allowed); body reads at 0
-    monkeypatch.setattr(AS, "_monotonic", _fake_clock(0.0, 0.0, 0.0, 10.0, after=0.0))
+    monkeypatch.setattr(safe_fetch, "_monotonic", _fake_clock(0.0, 0.0, 0.0, 10.0, after=0.0))
     stream = _Stream({PEXELS_OK: _redirect(other), other: _Resp(chunks=(b"ok",))})
     result = _pexels(tmp_path, [_video(1, [_vf(1080, 1920, link=PEXELS_OK)])], stream)
     assert stream.urls == [PEXELS_OK, other] and result is not None
@@ -837,10 +838,10 @@ def test_the_pre_hop_check_allows_exactly_the_deadline(tmp_path, monkeypatch):
 
 def test_host_for_log_length_bound_is_the_dns_maximum():
     ok = ".".join(["a" * 63] * 3 + ["a" * 61])           # 63+1+63+1+63+1+61 = 253
-    assert len(ok) == 253 and AS._host_for_log(f"https://{ok}/x") == ok
-    assert AS._host_for_log(f"https://{ok}a/x") == "?"   # 254
+    assert len(ok) == 253 and safe_fetch._host_for_log(f"https://{ok}/x") == ok
+    assert safe_fetch._host_for_log(f"https://{ok}a/x") == "?"   # 254
 
 
 @pytest.mark.parametrize("bad", [b"https://x.com", bytearray(b"x"), ("https://x.com",)])
 def test_host_for_log_never_raises_on_non_str_input(bad):
-    assert AS._host_for_log(bad) == "?"
+    assert safe_fetch._host_for_log(bad) == "?"

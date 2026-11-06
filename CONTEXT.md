@@ -66,3 +66,37 @@ a signature, a behavioral ledger and an AST guard) and `docs/design.md` §3 for 
 against a stale video/guide via fingerprint comparison, a different problem (data staleness after a
 guide edit) from job-claim ownership. Both are called "staleness" informally in conversation; they are
 unrelated mechanisms solving unrelated problems.
+
+---
+
+## Asset fetching & media policy
+
+Surfaced via the C2 architecture-review grilling session, which split the hardened fetch and the media check out
+of `engine/render/asset_sourcer.py` (Phase 8g, `docs/specs/2026-11-safe-fetch-media-policy-module-design.md`).
+
+- **Fetch budget** — the wall-clock limits that bound remote asset I/O, nested from small to large: a
+  per-download deadline (`_VIDEO_DEADLINE_S` / `_IMAGE_DEADLINE_S`, shared by that download's redirect hops
+  and 429 retry), a per-`search()` budget (`_PEXELS_SEARCH_BUDGET_S` / `_WIKI_SEARCH_BUDGET_S`), and the
+  render-wide **asset budget** (`asset_budget()`, `RENDER_ASSET_BUDGET_S`, a `ContextVar` deadline for the
+  asset time of one `render_cut`; TTS time is not charged to it). Inner budgets are clipped to the outer
+  one. It gates the *start* of downloads and paid HuggingFace calls only; a call already in flight and the
+  small API lookups are not interrupted. The mechanism (hop/read deadlines, the watchdog, the asset budget)
+  lives in `engine/render/safe_fetch.py`, while the per-download and per-search limits are chosen by the
+  adapters in `asset_sourcer.py` and cross the boundary as arguments (`url_ok`, `deadline_at`, the byte limit,
+  timeouts); `safe_fetch` supplies the clock `now`, `clip_to_asset_budget` and `asset_budget_spent`.
+- **Media policy** — the decision applied to a downloaded (or already-cached) asset before it is trusted:
+  admit it, downscale it, or refuse it. Covers the magic-byte sniff, the Pillow decode and pixel cap, the
+  downscale windows, and the URL-keyed `.refused` markers for images that cannot be shrunk. A refused asset
+  is never cached and, for the paid HuggingFace tiers, never billed. Lives in
+  `engine/render/media_policy.py`; the marker's name, stamp and check are there, while the marker *write*
+  stays in the Wikipedia adapter. Distinct from **safe_to_publish**, which is a *licence*
+  decision enforced at publish time (`engine/publish/gate.py`), not a decision about whether the bytes are
+  usable media.
+- **Adapter** — one of the four sources that talk to an upstream service and turn its answer into a local
+  asset: Pexels (video), Wikipedia (player photos), HuggingFace image, HuggingFace video. `LocalMusicSource` and
+  the id/selection helpers stay with them in `asset_sourcer.py`. An adapter chooses its own limits and URL
+  allowlist and asks `safe_fetch` and `media_policy` to enforce them; the policy modules know no upstream.
+- **Seam** — a moved function or constant that another module calls or that tests patch (22 of them public,
+  in `safe_fetch` and `media_policy`; tests also patch private ones such as `safe_fetch._http_stream`). A seam is reached as a module attribute (`safe_fetch.open_download(...)`),
+  never imported by name, aliased or held in a default argument, so a test that patches the owning module is
+  seen by every caller; `tests/test_module_seams.py` enforces that.

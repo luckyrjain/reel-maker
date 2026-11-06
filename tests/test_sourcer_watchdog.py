@@ -1,11 +1,11 @@
-"""The download watchdog and the Celery soft-limit pass-through (engine/render/asset_sourcer.py).
+"""The download watchdog and the Celery soft-limit pass-through (engine/render/safe_fetch.py).
 
-httpx timeouts are per read and `_iter_capped`'s deadline runs only when httpx yields a body chunk,
+httpx timeouts are per read and `iter_capped`'s deadline runs only when httpx yields a body chunk,
 so a hostile host that drips response *headers*, or a chunked-encoding size line / extension, held
 the (single) render worker indefinitely: no body event ever arrives for the deadline check to run on.
-`_open_download` now arms a `_Watchdog` from httpcore's `connect_tcp.complete` trace event; when the
+`open_download` now arms a `_Watchdog` from httpcore's `connect_tcp.complete` trace event; when the
 download's budget is spent it shuts the socket down, which makes the blocked read fail at once and
-`_open_download` reports it as a `ValueError("download too slow ...")`.
+`open_download` reports it as a `ValueError("download too slow ...")`.
 
 These tests use REAL sockets (a raw-socket server on 127.0.0.1) and real httpx: the whole point is
 that nothing in the fakes-only suites could notice a read that blocks. `url_ok` is passed as
@@ -25,11 +25,12 @@ import pytest
 from celery.exceptions import SoftTimeLimitExceeded
 
 from engine.render import asset_sourcer as AS
+from engine.render import safe_fetch
 from engine.render.asset_sourcer import PexelsVideoSource, WikipediaImageSource
 from tests.test_sourcer_download_guards import (
     PEXELS_OK, WIKI_OK, WIKI_THUMB, _Resp, _Stream, _pexels, _wiki,
 )
-from tests.test_sourcer_selection import _MOD, _json_resp, _summary, _video, _vf
+from tests.test_sourcer_selection import _FETCH_MOD, _json_resp, _summary, _video, _vf
 
 
 # ── a scripted raw-socket server ─────────────────────────────────────────────────────────────
@@ -158,11 +159,11 @@ def _serve(name, tls_ctx=None):
 def _fetch(url, deadline_s, *, timeout=30.0):
     """(result_or_exception, elapsed_s) for one guarded download of `url`."""
     started = time.monotonic()
-    deadline_at = AS._monotonic() + deadline_s
+    deadline_at = safe_fetch._monotonic() + deadline_s
     try:
-        with AS._open_download(url, lambda u: True, timeout=timeout, deadline_at=deadline_at) as r:
+        with safe_fetch.open_download(url, lambda u: True, timeout=timeout, deadline_at=deadline_at) as r:
             r.raise_for_status()
-            out = b"".join(AS._iter_capped(r, 10**6, deadline_at))
+            out = b"".join(safe_fetch.iter_capped(r, 10**6, deadline_at))
     except Exception as exc:                       # noqa: BLE001 - the exception IS the result here
         return exc, time.monotonic() - started
     return out, time.monotonic() - started
@@ -194,9 +195,9 @@ def test_a_fast_download_is_unaffected_and_leaves_no_timer_thread_behind():
 
 
 def test_no_budget_means_no_watchdog():
-    with patch.object(AS.threading, "Timer") as timer, _serve("fast_ok") as server:
-        with AS._open_download(server.url, lambda u: True, timeout=5.0) as r:
-            assert b"".join(AS._iter_capped(r, 1000)) == b"hello"
+    with patch.object(threading, "Timer") as timer, _serve("fast_ok") as server:
+        with safe_fetch.open_download(server.url, lambda u: True, timeout=5.0) as r:
+            assert b"".join(safe_fetch.iter_capped(r, 1000)) == b"hello"
     timer.assert_not_called()
 
 
@@ -210,7 +211,7 @@ def test_the_watchdog_is_armed_with_the_remaining_budget_and_cancelled_on_exit()
             self.armed_for = interval
             timers.append(self)
 
-    with patch.object(AS.threading, "Timer", Spy), _serve("fast_ok") as server:
+    with patch.object(threading, "Timer", Spy), _serve("fast_ok") as server:
         result, _ = _fetch(server.url, 30.0)
     assert result == b"hello" and len(timers) == 1
     assert 25.0 < timers[0].armed_for <= 30.0 and timers[0].daemon is True
@@ -226,17 +227,17 @@ def test_two_downloads_on_one_budget_arm_their_timers_for_what_remains():
             super().__init__(interval, *a, **kw)
             timers.append(interval)
 
-    with patch.object(AS.threading, "Timer", Spy), _serve("fast_ok") as server:
-        deadline_at = AS._monotonic() + 30.0
+    with patch.object(threading, "Timer", Spy), _serve("fast_ok") as server:
+        deadline_at = safe_fetch._monotonic() + 30.0
         for _ in range(2):
             time.sleep(0.05)
-            with AS._open_download(server.url, lambda u: True, timeout=5.0, deadline_at=deadline_at) as r:
-                list(AS._iter_capped(r, 1000, deadline_at))
+            with safe_fetch.open_download(server.url, lambda u: True, timeout=5.0, deadline_at=deadline_at) as r:
+                list(safe_fetch.iter_capped(r, 1000, deadline_at))
     assert len(timers) == 2 and timers[1] < timers[0]       # armed for the remaining budget, not a fresh one
 
 
 def test_a_fired_watchdog_is_logged_with_the_host_only(caplog):
-    caplog.set_level("WARNING", logger=AS.__name__)
+    caplog.set_level("WARNING", logger=safe_fetch.__name__)
     with _serve("header_drip") as server:
         _fetch(server.url + "?token=secret", 0.5)
     assert "127.0.0.1" in caplog.text and "token=secret" not in caplog.text and "deadline" in caplog.text
@@ -245,7 +246,7 @@ def test_a_fired_watchdog_is_logged_with_the_host_only(caplog):
 def test_an_exception_that_is_not_the_watchdogs_passes_through_unchanged():
     with _serve("fast_ok") as server:
         with pytest.raises(KeyError):
-            with AS._open_download(server.url, lambda u: True, timeout=5.0, deadline_at=AS._monotonic() + 30):
+            with safe_fetch.open_download(server.url, lambda u: True, timeout=5.0, deadline_at=safe_fetch._monotonic() + 30):
                 raise KeyError("mine")
 
 
@@ -257,7 +258,7 @@ def test_pexels_search_gives_up_on_a_hostile_host_and_leaves_nothing_behind(tmp_
     monkeypatch.setattr(AS, "_pexels_url_ok", lambda u: True)
     started = time.monotonic()
     with _serve(behavior) as server, \
-            patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920, link=server.url)])]})):
+            patch("httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920, link=server.url)])]})):
         result = PexelsVideoSource("k", tmp_path).search("q", 1.0)
     assert result is None and time.monotonic() - started < 4.0
     assert list(tmp_path.iterdir()) == []
@@ -279,7 +280,7 @@ def test_wikipedia_search_gives_up_on_a_hostile_host_and_leaves_nothing_behind(t
                 return _json_resp({"query": {"pages": {"1": {"imageinfo": [{"extmetadata": {}}]}}}})
             return _json_resp(summary)
 
-        with patch(f"{_MOD}.httpx.get", side_effect=fake_get):
+        with patch("httpx.get", side_effect=fake_get):
             result = WikipediaImageSource(tmp_path).search("Lionel Messi")
     assert result is None and time.monotonic() - started < 4.0
     assert list(tmp_path.iterdir()) == []
@@ -329,13 +330,13 @@ def test_an_ordinary_error_is_still_swallowed_and_the_next_candidate_tried(tmp_p
 
 
 def test_a_soft_time_limit_is_not_turned_into_a_deadline_error_by_a_fired_watchdog():
-    class Fired(AS._Watchdog):
+    class Fired(safe_fetch._Watchdog):
         def __init__(self, *a, **kw):
             super().__init__(*a, **kw)
             self.fired = True
-    with patch.object(AS, "_Watchdog", Fired), patch(f"{_MOD}._http_stream", _Stream({WIKI_OK: _Resp()})):
+    with patch.object(safe_fetch, "_Watchdog", Fired), patch(f"{_FETCH_MOD}._http_stream", _Stream({WIKI_OK: _Resp()})):
         with pytest.raises(SoftTimeLimitExceeded):
-            with AS._open_download(WIKI_OK, AS._wikimedia_url_ok, timeout=5.0, deadline_at=AS._monotonic() + 30):
+            with safe_fetch.open_download(WIKI_OK, AS._wikimedia_url_ok, timeout=5.0, deadline_at=safe_fetch._monotonic() + 30):
                 raise SoftTimeLimitExceeded()
 
 
@@ -360,8 +361,8 @@ def test_the_trace_hook_arms_one_timer_per_watchdog_even_if_it_sees_two_connects
             timers.append(self)
 
     try:
-        with patch.object(AS.threading, "Timer", Spy):
-            guard = AS._Watchdog(AS._monotonic() + 30.0)
+        with patch.object(threading, "Timer", Spy):
+            guard = safe_fetch._Watchdog(safe_fetch._monotonic() + 30.0)
             guard.trace("connection.connect_tcp.complete", {"return_value": _FakeNetworkStream(a)})
             guard.trace("connection.connect_tcp.complete", {"return_value": _FakeNetworkStream(b)})
             guard.cancel()
@@ -376,8 +377,8 @@ def test_the_trace_hook_arms_one_timer_per_watchdog_even_if_it_sees_two_connects
 def test_the_trace_hook_ignores_every_other_event(event):
     a, b = socket.socketpair()
     try:
-        with patch.object(AS.threading, "Timer") as timer:
-            AS._Watchdog(AS._monotonic() + 30.0).trace(event, {"return_value": _FakeNetworkStream(a)})
+        with patch.object(threading, "Timer") as timer:
+            safe_fetch._Watchdog(safe_fetch._monotonic() + 30.0).trace(event, {"return_value": _FakeNetworkStream(a)})
         timer.assert_not_called()
     finally:
         a.close()
@@ -387,8 +388,8 @@ def test_the_trace_hook_ignores_every_other_event(event):
 @pytest.mark.parametrize("info", [{}, {"return_value": None}, {"return_value": _FakeNetworkStream(None)},
                                   {"return_value": object()}])
 def test_the_trace_hook_never_raises_and_arms_nothing_without_a_real_socket(info):
-    with patch.object(AS.threading, "Timer") as timer:
-        AS._Watchdog(AS._monotonic() + 30.0).trace("connection.connect_tcp.complete", info)
+    with patch.object(threading, "Timer") as timer:
+        safe_fetch._Watchdog(safe_fetch._monotonic() + 30.0).trace("connection.connect_tcp.complete", info)
     timer.assert_not_called()
 
 
@@ -466,7 +467,7 @@ def test_pexels_search_never_caches_a_truncated_close_delimited_video(tmp_path, 
     monkeypatch.setattr(AS, "_VIDEO_DEADLINE_S", 0.6)
     monkeypatch.setattr(AS, "_pexels_url_ok", lambda u: True)
     with _serve("close_delimited_drip") as server, \
-            patch(f"{_MOD}.httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920, link=server.url)])]})):
+            patch("httpx.get", return_value=_json_resp({"videos": [_video(1, [_vf(1080, 1920, link=server.url)])]})):
         result = PexelsVideoSource("k", tmp_path).search("q", 1.0)
     assert result is None and list(tmp_path.iterdir()) == []
 
@@ -485,7 +486,7 @@ def test_wikipedia_search_never_caches_a_truncated_close_delimited_image(tmp_pat
                 return _json_resp({"query": {"pages": {"1": {"imageinfo": [{"extmetadata": {}}]}}}})
             return _json_resp(summary)
 
-        with patch(f"{_MOD}.httpx.get", side_effect=fake_get):
+        with patch("httpx.get", side_effect=fake_get):
             result = WikipediaImageSource(tmp_path).search("Lionel Messi")
     assert result is None and list(tmp_path.iterdir()) == []
 
@@ -500,7 +501,7 @@ def test_a_hostile_redirect_target_gets_its_own_watchdog():
             super().__init__(interval, *a, **kw)
             armed.append(interval)
 
-    with patch.object(AS.threading, "Timer", Spy), _serve("redirect_then_drip") as server:
+    with patch.object(threading, "Timer", Spy), _serve("redirect_then_drip") as server:
         result, elapsed = _fetch(server.url, 0.8)
     assert isinstance(result, ValueError) and "too slow" in str(result), repr(result)
     assert elapsed < 5.0 and len(armed) == 2 and armed[1] < armed[0]
@@ -530,7 +531,7 @@ class _FakeSock:
 
 
 def _armed(sock):
-    guard = AS._Watchdog(AS._monotonic() + 30.0)
+    guard = safe_fetch._Watchdog(safe_fetch._monotonic() + 30.0)
     guard._sock = sock                              # what trace() stores: a dup of the connection
     return guard
 
@@ -559,7 +560,7 @@ def test_fire_after_cancel_touches_nothing_and_cancel_closes_the_dup():
 
 
 def test_cancel_is_idempotent_and_safe_before_anything_was_armed():
-    guard = AS._Watchdog(AS._monotonic() + 30.0)
+    guard = safe_fetch._Watchdog(safe_fetch._monotonic() + 30.0)
     guard.cancel()
     guard.cancel()
 
@@ -567,7 +568,7 @@ def test_cancel_is_idempotent_and_safe_before_anything_was_armed():
 def test_the_watchdog_shuts_down_a_dup_so_the_tls_wrap_cannot_orphan_it():
     a, b = socket.socketpair()
     try:
-        guard = AS._Watchdog(AS._monotonic() + 30.0)
+        guard = safe_fetch._Watchdog(safe_fetch._monotonic() + 30.0)
         guard.trace("connection.connect_tcp.complete", {"return_value": _FakeNetworkStream(a)})
         assert guard._sock is not a and guard._sock.fileno() != a.fileno()
         a.detach()                                  # what ssl wrap_socket does to the original object
@@ -579,8 +580,8 @@ def test_the_watchdog_shuts_down_a_dup_so_the_tls_wrap_cannot_orphan_it():
 
 
 def test_a_non_socket_object_never_arms_a_timer():
-    with patch.object(AS.threading, "Timer") as timer:
-        AS._Watchdog(AS._monotonic() + 30.0).trace(
+    with patch.object(threading, "Timer") as timer:
+        safe_fetch._Watchdog(safe_fetch._monotonic() + 30.0).trace(
             "connection.connect_tcp.complete", {"return_value": _FakeNetworkStream("not-a-socket")})
     timer.assert_not_called()
 
@@ -597,10 +598,10 @@ def test_http_stream_forwards_its_arguments_and_closes_the_client(monkeypatch):
             seen["client"] = self
             return super().stream(method, url, **kw)
 
-    monkeypatch.setattr(AS.httpx, "Client", SpyClient)
+    monkeypatch.setattr(httpx, "Client", SpyClient)
     hook = lambda *a: None                          # noqa: E731
     with _serve("fast_ok") as server:
-        with AS._http_stream("GET", server.url, extensions={"trace": hook}, timeout=7.0,
+        with safe_fetch._http_stream("GET", server.url, extensions={"trace": hook}, timeout=7.0,
                              headers={"X-t": "1"}, follow_redirects=False) as r:
             assert r.status_code == 200 and not seen["client"].is_closed
     assert seen["client"].is_closed
@@ -617,10 +618,10 @@ def test_http_stream_closes_the_client_when_the_body_raises(monkeypatch):
             super().__init__(*a, **kw)
             seen["client"] = self
 
-    monkeypatch.setattr(AS.httpx, "Client", SpyClient)
+    monkeypatch.setattr(httpx, "Client", SpyClient)
     with _serve("fast_ok") as server:
         with pytest.raises(KeyError):
-            with AS._http_stream("GET", server.url, timeout=5.0, follow_redirects=False):
+            with safe_fetch._http_stream("GET", server.url, timeout=5.0, follow_redirects=False):
                 raise KeyError("mine")
     assert seen["client"].is_closed
 
@@ -631,7 +632,7 @@ def test_http_stream_sends_the_request_headers_and_does_not_follow_a_redirect():
 
     server = _Server(redirect)
     try:
-        with AS._http_stream("GET", server.url, timeout=5.0, headers={"X-t": "1"},
+        with safe_fetch._http_stream("GET", server.url, timeout=5.0, headers={"X-t": "1"},
                              follow_redirects=False) as r:
             assert r.status_code == 302 and r.headers["location"] == "/elsewhere"
         assert b"x-t: 1" in server.requests[0].lower()
@@ -651,6 +652,6 @@ def test_each_redirect_server_starts_with_a_fresh_counter():
                 super().__init__(interval, *a, **kw)
                 armed.append(interval)
 
-        with patch.object(AS.threading, "Timer", Spy), _serve("redirect_then_drip") as server:
+        with patch.object(threading, "Timer", Spy), _serve("redirect_then_drip") as server:
             result, _ = _fetch(server.url, 0.8)
         assert isinstance(result, ValueError) and len(armed) == 2, (result, armed)
