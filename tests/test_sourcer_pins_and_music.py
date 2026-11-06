@@ -1,4 +1,5 @@
-"""engine/render/asset_sourcer.py — the pin ledger, the persisted fingerprint formats, and
+"""engine/render/asset_sourcer.py — the pin ledger, the persisted fingerprint formats
+(the fingerprint functions themselves live in engine/render/render_output.py), and
 LocalMusicSource.
 
 Closes test debt found by an independent mutation review: every test below is aimed at a
@@ -7,7 +8,7 @@ named in its comment). Production code is untouched.
 
 Three groups:
   1. resolve_or_reuse() — the per-cut / per-beat CutAsset pin ledger and argument forwarding.
-  2. _fp / compute_pins_fingerprint / compute_pins_fingerprint_for_render — the formats are
+  2. _fp / render_output.compute_pins_fingerprint / compute_pins_fingerprint_for_render — the formats are
      persisted (cut_assets.resolved_from, cuts.rendered_pins_fingerprint), so they are pinned
      literally instead of through the function under test.
   3. LocalMusicSource — directory/file handling, tie-break, extension set, keyword rules.
@@ -21,13 +22,15 @@ from sqlalchemy.orm import Query
 
 from api import models
 from engine.render.asset_sourcer import (
-    EMPTY_PINS_FINGERPRINT,
     LocalMusicSource,
     SourcedAsset,
     _fp,
+    resolve_or_reuse,
+)
+from engine.render.render_output import (
+    EMPTY_PINS_FINGERPRINT,
     compute_pins_fingerprint,
     compute_pins_fingerprint_for_render,
-    resolve_or_reuse,
 )
 
 _LOG = "engine.render.asset_sourcer"

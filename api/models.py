@@ -108,7 +108,7 @@ class Cut(Base):
     # asset_sourcer visibility item — this is operator-visible so a black-frame reel
     # doesn't silently report `done`.
     black_frame_beat_indices = Column(JSON)
-    # Fingerprint (sha256, see engine/render/asset_sourcer.py::compute_pins_fingerprint) of
+    # Fingerprint (sha256, see engine/render/render_output.py::compute_pins_fingerprint) of
     # the CutAsset pins that built the CURRENTLY-STORED video_path, snapshotted at the moment
     # a render succeeds. None means either "not yet rendered" or "rendered before this column
     # existed" (a legacy row — see the None-means-skip rollout note in Key conventions).
@@ -118,7 +118,7 @@ class Cut(Base):
     # checks the current pins, not the video that will ship" entry and
     # docs/specs/2026-09-video-pins-staleness-gate-system-design.md.
     rendered_pins_fingerprint = Column(String(64))
-    # Fingerprint (sha256, see engine/generation/guide_schema.py::compute_guide_fingerprint)
+    # Fingerprint (sha256, see engine/render/render_output.py::compute_guide_fingerprint)
     # of the `guide` dict that built the CURRENTLY-STORED video_path, snapshotted at the
     # moment a render succeeds — the sibling of rendered_pins_fingerprint above, but for the
     # guide's own content (vo_script/on_screen_text/etc.) rather than which assets are bound.

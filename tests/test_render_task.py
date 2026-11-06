@@ -237,10 +237,10 @@ def test_rendered_pins_fingerprint_is_computed_and_assigned_on_success():
     stronger claim — that the fingerprint actually reflects real pins a real render bound —
     is proven by the real-DB end-to-end test in tests/test_publish_gate.py, not here.
 
-    render_cut must call compute_pins_fingerprint_for_render(), NOT the raw
-    compute_pins_fingerprint() — the _for_render wrapper is what guarantees a successful
-    all-black-frame render still writes a real, comparable value instead of None (see that
-    function's docstring in engine/render/asset_sourcer.py)."""
+    render_cut (through render_output.record()) must call compute_pins_fingerprint_for_render(),
+    NOT the raw compute_pins_fingerprint() — the _for_render wrapper is what guarantees a
+    successful all-black-frame render still writes a real, comparable value instead of None
+    (see that function's docstring in engine/render/render_output.py)."""
     from worker.tasks.render import render_cut
 
     job = _job()
@@ -261,7 +261,7 @@ def test_rendered_pins_fingerprint_is_computed_and_assigned_on_success():
         patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
         patch("worker.tasks.render.record_stage"),
         patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"], _FAKE_SRT_PATH)),
-        patch("worker.tasks.render.compute_pins_fingerprint_for_render", return_value="deadbeef" * 8) as mock_fp,
+        patch("engine.render.render_output.compute_pins_fingerprint_for_render", return_value="deadbeef" * 8) as mock_fp,
     ):
         render_cut(1)
 
@@ -295,7 +295,7 @@ def test_rendered_guide_fingerprint_is_computed_and_assigned_on_success():
         patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
         patch("worker.tasks.render.record_stage"),
         patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"], _FAKE_SRT_PATH)),
-        patch("worker.tasks.render.compute_guide_fingerprint", return_value="feedface" * 8) as mock_fp,
+        patch("engine.render.render_output.compute_guide_fingerprint", return_value="feedface" * 8) as mock_fp,
     ):
         render_cut(1)
 

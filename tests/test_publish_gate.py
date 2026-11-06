@@ -2,7 +2,6 @@
 import pytest
 
 from api import models
-from engine.generation.guide_schema import compute_guide_fingerprint
 from engine.publish.gate import (
     assert_safe_to_publish,
     assert_video_matches_guide,
@@ -10,11 +9,14 @@ from engine.publish.gate import (
     unsafe_assets,
 )
 from engine.render.asset_sourcer import (
-    EMPTY_PINS_FINGERPRINT,
     SourcedAsset,
+    resolve_or_reuse,
+)
+from engine.render.render_output import (
+    EMPTY_PINS_FINGERPRINT,
+    compute_guide_fingerprint,
     compute_pins_fingerprint,
     compute_pins_fingerprint_for_render,
-    resolve_or_reuse,
 )
 
 

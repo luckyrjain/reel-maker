@@ -1,9 +1,9 @@
-"""Tests for engine/generation/guide_schema.py::compute_guide_fingerprint().
+"""Tests for engine/render/render_output.py::compute_guide_fingerprint().
 
 No existing test file covered this function -- see
 docs/specs/2026-09-stale-video-on-failed-rerender-system-design.md.
 """
-from engine.generation.guide_schema import compute_guide_fingerprint
+from engine.render.render_output import compute_guide_fingerprint
 
 
 def _guide(vo="Test narration.", hashtags=None):
