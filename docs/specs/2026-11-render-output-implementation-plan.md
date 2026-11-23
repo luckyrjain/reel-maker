@@ -47,7 +47,7 @@ of spec §6.2, `tests/_seam_oracle.py`.
 - `render_output.py` per spec §4.1-4.4: moved functions/constant, `RENDER_ARTIFACT_COLUMNS`, `RenderOutput`, `record`
   (locals first, then one assignment block), `_assert_not_stale`, `assert_pins_not_stale`, `assert_guide_not_stale`.
   The staleness messages are copied byte for byte from the old `gate.py`.
-- `render.py`: build `RenderOutput` after the posted-while-rendering check, call `render_output.record(db, cut, out)`
+- `render.py`: build `RenderOutput` after the posted-while-rendering check, call `render_output.record(db, cut, output)`
   (module-attribute call), keep `transition(...)`; remove the eight assignments, the comment blocks that moved, and the
   imports of the moved names.
 - `gate.py`: two one-line delegates via `render_output.assert_*_not_stale(db, cut)`; imports of the moved names removed;

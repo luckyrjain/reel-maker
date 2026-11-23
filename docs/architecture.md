@@ -196,7 +196,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 ### `tests/`
 
-79 test files + `conftest.py` (and two helper modules, `_seam_oracle.py` / `_seam_ast.py`, that are not test files), **3154 tests run by default / 3155 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
+79 test files + `conftest.py` (and two helper modules, `_seam_oracle.py` / `_seam_ast.py`, that are not test files), **3160 tests run by default / 3161 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
 
 | File | Tests | File | Tests |
 |---|---|---|---|
@@ -239,7 +239,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_display.py` | 173 | `test_hidden_text.py` | 53 |
 | `test_youtube_token_refresh.py` | 24 | `test_jobs_router.py` | 21 |
 | `test_job_claim.py` | 100 | `test_module_seams.py` | 312 |
-| `test_render_output.py` | 78 | | |
+| `test_render_output.py` | 84 | | |
 
 Notable areas of coverage beyond what the filenames suggest: `test_job_lifecycle.py` and `test_maintenance.py` together carry the Job-fencing-token mechanism's regression suite (zombie resumed-while-still-alive detection at every `heartbeat()`/`lock_job()`/done-stamp/CAS checkpoint, differentiated per-job-type resume budgets), and `test_job_claim.py` pins the structure of that mechanism (a signature guard against any fence parameter having a default, a 13-scenario behavioral ledger of exactly which `_advance` writes are unfenced, an AST guard against writing `Job` rows around `_advance`, and the two deliberate SQL deltas); `test_compositor.py` covers the `ExitStack` reader-lifetime migration and the 2-up collage layout with real ffmpeg frame sampling; `test_evaluator.py` covers all 17 per-axis scorer functions in isolation; `test_publish_gate.py`/`test_cuts_publish_router.py` cover both staleness gates end-to-end; `test_render_output.py` pins the `render_output` module that owns the eight render-artifact columns and both fingerprints (`record()` on a real `Cut`, the checks and writer-to-reader round trips, plus AST/ledger guards G-A..G-D: every `Cut` column classified, `record()` changes exactly the eight, no other writer in `api/`/`engine/`/`worker/`, import direction); `test_module_seams.py` guards the `safe_fetch` / `media_policy` split (AST guards G1-G6: no stale or moved-name access through `asset_sourcer` in tests, strict patches, no seam captured in production code, one clock, dependency direction, no transport in `asset_sourcer`; plus seam probes that patch a sentinel on the owning module and watch each consumer use it, fixture-effectiveness tests for the conftest switch-offs, and logger-name tests), its checkers live in `tests/_seam_ast.py` and its name oracle in `tests/_seam_oracle.py`; the sourcer test files patch the OWNING module (`safe_fetch._http_stream`, `safe_fetch._monotonic`, `media_policy.image_ok`, ...) and conftest's four autouse switch-offs do too.
 

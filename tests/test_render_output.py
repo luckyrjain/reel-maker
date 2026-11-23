@@ -73,7 +73,7 @@ GUIDE = {
     "title": "Seeded guide",
     "niche": "football",
     "cuts": [{"platform": "youtube_shorts", "caption": "c", "hashtags": ["#b", "#a"], "beats": [
-        {"index": 0, "vo_script": "Hello there.", "duration_s": 3.0},
+        {"index": 0, "vo_script": "Hello there, Martínez.", "duration_s": 3.0},
         {"index": 1, "vo_script": "Second beat.", "duration_s": 4.0},
     ]}],
 }
@@ -113,6 +113,7 @@ NOT_RENDER_OUTPUT = frozenset({
 CAND_A = Path("/out/9/thumb_a.jpg")
 CAND_B = Path("/out/9/thumb_b.jpg")
 CAND_C = Path("/out/9/thumb_c.jpg")
+CAND_D = Path("/out/9/thumb_d.jpg")
 
 
 def test_the_sentinel_ledger_covers_exactly_the_artifact_columns():
@@ -221,6 +222,13 @@ def test_thumbnail_path_is_the_first_candidate_and_the_order_is_kept(world):
     record(world.db, world.cut, _output(thumbnail_candidates=(CAND_B, CAND_C, CAND_A)))
     assert world.cut.thumbnail_path == str(CAND_B)
     assert world.cut.thumbnail_candidates == [str(CAND_B), str(CAND_C), str(CAND_A)]
+
+
+def test_all_four_candidates_the_production_count_are_stored_in_order(world):
+    """render_cut hands record() four candidates (compositor._write_thumbnail_candidates)."""
+    record(world.db, world.cut, _output(thumbnail_candidates=(CAND_A, CAND_B, CAND_C, CAND_D)))
+    assert world.cut.thumbnail_path == str(CAND_A)
+    assert world.cut.thumbnail_candidates == [str(c) for c in (CAND_A, CAND_B, CAND_C, CAND_D)]
 
 
 def test_a_single_candidate_is_both_the_thumbnail_and_the_list(world):
@@ -410,6 +418,42 @@ def test_a_guide_mismatch_raises_the_literal_message_and_not_the_pins_one(world)
         assert_guide_not_stale(world.db, world.cut)
     assert str(exc.value) == GUIDE_MESSAGE
     assert "pinned" not in str(exc.value)
+
+
+def test_a_guide_cleared_after_the_render_is_a_mismatch_not_a_skip(world):
+    """The current fingerprint of a missing guide is None; a stored fingerprint still differs from it."""
+    _recorded_world(world)
+    world.cut.guide = None
+    with pytest.raises(ValueError) as exc:
+        assert_guide_not_stale(world.db, world.cut)
+    assert str(exc.value) == GUIDE_MESSAGE
+
+
+@pytest.mark.parametrize("which", ["pins", "guide"])
+def test_an_empty_string_stored_fingerprint_is_not_the_legacy_none_skip(world, which):
+    """Only None means "never rendered"; '' is a stored value that must still be compared (and differs)."""
+    _recorded_world(world, pins=1)
+    if which == "pins":
+        world.cut.rendered_pins_fingerprint = ""
+        with pytest.raises(ValueError):
+            assert_pins_not_stale(world.db, world.cut)
+    else:
+        world.cut.rendered_guide_fingerprint = ""
+        with pytest.raises(ValueError):
+            assert_guide_not_stale(world.db, world.cut)
+
+
+@pytest.mark.parametrize("which", ["pins", "guide"])
+def test_a_fingerprint_that_differs_only_in_its_last_character_is_a_mismatch(world, which):
+    """The whole 64-character value is compared, not a prefix."""
+    _recorded_world(world, pins=1)
+    attr = "rendered_pins_fingerprint" if which == "pins" else "rendered_guide_fingerprint"
+    stored = getattr(world.cut, attr)
+    assert len(stored) == 64
+    setattr(world.cut, attr, stored[:-1] + ("0" if stored[-1] != "0" else "1"))
+    check = assert_pins_not_stale if which == "pins" else assert_guide_not_stale
+    with pytest.raises(ValueError):
+        check(world.db, world.cut)
 
 
 def test_the_literal_messages_are_the_old_gate_texts():
@@ -681,8 +725,9 @@ def stray_hits(source, path):
                                 add(arg, _str_const(k), "dict")
         elif isinstance(node, ast.Dict):
             for k in node.keys:
-                if (isinstance(k, ast.Attribute) and k.attr in EIGHT and isinstance(k.value, ast.Attribute)
-                        and k.value.attr == "Cut"):
+                if (isinstance(k, ast.Attribute) and k.attr in EIGHT
+                        and ((isinstance(k.value, ast.Attribute) and k.value.attr == "Cut")
+                             or (isinstance(k.value, ast.Name) and k.value.id == "Cut"))):
                     add(node, k.attr, "dict")
     return hits
 
@@ -807,6 +852,7 @@ def test_G_C_control_dict_literals_fire_only_as_update_values_arguments_or_Cut_k
     _fires("def f(q):\n    q.values({'duration_s': 1.0})\n", [("duration_s", "dict")])
     _fires("def f(q):\n    q.update({models.Cut.thumbnail_path: 'x'})\n", [("thumbnail_path", "dict")])
     _fires("def f():\n    return {models.Cut.rendered_guide_fingerprint: 'x'}\n", [("rendered_guide_fingerprint", "dict")])
+    _fires("def f(q):\n    q.update({Cut.rendered_pins_fingerprint: None})\n", [("rendered_pins_fingerprint", "dict")])
     _quiet("def f(s):\n    return {'duration_s': s.duration_s}\n")
     _quiet("def f(s):\n    return {'video_path': s.video_path}\n")
     _quiet("def f(d):\n    d.setdefault({'video_path': 1})\n")

@@ -676,7 +676,7 @@ def test_render_cut_records_every_render_artifact_column():
     srt = Path("/frames/10/captions_x.srt")
 
     def fake_resolve(db, cut, beat_index, **kwargs):
-        if beat_index == 1:
+        if beat_index in (0, 2):
             return [(None, None)]
         return [(MagicMock(), MagicMock())]
 
@@ -697,13 +697,12 @@ def test_render_cut_records_every_render_artifact_column():
     thumb_base = mock_composite.call_args.kwargs["thumbnail_path"]
     assert out_path != thumb_base, "the two paths composite_cut was handed must be distinguishable"
     assert str(thumb_base) not in (str(cand0), str(cand1)), "candidates must not coincide with the base path"
-    assert str(thumb_base) not in (str(cand0), str(cand1)), "candidates must not coincide with the base path"
 
     assert cut.video_path == str(out_path)
     assert cut.duration_s == 17.25
     assert cut.thumbnail_path == str(cand0)
     assert cut.thumbnail_candidates == [str(cand0), str(cand1)]
-    assert cut.black_frame_beat_indices == [1]
+    assert cut.black_frame_beat_indices == [0, 2]
     assert cut.subtitle_path == str(srt)
     # The fingerprint functions run for real here (db is a MagicMock, so the pins read sees no
     # rows); their exact values are pinned by the patch-based tests above and the gate tests.

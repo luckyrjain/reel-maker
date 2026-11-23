@@ -103,7 +103,8 @@ class Cut(Base):
     # 0-indexed beat indices where resolve_beat_assets()'s whole Wikipedia -> Pexels ->
     # HF Video -> HF Image chain came up empty and the compositor rendered a black frame
     # for that beat's full duration. None/empty when every beat got real footage.
-    # Written by render_cut; a re-render replaces it wholesale. See
+    # Written by engine/render/render_output.py::record() (called by render_cut); a re-render
+    # replaces it wholesale. See
     # engine/render/asset_sourcer.py's fallback chain and docs/roadmap.md's Phase 7
     # asset_sourcer visibility item — this is operator-visible so a black-frame reel
     # doesn't silently report `done`.
@@ -133,7 +134,8 @@ class Cut(Base):
     rendered_guide_fingerprint = Column(String(64))
     # Path to the SRT caption file written alongside the MP4 by composite_cut(), or None
     # when there was nothing to caption (e.g. silent voiceover_mode) or the cut predates
-    # this feature. Written by render_cut; a re-render replaces it wholesale, same policy
+    # this feature. Written by engine/render/render_output.py::record() (called by render_cut); a
+    # re-render replaces it wholesale, same policy
     # as thumbnail_candidates/video_path/black_frame_beat_indices. See
     # engine/render/srt.py and docs/roadmap.md Phase 5 item 5d.
     subtitle_path = Column(String(500))

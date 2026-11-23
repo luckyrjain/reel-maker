@@ -201,8 +201,9 @@ failure, not just an asset-safety-relevant one).
 Pointers: `engine/render/asset_sourcer.py::resolve_or_reuse()`;
 `engine/render/render_output.py` (`record()`, `compute_pins_fingerprint()`,
 `compute_pins_fingerprint_for_render()`, `compute_guide_fingerprint()`, `assert_pins_not_stale()`,
-`assert_guide_not_stale()` — all moved there in Phase 8h; they lived in `asset_sourcer.py` and
-`guide_schema.py` before); `engine/publish/gate.py` (thin delegates); `docs/specs/2026-09-video-pins-staleness-gate-system-design.md`,
+`assert_guide_not_stale()`; the four `compute_*`/sentinel names moved there in Phase 8h from
+`asset_sourcer.py` and `guide_schema.py`, `assert_*_not_stale()` took over the logic of `gate.py`'s two gate
+functions, and `record()` is new); `engine/publish/gate.py` (thin delegates); `docs/specs/2026-09-video-pins-staleness-gate-system-design.md`,
 `docs/specs/2026-09-stale-video-on-failed-rerender-system-design.md`.
 
 ---

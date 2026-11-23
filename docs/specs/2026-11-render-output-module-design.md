@@ -314,8 +314,11 @@ G-A, G-B, G-C, G-D as in §4.5, each with controls.
 
 - G-C is a tripwire, not a proof. It misses `setattr` with a non-literal name, subscript writes with a non-literal key, an
   aliased receiver other than `__dict__`/`vars(...)` for the `duration_s` subscript case, a `Cut` reached through an alias for
-  the `duration_s` attribute allowlist, an aliased import of the model (`from api.models import Cut as C`) which evades the keyword rule, writes through
-  `Query.update()` with computed keys, and raw SQL. The columns are covered for the listed direct forms only.
+  the `duration_s` attribute allowlist, an aliased import of the model (`from api.models import Cut as C`, `C = Cut`) which evades the keyword rule,
+  `Cut(**fields)`, `cut.__setattr__("video_path", x)`, `bulk_update_mappings(models.Cut, [...])`, writes through
+  `Query.update()` with computed keys, and raw SQL (`text("UPDATE cuts ...")`). (A bare `Cut.<name>` dict key, as in
+  `q.update({Cut.rendered_pins_fingerprint: None})`, is covered since code review round 1.) G-D does not see
+  `importlib.import_module(...)` or `__import__(...)`. The columns are covered for the listed direct forms only.
 - `thumbnail_path` has a second sanctioned writer (`choose_thumbnail`), allowlisted by function name; moving it into the
   module would be a reader/writer-split decision deliberately not taken (Q1).
 - `RENDER_ARTIFACT_COLUMNS` and the `Cut` model remain two lists; G-A ties them but cannot stop an author classifying a
@@ -342,7 +345,7 @@ symbols, and is only re-read for accuracy). Edited in the move commit rather tha
 moved homes: the comments in `api/models.py:111,121` and `worker/tasks/render.py`; the moved docstrings (gate.py:48-79
 and :92-115; asset_sourcer.py:840-896 — docstrings 841-856 and 889-895, comment 868-884; guide_schema.py:85-104); the
 test-file comment pointers (§6.2). `docs/roadmap.md` and older design specs name the old homes as historical record and
-are deliberately not edited (same policy as C2).
+are deliberately not edited (same policy as C2), and neither are the superseded plans under `docs/superpowers/plans/`.
 
 ## 9. Open questions
 
@@ -373,7 +376,7 @@ Implementation record (filled in by the docs commit):
 |---|---|
 | `95f60f4` | `test: pin render_cut's writes before moving them` (the wiring test; +1 selected = 3076) |
 | `84b6767` | `refactor: move the render-output persistence and staleness checks into render_output` (14 files: new module, `render.py`, `gate.py`, `guide_schema.py`, `asset_sourcer.py`, `api/models.py` comments, seven retargeted test files, `_seam_oracle.py`) |
-| `46f3e24` | `test: pin record, the staleness checks and the column ledger` (`tests/test_render_output.py`, 78 tests = 3154 selected) |
+| `46f3e24` | `test: pin record, the staleness checks and the column ledger` (`tests/test_render_output.py`, 78 tests = 3154 selected; 84 after code review round 1, see §11) |
 | `0c3d331` | `refactor: make tts.audio_duration public` |
 | (this commit) | `docs: document render_output and record the evidence` |
 
@@ -381,7 +384,7 @@ Implementation record (filled in by the docs commit):
 
 **Normalized-diff proof of the mechanical retargets** (throwaway script, `ast.dump` equality after stripping docstrings, ignoring comments, flattening `ImportFrom` into a `(module, name, asname)` multiset with the four-name module remap, and rewriting exactly the six patch-target strings): all seven files pass (`tests/test_asset_sourcer.py`, `tests/test_sourcer_pins_and_music.py`, `tests/test_publish_gate.py`, `tests/test_guide_schema.py`, `tests/test_cuts_publish_router.py`, `tests/test_render_task.py` against its commit-1 version, `tests/test_publish_task.py`); the rewritten patch-string count asserted to be six; 14 negative controls (the kinds required by the plan: an extra edit, a moved-name import pointed at the wrong module, a patch string with the wrong prefix) each detected. `tests/_seam_oracle.py` checked separately: `STAYS` minus exactly the three pins names. The move commit's sorted node-id set equals the baseline set plus exactly the commit-1 test.
 
-**Final counts** (`24cbc91` -> HEAD): 3075 -> 3154 selected; the full run is 3151 passed, 3 skipped, 1 deselected (golden); 78 -> 79 test files; `tests/test_render_output.py` 78 tests; `tests/test_render_task.py` 19 -> 20; `ruff check --select F,E9 .` clean.
+**Final counts** (`24cbc91` -> HEAD): 3075 -> 3160 selected; the full run is 3157 passed, 3 skipped, 1 deselected (golden); 78 -> 79 test files; `tests/test_render_output.py` 84 tests (78 at commit `46f3e24`, +6 from code review round 1); `tests/test_render_task.py` 19 -> 20; `ruff check --select F,E9 .` clean.
 
 **G-C hit list on the real tree** (eleven attribute stores of the eight names in production code): `api/routers/cuts.py:294` `choose_thumbnail` (`thumbnail_path`), `engine/generation/beat_enrichment.py:117` `_enrich_with_insight` (`duration_s` of a `BeatStub`), `worker/tasks/generate.py:352` `_enrich_standard_path_guide` (`duration_s` of a `Beat`), and the eight stores of `record()` in `engine/render/render_output.py`; none in `worker/tasks/render.py`.
 
@@ -442,7 +445,7 @@ Implementation record (filled in by the docs commit):
 | R39a | assert_pins_not_stale stores to a column | engine/render/render_output.py | `test_G_C_the_real_tree_has_no_stray_writer` (2) |
 | R39b | assert_guide_not_stale stores to a column | engine/render/render_output.py | `test_G_C_the_real_tree_has_no_stray_writer` (2) |
 
-**Review.** Spec: four rounds of four personas (§11), round 4 clean. Code review rounds are recorded below as they run.
+**Review.** Spec: four rounds of four personas (§11), round 4 clean. Code review rounds are recorded in §11 and in the pull request.
 
 ## 11. Review history
 
@@ -467,3 +470,12 @@ CLAUDE.md/architecture.md pointer lists, extra negative controls, R18/R28 attrib
 R37-R38, the aliased-import gap, "up to seven columns". Folded into r4.
 
 Round 4: all four personas clean (security, correctness, test quality, docs consistency); no findings. Implementation began on r4.
+
+Code review round 1 (security, correctness, test quality, docs consistency on `main..HEAD`): security, correctness and docs
+CLEAN (Lows); test quality NOT CLEAN — one Medium: `ensure_ascii=False` in the guide fingerprint survived all tests because
+every fixture guide was pure ASCII (the persisted fingerprint format of any guide with an accented name, e.g. "Martínez",
+was unpinned). Fixed with an accented character in the shared fixture guide. Lows fixed: a cleared guide, an empty-string
+stored fingerprint and a last-character-only difference are each a mismatch (tests); four candidates (the production count)
+and a two-element black-frame list through `render_cut` are pinned; a duplicated assertion removed; G-C also matches a bare
+`Cut.<name>` dict key; spec §7 names the remaining G-C/G-D gaps; docs wording (`output`, design.md pointer sentence, the
+"structural" overclaim, `api/models.py` comments).
