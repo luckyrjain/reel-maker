@@ -174,7 +174,7 @@ untouched.
   - *Calls.* `setattr(x, "<literal name>", ...)` is a write. Keyword arguments count **only** when the callee is `Cut(...)`
     / `models.Cut(...)`, or a `.values(...)` / `.update(...)` / `insert(...)` call. A dict literal counts only when it is
     an argument of `.update(...)` / `.values(...)` and has a string key naming one of the eight, or anywhere when a key is
-    `<x>.Cut.<name>`. Keyword arguments of any other callee (`composite_cut(thumbnail_path=...)`,
+    `<x>.Cut.<name>` or bare `Cut.<name>`. Keyword arguments of any other callee (`composite_cut(thumbnail_path=...)`,
     `RenderOutput(video_path=...)`, `SourcedAsset(duration_s=...)`, `Beat(duration_s=...)`) and other dict literals
     (`"duration_s": s.duration_s` in `generate.py:244`) are not writes.
   - *Allowlists, fail-closed.* Inside `render_output.py` only `record`'s body is exempt; a separate assertion requires that
@@ -378,7 +378,9 @@ Implementation record (filled in by the docs commit):
 | `84b6767` | `refactor: move the render-output persistence and staleness checks into render_output` (14 files: new module, `render.py`, `gate.py`, `guide_schema.py`, `asset_sourcer.py`, `api/models.py` comments, seven retargeted test files, `_seam_oracle.py`) |
 | `46f3e24` | `test: pin record, the staleness checks and the column ledger` (`tests/test_render_output.py`, 78 tests = 3154 selected; 84 after code review round 1, see §11) |
 | `0c3d331` | `refactor: make tts.audio_duration public` |
-| (this commit) | `docs: document render_output and record the evidence` |
+| `90f261f` | `docs: document render_output and record the evidence` |
+| `0430dcd` | `test: close the code-review round 1 gaps in render_output` (+6 tests = 3160 selected; the seeded guide below is a deep copy; see §11) |
+| (this commit) | `test: close the code-review round 2 Lows` (4 candidates through `render_cut`, deep-copied seed guide, doc wording) |
 
 **T1, mutation check on the OLD writer** (`worker/tasks/render.py` at `24cbc91`, wiring test of commit `95f60f4`; each mutant applied, the test must go red, reverted): 10 mutants, all red — the `video_path`, `thumbnail_path`, `thumbnail_candidates` and `duration_s` assignments each dropped, `duration_s = 18.0` (the guide's beat sum instead of 17.25), the thumbnail taken from `candidates[-1]`, `video_path = thumb_path`, the candidates stored reversed, `thumbnail_path = thumb_path`, `duration_s = int(duration)`.
 
@@ -479,3 +481,11 @@ stored fingerprint and a last-character-only difference are each a mismatch (tes
 and a two-element black-frame list through `render_cut` are pinned; a duplicated assertion removed; G-C also matches a bare
 `Cut.<name>` dict key; spec §7 names the remaining G-C/G-D gaps; docs wording (`output`, design.md pointer sentence, the
 "structural" overclaim, `api/models.py` comments).
+
+Code review round 2 (same four personas on `main..HEAD` at `0430dcd`): all four CLEAN. Lows fixed in the following commit:
+the seeded guide in the G-B fixture was the module constant itself (an in-place guide mutation by `record()` went
+unnoticed; now a deep copy), the `render_cut` wiring test uses four candidates (the production count), CLAUDE.md/CONTEXT.md
+wording and the known-gaps list (`Cut(**fields)`, `__setattr__`, bulk `update(Cut)`, `values(dict(...))`, a dict built into
+a variable; G-D vs `importlib`/`__import__`), and the §10 commit table. Not pinned, by decision: `RENDER_ARTIFACT_COLUMNS`
+order, the order of the two gate calls in `publish_cut`, a `duration_s` of 0.0, sorting or de-duplicating candidates or
+black-frame indices.

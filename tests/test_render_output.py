@@ -17,6 +17,7 @@ Layout
 Run with ``python -m pytest`` (a bare ``pytest`` from a worktree can import the main checkout).
 """
 import ast
+import copy
 import dataclasses
 import hashlib
 import json
@@ -150,7 +151,7 @@ def world(db_session):
         return cut
 
     decoy = mk(reels[0], guide={"decoy": True})
-    cut = mk(reels[2], guide=GUIDE, **OTHER_SEED, **SENTINELS)
+    cut = mk(reels[2], guide=copy.deepcopy(GUIDE), **OTHER_SEED, **SENTINELS)
     lookalike = mk(reels[0], guide={"lookalike": True})
     assert cut.id != cut.reel_id
     assert lookalike.id == cut.reel_id

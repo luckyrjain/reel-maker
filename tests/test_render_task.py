@@ -673,6 +673,8 @@ def test_render_cut_records_every_render_artifact_column():
 
     cand0 = Path("/frames/10/candidate_a.jpg")
     cand1 = Path("/frames/10/candidate_b.jpg")
+    cand2 = Path("/frames/10/candidate_c.jpg")
+    cand3 = Path("/frames/10/candidate_d.jpg")
     srt = Path("/frames/10/captions_x.srt")
 
     def fake_resolve(db, cut, beat_index, **kwargs):
@@ -689,19 +691,19 @@ def test_render_cut_records_every_render_artifact_column():
         patch("worker.tasks.render.get_tts_provider"),
         patch("worker.tasks.render.resolve_or_reuse", side_effect=fake_resolve),
         patch("worker.tasks.render.record_stage"),
-        patch("worker.tasks.render.composite_cut", return_value=(17.25, [cand0, cand1], srt)) as mock_composite,
+        patch("worker.tasks.render.composite_cut", return_value=(17.25, [cand0, cand1, cand2, cand3], srt)) as mock_composite,
     ):
         render_cut(1)
 
     out_path = mock_composite.call_args.kwargs["output_path"]
     thumb_base = mock_composite.call_args.kwargs["thumbnail_path"]
     assert out_path != thumb_base, "the two paths composite_cut was handed must be distinguishable"
-    assert str(thumb_base) not in (str(cand0), str(cand1)), "candidates must not coincide with the base path"
+    assert str(thumb_base) not in (str(cand0), str(cand1), str(cand2), str(cand3)), "candidates must not coincide with the base path"
 
     assert cut.video_path == str(out_path)
     assert cut.duration_s == 17.25
     assert cut.thumbnail_path == str(cand0)
-    assert cut.thumbnail_candidates == [str(cand0), str(cand1)]
+    assert cut.thumbnail_candidates == [str(cand0), str(cand1), str(cand2), str(cand3)]
     assert cut.black_frame_beat_indices == [0, 2]
     assert cut.subtitle_path == str(srt)
     # The fingerprint functions run for real here (db is a MagicMock, so the pins read sees no

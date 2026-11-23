@@ -124,7 +124,7 @@ checking of a render's result into `engine/render/render_output.py` (Phase 8h,
 - **The eight artifact columns** — `video_path`, `duration_s`, `thumbnail_path`, `thumbnail_candidates`,
   `black_frame_beat_indices`, `subtitle_path`, `rendered_pins_fingerprint`, `rendered_guide_fingerprint`
   (`RENDER_ARTIFACT_COLUMNS`). They share one lifecycle: written together by a successful render, replaced
-  wholesale by the next, never partially updated. Every other `Cut` column is classified as *not* a render
+  wholesale by the next, never partially updated by a render (the operator's later thumbnail pick overwrites `thumbnail_path` alone). Every other `Cut` column is classified as *not* a render
   artifact in a test (`NOT_RENDER_OUTPUT`), so a new column has to be classified by its author.
 - **Rendered fingerprint** — a snapshot, taken by `record()`, of what built the stored video: the pins
   fingerprint (hash of the bound `CutAsset` rows, or the `EMPTY_PINS_FINGERPRINT` sentinel when a render
@@ -136,5 +136,5 @@ checking of a render's result into `engine/render/render_output.py` (Phase 8h,
   `engine/publish/gate.py::assert_video_matches_pins/guide` are one-line delegates, called by `publish_cut`
   on the upload branch only. Not to be confused with the Job-claim fencing above.
 - **Stray writer** — any code outside `record()` (and the one sanctioned `choose_thumbnail`) that assigns one of
-  the eight names. `tests/test_render_output.py` (guide G-C) walks `api/`, `engine/` and `worker/` for them;
+  the eight names on a `Cut` (a `Beat`/`BeatStub` `duration_s` store in `beat_enrichment.py` and `generate.py` is allowlisted, they are not `Cut` stores). `tests/test_render_output.py` (guide G-C) walks `api/`, `engine/` and `worker/` for them;
   it is a tripwire for the listed direct forms, not a proof (see CLAUDE.md, known gaps).
