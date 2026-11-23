@@ -177,14 +177,15 @@ ship a stale video with safety-irrelevant-looking pins.
 The fix, applied twice, once for pins and once for guide content:
 - **Pins fingerprint** (`Cut.rendered_pins_fingerprint`, Phase 7e) —
   `compute_pins_fingerprint_for_render()` snapshots a sha256 of the pins that built the
-  *currently stored* video at the exact moment `render_cut` finishes successfully.
-  `engine/publish/gate.py::assert_video_matches_pins()` recomputes it at publish time and raises
-  on mismatch.
+  *currently stored* video at the exact moment `render_cut` finishes successfully (through
+  `render_output.record()`, Phase 8h).
+  `engine/publish/gate.py::assert_video_matches_pins()` recomputes it at publish time (via
+  `render_output.assert_pins_not_stale()`) and raises on mismatch.
 - **Guide fingerprint** (`Cut.rendered_guide_fingerprint`, Phase 7m) — the content-sibling gate:
   an operator can edit `cut.guide` (PATCH, or a hook-variant swap) and trigger a re-render that
   fails before completing, leaving a stale pre-edit video that still matches its (now stale)
   pins. `compute_guide_fingerprint(cut.guide)` is snapshotted the same way and compared by
-  `assert_video_matches_guide()`.
+  `assert_video_matches_guide()` (via `render_output.assert_guide_not_stale()`).
 
 Both gates treat `None` (pre-migration rows, or a cut that's never completed a render) as
 "unknown — don't block," not a mismatch — a naive "any mismatch blocks" rule would have
@@ -197,9 +198,11 @@ for the full account, including why a fingerprint comparison was chosen over eag
 `video_path` on every re-render — the latter would destroy an approved video for *any* re-render
 failure, not just an asset-safety-relevant one).
 
-Pointers: `engine/render/asset_sourcer.py::resolve_or_reuse()`, `compute_pins_fingerprint()`,
-`compute_pins_fingerprint_for_render()`; `engine/generation/guide_schema.py::compute_guide_fingerprint()`;
-`engine/publish/gate.py`; `docs/specs/2026-09-video-pins-staleness-gate-system-design.md`,
+Pointers: `engine/render/asset_sourcer.py::resolve_or_reuse()`;
+`engine/render/render_output.py` (`record()`, `compute_pins_fingerprint()`,
+`compute_pins_fingerprint_for_render()`, `compute_guide_fingerprint()`, `assert_pins_not_stale()`,
+`assert_guide_not_stale()` — all moved there in Phase 8h; they lived in `asset_sourcer.py` and
+`guide_schema.py` before); `engine/publish/gate.py` (thin delegates); `docs/specs/2026-09-video-pins-staleness-gate-system-design.md`,
 `docs/specs/2026-09-stale-video-on-failed-rerender-system-design.md`.
 
 ---

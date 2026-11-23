@@ -62,7 +62,8 @@ mechanism, then later gaps through Phase 8f's `Claim`, which turned "remember to
 a signature, a behavioral ledger and an AST guard) and `docs/design.md` §3 for the summary-level why.
 
 **Related but distinct** — don't conflate with the *publish-time* staleness gates
-(`Cut.rendered_pins_fingerprint` / `rendered_guide_fingerprint`, Phase 7e/7m): those fence a re-render
+(`Cut.rendered_pins_fingerprint` / `rendered_guide_fingerprint`, Phase 7e/7m, now owned by
+`engine/render/render_output.py` — see "Render output" below): those fence a re-render
 against a stale video/guide via fingerprint comparison, a different problem (data staleness after a
 guide edit) from job-claim ownership. Both are called "staleness" informally in conversation; they are
 unrelated mechanisms solving unrelated problems.
@@ -100,3 +101,40 @@ of `engine/render/asset_sourcer.py` (Phase 8g, `docs/specs/2026-11-safe-fetch-me
   in `safe_fetch` and `media_policy`; tests also patch private ones such as `safe_fetch._http_stream`). A seam is reached as a module attribute (`safe_fetch.open_download(...)`),
   never imported by name, aliased or held in a default argument, so a test that patches the owning module is
   seen by every caller; `tests/test_module_seams.py` enforces that.
+
+---
+
+## Render output
+
+Surfaced via the C3 architecture-review grilling session, which gathered the persistence and staleness
+checking of a render's result into `engine/render/render_output.py` (Phase 8h,
+`docs/specs/2026-11-render-output-module-design.md`).
+
+- **RenderOutput** — the frozen value of what one successful render produced: the video path, the list of
+  candidate thumbnail frames, the duration, the black-frame beat indices and the optional subtitle path.
+  `thumbnail_path` is deliberately not a field: it is `thumbnail_candidates[0]` by definition, and the
+  operator's later pick (`api/routers/cuts.py::choose_thumbnail`) is a partial overwrite, the one other
+  sanctioned writer of any of the eight columns.
+- **Record** — `render_output.record(db, cut, output)`: writes the **eight artifact columns** of a cut in
+  one go. Everything is computed into locals first, then assigned in one block, so it is all-or-none in
+  memory. It never commits, flushes, refreshes or expires and does not move the cut's status; the caller
+  (`render_cut`) calls it after `composite_cut()` returns and after its "posted while it rendered" refresh,
+  which is what makes the fingerprints describe *this* render. "Record" a render, not "save" it: nothing is
+  persisted until the job's own done-stamp commit.
+- **The eight artifact columns** — `video_path`, `duration_s`, `thumbnail_path`, `thumbnail_candidates`,
+  `black_frame_beat_indices`, `subtitle_path`, `rendered_pins_fingerprint`, `rendered_guide_fingerprint`
+  (`RENDER_ARTIFACT_COLUMNS`). They share one lifecycle: written together by a successful render, replaced
+  wholesale by the next, never partially updated. Every other `Cut` column is classified as *not* a render
+  artifact in a test (`NOT_RENDER_OUTPUT`), so a new column has to be classified by its author.
+- **Rendered fingerprint** — a snapshot, taken by `record()`, of what built the stored video: the pins
+  fingerprint (hash of the bound `CutAsset` rows, or the `EMPTY_PINS_FINGERPRINT` sentinel when a render
+  bound none) and the guide fingerprint (hash of `cut.guide`). `None` means no completed render has ever
+  written it (never rendered, or rendered before the column existed).
+- **Staleness check** — `assert_pins_not_stale` / `assert_guide_not_stale`: recompute the fingerprint now and
+  compare it with the stored one, raising `ValueError` on a difference. A stored `None` skips the check
+  *without computing anything* (rollout safety: the check ships without blocking every already-rendered cut).
+  `engine/publish/gate.py::assert_video_matches_pins/guide` are one-line delegates, called by `publish_cut`
+  on the upload branch only. Not to be confused with the Job-claim fencing above.
+- **Stray writer** — any code outside `record()` (and the one sanctioned `choose_thumbnail`) that assigns one of
+  the eight names. `tests/test_render_output.py` (guide G-C) walks `api/`, `engine/` and `worker/` for them;
+  it is a tripwire for the listed direct forms, not a proof (see CLAUDE.md, known gaps).

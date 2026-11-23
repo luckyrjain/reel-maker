@@ -1,6 +1,6 @@
 # Design — `engine/render/render_output.py`: one owner for "what a render produced"
 
-Status: draft r4 (after spec-review rounds 1-3) · Phase 8h · Candidate C3 of the 2026-11-03 full-codebase architecture
+Status: implemented (spec r4 after spec-review rounds 1-3 and a clean round 4; implementation record in §10) · Phase 8h · Candidate C3 of the 2026-11-03 full-codebase architecture
 review ("Worth exploring", medium confidence) · Base `main` = `24cbc91`; every line number below refers to that tree ·
 Branch `c3-render-output` · Builds on the Phase 7e (pins) and Phase 7m (guide) staleness gates.
 
@@ -363,7 +363,86 @@ Plan file: `docs/specs/2026-11-render-output-implementation-plan.md`.
 5. `docs: ...` — §8 and this section.
 Review-fix commits follow as needed. No push until the code-review rounds are clean; no merge without "check ci and merge".
 
-Implementation record: _pending_
+Implementation record (filled in by the docs commit):
+
+**Baseline.** `pytest --collect-only -q` at `24cbc91`: 3075 selected (3072 passed, 3 skipped; the golden-reel test deselected).
+
+**Commits** (`git log --oneline d949361..HEAD`, after the spec/plan commit `d949361`):
+
+| Commit | Message |
+|---|---|
+| `95f60f4` | `test: pin render_cut's writes before moving them` (the wiring test; +1 selected = 3076) |
+| `84b6767` | `refactor: move the render-output persistence and staleness checks into render_output` (14 files: new module, `render.py`, `gate.py`, `guide_schema.py`, `asset_sourcer.py`, `api/models.py` comments, seven retargeted test files, `_seam_oracle.py`) |
+| `46f3e24` | `test: pin record, the staleness checks and the column ledger` (`tests/test_render_output.py`, 78 tests = 3154 selected) |
+| `0c3d331` | `refactor: make tts.audio_duration public` |
+| (this commit) | `docs: document render_output and record the evidence` |
+
+**T1, mutation check on the OLD writer** (`worker/tasks/render.py` at `24cbc91`, wiring test of commit `95f60f4`; each mutant applied, the test must go red, reverted): 10 mutants, all red — the `video_path`, `thumbnail_path`, `thumbnail_candidates` and `duration_s` assignments each dropped, `duration_s = 18.0` (the guide's beat sum instead of 17.25), the thumbnail taken from `candidates[-1]`, `video_path = thumb_path`, the candidates stored reversed, `thumbnail_path = thumb_path`, `duration_s = int(duration)`.
+
+**Normalized-diff proof of the mechanical retargets** (throwaway script, `ast.dump` equality after stripping docstrings, ignoring comments, flattening `ImportFrom` into a `(module, name, asname)` multiset with the four-name module remap, and rewriting exactly the six patch-target strings): all seven files pass (`tests/test_asset_sourcer.py`, `tests/test_sourcer_pins_and_music.py`, `tests/test_publish_gate.py`, `tests/test_guide_schema.py`, `tests/test_cuts_publish_router.py`, `tests/test_render_task.py` against its commit-1 version, `tests/test_publish_task.py`); the rewritten patch-string count asserted to be six; 14 negative controls (the kinds required by the plan: an extra edit, a moved-name import pointed at the wrong module, a patch string with the wrong prefix) each detected. `tests/_seam_oracle.py` checked separately: `STAYS` minus exactly the three pins names. The move commit's sorted node-id set equals the baseline set plus exactly the commit-1 test.
+
+**Final counts** (`24cbc91` -> HEAD): 3075 -> 3154 selected; the full run is 3151 passed, 3 skipped, 1 deselected (golden); 78 -> 79 test files; `tests/test_render_output.py` 78 tests; `tests/test_render_task.py` 19 -> 20; `ruff check --select F,E9 .` clean.
+
+**G-C hit list on the real tree** (eleven attribute stores of the eight names in production code): `api/routers/cuts.py:294` `choose_thumbnail` (`thumbnail_path`), `engine/generation/beat_enrichment.py:117` `_enrich_with_insight` (`duration_s` of a `BeatStub`), `worker/tasks/generate.py:352` `_enrich_standard_path_guide` (`duration_s` of a `Beat`), and the eight stores of `record()` in `engine/render/render_output.py`; none in `worker/tasks/render.py`.
+
+**Mutation battery R1-R39** (§6.4; 52 runs because several mutants have variants: R13a/b, R20a-c, R24a/b, R30a-e, R34a-c, R37a/b, R38a/b, R39a/b; each applied, the named test turned red, reverted). All 52 killed:
+
+| Run | Mutation | File mutated | First killer (tests failing) |
+|---|---|---|---|
+| R1 | drop the thumbnail_path assignment | engine/render/render_output.py | `test_record_writes_every_column_with_plain_json_types_before_any_flush` (10) |
+| R2 | thumbnail_path = candidates[-1] | engine/render/render_output.py | `test_record_writes_every_column_with_plain_json_types_before_any_flush` (4) |
+| R3 | drop `or None` on black frames | engine/render/render_output.py | `test_an_empty_black_frame_input_is_none_not_an_empty_list` (3) |
+| R4 | store 'None' for a missing subtitle | engine/render/render_output.py | `test_a_missing_subtitle_is_none_not_the_string_none` (3) |
+| R5 | pins fingerprint via the raw function | engine/render/render_output.py | `test_record_survives_a_flush_commit_expire_and_reload` (6) |
+| R6 | guide fingerprint of a copy missing a key | engine/render/render_output.py | `test_record_survives_a_flush_commit_expire_and_reload` (6) |
+| R7 | swap the two fingerprints | engine/render/render_output.py | `test_record_survives_a_flush_commit_expire_and_reload` (15) |
+| R8 | assign before computing | engine/render/render_output.py | `test_record_is_atomic_in_memory[pins computation raises]` (4) |
+| R9 | drop a name (subtitle_path) from RENDER_ARTIFACT_COLUMNS | engine/render/render_output.py | `test_the_sentinel_ledger_covers_exactly_the_artifact_columns` (10) |
+| R10 | _assert_not_stale raises on None | engine/render/render_output.py | `test_a_none_pins_fingerprint_skips_without_computing_even_with_live_pins` (9) |
+| R11 | drop the != check | engine/render/render_output.py | `test_a_pins_mismatch_raises_the_literal_message_and_not_the_guide_one` (16) |
+| R12 | swap the two messages | engine/render/render_output.py | `test_a_pins_mismatch_raises_the_literal_message_and_not_the_guide_one` (4) |
+| R13a | gate pins delegate calls the guide check | engine/publish/gate.py | `test_the_gate_pins_check_delegates_to_render_output` (6) |
+| R13b | gate guide delegate calls the pins check | engine/publish/gate.py | `test_the_gate_guide_check_delegates_to_render_output` (5) |
+| R14 | record commits | engine/render/render_output.py | `test_record_never_commits_flushes_refreshes_or_expires` (4) |
+| R15 | stray cut.video_path = in cuts.py | api/routers/cuts.py | `test_G_C_the_real_tree_has_no_stray_writer` (2) |
+| R16 | an unclassified Cut column | api/models.py | `test_G_A_every_cut_column_is_classified_exactly_once` (2) |
+| R17 | compute_guide_fingerprint without sort_keys | engine/render/render_output.py | `test_record_survives_a_flush_commit_expire_and_reload` (4) |
+| R18 | render_cut skips record | worker/tasks/render.py | `render_task::test_subtitle_path_is_populated_on_a_successful_render` (7) |
+| R19 | adapter wires video_path=thumb_path | worker/tasks/render.py | `render_task::test_render_cut_records_every_render_artifact_column` (1) |
+| R20a | adapter wires int(duration) | worker/tasks/render.py | `render_task::test_render_cut_records_every_render_artifact_column` (1) |
+| R20b | adapter wires round(duration) | worker/tasks/render.py | `render_task::test_render_cut_records_every_render_artifact_column` (1) |
+| R20c | adapter wires the beat-sum duration | worker/tasks/render.py | `render_task::test_render_cut_records_every_render_artifact_column` (1) |
+| R21 | candidates stored reversed | engine/render/render_output.py | `test_record_writes_every_column_with_plain_json_types_before_any_flush` (4) |
+| R22 | guide computed after the assignments | engine/render/render_output.py | `test_record_is_atomic_in_memory[guide computation raises]` (1) |
+| R23 | candidates[0] evaluated mid-block | engine/render/render_output.py | `test_record_is_atomic_in_memory[empty candidates]` (1) |
+| R24a | conditional black-frame assignment (stale retention) | engine/render/render_output.py | `test_an_empty_black_frame_input_is_none_not_an_empty_list` (3) |
+| R24b | conditional subtitle assignment (stale retention) | engine/render/render_output.py | `test_a_missing_subtitle_is_none_not_the_string_none` (3) |
+| R25 | eager compute | engine/render/render_output.py | `test_a_none_pins_fingerprint_skips_without_computing_even_with_live_pins` (7) |
+| R26 | gate delegate via from-import | engine/publish/gate.py | `test_the_gate_pins_check_delegates_to_render_output` (1) |
+| R27 | pins computed with cut.reel_id | engine/render/render_output.py | `test_the_pins_fingerprint_is_the_real_hash_of_this_cuts_own_pins` (7) |
+| R28 | record before the db.refresh / posted check | worker/tasks/render.py | `render_task::test_a_render_that_a_publish_overtook_is_discarded` (1) |
+| R29 | record omits one assignment while the tuple lists it | engine/render/render_output.py | `test_record_writes_every_column_with_plain_json_types_before_any_flush` (10) |
+| R30a | unstringified Path video_path | engine/render/render_output.py | `test_record_writes_every_column_with_plain_json_types_before_any_flush` (10) |
+| R30b | unstringified candidates (Paths in the list) | engine/render/render_output.py | `test_record_writes_every_column_with_plain_json_types_before_any_flush` (12) |
+| R30c | tuple of strings as candidates | engine/render/render_output.py | `test_record_writes_every_column_with_plain_json_types_before_any_flush` (5) |
+| R30d | unstringified Path thumbnail_path | engine/render/render_output.py | `test_record_writes_every_column_with_plain_json_types_before_any_flush` (12) |
+| R30e | unstringified Path subtitle | engine/render/render_output.py | `test_record_writes_every_column_with_plain_json_types_before_any_flush` (10) |
+| R31 | RenderOutput unfrozen | engine/render/render_output.py | `test_render_output_is_frozen` (1) |
+| R32 | a moved name re-exported from asset_sourcer | engine/render/asset_sourcer.py | `test_G_D_the_moved_names_are_gone_from_their_old_homes` (1) |
+| R33 | drop the list(...) coercion on black frames | engine/render/render_output.py | `test_record_writes_every_column_with_plain_json_types_before_any_flush` (2) |
+| R34a | record flushes | engine/render/render_output.py | `test_record_never_commits_flushes_refreshes_or_expires` (4) |
+| R34b | record refreshes | engine/render/render_output.py | `test_record_writes_every_column_with_plain_json_types_before_any_flush` (22) |
+| R34c | record expires | engine/render/render_output.py | `test_record_writes_every_column_with_plain_json_types_before_any_flush` (22) |
+| R35 | render_output imports guide_schema | engine/render/render_output.py | `test_G_D_render_output_imports_none_of_the_forbidden_modules` (1) |
+| R36 | stray Cut(video_path=...) | api/routers/cuts.py | `test_G_C_the_real_tree_has_no_stray_writer` (2) |
+| R37a | record also writes caption | engine/render/render_output.py | `test_G_B_record_changes_exactly_the_eight_columns_and_no_other` (3) |
+| R37b | record also writes status | engine/render/render_output.py | `test_G_B_record_changes_exactly_the_eight_columns_and_no_other` (19) |
+| R38a | assert_guide_not_stale reads the pins column | engine/render/render_output.py | `test_a_none_guide_fingerprint_skips_without_computing_even_with_a_live_guide` (8) |
+| R38b | assert_pins_not_stale reads the guide column | engine/render/render_output.py | `test_a_none_pins_fingerprint_skips_without_computing_even_with_live_pins` (11) |
+| R39a | assert_pins_not_stale stores to a column | engine/render/render_output.py | `test_G_C_the_real_tree_has_no_stray_writer` (2) |
+| R39b | assert_guide_not_stale stores to a column | engine/render/render_output.py | `test_G_C_the_real_tree_has_no_stray_writer` (2) |
+
+**Review.** Spec: four rounds of four personas (§11), round 4 clean. Code review rounds are recorded below as they run.
 
 ## 11. Review history
 
@@ -386,3 +465,5 @@ normalized-diff base for `test_render_task.py` must be commit 1's version; "nine
 seven files; the whole of `render_output.py` was exempt from G-C instead of `record`'s body only. Lows: line ranges,
 CLAUDE.md/architecture.md pointer lists, extra negative controls, R18/R28 attribution, a non-integral duration, mutants
 R37-R38, the aliased-import gap, "up to seven columns". Folded into r4.
+
+Round 4: all four personas clean (security, correctness, test quality, docs consistency); no findings. Implementation began on r4.
