@@ -127,7 +127,7 @@ class KokoroProvider:
         return out
 
 
-def _audio_duration(path: Path) -> float | None:
+def audio_duration(path: Path) -> float | None:
     """Return audio duration in seconds via ffprobe, or None on failure."""
     try:
         result = subprocess.run(
@@ -222,7 +222,7 @@ class EdgeTTSProvider:
         Rate is clamped to ±25% to stay within natural-sounding range.
         """
         out = self.synthesize(text)
-        actual = _audio_duration(out)
+        actual = audio_duration(out)
         if actual is None:
             return out
         drift = (actual - target_s) / max(target_s, 1.0)

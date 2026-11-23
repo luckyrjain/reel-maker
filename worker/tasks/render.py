@@ -8,7 +8,7 @@ from engine.observability import record_stage
 from engine.render import render_output, safe_fetch
 from engine.render.asset_sourcer import get_asset_sourcer, get_hf_sourcer, get_hf_video_sourcer, get_music_sourcer, get_wiki_sourcer, resolve_or_reuse
 from engine.render.compositor import DEFAULT_TEXT_COLOR, composite_cut
-from engine.render.tts import SilentProvider, _audio_duration, get_tts_provider
+from engine.render.tts import SilentProvider, audio_duration, get_tts_provider
 from worker.celery_app import celery_app
 from worker.tasks.common import heartbeat, job_task, time_limits
 
@@ -106,7 +106,7 @@ def render_cut(self, db, job, ctx):
     for beat, vo_path in zip(beats, beat_vo_paths):
         d = beat.model_dump()
         if has_speech and vo_path and vo_path.exists():
-            actual = _audio_duration(vo_path)
+            actual = audio_duration(vo_path)
             if actual is not None:
                 d["duration_s"] = round(actual + 0.1, 2)
         beat_dicts.append(d)
