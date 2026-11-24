@@ -105,8 +105,8 @@ def test_captions_upload_failure_does_not_fail_publish_cut_or_platform_post_id(f
 
     with (
         patch("worker.tasks.publish.get_publisher", return_value=YouTubePublisher()),
-        patch("engine.publish.youtube.httpx.post", return_value=init_resp),
-        patch("engine.publish.youtube.httpx.put", return_value=upload_resp),
+        patch("httpx.post", return_value=init_resp),
+        patch("httpx.put", return_value=upload_resp),
         patch("engine.publish.youtube._upload_captions", side_effect=RuntimeError("captions API down")),
     ):
         publish_cut(job_id)  # must not raise
@@ -158,8 +158,8 @@ def test_captions_upload_success_records_a_stage_event_with_ok_true(factory, tmp
 
     with (
         patch("worker.tasks.publish.get_publisher", return_value=YouTubePublisher()),
-        patch("engine.publish.youtube.httpx.post", return_value=init_resp),
-        patch("engine.publish.youtube.httpx.put", return_value=upload_resp),
+        patch("httpx.post", return_value=init_resp),
+        patch("httpx.put", return_value=upload_resp),
         patch("engine.publish.youtube._upload_captions", return_value=None) as mock_upload,
     ):
         publish_cut(job_id)
@@ -197,8 +197,8 @@ def test_no_captions_upload_attempted_when_subtitle_path_is_unset(factory, tmp_p
 
     with (
         patch("worker.tasks.publish.get_publisher", return_value=YouTubePublisher()),
-        patch("engine.publish.youtube.httpx.post", return_value=init_resp),
-        patch("engine.publish.youtube.httpx.put", return_value=upload_resp),
+        patch("httpx.post", return_value=init_resp),
+        patch("httpx.put", return_value=upload_resp),
         patch("engine.publish.youtube._upload_captions") as mock_upload,
     ):
         publish_cut(job_id)

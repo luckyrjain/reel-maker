@@ -17,6 +17,7 @@ import time
 
 import httpx
 
+from api import platform_http
 from api.config import settings
 
 _STATE_TTL_S = 600
@@ -94,24 +95,22 @@ class YouTubeOAuth(OAuthProvider):
         return f"{self.authorize_url}?{params}"
 
     def exchange_code(self, code: str) -> dict:
-        resp = httpx.post(self.token_url, data={
+        resp = platform_http.post(self.token_url, data={
             "code": code,
             "client_id": self.client_id,
             "client_secret": self.client_secret,
             "redirect_uri": self.redirect_uri,
             "grant_type": "authorization_code",
-        }, timeout=30.0)
-        resp.raise_for_status()
+        })
         return resp.json()
 
     def refresh(self, refresh_token: str) -> dict:
-        resp = httpx.post(self.token_url, data={
+        resp = platform_http.post(self.token_url, data={
             "refresh_token": refresh_token,
             "client_id": self.client_id,
             "client_secret": self.client_secret,
             "grant_type": "refresh_token",
-        }, timeout=30.0)
-        resp.raise_for_status()
+        })
         return resp.json()
 
 
@@ -143,13 +142,12 @@ class InstagramOAuth(OAuthProvider):
         # failed call, in job.error / HTTPException responses — the same class
         # of leak fixed elsewhere in this module for bearer tokens). Matches
         # YouTubeOAuth.exchange_code()'s pattern in this same file.
-        resp = httpx.post(self.token_url, data={
+        resp = platform_http.post(self.token_url, data={
             "client_id": self.client_id,
             "client_secret": self.client_secret,
             "redirect_uri": self.redirect_uri,
             "code": code,
-        }, timeout=30.0)
-        resp.raise_for_status()
+        })
         return resp.json()
 
     def exchange_long_lived_token(self, short_lived_token: str) -> dict:
@@ -164,13 +162,12 @@ class InstagramOAuth(OAuthProvider):
         """
         # POST body, not GET params — see exchange_code()'s comment; the same
         # leak applies here to both client_secret and the short-lived token.
-        resp = httpx.post(self.token_url, data={
+        resp = platform_http.post(self.token_url, data={
             "grant_type": "fb_exchange_token",
             "client_id": self.client_id,
             "client_secret": self.client_secret,
             "fb_exchange_token": short_lived_token,
-        }, timeout=30.0)
-        resp.raise_for_status()
+        })
         return resp.json()
 
     def discover_account(self, user_access_token: str) -> dict:
@@ -186,21 +183,16 @@ class InstagramOAuth(OAuthProvider):
         or error message a failed call bubbles up to (worker/tasks/*.py's
         `job.error = str(exc)`, in particular).
         """
-        resp = httpx.get(
-            "https://graph.facebook.com/v19.0/me/accounts",
-            headers={"Authorization": f"Bearer {user_access_token}"},
-            timeout=30.0,
+        resp = platform_http.get(
+            "https://graph.facebook.com/v19.0/me/accounts", bearer=user_access_token
         )
-        resp.raise_for_status()
         for page in resp.json().get("data", []):
             page_id, page_token = page["id"], page["access_token"]
-            ig_resp = httpx.get(
+            ig_resp = platform_http.get(
                 f"https://graph.facebook.com/v19.0/{page_id}",
                 params={"fields": "instagram_business_account"},
-                headers={"Authorization": f"Bearer {page_token}"},
-                timeout=30.0,
+                bearer=page_token,
             )
-            ig_resp.raise_for_status()
             ig_account = ig_resp.json().get("instagram_business_account")
             if ig_account:
                 return {"page_id": page_id, "page_access_token": page_token, "ig_user_id": ig_account["id"]}

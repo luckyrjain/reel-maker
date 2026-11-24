@@ -37,7 +37,7 @@ def _resp(json_data):
 
 def test_youtube_fetch_parses_statistics():
     resp = _resp({"items": [{"statistics": {"viewCount": "1500", "likeCount": "42", "commentCount": "3"}}]})
-    with patch("engine.publish.metrics.httpx.get", return_value=resp) as mock_get:
+    with patch("httpx.get", return_value=resp) as mock_get:
         result = YouTubeMetricsFetcher().fetch(_fake_cut(), _fake_credential(), MagicMock())
 
     assert result.views == 1500
@@ -50,14 +50,14 @@ def test_youtube_fetch_parses_statistics():
 
 def test_youtube_fetch_returns_none_when_video_not_found():
     resp = _resp({"items": []})
-    with patch("engine.publish.metrics.httpx.get", return_value=resp):
+    with patch("httpx.get", return_value=resp):
         result = YouTubeMetricsFetcher().fetch(_fake_cut(), _fake_credential(), MagicMock())
     assert result is None
 
 
 def test_youtube_fetch_tolerates_missing_fields():
     resp = _resp({"items": [{"statistics": {"viewCount": "10"}}]})
-    with patch("engine.publish.metrics.httpx.get", return_value=resp):
+    with patch("httpx.get", return_value=resp):
         result = YouTubeMetricsFetcher().fetch(_fake_cut(), _fake_credential(), MagicMock())
     assert result.views == 10
     assert result.likes is None
@@ -82,7 +82,7 @@ def test_youtube_fetch_refreshes_expired_token_before_calling_api():
     resp = _resp({"items": [{"statistics": {"viewCount": "10"}}]})
     with (
         patch("engine.publish.youtube.get_oauth_provider", return_value=fake_oauth),
-        patch("engine.publish.metrics.httpx.get", return_value=resp) as mock_get,
+        patch("httpx.get", return_value=resp) as mock_get,
     ):
         result = YouTubeMetricsFetcher().fetch(_fake_cut(), cred, db)
 
@@ -103,7 +103,7 @@ def test_instagram_fetch_parses_insights():
             {"name": "comments", "values": [{"value": 4}]},
         ]
     })
-    with patch("engine.publish.metrics.httpx.get", return_value=resp) as mock_get:
+    with patch("httpx.get", return_value=resp) as mock_get:
         result = InstagramMetricsFetcher().fetch(_fake_cut(post_id="ig-media-1"), _fake_credential("page-tok"), MagicMock())
 
     assert result.views == 500
@@ -117,14 +117,14 @@ def test_instagram_fetch_parses_insights():
 
 def test_instagram_fetch_returns_none_when_no_data():
     resp = _resp({"data": []})
-    with patch("engine.publish.metrics.httpx.get", return_value=resp):
+    with patch("httpx.get", return_value=resp):
         result = InstagramMetricsFetcher().fetch(_fake_cut(), _fake_credential(), MagicMock())
     assert result is None
 
 
 def test_instagram_fetch_ignores_metrics_without_values():
     resp = _resp({"data": [{"name": "plays", "values": []}]})
-    with patch("engine.publish.metrics.httpx.get", return_value=resp):
+    with patch("httpx.get", return_value=resp):
         result = InstagramMetricsFetcher().fetch(_fake_cut(), _fake_credential(), MagicMock())
     assert result.views is None
 
@@ -163,7 +163,7 @@ def test_instagram_fetch_records_the_no_data_yet_case_as_an_ordinary_ok_pull():
     calls = []
     resp = _resp({"data": []})
     with (
-        patch("engine.publish.metrics.httpx.get", return_value=resp),
+        patch("httpx.get", return_value=resp),
         patch("engine.publish.metrics.record_stage", _fake_record_stage(calls)),
     ):
         result = InstagramMetricsFetcher().fetch(_fake_cut(), _fake_credential(), MagicMock())
@@ -185,7 +185,7 @@ def test_instagram_fetch_records_a_clean_pull_as_ok():
     })
     cut = _fake_cut(post_id="ig-media-1")
     with (
-        patch("engine.publish.metrics.httpx.get", return_value=resp),
+        patch("httpx.get", return_value=resp),
         patch("engine.publish.metrics.record_stage", _fake_record_stage(calls)),
     ):
         result = InstagramMetricsFetcher().fetch(cut, _fake_credential(), MagicMock())
@@ -207,7 +207,7 @@ def test_instagram_fetch_records_missing_metrics_without_raising():
         ]
     })
     with (
-        patch("engine.publish.metrics.httpx.get", return_value=resp),
+        patch("httpx.get", return_value=resp),
         patch("engine.publish.metrics.record_stage", _fake_record_stage(calls)),
     ):
         result = InstagramMetricsFetcher().fetch(_fake_cut(), _fake_credential(), MagicMock())
@@ -235,7 +235,7 @@ def test_instagram_fetch_does_not_flag_a_present_but_valueless_metric_as_missing
     calls = []
     resp = _resp({"data": [{"name": "plays", "values": []}]})
     with (
-        patch("engine.publish.metrics.httpx.get", return_value=resp),
+        patch("httpx.get", return_value=resp),
         patch("engine.publish.metrics.record_stage", _fake_record_stage(calls)),
     ):
         result = InstagramMetricsFetcher().fetch(_fake_cut(), _fake_credential(), MagicMock())
@@ -274,7 +274,7 @@ def test_instagram_fetch_records_a_whole_request_failure():
     fake_response.raise_for_status.side_effect = httpx.HTTPStatusError(
         "400 Bad Request", request=MagicMock(), response=MagicMock()
     )
-    with patch("engine.publish.metrics.httpx.get", return_value=fake_response):
+    with patch("httpx.get", return_value=fake_response):
         with pytest.raises(httpx.HTTPStatusError):
             InstagramMetricsFetcher().fetch(cut, _fake_credential(), db)
 

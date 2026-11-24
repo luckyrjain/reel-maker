@@ -75,7 +75,7 @@ def _credential(*, expires_in_s=-3600, refresh_token="refresh-tok-3", token="sta
 
 def test_refresh_posts_a_form_encoded_refresh_grant_to_googles_token_endpoint():
     google = _Google()
-    with patch("api.oauth.httpx.post", side_effect=google):
+    with patch("httpx.post", side_effect=google):
         _provider().refresh("refresh-tok-3")
 
     request = google.requests[0]
@@ -92,7 +92,7 @@ def test_refresh_posts_a_form_encoded_refresh_grant_to_googles_token_endpoint():
 
 def test_refresh_keeps_the_refresh_token_and_client_secret_out_of_the_url():
     google = _Google()
-    with patch("api.oauth.httpx.post", side_effect=google):
+    with patch("httpx.post", side_effect=google):
         _provider().refresh("refresh-tok-3")
 
     request = google.requests[0]
@@ -105,7 +105,7 @@ def test_refresh_keeps_the_refresh_token_and_client_secret_out_of_the_url():
 
 def test_refresh_sends_a_timeout():
     google = _Google()
-    with patch("api.oauth.httpx.post", side_effect=google):
+    with patch("httpx.post", side_effect=google):
         _provider().refresh("refresh-tok-3")
 
     assert google.timeouts == [30.0]
@@ -113,14 +113,14 @@ def test_refresh_sends_a_timeout():
 
 def test_refresh_returns_the_providers_json_body_unchanged():
     body = {"access_token": "fresh-tok", "expires_in": 3599, "scope": "a b", "token_type": "Bearer"}
-    with patch("api.oauth.httpx.post", side_effect=_Google(body=body)):
+    with patch("httpx.post", side_effect=_Google(body=body)):
         assert _provider().refresh("refresh-tok-3") == body
 
 
 def test_refresh_raises_on_a_rejected_grant_without_echoing_the_secrets():
     """A revoked or expired refresh token is answered with 400 invalid_grant."""
     google = _Google(status=400, body={"error": "invalid_grant", "error_description": "Token has been revoked."})
-    with patch("api.oauth.httpx.post", side_effect=google):
+    with patch("httpx.post", side_effect=google):
         with pytest.raises(httpx.HTTPStatusError) as caught:
             _provider().refresh("refresh-tok-3")
 
@@ -131,7 +131,7 @@ def test_refresh_raises_on_a_rejected_grant_without_echoing_the_secrets():
 
 @pytest.mark.parametrize("status", [401, 403, 429, 500, 503])
 def test_refresh_raises_on_error_statuses(status):
-    with patch("api.oauth.httpx.post", side_effect=_Google(status=status, body={"error": "x"})):
+    with patch("httpx.post", side_effect=_Google(status=status, body={"error": "x"})):
         with pytest.raises(httpx.HTTPStatusError):
             _provider().refresh("refresh-tok-3")
 
@@ -146,7 +146,7 @@ def test_refresh_raises_on_an_error_status_with_a_non_json_body():
         with httpx.Client(transport=httpx.MockTransport(handler)) as client:
             return client.post(url, **kwargs)
 
-    with patch("api.oauth.httpx.post", side_effect=post):
+    with patch("httpx.post", side_effect=post):
         with pytest.raises(httpx.HTTPStatusError):
             _provider().refresh("refresh-tok-3")
 
@@ -166,7 +166,7 @@ def test_an_expired_token_is_refreshed_through_the_real_provider_and_persisted(r
     db = MagicMock()
     before = datetime.now(timezone.utc)
 
-    with patch("api.oauth.httpx.post", side_effect=google):
+    with patch("httpx.post", side_effect=google):
         token = get_valid_access_token(credential, db)
 
     assert token == "fresh-tok" and credential.token_blob == "fresh-tok"
@@ -183,7 +183,7 @@ def test_a_refresh_token_in_the_response_is_ignored_current_behaviour(real_provi
     credential = _credential(expires_in_s=-60)
     body = {"access_token": "fresh-tok", "expires_in": 3599, "refresh_token": "rotated-refresh"}
 
-    with patch("api.oauth.httpx.post", side_effect=_Google(body=body)):
+    with patch("httpx.post", side_effect=_Google(body=body)):
         get_valid_access_token(credential, MagicMock())
 
     assert credential.token_blob == "fresh-tok"
@@ -195,7 +195,7 @@ def test_a_token_that_is_still_valid_is_returned_without_any_request(real_provid
     credential = _credential(expires_in_s=3600)
     db = MagicMock()
 
-    with patch("api.oauth.httpx.post", side_effect=google):
+    with patch("httpx.post", side_effect=google):
         assert get_valid_access_token(credential, db) == "stale-tok"
 
     assert google.requests == []
@@ -207,7 +207,7 @@ def test_a_credential_without_an_expiry_is_never_refreshed(real_provider):
     credential = _credential(expires_at=None)
     db = MagicMock()
 
-    with patch("api.oauth.httpx.post", side_effect=google):
+    with patch("httpx.post", side_effect=google):
         assert get_valid_access_token(credential, db) == "stale-tok"
 
     assert google.requests == []
@@ -220,7 +220,7 @@ def test_a_failed_refresh_leaves_the_credential_untouched_and_commits_nothing(re
     credential = _credential(expires_at=expired_at)
     db = MagicMock()
 
-    with patch("api.oauth.httpx.post", side_effect=google):
+    with patch("httpx.post", side_effect=google):
         with pytest.raises(httpx.HTTPStatusError):
             get_valid_access_token(credential, db)
 
@@ -236,7 +236,7 @@ def test_a_refresh_response_without_an_access_token_does_not_half_update_the_cre
     credential = _credential(expires_at=expired_at)
     db = MagicMock()
 
-    with patch("api.oauth.httpx.post", side_effect=_Google(body={"expires_in": 3599})):
+    with patch("httpx.post", side_effect=_Google(body={"expires_in": 3599})):
         with pytest.raises(KeyError):
             get_valid_access_token(credential, db)
 
@@ -250,7 +250,7 @@ def test_an_expired_token_with_no_refresh_token_fails_before_any_request(real_pr
     credential = _credential(refresh_token=missing)
     db = MagicMock()
 
-    with patch("api.oauth.httpx.post", side_effect=google):
+    with patch("httpx.post", side_effect=google):
         with pytest.raises(ValueError, match="reconnect the account"):
             get_valid_access_token(credential, db)
 
@@ -263,7 +263,7 @@ def test_expires_in_given_as_a_string_is_accepted(real_provider):
     credential = _credential(expires_in_s=-60)
     before = datetime.now(timezone.utc)
 
-    with patch("api.oauth.httpx.post", side_effect=_Google(body={"access_token": "t", "expires_in": "1800"})):
+    with patch("httpx.post", side_effect=_Google(body={"access_token": "t", "expires_in": "1800"})):
         get_valid_access_token(credential, MagicMock())
 
     assert before + timedelta(seconds=1800) <= credential.expires_at <= datetime.now(timezone.utc) + timedelta(seconds=1800)
@@ -275,7 +275,7 @@ def test_a_response_without_expires_in_stores_no_expiry_current_behaviour(real_p
     always sends expires_in, so this is not reachable today; it is pinned so a change is deliberate."""
     credential = _credential(expires_in_s=-60)
 
-    with patch("api.oauth.httpx.post", side_effect=_Google(body={"access_token": "t"})):
+    with patch("httpx.post", side_effect=_Google(body={"access_token": "t"})):
         get_valid_access_token(credential, MagicMock())
 
     assert credential.token_blob == "t" and credential.expires_at is None
@@ -293,8 +293,8 @@ def test_the_refreshed_token_is_what_the_metrics_fetcher_sends_to_the_api(real_p
     api.json.return_value = {"items": [{"statistics": {"viewCount": "7"}}]}
 
     with (
-        patch("api.oauth.httpx.post", side_effect=google),
-        patch("engine.publish.metrics.httpx.get", return_value=api) as mock_get,
+        patch("httpx.post", side_effect=google),
+        patch("httpx.get", return_value=api) as mock_get,
     ):
         result = YouTubeMetricsFetcher().fetch(cut, credential, MagicMock())
 
@@ -313,7 +313,7 @@ def test_neither_a_successful_nor_a_failed_refresh_logs_a_secret(real_provider, 
     body = {"access_token": "Fresh-TOK-9", "expires_in": 3599} if status == 200 else {"error": "invalid_grant"}
     credential = _credential(expires_in_s=-60, token="Stale-TOK-8")
 
-    with caplog.at_level(logging.DEBUG), patch("api.oauth.httpx.post", side_effect=_Google(status=status, body=body)):
+    with caplog.at_level(logging.DEBUG), patch("httpx.post", side_effect=_Google(status=status, body=body)):
         try:
             get_valid_access_token(credential, MagicMock())
         except httpx.HTTPStatusError:
