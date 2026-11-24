@@ -146,6 +146,7 @@ class YouTubePublisher(Publisher):
             headers={"Content-Type": "video/mp4", "Content-Length": str(video_size)},
             content=video_bytes,
             timeout=platform_http.UPLOAD_TIMEOUT_S,
+            server_supplied_url=True,
         )
         video_id = upload_resp.json()["id"]
 
