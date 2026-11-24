@@ -524,8 +524,313 @@ Plan: `docs/specs/2026-11-platform-http-implementation-plan.md` (written once th
    `tests/test_platform_http.py` (module behavior, PH-G1..PH-G5) and the mutation battery M1-M171.
 4. `docs: document platform_http and record the evidence`: §8 and this section's record.
 
-Implementation record: *(filled in during implementation: baseline counts, normalized-diff output, commit-1 old-code
-mutation results and the count of value mutants, the M1-M171 table with any equivalent mutants named, final counts.)*
+Implementation record (filled in at implementation; every number below was re-run by the controller, not taken from
+an implementer's report):
+
+- **Baseline** at `1b49607`: 3160 selected (3157 passed, 3 skipped, 1 deselected), 79 test files. Final: 4321 selected, 4322
+  total with the golden test, 81 test files (`tests/test_platform_http.py` 1084 tests, `tests/test_platform_http_callsites.py`
+  77 tests, plus the helper `tests/_platform_http_helpers.py`); full suite 4318 passed, 3 skipped, 1 deselected; ruff
+  `--select F,E9` clean.
+- **Commit 1** (`6923313`): the characterization test, 77 tests, green on the old code. Scripted old-code mutation: 301
+  mutants, 301 killed, 0 survived (families: auth-added 1, auth-removed 7, literal 188, raise_for_status 14, swap 71, swap-extra 6, timeout 14),
+  every kill a pytest failure; no equivalent mutants. The first pass left three survivors in `YouTubePublisher.publish`
+  (the `""` after `caption or` in the title and description lines, and the log message literal), closed by drive variant D (a
+  `None` caption with `None` hashtags) and an exact-equality check on the log record.
+- **Commit 2** (`c531b64`): the move. T1's tests passed unmodified; the normalized-AST diff passed on all six files (65 of 65
+  strings rewritten, 0 old matches left; self-test: a correct rewrite passes, and an extra edit, a wrong module, a wrong function
+  and an unrewritten string are each detected); the test node-id set is the baseline plus exactly the 77 new tests (0 removed).
+- **Commit 3** (`856fa54`): module mutation battery: 143 mutants, 140 killed, 3 equivalent survivors
+  (M61e2, M155b, M155c: a leading `?` not dropped is equivalent because `_normalise` strips non-alphanumerics, and the two
+  whitespace-URL conditions of rule 3 are redundant with each other). Guard battery: 120 mutants, 119 red,
+  1 green (M164b, an extra that restores with `setattr` only: equivalent, no `is` assertion can tell the
+  difference). M59 is retired. The full per-mutant results follow (first failing test per mutant; the plan's map is the intent,
+  this is the observed result).
+
+<details><summary>Module mutants (M-ids as in section 6.4; variants lettered)</summary>
+
+| Mutant | Result | First failing test (tests/test_platform_http.py) |
+|---|---|---|
+| M1 | killed | test_raise_for_status_per_verb[get] |
+| M2 | killed | test_raise_for_status_per_verb[post] |
+| M3 | killed | test_raise_for_status_per_verb[put] |
+| M4 | killed | test_status_variants[400-get] |
+| M5 | killed | test_status_variants[301-get] |
+| M6 | killed | test_returns_resp_not_raise_result[get] |
+| M7 | killed | test_raise_for_status_per_verb[get] |
+| M8 | killed | test_bearer_format_and_first_header[get] |
+| M9 | killed | test_bearer_format_and_first_header[get] |
+| M10 | killed | test_bearer_rejected_before_any_request[''-get] |
+| M11 | killed | test_bearer_rejected_before_any_request[None-get] |
+| M12 | killed | test_bearer_rejected_before_any_request[None-get] |
+| M13 | killed | test_bearer_rejected_before_any_request[''-get] |
+| M14 | killed | test_bearer_rejected_before_any_request[None-get] |
+| M15 | killed | test_bearer_rejected_before_any_request[None-get] |
+| M16 | killed | test_bearer_format_and_first_header[get] |
+| M17 | killed | test_bearer_header_collision_any_case[get] |
+| M18 | killed | test_bearer_header_collision_any_case[get] |
+| M19 | killed | test_headers_authorization_without_bearer_is_accepted_but_still_validated[get] |
+| M20 | killed | test_bearer_format_and_first_header[get] |
+| M21 | killed | test_bearer_format_and_first_header[get] |
+| M22 | killed | test_headers_must_be_a_mapping_of_str[get] |
+| M23 | killed | test_type_checks_no_echo[get] |
+| M24 | killed | test_forwards_only_supplied[get] |
+| M25 | killed | test_forwards_only_supplied[get] |
+| M26 | killed | test_forwards_a_falsy_value_that_is_not_none[get] |
+| M27 | killed | test_forwards_only_supplied[post] |
+| M28 | killed | test_forwards_only_supplied[put] |
+| M29 | killed | test_forwards_only_supplied[post] |
+| M30 | killed | test_raise_for_status_per_verb[get] |
+| M31 | killed | test_raise_for_status_per_verb[get] |
+| M32 | killed | test_status_variants[301-get] |
+| M33 | killed | test_raise_for_status_per_verb[get] |
+| M34 | killed | test_timeout_default_per_verb[get] |
+| M35 | killed | test_timeout_default_per_verb[post] |
+| M36 | killed | test_timeout_default_per_verb[put] |
+| M37 | killed | test_timeout_override_is_forwarded_as_a_float[put] |
+| M38 | killed | test_timeout_override_is_forwarded_as_a_float[get] |
+| M39 | killed | test_forwards_only_supplied[get] |
+| M40 | killed | test_timeout_type_rejected[None-get] |
+| M41 | killed | test_public_surface_constants |
+| M41b | killed | test_public_surface_constants |
+| M42 | killed | test_guard_params_forms[get] |
+| M43 | killed | test_guard_url_query_forms[get] |
+| M44 | killed | test_guard_params_spellings[get] |
+| M45 | killed | test_guard_url_query_spellings[get] |
+| M46 | killed | test_guard_params_forms[get] |
+| M47 | killed | test_secret_names_literal_pin |
+| M48 | killed | test_guard_params_forms[get] |
+| M49 | killed | test_guard_userinfo[get] |
+| M50 | killed | test_guard_accepts_the_real_call_params_and_near_misses[get] |
+| M51 | killed | test_secret_names_literal_pin |
+| M52 | killed | test_guard_params_forms[get] |
+| M53 | killed | test_guard_params_forms[get] |
+| M54 | killed | test_guard_does_not_inspect_bodies_or_headers[post] |
+| M55 | killed | test_guard_params_forms[get] |
+| M56 | killed | test_guard_whitespace_around_the_url_is_unparseable[ |
+| M57 | killed | test_guard_userinfo[get] |
+| M58 | killed | test_guard_params_forms[get] |
+| M60 | killed | test_guard_params_spellings[get] |
+| M61a | killed | test_guard_params_forms[get] |
+| M61b | killed | test_guard_params_forms[get] |
+| M61c | killed | test_guard_params_forms[get] |
+| M61d | killed | test_guard_params_forms[get] |
+| M61e | killed | test_guard_params_forms[get] |
+| M61e2 | SURVIVED |  |
+| M61f | killed | test_guard_params_forms[get] |
+| M61g | killed | test_guard_params_forms[get] |
+| M61h | killed | test_guard_params_forms[get] |
+| M62 | killed | test_unparseable_url[get] |
+| M63 | killed | test_type_checks_no_echo[get] |
+| M64 | killed | test_server_supplied_url_skips_only_the_url_query_scan |
+| M65 | killed | test_server_supplied_url_rejects_any_params[params0] |
+| M66 | killed | test_server_supplied_url_still_rejects_userinfo |
+| M67 | killed | test_raise_for_status_per_verb[put] |
+| M68 | killed | test_bearer_format_and_first_header[put] |
+| M69a | killed | test_get_takes_no_body_keywords |
+| M69b | killed | test_get_takes_no_body_keywords |
+| M70 | killed | test_raise_for_status_per_verb[post] |
+| M81 | killed | test_server_supplied_url_site9_publishes_with_a_secret_looking_session_query[https://upload.example.com/s/abc?upload_id=U1&key=K2&upload_protocol=resumable] |
+| M82 | killed | test_bearer_rejected_before_any_request['\\n'-get] |
+| M83 | killed | test_bearer_requires_https[http://api.example/x-get] |
+| M84 | killed | test_headers_authorization_without_bearer_is_accepted_but_still_validated[get] |
+| M85 | killed | test_type_checks_no_echo[get] |
+| M86 | killed | test_unparseable_url[get] |
+| M87 | killed | test_guard_accepts_the_real_call_params_and_near_misses[get] |
+| M88 | killed | test_type_checks_no_echo[get] |
+| M89 | killed | test_guard_params_spellings[get] |
+| M90 | killed | test_timeout_type_rejected[True-get] |
+| M91 | killed | test_timeout_type_rejected[bad7-get] |
+| M92a | killed | test_forwards_only_supplied[get] |
+| M92b | killed | test_forwards_only_supplied[post] |
+| M92c | killed | test_forwards_only_supplied[put] |
+| M93 | killed | test_forwards_only_supplied[put] |
+| M94 | killed | test_forwards_only_supplied[post] |
+| M95a | killed | test_raise_for_status_per_verb[get] |
+| M95b | killed | test_raise_for_status_per_verb[put] |
+| M96a | killed | test_bearer_omitted_sends_no_authorization[get] |
+| M96b | killed | test_bearer_omitted_sends_no_authorization[get] |
+| M96c | killed | test_headers_with_bearer_are_a_new_dict_and_the_caller_dict_is_untouched[get] |
+| M97 | killed | test_transport_errors_not_wrapped[get] |
+| M97b | killed | test_transport_errors_not_wrapped[get] |
+| M98 | killed | test_raise_for_status_per_verb[post] |
+| M98b | killed | test_raise_for_status_per_verb[get] |
+| M98c | killed | test_raise_for_status_per_verb[put] |
+| M107 | killed | test_unparseable_url[get] |
+| M108 | killed | test_unparseable_params[get] |
+| M109 | killed | test_server_supplied_url_rejects_a_bearer |
+| M110 | killed | test_headers_value_must_fullmatch_printable_ascii[ |
+| M111 | killed | test_headers_name_must_be_an_rfc7230_token[ |
+| M112 | killed | test_guard_params_spellings[get] |
+| M112b | killed | test_normalise_fixpoint |
+| M112c | killed | test_guard_variants[get] |
+| M113 | killed | test_bearer_rejected_before_any_request['a |
+| M114a | killed | test_headers_value_must_fullmatch_printable_ascii[-get] |
+| M114b | killed | test_type_checks_no_echo[get] |
+| M115 | killed | test_bearer_omitted_sends_no_authorization[get] |
+| M116 | killed | test_guard_params_forms[get] |
+| M117 | killed | test_guard_url_query_forms[get] |
+| M118 | killed | test_forwards_only_supplied[put] |
+| M119a | killed | test_bearer_format_and_first_header[get] |
+| M119b | killed | test_bearer_format_and_first_header[post] |
+| M119c | killed | test_bearer_format_and_first_header[put] |
+| M120a | killed | test_forwards_only_supplied[get] |
+| M120b | killed | test_forwards_only_supplied[post] |
+| M120c | killed | test_forwards_only_supplied[put] |
+| M148a | killed | test_server_supplied_url_rejects_any_params[params0] |
+| M148b | killed | test_server_supplied_url_rejects_a_bearer |
+| M154a | killed | test_timeout_range_rejected_before_any_float_conversion[10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000-get] |
+| M154b | killed | test_timeout_range_rejected_before_any_float_conversion[nan-get] |
+| M154c | killed | test_timeout_range_rejected_before_any_float_conversion[inf-get] |
+| M155 | killed | test_guard_whitespace_around_the_url_is_unparseable[ |
+| M155b | SURVIVED |  |
+| M155c | SURVIVED |  |
+| M156 | killed | test_guard_params_forms[get] |
+| M157 | killed | test_timeout_override_is_forwarded_as_a_float[get] |
+| M158 | killed | test_timeout_range_rejected_before_any_float_conversion[0-get] |
+| M159 | killed | test_unparseable_params_real_smokes[get] |
+| M162 | killed | test_server_supplied_url_header_allowlist[X_Goog_Api_Key] |
+| M168 | killed | test_server_supplied_url_rejects_any_params[params0] |
+| M169 | killed | test_server_supplied_url_duplicate_names_after_case_folding |
+| M170 | killed | test_put_flag_is_never_forwarded |
+| M171 | killed | test_server_supplied_url_header_allowlist[ContentType] |
+
+</details>
+
+<details><summary>Guard mutants</summary>
+
+| Mutant | Result | First failing test (tests/test_platform_http.py) |
+|---|---|---|
+| M71 | red | test_ph_g1_real_tree_is_confined |
+| M71c | red | test_ph_g1_control_unknown_httpx_name_fires_in_every_form[Client] |
+| M72 | red | test_ph_g2_real_tree_is_clean |
+| M72c | red | test_ph_g2_control_every_forbidden_import_form_fires[from |
+| M73 | red | test_ph_g4_real_tree_is_clean |
+| M74 | red | test_ph_g4_real_tree_is_clean |
+| M75 | red | test_ph_g4_real_tree_is_clean |
+| M76 | red | test_ph_g4_real_tree_is_clean |
+| M77 | red | test_ph_g2_real_tree_is_clean |
+| M77c1 | red | test_ph_g2_control_every_bad_server_supplied_url_shape_fires[platform_http.put(u, |
+| M77c2 | red | test_ph_g2_control_every_bad_server_supplied_url_shape_fires[platform_http.put(u, |
+| M78 | red | test_ph_g5_the_real_module_is_clean |
+| M78c | red | test_ph_g5_control_imports_fire[import |
+| M79 | red | test_ph_g5_the_real_module_is_clean |
+| M79c | red | test_ph_g5_control_imports_fire[import |
+| M80 | red | test_ph_g1_real_tree_is_confined |
+| M99 | red | test_ph_g1_real_tree_is_confined |
+| M99c | red | test_ph_g1_control_raise_for_status_only_in_the_request_modules |
+| M100 | red | test_ph_g1_real_tree_is_confined |
+| M100c | red | test_ph_g1_control_other_http_clients_fire_in_every_form[import |
+| M101 | red | test_ph_g5_the_real_module_is_clean |
+| M101c | red | test_ph_g5_control_a_new_public_name_fires[def |
+| M102 | red | test_ph_g4_real_tree_is_clean |
+| M102c | red | test_ph_g4_control_call_shape_fires[platform_http.get(_GRAPH, |
+| M103c | red | test_ph_g4_control_aliased_callees_are_counted_and_checked |
+| M104c | red | test_ph_g4_control_upload_url_is_allowlisted_only_for_put_in_publish |
+| M104p | red | test_ph_g2_real_tree_is_clean |
+| M105 | red | test_ph_g4_real_tree_is_clean |
+| M106 | red | test_ph_g4_real_tree_is_clean |
+| M121 | red | test_ph_g1_control_unknown_httpx_name_fires_in_every_form[HTTPTransport] |
+| M122 | red | test_ph_g1_control_unknown_httpx_name_fires_in_every_form[Client] |
+| M123 | red | test_ph_g1_control_unknown_httpx_name_fires_in_every_form[Client] |
+| M124c | red | test_ph_g2_control_a_valid_shape_in_the_wrong_place_fires |
+| M124p | red | test_ph_g2_real_tree_is_clean |
+| M125c | red | test_ph_g2_control_the_constants_are_reads_inside_a_function_only[from |
+| M125p | red | test_ph_g2_real_tree_is_clean |
+| M126a | red | test_ph_g4_control_bad_urls_fire[f"{_GRAPH}/{other.platform_post_id}"-None] |
+| M126b | red | test_ph_g4_real_tree_is_clean |
+| M127 | red | test_ph_g4_control_bad_urls_fire[f"https://graph.facebook.com{ig_user_id}/x"-authority] |
+| M128 | red | test_ph_g4_control_clean_baselines_pass |
+| M129a | red | test_ph_g4_control_call_shape_fires[platform_http.get(u, |
+| M129b | red | test_ph_g4_control_call_shape_fires[platform_http.get(*args)-*args] |
+| M130 | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[assignment-url] |
+| M131a | red | test_ph_g4_control_stores_through_self_cls_classname_or_setattr_fire[self.token_url |
+| M131b | red | test_ph_g4_control_a_second_binding_in_the_class_body_fires[assignment] |
+| M132 | red | test_ph_g4_control_bad_urls_fire["https://u:p@graph.facebook.com/x"-userinfo] |
+| M133 | red | test_ph_g4_control_upload_url_is_allowlisted_only_for_put_in_publish |
+| M134 | red | test_ph_g4_control_bearer_needs_an_https_url_and_no_authorization_header |
+| M135 | red | test_ph_g4_caller_list_is_derived_and_pinned |
+| M136 | red | test_ph_g1_real_tree_non_vacuity |
+| M137a | red | test_network_guard_control |
+| M137b | red | test_network_guard_control |
+| M138a | red | test_bearer_rejected_before_any_request['tok\\x7f'-get] |
+| M138b | red | test_bearer_rejected_before_any_request['tok\\x7f'-get] |
+| M138c | red | test_bearer_rejected_before_any_request[' |
+| M139 | red | test_headers_value_must_fullmatch_printable_ascii[-get] |
+| M140a | red | test_headers_name_must_be_an_rfc7230_token[-get] |
+| M140b | red | test_headers_value_must_fullmatch_printable_ascii[-get] |
+| M140c | red | test_timeout_messages_do_not_echo |
+| M141c | red | test_ph_g2_control_captures_and_non_callee_uses_fire[x |
+| M141p | red | test_ph_g2_real_tree_is_clean |
+| M142c | red | test_ph_g2_control_every_bad_server_supplied_url_shape_fires[platform_http.put(u, |
+| M142p | red | test_ph_g2_real_tree_is_clean |
+| M143 | red | test_ph_g4_control_upload_url_is_allowlisted_only_for_put_in_publish |
+| M144 | red | test_ph_g4_control_bad_urls_fire["https://graph.facebook.com/x;key=1"-';'] |
+| M145 | red | test_ph_g4_control_bad_urls_fire["https://graph.facebook.com/x#x"-'#'] |
+| M146a | red | test_ph_g4_caller_list_is_derived_and_pinned |
+| M146b | red | test_ph_g4_real_tree_non_vacuity_by_kind |
+| M147a | red | test_ph_g1_control_other_http_clients_fire_in_every_form[import |
+| M147b | red | test_ph_g1_control_other_http_clients_fire_in_every_form[from |
+| M149 | red | test_ph_g4_control_bad_urls_fire[f"https://graph.facebook.com{ig_user_id}/x"-authority] |
+| M150a | red | test_ph_g4_control_bad_urls_fire[f"{_GRAPH}/{ig_user_id:{q}}"-format |
+| M150b | red | test_ph_g4_control_bad_urls_fire[f"{_GRAPH}/{ig_user_id!r}"-conversion] |
+| M151a | red | test_ph_g4_control_bad_urls_fire[f"{_GRAPH}/{other.platform_post_id}"-None] |
+| M151b | red | test_ph_g4_control_bad_urls_fire[f"{_GRAPH}/{page_id}"-None] |
+| M151c | red | test_ph_g4_control_bad_urls_fire[f"{_GRAPH}/{cut.platform_post_id}"-None] |
+| M152 | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[assignment-url] |
+| M153a | red | test_ph_g4_control_stores_through_self_cls_classname_or_setattr_fire[self.token_url |
+| M153b | red | test_ph_g4_control_stores_through_self_cls_classname_or_setattr_fire[setattr(self, |
+| M160c1 | red | test_ph_g2_control_every_bad_server_supplied_url_shape_fires[platform_http.put(u, |
+| M160c2 | red | test_ph_g2_control_every_bad_server_supplied_url_shape_fires[platform_http.put(u, |
+| M160c3 | red | test_ph_g2_control_every_bad_server_supplied_url_shape_fires[platform_http.put(u, |
+| M160p | red | test_ph_g2_real_tree_is_clean |
+| M161a | red | test_ph_g5_the_real_module_is_clean |
+| M161b | red | test_ph_g5_the_real_module_is_clean |
+| M161c | red | test_ph_g5_control_imports_fire[from |
+| M161d | red | test_ph_g5_control_imports_fire[from |
+| M163-annassign | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[annotated |
+| M163-annotation only counted | red | test_ph_g4_control_module_name_baselines_pass |
+| M163-assign | red | test_ph_g4_real_tree_is_clean |
+| M163-async def | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[async |
+| M163-augassign | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[augmented |
+| M163-class | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[class-url] |
+| M163-comprehension | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[comprehension |
+| M163-def | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[def-url] |
+| M163-del | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[del-url] |
+| M163-except | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[except |
+| M163-for | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[for-url] |
+| M163-import | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[import |
+| M163-import as | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[import |
+| M163-match as | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[match |
+| M163-match mapping | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[match |
+| M163-match star | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[match |
+| M163-param | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[function |
+| M163-star import | red | test_ph_g4_control_a_star_import_fails_closed |
+| M163-star report | red | test_ph_g4_control_a_star_import_fails_closed |
+| M163-starred | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[star |
+| M163-tuple | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[tuple |
+| M163-type alias | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[type |
+| M163-type param | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[type |
+| M163-walrus | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[walrus-url] |
+| M163-with | red | test_ph_g4_control_a_second_binding_of_a_module_name_fires[with-url] |
+| M164 | red | test_network_guard_control |
+| M164b | GREEN (equivalent) |  |
+| M165 | red | test_ph_g4_control_bad_urls_fire["http://graph.facebook.com/x"-https://] |
+| M166a | red | test_ph_g1_control_unknown_httpx_name_fires_in_every_form[Client] |
+| M166b | red | test_ph_g1_control_unknown_httpx_name_fires_in_every_form[AsyncClient] |
+| M166c | red | test_ph_g1_control_unknown_httpx_name_fires_in_every_form[request] |
+| M167 | red | test_ph_g4_real_tree_is_clean |
+| X-inbody | red | test_ph_g2_control_the_constants_are_reads_inside_a_function_only[from |
+
+</details>
+
+- **Deviations from the spec text (all stricter, none weaker)**: the bearer check order is value, then `server_supplied_url`, then
+  https, then the `Authorization` collision; a non-bool `server_supplied_url` is a `TypeError`; the decode cap returns an
+  internal sentinel the guard rejects with a fixed message instead of raising from `_normalise`; PH-G2 also fails the module used
+  as a bare value and any `platform_http.<attr>` outside the six public names; PH-G4 treats any `setattr`/`delattr` with a
+  non-constant attribute name as a store that blocks `self.<attr>` resolution and reports a star-import as a problem in
+  itself; the network-guard control checks all four blocked routes and the recorded order, and asserts the guard starts with an
+  empty list.
+- **Commit 4**: this documentation commit.
 
 ## 11. Review history
 
