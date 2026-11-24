@@ -81,6 +81,8 @@ NEW = {"now": ("safe_fetch", "callable")}
 BRIDGE_EXTRAS = frozenset({"httpx", "threading", "socket"})
 
 # Every non-moved baseline top-level definition of asset_sourcer, plus the imported names tests reach on it.
+# (C3 then moved compute_pins_fingerprint, EMPTY_PINS_FINGERPRINT and compute_pins_fingerprint_for_render out to
+# engine/render/render_output.py, so those three are no longer defined here and are not listed.)
 STAYS = frozenset({
     "_log",
     "_PERMISSIVE_LICENSES",
@@ -122,9 +124,6 @@ STAYS = frozenset({
     "_generate_gated_hf_asset",
     "resolve_beat_assets",
     "_fp",
-    "compute_pins_fingerprint",
-    "EMPTY_PINS_FINGERPRINT",
-    "compute_pins_fingerprint_for_render",
     "resolve_or_reuse",
     # imported names that tests legitimately reach on asset_sourcer
     "settings",

@@ -128,7 +128,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `tasks/common.py` | `job_task()` — the shared Job lifecycle decorator every task body runs under (atomic claim with fencing-token bump, captured once as an immutable `Claim` → heartbeat thread → `prepare` → body → fenced done-stamp → `after_commit`; retry-reset or failure stamp + per-job-type owner rollback on error, every write a compare-and-set); `heartbeat()`, `rollback_owner()`, `should_retry()`/`is_transient_error()` |
 | `tasks/enrich_context.py` | `enrich_context(job_id)` — `evaluate_context()` → `is_structured()` guard → optional `llm_enrich()` → stores `reel.enriched_context` → creates + enqueues the generate job |
 | `tasks/generate.py` | `generate_guide(job_id)` — a short orchestration sequence (Phase 7q decomposition) over `_try_structured_path()` / `_run_standard_path_attempts()` / `_maybe_regenerate_caption_hashtags()` / `_maybe_generate_hook_variants()` / `_persist_guide()`, sharing one `_GenerationContext` dataclass; retries transient failures twice |
-| `tasks/render.py` | `render_cut(job_id)` — `resolve_or_reuse()` per beat (under `safe_fetch.asset_budget`, asset time only, timed with `safe_fetch.now()`) → `synth_to_budget()` → TTS-accurate timecodes → atomic MP4; writes `thumbnail_candidates`, `black_frame_beat_indices`, `rendered_pins_fingerprint`, `rendered_guide_fingerprint`, `subtitle_path`; retries transient failures twice |
+| `tasks/render.py` | `render_cut(job_id)` — `resolve_or_reuse()` per beat (under `safe_fetch.asset_budget`, asset time only, timed with `safe_fetch.now()`) → `synth_to_budget()` → TTS-accurate timecodes → atomic MP4; after `composite_cut()` and its posted-while-rendering refresh it builds a `RenderOutput` and calls `render_output.record()`, which writes the eight render-artifact columns (`video_path`, `duration_s`, `thumbnail_path`, `thumbnail_candidates`, `black_frame_beat_indices`, `subtitle_path`, `rendered_pins_fingerprint`, `rendered_guide_fingerprint`) — Phase 8h; retries transient failures twice |
 | `tasks/publish.py` | `publish_cut(job_id)` — `assert_safe_to_publish()` → `assert_video_matches_pins()` → `assert_video_matches_guide()` → `build_published_caption()` → dispatch via `engine/publish/registry.py` → commit `platform_post_id` the moment the upload is live; `max_retries=0` (irreversible external side effect) |
 | `tasks/metrics.py` | `pull_publish_metrics()` — Celery beat task (every 6 h); pulls views/likes/comments per published cut via `get_metrics_fetcher()`, forward-fills `Cut.*`, appends a `CutMetricSnapshot` row; tolerates per-cut failures |
 | `tasks/maintenance.py` | `reap_stuck_jobs()` — Celery beat, every 60 s; fails/resumes stale jobs (see "Reliability" below) via compare-and-set, rolling back only the owner state the job's type owns |
@@ -145,7 +145,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 | File | Responsibility |
 |---|---|
-| `guide_schema.py` | `Beat`, `PlatformGuide`, `MasterGuide` Pydantic models; `compute_guide_fingerprint()` |
+| `guide_schema.py` | `Beat`, `PlatformGuide`, `MasterGuide` Pydantic models (`compute_guide_fingerprint()` moved to `engine/render/render_output.py` in Phase 8h) |
 | `llm.py` | `LLMProvider` + `OllamaProvider` (OpenAI-compatible, captures token usage); `get_llm_provider()`, `get_enrichment_provider()`, `is_nvidia_generation()`; `validate_configured_models()` — best-effort startup model-availability ping |
 | `pricing.py` | `llm_cost_usd()` — NVIDIA per-token cost from `Settings` rates (0 until configured) |
 | `estimate.py` | `estimate_generation()` — pre-generation call-count/time/cost estimate sourced from real `StageEvent` history |
@@ -165,11 +165,12 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 | File | Responsibility |
 |---|---|
-| `asset_sourcer.py` | the adapters and the ledger: `PexelsVideoSource` + `WikipediaImageSource` (+ license metadata) + `HuggingFaceVideoSource`/`HuggingFaceImageSource`, the adapters' own limits (byte caps, per-download deadlines, per-search budgets) passed to `safe_fetch` as arguments, the two URL allowlists `_pexels_url_ok()` / `_wikimedia_url_ok()` (passed as `url_ok` to `safe_fetch.open_download()`); the refusal-marker WRITE (the marker's name/stamp/check are `media_policy`'s); pure selection decisions `_choose_video_file()` / `_license_from_extmetadata()` / `_image_extension()` (Phase 7z); remote-id validation `_numeric_id()` / `_title_id()`, `PexelsVideoSource._pick()` (Phase 7aa); fallback chain Wikipedia → Pexels → HF Video → HF Image → black frame; `_generate_gated_hf_asset()` — shared gate/record_stage/cost shell for both HF tiers; `resolve_or_reuse()` — per-beat asset pinning; `LocalMusicSource.find()`; `compute_pins_fingerprint()` / `compute_pins_fingerprint_for_render()`. No socket, redirect, decode or pixel logic (Phase 8g: that moved to the two modules below) |
+| `asset_sourcer.py` | the adapters and the ledger: `PexelsVideoSource` + `WikipediaImageSource` (+ license metadata) + `HuggingFaceVideoSource`/`HuggingFaceImageSource`, the adapters' own limits (byte caps, per-download deadlines, per-search budgets) passed to `safe_fetch` as arguments, the two URL allowlists `_pexels_url_ok()` / `_wikimedia_url_ok()` (passed as `url_ok` to `safe_fetch.open_download()`); the refusal-marker WRITE (the marker's name/stamp/check are `media_policy`'s); pure selection decisions `_choose_video_file()` / `_license_from_extmetadata()` / `_image_extension()` (Phase 7z); remote-id validation `_numeric_id()` / `_title_id()`, `PexelsVideoSource._pick()` (Phase 7aa); fallback chain Wikipedia → Pexels → HF Video → HF Image → black frame; `_generate_gated_hf_asset()` — shared gate/record_stage/cost shell for both HF tiers; `resolve_or_reuse()` — per-beat asset pinning; `LocalMusicSource.find()` (the pins-fingerprint functions moved to `render_output.py` in Phase 8h). No socket, redirect, decode or pixel logic (Phase 8g: that moved to the two modules below) |
 | `safe_fetch.py` | the hardened fetch layer (Phase 8g, split out of `asset_sourcer.py`): `open_download()` (https only, redirects followed by hand with `url_ok` re-checked on every hop, size caps, per-hop and wall-clock deadlines, `_Watchdog`, DNS gate), `iter_capped()`, `api_get()` / `api_post()` (streamed and capped, with their own deadline), `body_too_large()` / `TooLarge`, `https_host()`, `MAX_API_JSON_BYTES`, and the clock and the render-wide budget: `now()` (reads `_monotonic`, the one patch point), `asset_budget()` (1200 s per render), `clip_to_asset_budget()`, `asset_budget_spent()`, `RENDER_ASSET_BUDGET_S`. Host-agnostic: the allowlist is the caller's `url_ok`; knows nothing about Pexels, Wikipedia or Hugging Face. Imports nothing from `api`/`engine` |
 | `media_policy.py` | the media policy (Phase 8g, split out of `asset_sourcer.py`): `sniff_ok()` (magic bytes), `image_ok()` (Pillow decode, 50 Mpx / 20 Mpx WebP, TIFF tile guard), `fit_image()` (downscale) + `OversizedImage`, `refusal_marker()` / `refusal_stamp()` / `refusal_recorded()` (`.refused` markers), `require_media()`, `cached_media_ok()`. Admits, downscales or refuses bytes it is handed and never fetches; depends on nothing in `safe_fetch` or `asset_sourcer`; Pillow is imported lazily |
+| `render_output.py` | Phase 8h (C3): the one owner of the eight `Cut` columns a successful render writes together and replaces wholesale, and of the publish-time staleness checks on two of them. `RENDER_ARTIFACT_COLUMNS`; frozen `RenderOutput` (video path, candidate thumbnails, duration, black-frame beats, subtitle path — `thumbnail_path` is `candidates[0]`); `record(db, cut, output)` (computes into locals, then one assignment block: all or none in memory; no commit/flush/refresh/expire; called by `render_cut` after `composite_cut()` and its posted-while-rendering refresh); `compute_pins_fingerprint()` / `compute_pins_fingerprint_for_render()` / `EMPTY_PINS_FINGERPRINT` / `compute_guide_fingerprint()` (moved here unchanged); `assert_pins_not_stale()` / `assert_guide_not_stale()` (`None` skips without computing, else `ValueError`). Depends on `api.models` and the standard library only |
 | `pricing.py` | `hf_image_cost_usd()` / `hf_video_cost_usd()` — HF asset-generation cost (0 until configured) |
-| `tts.py` | `EdgeTTSProvider`/`KokoroProvider`/`SilentProvider`; `synthesize()` + `synth_to_budget()` (±25% rate adjustment); `CURATED_EDGE_VOICES` |
+| `tts.py` | `EdgeTTSProvider`/`KokoroProvider`/`SilentProvider`; `synthesize()` + `synth_to_budget()` (±25% rate adjustment); `audio_duration()` (public since Phase 8h); `CURATED_EDGE_VOICES` |
 | `captions.py` | `transcribe_audio()` — one Whisper pass producing both `.words` (burned-in text) and `.segments` (SRT export); no-op if Whisper isn't installed |
 | `srt.py` | `write_srt()` — pure `list[CaptionSegment]` → `.srt` formatter, no ffmpeg/network |
 | `compositor.py` | `composite_cut()` — MoviePy stage + FFmpeg drawtext stage, returns `(duration, thumbnail_candidates, subtitle_path)`; reader lifetime managed via `contextlib.ExitStack` (Phase 7r) rather than manual tuple-threading; `_build_collage_clip()` for a 2-item beat; `CURATED_TEXT_COLORS`; `_proportional_spans()`/`_split_vo_sentences()` (Phase 7y) — the shared placement core of the no-Whisper drawtext and SRT timing fallbacks; music mixing with sidechain ducking; atomic `os.replace()` |
@@ -180,7 +181,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 |---|---|
 | `base.py` | `Publisher` interface + `PublishResult` dataclass; `publish()` takes an explicit `caption` param |
 | `registry.py` | `get_publisher(platform)` / `credential_provider_for_platform(platform)` / `get_metrics_fetcher(platform)` (returns `None`, not a raise, for an unmapped platform) |
-| `gate.py` | `assert_safe_to_publish()` / `unsafe_assets()`; `assert_video_matches_pins()`; `assert_video_matches_guide()` — the three publish-time gates |
+| `gate.py` | `assert_safe_to_publish()` / `unsafe_assets()`; `assert_video_matches_pins()`; `assert_video_matches_guide()` — the three publish-time gates (the last two are one-line delegates to `render_output.assert_pins_not_stale()` / `assert_guide_not_stale()`) |
 | `attribution.py` | `build_attribution_block()` / `build_published_caption()` — appends Wikipedia attribution without mutating the DB-stored caption |
 | `metrics.py` | `EngagementMetrics` + `MetricsFetcher` base; `YouTubeMetricsFetcher`, `InstagramMetricsFetcher` (with metric-name-drift detection via `record_stage`) |
 | `youtube.py` | `YouTubePublisher` — resumable upload; best-effort `captions.insert` when `subtitle_path` is set; `get_valid_access_token()` |
@@ -195,7 +196,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 
 ### `tests/`
 
-78 test files + `conftest.py` (and two helper modules, `_seam_oracle.py` / `_seam_ast.py`, that are not test files), **3075 tests run by default / 3076 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
+79 test files + `conftest.py` (and two helper modules, `_seam_oracle.py` / `_seam_ast.py`, that are not test files), **3160 tests run by default / 3161 total** (1 golden-reel test, marked `golden`, is deselected by default — real edge-tts + real ffmpeg, ~20 s, run explicitly by CI). Counts below are what `pytest --collect-only` actually reports for each file today:
 
 | File | Tests | File | Tests |
 |---|---|---|---|
@@ -205,7 +206,7 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_compositor.py` | 31 | `test_r4_gaps.py` | 30 |
 | `test_generate_task.py` | 30 | `test_common.py` | 18 |
 | `test_audio_text_sync.py` | 16 | `test_guide_edit.py` | 16 |
-| `test_render_task.py` | 19 | `test_tts.py` | 16 |
+| `test_render_task.py` | 20 | `test_tts.py` | 16 |
 | `test_asset_sourcer_cost.py` | 15 | `test_enrichment.py` | 38 |
 | `test_state.py` | 15 | `test_variants_router.py` | 8 |
 | `test_asset_sourcer.py` | 14 | `test_context_enricher.py` | 14 |
@@ -238,8 +239,9 @@ The browser never fetches JSON for its own rendering. Every route except `GET /a
 | `test_display.py` | 173 | `test_hidden_text.py` | 53 |
 | `test_youtube_token_refresh.py` | 24 | `test_jobs_router.py` | 21 |
 | `test_job_claim.py` | 100 | `test_module_seams.py` | 312 |
+| `test_render_output.py` | 84 | | |
 
-Notable areas of coverage beyond what the filenames suggest: `test_job_lifecycle.py` and `test_maintenance.py` together carry the Job-fencing-token mechanism's regression suite (zombie resumed-while-still-alive detection at every `heartbeat()`/`lock_job()`/done-stamp/CAS checkpoint, differentiated per-job-type resume budgets), and `test_job_claim.py` pins the structure of that mechanism (a signature guard against any fence parameter having a default, a 13-scenario behavioral ledger of exactly which `_advance` writes are unfenced, an AST guard against writing `Job` rows around `_advance`, and the two deliberate SQL deltas); `test_compositor.py` covers the `ExitStack` reader-lifetime migration and the 2-up collage layout with real ffmpeg frame sampling; `test_evaluator.py` covers all 17 per-axis scorer functions in isolation; `test_publish_gate.py`/`test_cuts_publish_router.py` cover both staleness gates end-to-end; `test_module_seams.py` guards the `safe_fetch` / `media_policy` split (AST guards G1-G6: no stale or moved-name access through `asset_sourcer` in tests, strict patches, no seam captured in production code, one clock, dependency direction, no transport in `asset_sourcer`; plus seam probes that patch a sentinel on the owning module and watch each consumer use it, fixture-effectiveness tests for the conftest switch-offs, and logger-name tests), its checkers live in `tests/_seam_ast.py` and its name oracle in `tests/_seam_oracle.py`; the sourcer test files patch the OWNING module (`safe_fetch._http_stream`, `safe_fetch._monotonic`, `media_policy.image_ok`, ...) and conftest's four autouse switch-offs do too.
+Notable areas of coverage beyond what the filenames suggest: `test_job_lifecycle.py` and `test_maintenance.py` together carry the Job-fencing-token mechanism's regression suite (zombie resumed-while-still-alive detection at every `heartbeat()`/`lock_job()`/done-stamp/CAS checkpoint, differentiated per-job-type resume budgets), and `test_job_claim.py` pins the structure of that mechanism (a signature guard against any fence parameter having a default, a 13-scenario behavioral ledger of exactly which `_advance` writes are unfenced, an AST guard against writing `Job` rows around `_advance`, and the two deliberate SQL deltas); `test_compositor.py` covers the `ExitStack` reader-lifetime migration and the 2-up collage layout with real ffmpeg frame sampling; `test_evaluator.py` covers all 17 per-axis scorer functions in isolation; `test_publish_gate.py`/`test_cuts_publish_router.py` cover both staleness gates end-to-end; `test_render_output.py` pins the `render_output` module that owns the eight render-artifact columns and both fingerprints (`record()` on a real `Cut`, the checks and writer-to-reader round trips, plus AST/ledger guards G-A..G-D: every `Cut` column classified, `record()` changes exactly the eight, no other writer in `api/`/`engine/`/`worker/`, import direction); `test_module_seams.py` guards the `safe_fetch` / `media_policy` split (AST guards G1-G6: no stale or moved-name access through `asset_sourcer` in tests, strict patches, no seam captured in production code, one clock, dependency direction, no transport in `asset_sourcer`; plus seam probes that patch a sentinel on the owning module and watch each consumer use it, fixture-effectiveness tests for the conftest switch-offs, and logger-name tests), its checkers live in `tests/_seam_ast.py` and its name oracle in `tests/_seam_oracle.py`; the sourcer test files patch the OWNING module (`safe_fetch._http_stream`, `safe_fetch._monotonic`, `media_policy.image_ok`, ...) and conftest's four autouse switch-offs do too.
 
 ---
 
@@ -447,7 +449,7 @@ The `/api/reels/{id}` pipeline panel sums `cost_usd`/`latency_ms` across stages,
 3. If all pins have matching `resolved_from`: returns pinned assets directly (no API call)
 4. Otherwise: calls `resolve_beat_assets()`, deletes stale pins, inserts new ones with the fingerprint
 
-This means editing beat 3's VO and re-rendering only triggers a new API call for beat 3; all other beats reuse cached pins. `compute_pins_fingerprint_for_render()` hashes the full set of currently-bound pins and is snapshotted onto `Cut.rendered_pins_fingerprint` at render success (see "Publishing" below).
+This means editing beat 3's VO and re-rendering only triggers a new API call for beat 3; all other beats reuse cached pins. `render_output.compute_pins_fingerprint_for_render()` hashes the full set of currently-bound pins and is snapshotted onto `Cut.rendered_pins_fingerprint` by `render_output.record()` at render success (see "Publishing" below).
 
 ---
 
@@ -523,6 +525,8 @@ unlink .notxt.mp4  (in finally block)
 
 Every drawtext clause carries `:expansion=none` — disables ffmpeg's own `%`-expansion engine wholesale, since the previous `\%` escape for a literal percent sign was never a working escape at all (confirmed empirically against real ffmpeg) and crashed the render on any on-screen text containing `%`. Font: 60px white, black shadow, centered at 73% of frame height. Up to 5 segments per beat.
 
+**Recording the result** (Phase 8h): once `composite_cut()` has returned and `render_cut` has re-read the cut (the "posted while it rendered" check), it builds a `render_output.RenderOutput` and calls `render_output.record(db, cut, output)`, then moves the cut to `in_review`. `record()` computes both fingerprints and every stored value into locals, then assigns the eight render-artifact columns in one block — all or none in memory — without committing, flushing, refreshing or expiring; the done-stamp commit in `job_task` lands them atomically with `status = done`. A re-render replaces all eight wholesale (an operator's thumbnail pick from the previous render is reset).
+
 ---
 
 ## Asset sourcing
@@ -575,8 +579,8 @@ Every drawtext clause carries `:expansion=none` — disables ffmpeg's own `%`-ex
 
 Three gates run in `publish_cut`, in order, before any upload:
 1. `assert_safe_to_publish()` — every bound `CutAsset`'s `Asset.safe_to_publish`
-2. `assert_video_matches_pins()` — `Cut.rendered_pins_fingerprint` vs. a fresh `compute_pins_fingerprint_for_render()` (catches a re-pin followed by a render that failed before `video_path` caught up)
-3. `assert_video_matches_guide()` — `Cut.rendered_guide_fingerprint` vs. a fresh `compute_guide_fingerprint(cut.guide)` (catches a guide edit followed by a failed re-render)
+2. `assert_video_matches_pins()` (delegates to `render_output.assert_pins_not_stale()`) — `Cut.rendered_pins_fingerprint` vs. a fresh `render_output.compute_pins_fingerprint_for_render()` (catches a re-pin followed by a render that failed before `video_path` caught up)
+3. `assert_video_matches_guide()` (delegates to `render_output.assert_guide_not_stale()`) — `Cut.rendered_guide_fingerprint` vs. a fresh `render_output.compute_guide_fingerprint(cut.guide)` (catches a guide edit followed by a failed re-render)
 
 Both fingerprint checks treat `None` as "unknown, don't block" (pre-migration/never-rendered rows), never as a mismatch. None of the three gates run on the "finalize" branch (a cut that already has `platform_post_id` — nothing is uploaded there, so blocking it would leave a live post unrecorded with no operator way out).
 
@@ -639,7 +643,7 @@ MasterGuide:
   cuts: list[PlatformGuide]       # one per requested platform
 ```
 
-`compute_guide_fingerprint(guide)` — sha256 of `json.dumps(guide, sort_keys=True)` — fingerprints a guide's content for the publish-time staleness gate; dict-key order is normalized, list order (beats, hashtags) is deliberately significant.
+`render_output.compute_guide_fingerprint(guide)` — sha256 of `json.dumps(guide, sort_keys=True)` — fingerprints a guide's content for the publish-time staleness gate; dict-key order is normalized, list order (beats, hashtags) is deliberately significant.
 
 ---
 

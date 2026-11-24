@@ -448,10 +448,10 @@ def test_update_cut_untouched_beat_fields_do_not_change_the_guide_or_its_fingerp
     operator actually touched it, and a browser always re-encodes a <textarea>'s newlines
     as CRLF on submit. Before this fix, a caption-only edit (or any edit that leaves a
     multi-line vo_script textarea untouched) still rewrote cut.guide's vo_script with LF
-    replaced by CRLF, changing compute_guide_fingerprint()'s output for a render that
+    replaced by CRLF, changing render_output.compute_guide_fingerprint()'s output for a render that
     never actually went stale -- see docs/specs/2026-09-stale-video-on-failed-rerender-
     system-design.md."""
-    from engine.generation.guide_schema import compute_guide_fingerprint
+    from engine.render.render_output import compute_guide_fingerprint
 
     cut_id = _make_cut_with_guide(client._session_factory, _MULTILINE_GUIDE)
     fingerprint_before = compute_guide_fingerprint(_MULTILINE_GUIDE)
@@ -482,7 +482,7 @@ def test_update_cut_still_writes_through_a_genuine_vo_script_edit(client):
     """The other half of the regression guard above: a REAL content change must still be
     written and must still change the fingerprint -- the fix must not make update_cut
     silently drop real edits while chasing the false-positive above."""
-    from engine.generation.guide_schema import compute_guide_fingerprint
+    from engine.render.render_output import compute_guide_fingerprint
 
     cut_id = _make_cut_with_guide(client._session_factory, _MULTILINE_GUIDE)
     fingerprint_before = compute_guide_fingerprint(_MULTILINE_GUIDE)
@@ -514,7 +514,7 @@ def test_update_cut_a_stored_value_with_pre_existing_whitespace_is_not_changed_b
     comparison target didn't. Fails closed (only over-blocks publish, never bypasses
     the gate) but is still a real, fixable false positive -- normalizing BOTH sides
     before comparing closes it fully."""
-    from engine.generation.guide_schema import compute_guide_fingerprint
+    from engine.render.render_output import compute_guide_fingerprint
 
     guide_with_untrimmed_visual_direction = {
         **_MULTILINE_GUIDE,

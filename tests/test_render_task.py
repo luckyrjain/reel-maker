@@ -1,4 +1,6 @@
 """Tests for the render_cut task's failure handling and success-path cleanup."""
+import hashlib
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -235,10 +237,10 @@ def test_rendered_pins_fingerprint_is_computed_and_assigned_on_success():
     stronger claim — that the fingerprint actually reflects real pins a real render bound —
     is proven by the real-DB end-to-end test in tests/test_publish_gate.py, not here.
 
-    render_cut must call compute_pins_fingerprint_for_render(), NOT the raw
-    compute_pins_fingerprint() — the _for_render wrapper is what guarantees a successful
-    all-black-frame render still writes a real, comparable value instead of None (see that
-    function's docstring in engine/render/asset_sourcer.py)."""
+    render_cut (through render_output.record()) must call compute_pins_fingerprint_for_render(),
+    NOT the raw compute_pins_fingerprint() — the _for_render wrapper is what guarantees a
+    successful all-black-frame render still writes a real, comparable value instead of None
+    (see that function's docstring in engine/render/render_output.py)."""
     from worker.tasks.render import render_cut
 
     job = _job()
@@ -259,7 +261,7 @@ def test_rendered_pins_fingerprint_is_computed_and_assigned_on_success():
         patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
         patch("worker.tasks.render.record_stage"),
         patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"], _FAKE_SRT_PATH)),
-        patch("worker.tasks.render.compute_pins_fingerprint_for_render", return_value="deadbeef" * 8) as mock_fp,
+        patch("engine.render.render_output.compute_pins_fingerprint_for_render", return_value="deadbeef" * 8) as mock_fp,
     ):
         render_cut(1)
 
@@ -293,7 +295,7 @@ def test_rendered_guide_fingerprint_is_computed_and_assigned_on_success():
         patch("worker.tasks.render.resolve_or_reuse", return_value=[(MagicMock(), None)]),
         patch("worker.tasks.render.record_stage"),
         patch("worker.tasks.render.composite_cut", return_value=(18.0, ["thumb.jpg"], _FAKE_SRT_PATH)),
-        patch("worker.tasks.render.compute_guide_fingerprint", return_value="feedface" * 8) as mock_fp,
+        patch("engine.render.render_output.compute_guide_fingerprint", return_value="feedface" * 8) as mock_fp,
     ):
         render_cut(1)
 
@@ -650,3 +652,63 @@ def test_only_asset_time_counts_against_the_render_budget_not_tts():
     B = safe_fetch.RENDER_ASSET_BUDGET_S
     # beat k starts at 1000 + 600*k; its deadline is that + (B - 100*k) -- the earlier beats' TTS is not charged
     assert seen == [1000.0 + B, 1600.0 + (B - 100.0), 2200.0 + (B - 200.0)]
+
+
+def test_render_cut_records_every_render_artifact_column():
+    """Pins what render_cut writes onto the Cut for one successful render, so the writer can
+    be moved without losing a column. The test_*_is_*/test_subtitle_* tests above each pin
+    one or two of these columns; nothing else asserted video_path, thumbnail_path,
+    thumbnail_candidates or duration_s. Two DISTINCT candidates (so a wrong index or a
+    reversed list differs), a non-integral duration that is not the guide's beat sum of
+    18.0 (so sum/int/round mutants differ), a non-empty black-frame list and a subtitle."""
+    from worker.tasks.render import render_cut
+
+    job = _job()
+    cut = _cut()
+    reel = _reel()
+    db = MagicMock()
+    db.get.side_effect = lambda model, _id: job if model is models.Job else (
+        cut if model is models.Cut else reel
+    )
+
+    cand0 = Path("/frames/10/candidate_a.jpg")
+    cand1 = Path("/frames/10/candidate_b.jpg")
+    cand2 = Path("/frames/10/candidate_c.jpg")
+    cand3 = Path("/frames/10/candidate_d.jpg")
+    srt = Path("/frames/10/captions_x.srt")
+
+    def fake_resolve(db, cut, beat_index, **kwargs):
+        if beat_index in (0, 2):
+            return [(None, None)]
+        return [(MagicMock(), MagicMock())]
+
+    with (
+        patch("worker.tasks.common.SessionLocal", return_value=db),
+        patch("worker.tasks.render.get_asset_sourcer"),
+        patch("worker.tasks.render.get_wiki_sourcer"),
+        patch("worker.tasks.render.get_hf_sourcer"),
+        patch("worker.tasks.render.get_hf_video_sourcer"),
+        patch("worker.tasks.render.get_tts_provider"),
+        patch("worker.tasks.render.resolve_or_reuse", side_effect=fake_resolve),
+        patch("worker.tasks.render.record_stage"),
+        patch("worker.tasks.render.composite_cut", return_value=(17.25, [cand0, cand1, cand2, cand3], srt)) as mock_composite,
+    ):
+        render_cut(1)
+
+    out_path = mock_composite.call_args.kwargs["output_path"]
+    thumb_base = mock_composite.call_args.kwargs["thumbnail_path"]
+    assert out_path != thumb_base, "the two paths composite_cut was handed must be distinguishable"
+    assert str(thumb_base) not in (str(cand0), str(cand1), str(cand2), str(cand3)), "candidates must not coincide with the base path"
+
+    assert cut.video_path == str(out_path)
+    assert cut.duration_s == 17.25
+    assert cut.thumbnail_path == str(cand0)
+    assert cut.thumbnail_candidates == [str(cand0), str(cand1), str(cand2), str(cand3)]
+    assert cut.black_frame_beat_indices == [0, 2]
+    assert cut.subtitle_path == str(srt)
+    # The fingerprint functions run for real here (db is a MagicMock, so the pins read sees no
+    # rows); their exact values are pinned by the patch-based tests above and the gate tests.
+    assert isinstance(cut.rendered_pins_fingerprint, str) and cut.rendered_pins_fingerprint
+    assert cut.rendered_guide_fingerprint == hashlib.sha256(
+        json.dumps(_GUIDE, sort_keys=True).encode()
+    ).hexdigest()[:64]

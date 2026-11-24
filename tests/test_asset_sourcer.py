@@ -6,12 +6,14 @@ from sqlalchemy.orm import sessionmaker
 
 from api import models
 from engine.render.asset_sourcer import (
-    EMPTY_PINS_FINGERPRINT,
     SourcedAsset,
     _fp,
+    resolve_or_reuse,
+)
+from engine.render.render_output import (
+    EMPTY_PINS_FINGERPRINT,
     compute_pins_fingerprint,
     compute_pins_fingerprint_for_render,
-    resolve_or_reuse,
 )
 
 
@@ -256,9 +258,10 @@ def test_compute_pins_fingerprint_unaffected_when_untouched_beats_pin_stays_the_
 
 
 # ---------------------------------------------------------------------------
-# compute_pins_fingerprint_for_render — the wrapper render.py/gate.py must always use for
-# Cut.rendered_pins_fingerprint, never the raw compute_pins_fingerprint() above (see
-# EMPTY_PINS_FINGERPRINT's docstring in engine/render/asset_sourcer.py: using the raw
+# compute_pins_fingerprint_for_render — the wrapper render_output.record() and
+# render_output.assert_pins_not_stale() must always use for Cut.rendered_pins_fingerprint,
+# never the raw compute_pins_fingerprint() above (see EMPTY_PINS_FINGERPRINT's comment in
+# engine/render/render_output.py: using the raw
 # function at either the write or read site reopens the black-frame staleness hole
 # independent review caught).
 # ---------------------------------------------------------------------------
