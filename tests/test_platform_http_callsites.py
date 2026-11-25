@@ -334,7 +334,7 @@ def site07(ctx):
     )
 
 
-# Sites 8 and 9: YouTubePublisher.publish, in the three variants of the spec (section 6.3).
+# Sites 8 and 9: YouTubePublisher.publish, in the variants A/B/C of the spec (section 6.3) plus C-empty and D.
 UPLOAD_PATH = "/upload/youtube/v3/videos"
 UPLOAD_URL = "https://www.googleapis.com" + UPLOAD_PATH
 VIDEO_BYTES = b"\x00fake-mp4-bytes-for-the-put-2929"

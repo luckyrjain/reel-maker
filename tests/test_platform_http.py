@@ -339,6 +339,13 @@ def test_bearer_requires_https(verb, url, bind):
 
 
 @pytest.mark.parametrize("verb", VERBS)
+@pytest.mark.parametrize("url", ["HTTPS://api.example/x", "Https://api.example/x"])
+def test_bearer_accepts_any_case_of_the_https_scheme(verb, url, bind):
+    call(verb, url, bearer="tok")
+    assert bind.kwargs["headers"] == {"Authorization": "Bearer tok"}
+
+
+@pytest.mark.parametrize("verb", VERBS)
 def test_bearer_not_required_for_http_without_a_bearer(verb, bind):
     call(verb, "http://api.example/x")                 # no bearer: a plain http URL is not this rule's business
     assert bind.calls[0][1] == ("http://api.example/x",)
@@ -351,6 +358,11 @@ def test_bearer_header_collision_any_case(verb, bind):
     # `Proxy-Authorization` is a different header, not a collision
     call(verb, bearer="tok", headers={"Proxy-Authorization": "x"})
     assert list(bind.kwargs["headers"]) == ["Authorization", "Proxy-Authorization"]
+    # a name that merely starts with "auth" is not Authorization either
+    for near in ["Authentication-Info", "Auth-Foo", "AuthorizationX", "X-Authorization"]:
+        bind.calls.clear()
+        call(verb, bearer="tok", headers={near: "x"})
+        assert list(bind.kwargs["headers"]) == ["Authorization", near], near
 
 
 @pytest.mark.parametrize("verb", VERBS)
@@ -392,7 +404,8 @@ def test_headers_authorization_without_bearer_is_accepted_but_still_validated(ve
 @pytest.mark.parametrize("verb", VERBS)
 def test_headers_must_be_a_mapping_of_str(verb, bind):
     for bad in ([("A", "b")], "A: b", b"A: b", ("A", "b"), 5, object(), {1: "x"}, {"X": 1}, {"X": b"v"}, {"X": None},
-                {b"X": "v"}, {"X": ["v"]}):
+                {b"X": "v"}, {"X": ["v"]},
+                [], (), "", 0, b""):          # falsy non-mappings must not slip past an `if headers:` check
         reject(bind, verb, TypeError, headers=bad)
     call(verb, headers=httpx.Headers({"A": "b"}))        # an httpx.Headers is a Mapping of str
 
@@ -654,7 +667,8 @@ def test_guard_variants(verb, bind):
         key = layered("access_token", layers)
         for exc in (reject(bind, verb, ValueError, params={key: "v"}), reject(bind, verb, ValueError, url=f"{URL}?{key}=v"),
                     reject(bind, verb, ValueError, params=f"{key}=v"), reject(bind, verb, ValueError, params=[(key, "v")])):
-            assert "bearer=" in str(exc), layers
+            assert str(exc) == ("platform_http: a query parameter name is encoded too many times; "
+                                "send it with bearer= or in the request body"), layers
     # an innocent key that merely encodes a harmless name is still accepted at a depth the cap allows
     bind.calls.clear()
     call(verb, params={layered("fields", 3): "v"})
@@ -908,9 +922,14 @@ def test_type_checks_no_echo(verb, bind):
         ("timeout", dict(timeout=_Loud("SENTINEL-TT2"))),
         ("timeout", dict(timeout=None)),
         ("timeout", dict(timeout=True)),
+        # a sentinel hidden in the CLASS NAME (not in repr/str): a message that echoes `type(x)` would leak it
+        ("url", dict(url=type("SENTINEL_TU4", (), {})())),
+        ("headers", dict(headers=type("SENTINEL_TH6", (), {})())),
+        ("params", dict(params=type("SENTINEL_TP3", (), {})())),
+        ("timeout", dict(timeout=type("SENTINEL_TT3", (), {})())),
     ]
     for kind, kwargs in cases:
-        tag = re.search(r"SENTINEL-\w+", repr(kwargs))
+        tag = re.search(r"SENTINEL[-_]\w+", repr(kwargs))
         exc = reject(bind, verb, TypeError, **kwargs)
         if tag:
             assert tag.group(0) not in str(exc), kwargs

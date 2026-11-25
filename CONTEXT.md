@@ -167,4 +167,3 @@ Surfaced via the C4 architecture-review grilling session (Phase 8i,
 
 See CLAUDE.md's "Platform calls go through `api/platform_http.py`" Key-conventions entry for the guards (PH-G1..PH-G5),
 the deliberate deltas and the known gaps.
-

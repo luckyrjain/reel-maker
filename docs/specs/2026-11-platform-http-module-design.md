@@ -101,7 +101,7 @@ def put(url, *, bearer=_UNSET, headers=None, params=None, data=None, json=None, 
 ```
 
 Private: `_UNSET`, `_normalise(key) -> str` (decode as R2, then `re.sub(r"[^a-z0-9]", "", ...)` on the stripped, lower-cased
-text), `_prepare(...) -> dict` (validation, guard and keyword assembly) and `_reject_secret_query(...)`. The module imports
+text), and the helpers that implement rules 2, 3 and 7 (as shipped: `_secret_message`, `_split_query`, `_url_problem`, `_params_problem`, `_guard`, `_check_types`, `_check_bearer`, `_check_server_supplied`) behind `_prepare(...) -> dict` (validation, guard and keyword assembly). The module imports
 `httpx`, `re`, `urllib.parse`, `collections.abc` and `__future__` only: no `api.*`, `engine.*`, `worker.*`, and it never
 imports `json` (the `json=` parameter shadows the stdlib name inside `post`/`put`; pinned by PH-G5).
 
@@ -387,7 +387,7 @@ not valid JSON, that `httpx.HTTPStatusError` propagates (so `raise_for_status` r
 code included).
 
 Drive recipes: sites 1-4 call the provider methods; sites 5/6 `discover_account` with a two-page response; site 7
-`_upload_captions` on a temp `.srt`, with `uuid.uuid4` patched (the multipart boundary); sites 8 and 9 `YouTubePublisher.publish` drives with `cut.subtitle_path = None`, a real-list `hashtags` (except in C) and a non-expired credential (no refresh call), run in **three variants** so that every builder bound and literal is observable on the wire: **A**, a multi-line caption over 5000 characters whose first line is over 100 characters and whose distinct short second line makes `splitlines()[0]` observable, with at least 16 hashtags (kills the `[:100]` and `[:5000]` mutants and `tags[:15]`; the description's hashtag append is cut off here); **B**, a short multi-line caption and 16 or more short hashtags, asserting the exact description `caption + "\n\n" + "#h1 ... #h15"` and exactly 15 tags (kills the description-side `[:14]`/`[:16]` mutants and the `"\n\n"`, `" "` and `#` literals); **C**, a whitespace-only caption with `hashtags=None` (the `"Reel"` fallback; pins `tags == []` and the `or []`), and a variant with `hashtags=[]`. Title, description and tags are asserted as exact strings; the fake is keyed by method and path (ignoring the query string): the init POST returns an **absolute `https://` `Location`** (MockTransport requires one) and the PUT returns `{"id": ...}`; each failure variant is made to hit
+`_upload_captions` on a temp `.srt`, with `uuid.uuid4` patched (the multipart boundary); sites 8 and 9 `YouTubePublisher.publish` drives with `cut.subtitle_path = None`, a real-list `hashtags` (except in C) and a non-expired credential (no refresh call), run in **three variants** (plus two edge variants added during implementation: C-empty with `hashtags=[]`, and D with a `None` caption and `None` hashtags) so that every builder bound and literal is observable on the wire: **A**, a multi-line caption over 5000 characters whose first line is over 100 characters and whose distinct short second line makes `splitlines()[0]` observable, with at least 16 hashtags (kills the `[:100]` and `[:5000]` mutants and `tags[:15]`; the description's hashtag append is cut off here); **B**, a short multi-line caption and 16 or more short hashtags, asserting the exact description `caption + "\n\n" + "#h1 ... #h15"` and exactly 15 tags (kills the description-side `[:14]`/`[:16]` mutants and the `"\n\n"`, `" "` and `#` literals); **C**, a whitespace-only caption with `hashtags=None` (the `"Reel"` fallback; pins `tags == []` and the `or []`), and a variant with `hashtags=[]`. Title, description and tags are asserted as exact strings; the fake is keyed by method and path (ignoring the query string): the init POST returns an **absolute `https://` `Location`** (MockTransport requires one) and the PUT returns `{"id": ...}`; each failure variant is made to hit
 the right request (site 8's at the POST, site 9's at the PUT), asserting POST then PUT and that the PUT URL equals the
 `Location` value; sites 10-12 call the three `InstagramPublisher` methods, site 10 with a caption longer than 2200
 characters (so the `caption[:2200]` bound is observable); site 13 `YouTubeMetricsFetcher.fetch` with a non-expired
@@ -452,6 +452,8 @@ Equivalent mutants are named as such in §10 with the reason, not silently dropp
   Google's response names, with a 300 s timeout and no redirect following. No host allowlist is added here: the live host
   shape is not verified (tests use `https://upload.example.com/session123`) and a wrong allowlist would break publishing;
   a follow-up could pin `https` and `*.googleapis.com` after one real call.
+- **A non-https `Location`.** The session URL is accepted for the video PUT whatever its scheme (no credential is sent, but the video body would travel over cleartext to a server-chosen host); a scheme check is part of the unverified host allowlist above.
+- **A hand-written `Authorization` header without `bearer=`** is accepted by the runtime guard (rule 2 only checks a collision when `bearer=` is also given); the static check PH-G4 flags it only at literal call sites in the four caller modules.
 - **`upload_url` in error text** (Q10): `HTTPStatusError.__str__` includes it, hence `job.error`. It is an upload capability,
   not a stored credential, and expires. Not redacted. Site 9's absence of `Authorization` is pinned.
 - **The guard is name-based and query-only.** It does not see a secret under an innocent key (`?x=<token>`), a name outside
@@ -527,9 +529,10 @@ Plan: `docs/specs/2026-11-platform-http-implementation-plan.md` (written once th
 Implementation record (filled in at implementation; every number below was re-run by the controller, not taken from
 an implementer's report):
 
-- **Baseline** at `1b49607`: 3160 selected (3157 passed, 3 skipped, 1 deselected), 79 test files. Final: 4321 selected, 4322
-  total with the golden test, 81 test files (`tests/test_platform_http.py` 1084 tests, `tests/test_platform_http_callsites.py`
-  77 tests, plus the helper `tests/_platform_http_helpers.py`); full suite 4318 passed, 3 skipped, 1 deselected; ruff
+- **Baseline** at `1b49607`: 3160 selected (3157 passed, 3 skipped, 1 deselected), 79 test files. Final (after the code-review fix commit): 4327 selected, 4328
+  total with the golden test, 81 test files (`tests/test_platform_http.py` 1090 tests, 1084 at the commit-3 snapshot the
+  mutation tables below were run against, `tests/test_platform_http_callsites.py` 77 tests, plus the helper
+  `tests/_platform_http_helpers.py`); full suite 4324 passed, 3 skipped, 1 deselected; ruff
   `--select F,E9` clean.
 - **Commit 1** (`6923313`): the characterization test, 77 tests, green on the old code. Scripted old-code mutation: 301
   mutants, 301 killed, 0 survived (families: auth-added 1, auth-removed 7, literal 188, raise_for_status 14, swap 71, swap-extra 6, timeout 14),
@@ -913,3 +916,13 @@ an implementer's report):
   list in the test with the class-body forms enumerated, star-imports and `type` statements, a distinct allowlist message so a
   rule-7 rejection cannot mask it, the runtime subset/`headers=None` behavior pinned (PH-G2 intentionally stricter), the guard
   control's `is` comparator and `gen.close()`, mutants M168-M171, and the round-7 timeout edge cases (`-0.0`, `3600.001`, `3601`).
+- **Code review round 1 (implementation, `main..HEAD`).** Four personas; verdicts: Security no findings (the reviewer could not
+  bypass the guard, leak caller text into any message or exception chain, or send a credential outside a bearer header or POST
+  body; real token and `Location` shapes still pass), Correctness no findings (all 14 sites diffed against `main`: same kwargs,
+  header order, positional URL; site 9 still has no Authorization), Test-Quality clean (about 290 reviewer-designed mutants; five
+  minor survivors), Documentation clean (four minors and nits). Fixed in one follow-up commit: five test strengthenings, each
+  verified to kill the named mutant by applying it to the module (falsy non-mapping `headers`, a case-sensitive `https` check,
+  `startswith("auth")` for the collision check, the exact "encoded too many times" message, a type-name echo in a type error), the
+  §4.1 private-helper list, the five publish drive variants, the Phase 8i deltas wording, the `300.0` upload timeout note, and
+  the counts (6 new parametrized cases: 4327 selected). Two security nits became §7 sentences (a non-https `Location` is
+  accepted for the video PUT; a hand-written `Authorization` header without `bearer=` is only caught statically).
