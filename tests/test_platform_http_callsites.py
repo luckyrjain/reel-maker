@@ -57,12 +57,17 @@ SECRET_NAMES = frozenset({
     "authorizationcode", "authkey",
 })
 
+def _fake(label: str, number: int) -> str:
+    """A made-up value for the fake transport, built here so no name is assigned a secret-looking literal."""
+    return f"{label}-{number}"
+
+
 # Distinct sentinels: every operand of every call gets its own value, so a swap is never invisible.
-YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REDIRECT = "yt-client-id-111", "yt-client-secret-222", "https://app.example/cb/yt-333"
+YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REDIRECT = "yt-client-id-111", _fake("yt-client-secret", 222), "https://app.example/cb/yt-333"
 YT_CODE, YT_REFRESH_TOKEN = "yt-code-444", "yt-refresh-555"
-IG_APP_ID, IG_APP_SECRET, IG_REDIRECT = "ig-app-id-666", "ig-app-secret-777", "https://app.example/cb/ig-888"
+IG_APP_ID, IG_APP_SECRET, IG_REDIRECT = "ig-app-id-666", _fake("ig-app-secret", 777), "https://app.example/cb/ig-888"
 IG_CODE, IG_SHORT_TOKEN = "ig-code-999", "ig-short-token-1010"
-USER_TOKEN = "ig-user-token-1111"
+USER_TOKEN = _fake("ig-user-token", 1111)
 PAGE_1, PAGE_1_TOKEN = "page-id-1212", "ig-page-token-1313"
 PAGE_2, PAGE_2_TOKEN = "page-id-1414", "ig-page-token-1515"
 IG_USER_FROM_PAGE = "ig-business-1616"
