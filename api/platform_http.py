@@ -6,13 +6,16 @@ straight after the call, an ``Authorization: Bearer`` header built from ``bearer
 used to live only in comments: **a secret never goes in a URL**. A secret-named query key (see
 ``SECRET_QUERY_NAMES``), userinfo in the URL or a bearer sent over a non-https URL raises
 ``ValueError`` before any request is made, because ``httpx.HTTPStatusError.__str__`` includes the URL
-and that text reaches ``job.error`` and the credentials router's 502 body.
+and that text reaches ``job.error`` and the credentials router's 502 body. One exception:
+``put(..., server_supplied_url=True)``, for a URL the platform chose (the YouTube upload session),
+skips the scan of that URL's query; userinfo is still rejected, and the call may carry no ``params``,
+no ``bearer`` and only ``Content-Type``/``Content-Length`` headers.
 
 The response is returned untouched; the exception type is still ``httpx.HTTPStatusError``, so
 ``worker/tasks/common.py::is_transient_error`` and the credentials router's error text are unchanged.
 
-Only the arguments a caller supplied are forwarded to ``httpx`` (never ``params=None`` and so on), and
-the URL is passed positionally. ``urllib.parse`` and ``httpx`` are always called as module attributes
+Only the arguments a caller supplied are forwarded to ``httpx`` (never ``params=None`` and so on), plus
+``timeout``, which is always sent. The URL is passed positionally. ``urllib.parse`` and ``httpx`` are always called as module attributes
 (never through a ``from ... import``) so a test's patch of them is seen.
 
 No message raised here contains caller-supplied text: only the matched secret name taken from the
@@ -27,6 +30,7 @@ import urllib.parse
 from collections.abc import Mapping
 
 import httpx
+from celery.exceptions import SoftTimeLimitExceeded
 
 DEFAULT_TIMEOUT_S = 30.0  # every platform call except the video upload
 UPLOAD_TIMEOUT_S = 300.0  # the YouTube video PUT only
@@ -52,6 +56,8 @@ _BEARER_RE = r"[\x21-\x7e]+"
 _HEADER_NAME_RE = r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+"  # an RFC 7230 token
 _HEADER_VALUE_RE = r"[\x21-\x7e]([\x20-\x7e\t]*[\x21-\x7e])?"
 _SERVER_URL_HEADERS = frozenset({"content-type", "content-length"})
+# httpx turns a bytes key into its repr, "b'name'", which would not match a secret name
+_BYTES_KEY_RE = r"""b(['"]).*\1"""
 
 _HINT = "send it with bearer= or in the request body"
 _MSG_BAD_URL = "platform_http: unparseable URL"
@@ -120,21 +126,28 @@ def _params_problem(params) -> str | None:
         keys = _split_query(text)
     else:
         keys = list(httpx.QueryParams(params).keys())
+        if any(re.fullmatch(_BYTES_KEY_RE, key) for key in keys):
+            return _MSG_BAD_PARAMS
     return _secret_message(keys)
 
 
 def _guard(url: str, params, server_supplied_url: bool) -> None:
     """Raise ValueError when a secret could travel in the URL. Any failure while computing the answer
     is caught, remembered, and raised as a fixed message AFTER the except block, so the original
-    error (which can quote part of the URL) is neither the cause nor the context."""
+    error (which can quote part of the URL) is neither the cause nor the context. Celery's soft time
+    limit is the one exception let through: the worker must see it to report the timeout."""
     problem = None
     try:
         problem = _url_problem(url, server_supplied_url)
+    except SoftTimeLimitExceeded:
+        raise
     except Exception:
         problem = _MSG_BAD_URL
     if problem is None:
         try:
             problem = _params_problem(params)
+        except SoftTimeLimitExceeded:
+            raise
         except Exception:
             problem = _MSG_BAD_PARAMS
     if problem is not None:

@@ -29,6 +29,7 @@ from unittest.mock import MagicMock
 
 import httpx
 import pytest
+from celery.exceptions import SoftTimeLimitExceeded
 
 from api import platform_http
 from engine.publish.youtube import YouTubePublisher
@@ -157,6 +158,12 @@ PARAM_FORMS = {
     "str blank value": lambda k: f"{k}=",
     "bytes": lambda k: f"{k}=v".encode(),
     "bytes key not first": lambda k: f"part=x&{k}=v".encode(),
+    "str value containing '='": lambda k: f"{k}=abc==",
+    "bytes value containing '='": lambda k: f"{k}=abc==".encode(),
+    "str earlier value with '/' and '?'": lambda k: f"next=/cb?x&{k}=v",
+    "str later value with '?'": lambda k: f"{k}=v&q=why?",
+    "str two semicolons before": lambda k: f"a=1;b=2;{k}=v",
+    "str earlier value with '#'": lambda k: f"a=#&{k}=v",
 }
 
 URL_FORMS = {
@@ -167,6 +174,10 @@ URL_FORMS = {
     "key first then semicolon": lambda k: f"{URL}?{k}=v;part=x",
     "blank value": lambda k: f"{URL}?{k}=",
     "before a fragment": lambda k: f"{URL}?part=x&{k}=v#frag",
+    "value containing '='": lambda k: f"{URL}?{k}=abc==",
+    "earlier value with '/'": lambda k: f"{URL}?next=/cb&{k}=v",
+    "earlier value with '?'": lambda k: f"{URL}?q=why?&{k}=v",
+    "two semicolons before": lambda k: f"{URL}?a=1;b=2;{k}=v",
 }
 
 
@@ -331,7 +342,8 @@ def test_bearer_message_never_echoes_the_value(verb, bind):
 
 @pytest.mark.parametrize("verb", VERBS)
 @pytest.mark.parametrize("url", ["http://api.example/x", "ftp://api.example/x", "api.example/x", "//api.example/x",
-                                 "http://SENTINEL-host.example/x", "httpsx://api.example/x", "https:/api.example"])
+                                 "http://SENTINEL-host.example/x", "httpsx://api.example/x", "https:/api.example",
+                                 "http://api.example/x?next=https://ok.example", "ftp://api.example/https://x"])
 def test_bearer_requires_https(verb, url, bind):
     exc = reject(bind, verb, ValueError, url=url, bearer="tok")
     assert str(exc) == "bearer requires an https URL"
@@ -355,6 +367,10 @@ def test_bearer_not_required_for_http_without_a_bearer(verb, bind):
 def test_bearer_header_collision_any_case(verb, bind):
     for name in ["Authorization", "authorization", "AUTHORIZATION", "aUtHoRiZaTiOn"]:
         reject(bind, verb, ValueError, bearer="tok", headers={"X-A": "1", name: "Bearer other"})
+    for position in range(5):
+        names = ["X-A", "X-B", "X-C", "X-D"]
+        names.insert(position, "Authorization")
+        reject(bind, verb, ValueError, bearer="tok", headers={name: "v" for name in names})
     # `Proxy-Authorization` is a different header, not a collision
     call(verb, bearer="tok", headers={"Proxy-Authorization": "x"})
     assert list(bind.kwargs["headers"]) == ["Authorization", "Proxy-Authorization"]
@@ -457,6 +473,21 @@ def test_headers_messages_do_not_echo(verb, bind):
     for index, headers in enumerate([{"SENTINEL-HN1 x": "v"}, {"X": "SENTINEL-HV2\n"}, {"X": "SENTINEL-HV3\u00e9"}]):
         exc = reject(bind, verb, ValueError, headers=headers)
         assert f"SENTINEL-HN{index + 1}" not in str(exc) and f"SENTINEL-HV{index + 1}" not in str(exc)
+
+
+@pytest.mark.parametrize("verb", VERBS)
+@pytest.mark.parametrize("position", [0, 1, 2], ids=["first", "middle", "last"])
+@pytest.mark.parametrize("name, value, exc_type, message", [
+    ("Bad Name", "v", ValueError, "platform_http: invalid header name"),
+    ("X-Bad", "a\nb", ValueError, "platform_http: invalid header value"),
+    (5, "v", TypeError, "platform_http: headers must be a mapping of str to str"),
+    ("X-Bad", 5, TypeError, "platform_http: headers must be a mapping of str to str"),
+])
+def test_headers_every_entry_is_validated(verb, position, name, value, exc_type, message, bind):
+    items = [("X-One", "1"), ("X-Two", "2")]
+    items.insert(position, (name, value))
+    exc = reject(bind, verb, exc_type, headers=dict(items))
+    assert str(exc) == message
 
 
 # ── what is forwarded (rule 1) ─────────────────────────────────────────────────────────────────────
@@ -809,7 +840,6 @@ def _assert_replacement(exc, message):
     assert type(exc) is ValueError
     assert str(exc) == message
     assert exc.__context__ is None and exc.__cause__ is None
-    assert exc.__suppress_context__ is False or exc.__context__ is None
 
 
 @pytest.mark.parametrize("verb", VERBS)
@@ -888,6 +918,49 @@ def test_unparseable_params_real_smokes(verb, bind):
         _assert_replacement(exc, PARAMS_MESSAGE)
 
 
+BYTES_KEY_PARAMS = [
+    {b"access_token": "SENTINEL-BK"},
+    {"part": "x", b"client_secret": "SENTINEL-BK"},
+    [(b"access_token", "SENTINEL-BK")],
+    (("part", "x"), (b"client_secret", "SENTINEL-BK")),
+    httpx.QueryParams({b"access_token": "SENTINEL-BK"}),
+    {b"harmless": "SENTINEL-BK"},                    # any bytes key is refused: its wire name is "b'...'"
+    {b"it's": "SENTINEL-BK"},                        # repr uses double quotes here
+]
+
+
+@pytest.mark.parametrize("verb", VERBS)
+@pytest.mark.parametrize("params", BYTES_KEY_PARAMS)
+def test_bytes_params_keys_are_refused(verb, params, bind):
+    exc = reject(bind, verb, ValueError, params=params)
+    _assert_replacement(exc, PARAMS_MESSAGE)
+
+
+@pytest.mark.parametrize("verb", VERBS)
+def test_params_keys_that_only_look_a_little_like_a_bytes_repr_pass(verb, bind):
+    params = {"b": "1", "b'": "2", "'b'": "3", "ab'c'": "4", "b'c'd": "5", "b'c\"": "6"}
+    call(verb, params=params)
+    assert bind.kwargs["params"] == params
+
+
+@pytest.mark.parametrize("verb", VERBS)
+@pytest.mark.parametrize("where", ["url", "params"])
+def test_soft_time_limit_passes_through_the_guard(verb, where, bind, monkeypatch):
+    limit = SoftTimeLimitExceeded()
+
+    def boom(*args, **kwargs):
+        raise limit
+
+    if where == "url":
+        monkeypatch.setattr(urllib.parse, "urlsplit", boom)
+        kwargs = {}
+    else:
+        monkeypatch.setattr(httpx, "QueryParams", boom)
+        kwargs = {"params": {"a": "b"}}
+    exc = reject(bind, verb, SoftTimeLimitExceeded, **kwargs)
+    assert exc is limit
+
+
 # ── type checks, nothing echoed (rule 7) ───────────────────────────────────────────────────────────
 
 class _Loud:
@@ -927,6 +1000,8 @@ def test_type_checks_no_echo(verb, bind):
         ("headers", dict(headers=type("SENTINEL_TH6", (), {})())),
         ("params", dict(params=type("SENTINEL_TP3", (), {})())),
         ("timeout", dict(timeout=type("SENTINEL_TT3", (), {})())),
+        ("headers", dict(headers={"X": type("SENTINEL_TH7", (), {})()})),
+        ("headers", dict(headers={type("SENTINEL_TH8", (), {})(): "v"})),
     ]
     for kind, kwargs in cases:
         tag = re.search(r"SENTINEL[-_]\w+", repr(kwargs))
@@ -1285,6 +1360,26 @@ def httpx_names(source, path) -> list:
     return found
 
 
+def httpx_indirections(source, path) -> list:
+    """(what, line) for the ways of reaching raw httpx that `httpx_names` cannot name: the module taken out of
+    another module (`from api.oauth import httpx`, `oauth.httpx`), or `httpx` used as a value instead of as
+    `httpx.<name>` (annotated or tuple assignment, walrus, argument default, passing it on)."""
+    tree = S.parse(source, path)
+    bindings = S.import_bindings(tree, path)
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if any(alias.name == "httpx" for alias in node.names):
+                found.append(("httpx imported from another module", node.lineno))
+        elif isinstance(node, ast.Attribute) and node.attr == "httpx":
+            if any(dotted_path != "httpx" for dotted_path in S.dotted(node, bindings)):
+                found.append(("httpx reached through another module", node.lineno))
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and "httpx" in S.dotted(node, bindings):
+            if not (isinstance(node._parent, ast.Attribute) and node._field == "value"):
+                found.append(("httpx used as a value", node.lineno))
+    return found
+
+
 def http_client_imports(source, path) -> list:
     """(module, line) for every import of another HTTP client, in every spelling."""
     tree = S.parse(source, path)
@@ -1316,6 +1411,8 @@ def g1_problems(source, path) -> list:
         for name, line in httpx_names(source, path):
             if name not in NON_REQUEST:
                 problems.append(S.Problem(path, line, "PH-G1(a)", f"httpx.{name} is not on the non-request allowlist"))
+        for what, line in httpx_indirections(source, path):
+            problems.append(S.Problem(path, line, "PH-G1(a)", what))
         for module, line in http_client_imports(source, path):
             problems.append(S.Problem(path, line, "PH-G1(c)", f"import of the HTTP client {module}"))
     if path not in ALLOWED_RAISE:
@@ -1396,6 +1493,27 @@ def test_ph_g1_control_star_and_submodule_imports_fire():
     for source in ("from httpx import *\n", "import httpx._client\n", "from httpx._client import Client\n",
                    "import httpx.something\n"):
         assert g1_problems(source, "engine/foo.py"), source
+
+
+@pytest.mark.parametrize("source", [
+    "from api.oauth import httpx\nhttpx.get(u)\n",
+    "from api.oauth import httpx as h\nh.get(u)\n",
+    "from . import httpx\n",
+    "import api.oauth\napi.oauth.httpx.get(u)\n",
+    "from api import oauth\noauth.httpx.get(u)\n",
+    "from api import oauth\nc = oauth.httpx\n",
+    "import httpx\nc: object = httpx\nc.get(u)\n",
+    "import httpx\na, b = httpx, 1\na.get(u)\n",
+    "import httpx\nif (c := httpx):\n    c.get(u)\n",
+    "import httpx\ndef f(u, c=httpx):\n    c.get(u)\n",
+    "import httpx\nsend(httpx)\n",
+    "import httpx\nclients = [httpx]\n",
+    "import httpx as h\nsend(client=h)\n",
+])
+def test_ph_g1_control_indirect_ways_to_httpx_fire(source):
+    problems = g1_problems(source, "engine/publish/youtube.py")
+    assert problems and all(p.rule == "PH-G1(a)" for p in problems), (source, problems)
+    assert g1_problems(source, SAFE_FETCH_PATH) == []
 
 
 @pytest.mark.parametrize("name", sorted(NON_REQUEST))
@@ -1576,7 +1694,7 @@ def test_ph_g2_real_tree_non_vacuity():
     assert [(p, q) for p, q, _ in reads] == [FLAG_SITE]
     # the callers are exactly the files whose walk saw an import
     assert sorted(path for path, result in results.items() if result.imports_module) == PINNED_CALLERS
-    # which verbs: 8 post, 4 get ... pinned by function and file
+    # which verbs: 8 post, 5 get, 1 put, pinned by function and file
     verbs = sorted((path, fn) for result in results.values() for path, _, fn, _ in result.calls)
     assert verbs == sorted([
         (OAUTH_PATH, "post")] * 4 + [(OAUTH_PATH, "get")] * 2
@@ -2003,6 +2121,22 @@ def _params_problems(node) -> list:
     return out
 
 
+def _headers_problems(node) -> list:
+    """What is wrong with a `headers=` expression: it must be a dict literal with constant keys, none of them
+    Authorization (that header is built from `bearer=`)."""
+    if not isinstance(node, ast.Dict):
+        return [f"headers= is not a dict literal: {ast.unparse(node)!r}"]
+    out = []
+    for key in node.keys:
+        if key is None:
+            out.append("headers= has a ** spread")
+        elif not _is_str_constant(key):
+            out.append("headers= has a key that is not a string constant")
+        elif key.value.strip().lower() == "authorization":
+            out.append("a hand-written Authorization header: use bearer=")
+    return out
+
+
 def ph_g4_check(source, path) -> G4Result:
     f = _G4File(source, path)
     problems, calls = [], []
@@ -2043,13 +2177,12 @@ def ph_g4_check(source, path) -> G4Result:
                     for message in _url_text_problems(text):
                         fail(call, "PH-G4/url", message)
         bearer = S._kw(call, "bearer") is not None
-        if bearer:
-            if text is None or not text.startswith("https://"):
-                fail(call, "PH-G4/bearer", "bearer= needs a URL that statically resolves to https://")
-            headers = S._kw(call, "headers")
-            if isinstance(headers, ast.Dict) and any(
-                    _is_str_constant(key) and key.value.lower() == "authorization" for key in headers.keys):
-                fail(call, "PH-G4/bearer", "an Authorization header next to bearer=")
+        if bearer and (text is None or not text.startswith("https://")):
+            fail(call, "PH-G4/bearer", "bearer= needs a URL that statically resolves to https://")
+        headers = S._kw(call, "headers")
+        if headers is not None:
+            for message in _headers_problems(headers):
+                fail(call, "PH-G4/headers", message)
         params = S._kw(call, "params")
         if params is not None:
             for message in _params_problems(params):
@@ -2166,7 +2299,7 @@ def test_ph_g4_control_clean_baselines_pass():
         'platform_http.get(_GRAPH, params=dict(part="x", id=q))',
         'platform_http.get(f"{_HOST}/v19.0/{ig_user_id}")',
         'platform_http.post(f"{_GRAPH}/{ig_user_id}/media_publish", data={"creation_id": q}, json={"access_token": t})',
-        'platform_http.put(_GRAPH, headers={"Authorization": "x"}, content=b)',     # no bearer: the runtime rule 7 only
+        'platform_http.put(_GRAPH, headers={"Content-Type": "x"}, content=b)',
     ):
         result = _passes(g4_in_method(body))
         assert len(result.calls) == 1, body
@@ -2354,9 +2487,16 @@ def test_ph_g4_control_bearer_needs_an_https_url_and_no_authorization_header():
     _fires(g4_in_method('platform_http.get(u, bearer=t)'))
     for key in ("Authorization", "authorization", "AUTHORIZATION", "aUtHoRiZaTiOn"):
         source = g4_in_method(f'platform_http.get(_GRAPH, bearer=t, headers={{"{key}": "x"}})')
-        _fires(source, rule="PH-G4/bearer", text="Authorization")
+        _fires(source, rule="PH-G4/headers", text="Authorization")
         source = g4_in_method(f'platform_http.get(_GRAPH, bearer=t, headers={{"X-A": "1", "{key}": "x"}})')
-        _fires(source, rule="PH-G4/bearer", text="Authorization")
+        _fires(source, rule="PH-G4/headers", text="Authorization")
+        # without bearer= too: this is the shape that would bypass the bearer rules altogether
+        source = g4_in_method(f'platform_http.post(_GRAPH, headers={{"X-A": "1", "{key}": f"Bearer {{t}}"}})')
+        _fires(source, rule="PH-G4/headers", text="Authorization")
+    for headers, text in (("h", "not a dict literal"), ("dict(h)", "not a dict literal"), ("{**h}", "** spread"),
+                          ('{"X-A": "1", **h}', "** spread"), ('{k: "x"}', "not a string constant"),
+                          ('{"X-A": "1", k: "x"}', "not a string constant")):
+        _fires(g4_in_method(f"platform_http.get(_GRAPH, headers={headers})"), rule="PH-G4/headers", text=text)
     _passes(g4_in_method('platform_http.get(_GRAPH, bearer=t, headers={"Content-Type": "x", "Proxy-Authorization": "y"})'))
     _passes(g4_in_method('platform_http.get(_GRAPH, bearer=t, headers={"Content-Type": "x"})'))
 
@@ -2661,7 +2801,7 @@ def test_ph_g4_control_non_resolving_inputs_do_not_count_as_calls_to_something_e
 
 # ── PH-G5 module hygiene ───────────────────────────────────────────────────────────────────────────
 
-G5_ALLOWED_MODULES = frozenset({"httpx", "re", "urllib.parse", "collections.abc", "__future__"})
+G5_ALLOWED_MODULES = frozenset({"httpx", "re", "urllib.parse", "collections.abc", "celery.exceptions", "__future__"})
 G5_FORBIDDEN_FROM = frozenset({"httpx", "urllib.parse"})
 G5_PUBLIC = frozenset({"get", "post", "put", "DEFAULT_TIMEOUT_S", "UPLOAD_TIMEOUT_S", "SECRET_QUERY_NAMES"})
 
@@ -2692,7 +2832,7 @@ def g5_problems(source, path=PH_PATH) -> list:
             for alias in node.names:
                 if alias.name == "json":
                     bad(node, "import json: the json= parameter shadows it inside post/put (json shadows)")
-                elif alias.name not in G5_ALLOWED_MODULES:
+                elif alias.name not in G5_ALLOWED_MODULES or alias.name == "celery.exceptions":
                     bad(node, f"import of {alias.name}: not one of {sorted(G5_ALLOWED_MODULES)}")
         elif isinstance(node, ast.ImportFrom):
             module = ("." * node.level) + (node.module or "")
@@ -2702,6 +2842,8 @@ def g5_problems(source, path=PH_PATH) -> list:
                 bad(node, f"from {module} import ...: call it as a module attribute so a test's patch is seen")
             elif module not in G5_ALLOWED_MODULES:
                 bad(node, f"from {module} import ...: not one of {sorted(G5_ALLOWED_MODULES)}")
+            elif module == "celery.exceptions" and [(a.name, a.asname) for a in node.names] != [("SoftTimeLimitExceeded", None)]:
+                bad(node, "import from celery.exceptions: only SoftTimeLimitExceeded, under its own name")
     public = {name for name in _top_level_names(tree) if not name.startswith("_")}
     if public != G5_PUBLIC:
         problems.append(S.Problem(path, 1, "PH-G5", f"public names are {sorted(public)}, expected {sorted(G5_PUBLIC)}"))
@@ -2734,6 +2876,12 @@ def _g5_real_with(line_before="", line_after=""):
     ("from httpx._client import Client\n", "from httpx submodule"),
     ("import requests\n", "requests"),
     ("from . import other\n", "relative"),
+    ("import celery.exceptions\n", "import celery.exceptions"),
+    ("import celery\n", "import celery"),
+    ("from celery import Celery\n", "from celery"),
+    ("from celery.exceptions import Retry\n", "another celery name"),
+    ("from celery.exceptions import SoftTimeLimitExceeded, Retry\n", "an extra celery name"),
+    ("from celery.exceptions import SoftTimeLimitExceeded as S\n", "renamed"),
     ("def f():\n    import json\n", "import inside a function"),
     ("def f():\n    from httpx import get\n", "from httpx inside a function"),
 ])
@@ -2766,7 +2914,8 @@ def test_ph_g5_control_private_names_and_allowed_imports_pass_and_a_missing_name
     source = _g5_real_with(line_after="\n_PRIVATE = 1\ndef _helper():\n    pass\nclass _Hidden:\n    pass\n")
     assert g5_problems(source) == []
     for allowed in ("import re\n", "import httpx\n", "import urllib.parse\n", "from collections.abc import Mapping\n",
-                    "from collections.abc import Callable\n", "from __future__ import annotations\n", "from re import fullmatch\n"):
+                    "from collections.abc import Callable\n", "from __future__ import annotations\n", "from re import fullmatch\n",
+                    "from celery.exceptions import SoftTimeLimitExceeded\n"):
         assert g5_problems(_g5_real_with(line_before=allowed)) == [], allowed
     removed = _sources()[PH_PATH].replace("def put(", "def _put(")
     assert removed != _sources()[PH_PATH]

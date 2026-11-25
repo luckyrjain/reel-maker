@@ -101,8 +101,8 @@ def put(url, *, bearer=_UNSET, headers=None, params=None, data=None, json=None, 
 ```
 
 Private: `_UNSET`, `_normalise(key) -> str` (decode as R2, then `re.sub(r"[^a-z0-9]", "", ...)` on the stripped, lower-cased
-text), and the helpers that implement rules 2, 3 and 7 (as shipped: `_secret_message`, `_split_query`, `_url_problem`, `_params_problem`, `_guard`, `_check_types`, `_check_bearer`, `_check_server_supplied`) behind `_prepare(...) -> dict` (validation, guard and keyword assembly). The module imports
-`httpx`, `re`, `urllib.parse`, `collections.abc` and `__future__` only: no `api.*`, `engine.*`, `worker.*`, and it never
+text), and the helpers that implement rules 2, 3 and 7 (as shipped: `_msg_secret`, `_secret_message`, `_split_query`, `_url_problem`, `_params_problem`, `_guard`, `_check_types`, `_check_bearer`, `_check_server_supplied`) behind `_prepare(...) -> dict` (validation, guard and keyword assembly). The module imports
+`httpx`, `re`, `urllib.parse`, `collections.abc`, `__future__` and the one name `celery.exceptions.SoftTimeLimitExceeded` only: no `api.*`, `engine.*`, `worker.*`, and it never
 imports `json` (the `json=` parameter shadows the stdlib name inside `post`/`put`; pinned by PH-G5).
 
 ### 4.2 Behavior (each rule is test-pinned)
@@ -133,7 +133,7 @@ imports `json` (the `json=` parameter shadows the stdlib name inside `post`/`put
    while computing the guard (`str(key)`, `QueryParams(...)` on hostile params) are caught, a flag is set, and the
    replacement `ValueError("platform_http: unparseable URL")` (or `"platform_http: unparseable params"`) is raised **after**
    the `except` block: `from None` alone would leave the original in `__context__`, so the tests assert
-   `exc.__context__ is None and exc.__cause__ is None`. The guard's own message names the **matched secret name taken from
+   `exc.__context__ is None and exc.__cause__ is None`. The one exception the guard lets through is Celery's `SoftTimeLimitExceeded` (an `Exception` subclass): swallowing it would report a timed-out job as `unparseable URL` (the same re-raise `safe_fetch` uses). A `params` key shaped like a `bytes` repr (`b'...'` or `b"..."`) is `unparseable params`: httpx turns `b"access_token"` into the wire name `b'access_token'`, which would not match a secret name. The guard's own message names the **matched secret name taken from
    the constant** (for example `accesstoken`), never the caller's raw key, value or URL, and says to use `bearer=` or the
    request body (the substring `bearer=` is pinned). Not guarded, on purpose: `data=`, `json=`, `content=`, parameter
    *values*, the URL path and fragment (§7); `headers` are validated by rule 7 but never scanned for secrets (secrets belong
@@ -155,7 +155,7 @@ imports `json` (the `json=` parameter shadows the stdlib name inside `post`/`put
    token, and for a header value that does not `fullmatch` `[\x21-\x7e]([\x20-\x7e\t]*[\x21-\x7e])?` (so CR, LF, NUL, `\x0b`,
    DEL, non-ASCII, leading/trailing whitespace and the empty string are rejected: h11 would echo the whole value in its error
    text, which reaches `job.error`; a non-ASCII header value is rejected on purpose, no site sends one). **No message raised
-   by the module contains caller-supplied text** (only the matched secret name from the constant and type names), pinned
+   by the module contains caller-supplied text** (only the matched secret name from the constant and fixed wording, never a caller's type name), pinned
    with one distinct-sentinel test per message; messages raised by third-party code on malformed input that gets past the
    module (an `httpx.InvalidURL` quoting a bad port, a `UnicodeEncodeError` naming a lone surrogate in `data`) are out of
    this claim (§7). No site violates any of these today.
@@ -204,7 +204,7 @@ import platform_http` and called as `platform_http.get(...)` (module attribute, 
   only in `ALLOWED_RAISE = ALLOWED_REQUEST | {engine/render/asset_sourcer.py}` (the sourcers own the status check after
   `safe_fetch`, C2). (c) An import of another HTTP client (`requests`, `aiohttp`, `urllib3`, `http.client`,
   `urllib.request`) only in `ALLOWED_REQUEST` (today only `safe_fetch.py` imports `urllib.request`, for proxy detection).
-  Non-vacuity on the real tree, outside the three allowed files: the only `httpx` names used are `QueryParams`
+  (d) Outside `ALLOWED_REQUEST`, two indirections fail too: `httpx` taken from another module (`from api.oauth import httpx`, `oauth.httpx`, `api.oauth.httpx`) and `httpx` used as a value rather than as `httpx.<name>` (an annotated or tuple assignment, a walrus, an argument default, passing it on). Non-vacuity on the real tree, outside the three allowed files: the only `httpx` names used are `QueryParams`
   (`api/oauth.py`), `TransportError` and `HTTPStatusError` (`worker/tasks/common.py`); `youtube.py`, `instagram.py` and
   `metrics.py` use none; and the three allowed files do use request-capable names.
 - **PH-G2 module-attribute access.** In production code `api.platform_http` is imported only as a module (`from api import
@@ -274,8 +274,8 @@ import platform_http` and called as `platform_http.get(...)` (module attribute, 
     ever added through `params=`; no current site has one) and no `@` in its authority. Any other URL expression fails,
     except the single allowlisted `upload_url` Name, valid only as the URL of a `platform_http.put` call inside
     `youtube.py::YouTubePublisher.publish` (matched by file, function and callee, not by name).
-  - **`bearer=`.** A call passing `bearer=` must resolve to a URL starting `https://` and have no `Authorization` key (any
-    case) in a `headers=` dict literal.
+  - **`bearer=`.** A call passing `bearer=` must resolve to a URL starting `https://`.
+  - **`headers=`.** On every call, with or without `bearer=`: absent, or a dict literal with constant `str` keys (a name, a `dict(...)` call, a `**` spread or a non-constant key fails), none of them `Authorization` (any case).
 
   Non-vacuity, pinned by kind: of the 14 URLs, 2 are `Constant` (sites 5, 13), 5 are f-strings (6, 10, 11, 12, 14), 4 are
   `self.token_url` resolved to the class constant (1-4; with the base-class annotation present), 2 are module-level `Name`s (7,
@@ -294,8 +294,7 @@ import platform_http` and called as `platform_http.get(...)` (module attribute, 
   Also: a constant `"http://graph.facebook.com/x"` URL without `bearer=` fires; `ClassName.token_url = ...` and `setattr(Cls, "token_url", ...)` fire; two subclasses each defining `token_url` once pass and one class defining it twice fires; `def f(_GRAPH): platform_http.get(f"{_GRAPH}/{page_id}")` (a parameter shadow) fires; `put(upload_url, ...)` in another function and in another file fires; the multi-binding controls are parametrized over **every binding form the rule lists**, as a **literal list in the test file** (never derived from the implementation's own list), one synthetic snippet per form, for a module `Name` in the URL position and in the hole position and for the class body, whose forms are listed explicitly: assignment, augmented assignment, annotated assignment with a value, `def`, `class`, `for`, `with`, import, `del` and walrus; the `type X = ...` statement counts as a binding form, and a `from m import *` in a caller file fails closed (M163). Must not fire: `data={"access_token": t}`, `params={"fields": "access_token"}`. A secret that arrives through an allowed
   id hole (`https://.../a?access_token=` built from `page_id`) is statically invisible and rejected at runtime by rule 3(b):
   PH-G4 is a tripwire for the shapes above, not a completeness proof.
-- **PH-G5 module hygiene.** `api/platform_http.py` imports only `httpx`, `re`, `urllib.parse`, `collections.abc` and
-  `__future__`; it has no `import json`; it has no `from urllib.parse import ...` and no `from httpx import ...` (every call
+- **PH-G5 module hygiene.** `api/platform_http.py` imports only `httpx`, `re`, `urllib.parse`, `collections.abc`, `__future__` and, as `from celery.exceptions import SoftTimeLimitExceeded` exactly, that one name; it has no `import json`; it has no `from urllib.parse import ...` and no `from httpx import ...` (every call
   into those two modules is a module-attribute call, so a test's `monkeypatch.setattr(urllib.parse, ...)` and
   `monkeypatch.setattr(httpx, ...)` reach it; synthetic positive control for each); its public names (top-level defs and
   assignments not starting with `_` and not imports) are exactly `get, post, put, DEFAULT_TIMEOUT_S, UPLOAD_TIMEOUT_S,
@@ -453,7 +452,7 @@ Equivalent mutants are named as such in §10 with the reason, not silently dropp
   shape is not verified (tests use `https://upload.example.com/session123`) and a wrong allowlist would break publishing;
   a follow-up could pin `https` and `*.googleapis.com` after one real call.
 - **A non-https `Location`.** The session URL is accepted for the video PUT whatever its scheme (no credential is sent, but the video body would travel over cleartext to a server-chosen host); a scheme check is part of the unverified host allowlist above.
-- **A hand-written `Authorization` header without `bearer=`** is accepted by the runtime guard (rule 2 only checks a collision when `bearer=` is also given); the static check PH-G4 flags it only at literal call sites in the four caller modules.
+- **A hand-written `Authorization` header without `bearer=`** is accepted by the runtime guard (rule 2 only checks a collision when `bearer=` is also given); the static check PH-G4 rejects it at every `platform_http` call in the caller modules, together with any `headers=` that is not a dict literal with constant keys.
 - **`upload_url` in error text** (Q10): `HTTPStatusError.__str__` includes it, hence `job.error`. It is an upload capability,
   not a stored credential, and expires. Not redacted. Site 9's absence of `Authorization` is pinned.
 - **The guard is name-based and query-only.** It does not see a secret under an innocent key (`?x=<token>`), a name outside
@@ -468,7 +467,7 @@ Equivalent mutants are named as such in §10 with the reason, not silently dropp
   example `?access_token=`) makes the guard raise `ValueError` (fail loud, a new exception class at those sites); `?x=1` or
   an `@` in the path is accepted (PH-G3), an id at the very end of the URL (sites 6 and 11) with trailing whitespace makes the guard raise `unparseable URL` before the request (interior whitespace, at sites 10, 12 and 14, is accepted), and an id cannot change the host because the host prefix is a constant.
 - **PH-G4 and the caller list.** A fifth caller module of `platform_http` is picked up automatically (PH-G4's list is derived from PH-G2's walk) and fails the "equals the pinned four" assertion until it is deliberately added; a module that bypasses `platform_http` is blocked by PH-G1 from using raw `httpx`. PH-G1/G2/G4 are AST tripwires, not proofs: they do not see `getattr(httpx, "post")`, `importlib`,
-  `__import__` or a dynamically built module name. Same limit as C3's G-C.
+  `__import__`, `sys.modules["httpx"]`, `vars()`/`__dict__` access or a dynamically built module name. Same limit as C3's G-C.
 - **Third-party error text.** The "no message raised by the module contains caller text" claim covers only messages the module raises. What httpx, h11 or the stdlib raise on input that passes the module's validation is outside it: an `httpx.InvalidURL` quoting a bad port, a `UnicodeEncodeError` naming a lone surrogate in `data`, `params` values or the URL path. None carries a stored credential at today's sites, and the guard rejects the header and bearer shapes h11 would echo.
 - **Non-ASCII header values** (for example `filename="café.mp4"`) are rejected on purpose; no site sends one.
 - **Sites 10 and 12 send `access_token` in a form body**, which Meta also accepts as a bearer header. A body is not a URL,
@@ -529,10 +528,9 @@ Plan: `docs/specs/2026-11-platform-http-implementation-plan.md` (written once th
 Implementation record (filled in at implementation; every number below was re-run by the controller, not taken from
 an implementer's report):
 
-- **Baseline** at `1b49607`: 3160 selected (3157 passed, 3 skipped, 1 deselected), 79 test files. Final (after the code-review fix commit): 4327 selected, 4328
-  total with the golden test, 81 test files (`tests/test_platform_http.py` 1090 tests, 1084 at the commit-3 snapshot the
+- **Baseline** at `1b49607`: 3160 selected (3157 passed, 3 skipped, 1 deselected), 79 test files. Final (after the second code-review fix commit): 4418 selected, 4419 total with the golden test, 81 test files (`tests/test_platform_http.py` 1181 tests, 1084 at the commit-3 snapshot the
   mutation tables below were run against, `tests/test_platform_http_callsites.py` 77 tests, plus the helper
-  `tests/_platform_http_helpers.py`); full suite 4324 passed, 3 skipped, 1 deselected; ruff
+  `tests/_platform_http_helpers.py`); full suite 4415 passed, 3 skipped, 1 deselected; ruff
   `--select F,E9` clean.
 - **Commit 1** (`6923313`): the characterization test, 77 tests, green on the old code. Scripted old-code mutation: 301
   mutants, 301 killed, 0 survived (families: auth-added 1, auth-removed 7, literal 188, raise_for_status 14, swap 71, swap-extra 6, timeout 14),
@@ -926,3 +924,21 @@ an implementer's report):
   §4.1 private-helper list, the five publish drive variants, the Phase 8i deltas wording, the `300.0` upload timeout note, and
   the counts (6 new parametrized cases: 4327 selected). Two security nits became §7 sentences (a non-https `Location` is
   accepted for the video PUT; a hand-written `Authorization` header without `bearer=` is only caught statically).
+  This round was first recorded as clean. It was not: it had findings, so by this repository's rule (review until one
+  full round finds nothing) another round had to run on the fixed code. The pull request was opened before that round.
+- **Snyk Code** (run after the pull request was opened, later than it should have been): `engine/` 0 findings; `api/` one
+  Medium open-redirect report in `api/routers/credentials.py`, unchanged by this branch and judged a false positive
+  (`provider` is checked against `SUPPORTED_PROVIDERS` and the redirect starts with a class-constant URL); `tests/` seven
+  Low findings, three of them new here (made-up values in the characterization test, cleared in `3362de4` by building
+  them with a helper; the strings are unchanged), four older and left as they were.
+- **Code review round 2** (four personas on `1b49607..3362de4`): 3 major, 6 minor and 12 nit findings; no production bug
+  at any current call site (the correctness lens drove all 14 sites on both trees: no difference for successful,
+  HTTP-status or transport-error cases). Majors: the secret guard's tests missed a secret value containing `=` and a bad
+  header that was not the only one, and this document claimed a static `Authorization` check that PH-G4 only ran next to
+  `bearer=`. Others: a `bytes` `params` key passed the secret guard; the guard swallowed Celery's soft time limit; PH-G1
+  missed `httpx` reached through another module or used as a value; more untested splitting, prefix and echo cases; stale
+  or overstated doc sentences. All fixed in one follow-up commit: code changes in `api/platform_http.py` (the `bytes` key
+  rule, the soft-limit re-raise, the docstring), PH-G1(d), the fail-closed `headers=` rule in PH-G4, the tightened PH-G5
+  import list and the new tests. A replay of 25 mutants (the 11 that had survived in the module, 14 against the new code
+  and guard rules) against the two platform test files killed all 25. A further round runs on the fixed code; its result
+  is recorded in the pull request.

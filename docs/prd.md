@@ -226,7 +226,9 @@ causing topic drift — see CLAUDE.md's topic-fence notes).
 - A credential token is never placed in a URL query string — always an `Authorization: Bearer`
   header or a POST body — so it can't leak into an exception message, a log line, or `job.error`.
   `api/platform_http.py` enforces this for every platform API call (a secret-named query key or URL
-  userinfo is rejected before the request is made).
+  userinfo is rejected before the request is made). The one exemption is the upload-session URL the platform itself
+  returns (YouTube): its query is not scanned; userinfo is still rejected, and that call can carry no
+  `Authorization` header.
 
 ---
 
