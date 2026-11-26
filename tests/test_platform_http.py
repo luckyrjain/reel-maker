@@ -178,6 +178,7 @@ URL_FORMS = {
     "earlier value with '/'": lambda k: f"{URL}?next=/cb&{k}=v",
     "earlier value with '?'": lambda k: f"{URL}?q=why?&{k}=v",
     "two semicolons before": lambda k: f"{URL}?a=1;b=2;{k}=v",
+    "later value with '?'": lambda k: f"{URL}?{k}=v&q=why?",
 }
 
 
@@ -1100,9 +1101,26 @@ def test_server_supplied_url_accepted_header_spellings(bind):
 
 @pytest.mark.parametrize("params", [{}, {"part": "x"}, [], [("a", "b")], "", "a=1", b"", httpx.QueryParams()])
 def test_server_supplied_url_rejects_any_params(params, bind):
-    exc = reject(bind, "put", ValueError, url=SESSION_URL, headers=UPLOAD_HEADERS, content=b"abc", params=params,
-                 server_supplied_url=True)
-    assert str(exc) == "platform_http: params not allowed with a server-supplied URL"
+    # with and without headers: the rule must not hang off there being something else to check
+    for headers in (UPLOAD_HEADERS, {}, None):
+        exc = reject(bind, "put", ValueError, url=SESSION_URL, headers=headers, content=b"abc", params=params,
+                     server_supplied_url=True)
+        assert str(exc) == "platform_http: params not allowed with a server-supplied URL", headers
+
+
+@pytest.mark.parametrize("keyword", ["data", "json"])
+@pytest.mark.parametrize("body", [{"refresh_token": "SENTINEL-BODY"}, {"a": "b"}, {}, ""])
+def test_server_supplied_url_takes_no_form_or_json_body(keyword, body, bind):
+    for headers in (UPLOAD_HEADERS, {}, None):
+        exc = reject(bind, "put", ValueError, url=SESSION_URL, headers=headers, server_supplied_url=True,
+                     **{keyword: body})
+        assert str(exc) == "platform_http: only content= may carry the body with a server-supplied URL", headers
+
+
+@pytest.mark.parametrize("keyword", ["data", "json"])
+def test_without_the_server_flag_put_still_forwards_a_form_or_json_body(keyword, bind):
+    call("put", **{keyword: {"a": "b"}})
+    assert bind.kwargs[keyword] == {"a": "b"}
 
 
 def test_server_supplied_url_still_rejects_userinfo(bind):
@@ -1224,8 +1242,8 @@ def test_server_supplied_url_site9_still_refuses_a_session_url_with_userinfo(tmp
 #
 # Every checker below takes SOURCE TEXT plus a repo-relative path, so the very same function runs on the
 # real tree (api/ engine/ worker/) and on small synthetic snippets: each rule has a snippet that must fire
-# and an exclusion that must not. They are AST tripwires, not proofs (they do not see getattr(httpx, ...),
-# importlib or a dynamically built module name; spec section 7).
+# and an exclusion that must not. They are AST tripwires, not proofs (they do not see importlib, __import__,
+# sys.modules, globals() or a dynamically built module name; spec section 7).
 #
 #   PH-G1  raw httpx request calls, `.raise_for_status` and other HTTP clients stay in a short allowlist.
 #   PH-G2  `api.platform_http` is imported as a module and its functions are only ever CALLED as attributes;
@@ -1360,6 +1378,9 @@ def httpx_names(source, path) -> list:
     return found
 
 
+FIRST_PARTY = frozenset({"api", "engine", "worker"})
+
+
 def httpx_indirections(source, path) -> list:
     """(what, line) for the ways of reaching raw httpx that `httpx_names` cannot name: the module taken out of
     another module (`from api.oauth import httpx`, `oauth.httpx`), or `httpx` used as a value instead of as
@@ -1371,6 +1392,9 @@ def httpx_indirections(source, path) -> list:
         if isinstance(node, ast.ImportFrom):
             if any(alias.name == "httpx" for alias in node.names):
                 found.append(("httpx imported from another module", node.lineno))
+            if any(alias.name == "*" for alias in node.names) and (
+                    node.level > 0 or (node.module or "").split(".")[0] in FIRST_PARTY):
+                found.append(("a star import of a first-party module (it can re-export httpx)", node.lineno))
         elif isinstance(node, ast.Attribute) and node.attr == "httpx":
             if any(dotted_path != "httpx" for dotted_path in S.dotted(node, bindings)):
                 found.append(("httpx reached through another module", node.lineno))
@@ -1499,6 +1523,12 @@ def test_ph_g1_control_star_and_submodule_imports_fire():
     "from api.oauth import httpx\nhttpx.get(u)\n",
     "from api.oauth import httpx as h\nh.get(u)\n",
     "from . import httpx\n",
+    "from api.oauth import *\nhttpx.post(u)\n",
+    "from api import *\n",
+    "from engine.publish.youtube import *\n",
+    "from worker.tasks.common import *\n",
+    "from .youtube import *\n",
+    "from . import *\n",
     "import api.oauth\napi.oauth.httpx.get(u)\n",
     "from api import oauth\noauth.httpx.get(u)\n",
     "from api import oauth\nc = oauth.httpx\n",
@@ -1614,7 +1644,7 @@ def _flag_call_problems(call, path, bindings) -> list:
         bad("server_supplied_url only on a platform_http.put call")
     if any(keyword.arg is None for keyword in call.keywords):
         bad("a ** spread next to server_supplied_url")
-    for name in ("bearer", "params"):
+    for name in ("bearer", "params", "data", "json"):
         if S._kw(call, name) is not None:
             bad(f"{name}= next to server_supplied_url")
     headers = S._kw(call, "headers")
@@ -1629,6 +1659,27 @@ def _flag_call_problems(call, path, bindings) -> list:
     return out
 
 
+def _g2_indirections(tree, bindings, path, imports_it) -> list:
+    """The routes to the module that PH-G4's caller list (built from imports) would not see: taking it out of
+    another module, or using it in a file that never imports it."""
+    problems = []
+    package = S.package_of(path)
+
+    def bad(node, message):
+        problems.append(S.Problem(path, node.lineno, "PH-G2", message))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and S._from_base(node, package) != "api":
+            if any(alias.name == "platform_http" for alias in node.names):
+                bad(node, "platform_http imported from another module: use `from api import platform_http`")
+        elif isinstance(node, ast.Attribute) and node.attr == "platform_http":
+            if any(dotted_path != PLATFORM_HTTP for dotted_path in S.dotted(node, bindings)):
+                bad(node, "platform_http reached through another module")
+        if not imports_it and _is_module_expr(node, bindings):
+            bad(node, "api.platform_http used in a file that does not import it")
+    return problems
+
+
 def ph_g2_walk(source, path) -> G2Result:
     tree = S.parse(source, path)
     bindings = S.import_bindings(tree, path)
@@ -1639,6 +1690,7 @@ def ph_g2_walk(source, path) -> G2Result:
         if form == "names":
             result.problems.append(S.Problem(path, node.lineno, "PH-G2",
                                              "from-import of names out of api.platform_http: import the module"))
+    result.problems.extend(_g2_indirections(tree, bindings, path, bool(imports)))
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and S._kw(node, "server_supplied_url") is not None:
             result.flag_calls.append((path, _qualname(node), node.lineno))
@@ -1712,6 +1764,31 @@ def _g2_flag_site(call_source, prefix=_G2_IMPORT):
 
 _G2_OK_CALL = ('platform_http.put(u, headers={"Content-Type": "video/mp4", "Content-Length": "3"}, content=c, '
                "server_supplied_url=True)")
+
+
+@pytest.mark.parametrize("source", [
+    "from api.oauth import platform_http\ndef f(u):\n    platform_http.post(u)\n",
+    "from api.oauth import platform_http as ph\ndef f(u):\n    ph.post(u)\n",
+    "from engine.publish.youtube import platform_http\n",
+    "from .youtube import platform_http\n",
+    "from . import platform_http\n",
+    "from api import oauth\ndef f(u):\n    oauth.platform_http.get(u)\n",
+    "from api import oauth\nplatform_http = oauth.platform_http\n",
+    "import api.oauth\ndef f(u):\n    api.oauth.platform_http.get(u)\n",
+    "import api.config\ndef f(u, t):\n    api.platform_http.post(u, bearer=t)\n",
+])
+def test_ph_g2_control_indirect_ways_to_platform_http_fire(source):
+    assert ph_g2_walk(source, "engine/publish/new_mod.py").problems, source
+
+
+@pytest.mark.parametrize("source, path", [
+    ("from api import platform_http\ndef f(u):\n    platform_http.post(u)\n", "engine/publish/new_mod.py"),
+    ("import api.platform_http\ndef f(u):\n    api.platform_http.post(u)\n", "engine/publish/new_mod.py"),
+    ("from . import platform_http\ndef f(u):\n    platform_http.post(u)\n", "api/new_mod.py"),
+    ("from .. import platform_http\ndef f(u):\n    platform_http.post(u)\n", "api/routers/new_mod.py"),
+])
+def test_ph_g2_control_direct_ways_to_platform_http_pass(source, path):
+    assert ph_g2_walk(source, path).problems == [], source
 
 
 def test_ph_g2_control_the_valid_site_passes():
@@ -1822,6 +1899,8 @@ def test_ph_g2_control_the_constants_are_reads_inside_a_function_only(source):
     ('platform_http.put(u, bearer=t, headers={"Content-Type": "a", "Content-Length": "1"}, server_supplied_url=True)', "bearer"),
     ('platform_http.put(u, params={}, headers={"Content-Type": "a", "Content-Length": "1"}, server_supplied_url=True)', "params"),
     ('platform_http.put(u, params={"part": "x"}, headers={"Content-Type": "a", "Content-Length": "1"}, server_supplied_url=True)', "params2"),
+    ('platform_http.put(u, data={"a": t}, headers={"Content-Type": "a", "Content-Length": "1"}, server_supplied_url=True)', "data"),
+    ('platform_http.put(u, json={"a": t}, headers={"Content-Type": "a", "Content-Length": "1"}, server_supplied_url=True)', "json"),
     ('platform_http.put(u, headers={"Authorization": "x", "Content-Length": "1"}, server_supplied_url=True)', "Authorization"),
     ('platform_http.put(u, headers={"Cookie": "a"}, server_supplied_url=True)', "Cookie"),
     ('platform_http.put(u, headers={"Accept": "a"}, server_supplied_url=True)', "Accept"),

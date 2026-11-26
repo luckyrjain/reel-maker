@@ -9,7 +9,8 @@ used to live only in comments: **a secret never goes in a URL**. A secret-named 
 and that text reaches ``job.error`` and the credentials router's 502 body. One exception:
 ``put(..., server_supplied_url=True)``, for a URL the platform chose (the YouTube upload session),
 skips the scan of that URL's query; userinfo is still rejected, and the call may carry no ``params``,
-no ``bearer`` and only ``Content-Type``/``Content-Length`` headers.
+no ``bearer``, no ``data``/``json`` (the body goes in ``content``) and only
+``Content-Type``/``Content-Length`` headers.
 
 The response is returned untouched; the exception type is still ``httpx.HTTPStatusError``, so
 ``worker/tasks/common.py::is_transient_error`` and the credentials router's error text are unchanged.
@@ -66,6 +67,7 @@ _MSG_USERINFO = "platform_http: credentials (userinfo) are not allowed in a URL;
 _MSG_UNSTABLE = f"platform_http: a query parameter name is encoded too many times; {_HINT}"
 _MSG_SERVER_PARAMS = "platform_http: params not allowed with a server-supplied URL"
 _MSG_SERVER_HEADER = "platform_http: header not allowed with a server-supplied URL"
+_MSG_SERVER_BODY = "platform_http: only content= may carry the body with a server-supplied URL"
 
 
 def _msg_secret(name: str) -> str:
@@ -188,10 +190,13 @@ def _check_bearer(url: str, bearer, headers, server_supplied_url: bool) -> None:
         raise ValueError("platform_http: headers already carry Authorization; remove it when using bearer=")
 
 
-def _check_server_supplied(headers, params) -> None:
-    """With a server-supplied URL only Content-Type / Content-Length may be sent, and no params."""
+def _check_server_supplied(headers, params, data, json) -> None:
+    """With a server-supplied URL only Content-Type / Content-Length may be sent, no params, and the body
+    only as content= (a form or JSON body is where the other calls carry credentials)."""
     if params is not None:
         raise ValueError(_MSG_SERVER_PARAMS)
+    if data is not None or json is not None:
+        raise ValueError(_MSG_SERVER_BODY)
     seen = set()
     for name in headers or {}:
         lowered = name.lower()
@@ -208,7 +213,7 @@ def _prepare(url, bearer, headers, params, data, json, content, timeout, server_
     if bearer is not _UNSET:
         _check_bearer(url, bearer, headers, server_supplied_url)
     if server_supplied_url:
-        _check_server_supplied(headers, params)
+        _check_server_supplied(headers, params, data, json)
     _guard(url, params, server_supplied_url)
 
     kwargs: dict = {}

@@ -162,7 +162,7 @@ Surfaced via the C4 architecture-review grilling session (Phase 8i,
   `DEFAULT_TIMEOUT_S` (30 s).
 - **Server-supplied URL** — a URL the platform chose for us rather than one we built: the YouTube resumable upload session
   URL from the init response's `Location` header. `put(..., server_supplied_url=True)` skips only the URL-query scan and
-  allows only `Content-Type` and `Content-Length` headers, no `params`, no `bearer`. No host allowlist is applied to it
+  allows only `Content-Type` and `Content-Length` headers, no `params`, no `bearer`, no `data`/`json` (the body goes in `content`). No host allowlist is applied to it
   (a known gap).
 
 See CLAUDE.md's "Platform calls go through `api/platform_http.py`" Key-conventions entry for the guards (PH-G1..PH-G5),
