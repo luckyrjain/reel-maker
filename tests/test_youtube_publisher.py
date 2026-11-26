@@ -53,8 +53,8 @@ def test_publish_uploads_and_returns_video_id(video_file):
     upload_resp.json.return_value = {"id": "yt-abc123"}
 
     with (
-        patch("engine.publish.youtube.httpx.post", return_value=init_resp) as mock_post,
-        patch("engine.publish.youtube.httpx.put", return_value=upload_resp) as mock_put,
+        patch("httpx.post", return_value=init_resp) as mock_post,
+        patch("httpx.put", return_value=upload_resp) as mock_put,
     ):
         result = YouTubePublisher().publish(cut, credential, db, caption=cut.caption)
 
@@ -79,7 +79,7 @@ def test_publish_raises_when_no_upload_url_returned(video_file):
     init_resp.raise_for_status.return_value = None
     init_resp.headers = {}  # no Location header
 
-    with patch("engine.publish.youtube.httpx.post", return_value=init_resp):
+    with patch("httpx.post", return_value=init_resp):
         with pytest.raises(ValueError, match="did not return a resumable upload session"):
             YouTubePublisher().publish(cut, credential, db, caption=cut.caption)
 
@@ -101,8 +101,8 @@ def test_expired_token_is_refreshed_before_upload(video_file):
 
     with (
         patch("engine.publish.youtube.get_oauth_provider", return_value=fake_oauth),
-        patch("engine.publish.youtube.httpx.post", return_value=init_resp) as mock_post,
-        patch("engine.publish.youtube.httpx.put", return_value=upload_resp),
+        patch("httpx.post", return_value=init_resp) as mock_post,
+        patch("httpx.put", return_value=upload_resp),
     ):
         YouTubePublisher().publish(cut, credential, db, caption=cut.caption)
 
@@ -129,8 +129,8 @@ def test_publish_uses_provided_caption_not_cut_caption(video_file):
     upload_resp.json.return_value = {"id": "yt-abc123"}
 
     with (
-        patch("engine.publish.youtube.httpx.post", return_value=init_resp) as mock_post,
-        patch("engine.publish.youtube.httpx.put", return_value=upload_resp),
+        patch("httpx.post", return_value=init_resp) as mock_post,
+        patch("httpx.put", return_value=upload_resp),
     ):
         YouTubePublisher().publish(
             cut, credential, db,
@@ -157,8 +157,8 @@ def test_publish_with_whitespace_only_caption_falls_back_to_default_title(video_
     upload_resp.json.return_value = {"id": "yt-abc123"}
 
     with (
-        patch("engine.publish.youtube.httpx.post", return_value=init_resp) as mock_post,
-        patch("engine.publish.youtube.httpx.put", return_value=upload_resp),
+        patch("httpx.post", return_value=init_resp) as mock_post,
+        patch("httpx.put", return_value=upload_resp),
     ):
         YouTubePublisher().publish(cut, credential, db, caption="   \n\n  ")
 
@@ -190,7 +190,7 @@ def test_upload_captions_sends_token_in_header_never_in_params(tmp_path):
 
     resp = MagicMock()
     resp.raise_for_status = MagicMock()
-    with patch("engine.publish.youtube.httpx.post", return_value=resp) as mock_post:
+    with patch("httpx.post", return_value=resp) as mock_post:
         _upload_captions("vid123", str(srt_path), "secret-access-token")
 
     _, kwargs = mock_post.call_args
@@ -214,7 +214,7 @@ def test_upload_captions_builds_a_multipart_related_body_not_form_data(tmp_path)
 
     resp = MagicMock()
     resp.raise_for_status = MagicMock()
-    with patch("engine.publish.youtube.httpx.post", return_value=resp) as mock_post:
+    with patch("httpx.post", return_value=resp) as mock_post:
         _upload_captions("vid123", str(srt_path), "tok")
 
     _, kwargs = mock_post.call_args

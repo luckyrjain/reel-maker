@@ -138,3 +138,32 @@ checking of a render's result into `engine/render/render_output.py` (Phase 8h,
 - **Stray writer** — any code outside `record()` (and the one sanctioned `choose_thumbnail`) that assigns one of
   the eight names on a `Cut` (a `Beat`/`BeatStub` `duration_s` store in `beat_enrichment.py` and `generate.py` is allowlisted, they are not `Cut` stores). `tests/test_render_output.py` (guide G-C) walks `api/`, `engine/` and `worker/` for them;
   it is a tripwire for the listed direct forms, not a proof (see CLAUDE.md, known gaps).
+
+---
+
+## Platform HTTP
+
+Surfaced via the C4 architecture-review grilling session (Phase 8i,
+`docs/specs/2026-11-platform-http-module-design.md`).
+
+- **Platform call** — one outbound HTTP request to a publish-target platform (Google OAuth/YouTube, Meta Graph): the
+  14 call sites of `api/oauth.py` and `engine/publish/{youtube,instagram,metrics}.py`. All of them go through
+  `api/platform_http.py` (`get`/`post`/`put`), always as `platform_http.<fn>(...)` (a module-attribute call). Not a
+  platform call: the LLM calls (`engine/generation/llm.py`, a different policy) and the asset sourcers (behind
+  `safe_fetch`).
+- **Secret query guard** — the rule `platform_http` enforces that a secret never goes in a URL: before any request a
+  secret-named query key (`SECRET_QUERY_NAMES`, matched on normalised keys), URL userinfo, or an unparseable URL/params
+  raises `ValueError`. The reason is `httpx.HTTPStatusError.__str__`, which includes the URL and reaches `job.error`
+  and the credentials router's 502 body. Name-based and query-only: a secret in the path or under an innocent key is a
+  known gap.
+- **Bearer** — `bearer=` on a platform call: builds `Authorization: Bearer <token>` (printable ASCII, https only, never
+  with a server-supplied URL). An explicit null or malformed token is a `ValueError` before the request.
+- **Upload timeout** — `UPLOAD_TIMEOUT_S` (300 s), used only by the YouTube video PUT; every other platform call uses
+  `DEFAULT_TIMEOUT_S` (30 s).
+- **Server-supplied URL** — a URL the platform chose for us rather than one we built: the YouTube resumable upload session
+  URL from the init response's `Location` header. `put(..., server_supplied_url=True)` skips only the URL-query scan and
+  allows only `Content-Type` and `Content-Length` headers, no `params`, no `bearer`, no `data`/`json` (the body goes in `content`). No host allowlist is applied to it
+  (a known gap).
+
+See CLAUDE.md's "Platform calls go through `api/platform_http.py`" Key-conventions entry for the guards (PH-G1..PH-G5),
+the deliberate deltas and the known gaps.

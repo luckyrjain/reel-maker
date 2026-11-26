@@ -53,7 +53,7 @@ def test_youtube_exchange_code_posts_expected_payload():
     fake_resp.raise_for_status.return_value = None
     fake_resp.json.return_value = {"access_token": "tok", "refresh_token": "rtok", "expires_in": 3600}
 
-    with patch("api.oauth.httpx.post", return_value=fake_resp) as mock_post:
+    with patch("httpx.post", return_value=fake_resp) as mock_post:
         result = oauth.exchange_code("auth-code")
 
     assert result["access_token"] == "tok"
@@ -78,7 +78,7 @@ def test_instagram_exchange_code_posts_client_secret_not_in_url():
     fake_resp.raise_for_status.return_value = None
     fake_resp.json.return_value = {"access_token": "short-lived-tok"}
 
-    with patch("api.oauth.httpx.post", return_value=fake_resp) as mock_post:
+    with patch("httpx.post", return_value=fake_resp) as mock_post:
         result = oauth.exchange_code("auth-code")
 
     assert result["access_token"] == "short-lived-tok"
@@ -97,7 +97,7 @@ def test_instagram_exchange_long_lived_token_requests_fb_exchange_grant():
     fake_resp.raise_for_status.return_value = None
     fake_resp.json.return_value = {"access_token": "long-lived-tok", "expires_in": 5_183_944}
 
-    with patch("api.oauth.httpx.post", return_value=fake_resp) as mock_post:
+    with patch("httpx.post", return_value=fake_resp) as mock_post:
         result = oauth.exchange_long_lived_token("short-lived-tok")
 
     assert result["access_token"] == "long-lived-tok"
@@ -121,7 +121,7 @@ def test_instagram_discover_account_finds_linked_ig_business_account():
     ig_resp.raise_for_status.return_value = None
     ig_resp.json.return_value = {"instagram_business_account": {"id": "ig123"}}
 
-    with patch("api.oauth.httpx.get", side_effect=[pages_resp, ig_resp]) as mock_get:
+    with patch("httpx.get", side_effect=[pages_resp, ig_resp]) as mock_get:
         account = oauth.discover_account("user-token")
 
     assert account == {"page_id": "page1", "page_access_token": "page-token", "ig_user_id": "ig123"}
@@ -146,7 +146,7 @@ def test_instagram_discover_account_raises_when_no_linked_account():
     ig_resp.raise_for_status.return_value = None
     ig_resp.json.return_value = {}  # no instagram_business_account field
 
-    with patch("api.oauth.httpx.get", side_effect=[pages_resp, ig_resp]):
+    with patch("httpx.get", side_effect=[pages_resp, ig_resp]):
         with pytest.raises(ValueError, match="No Facebook Page"):
             oauth.discover_account("user-token")
 

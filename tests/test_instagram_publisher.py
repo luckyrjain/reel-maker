@@ -38,8 +38,8 @@ def test_publish_full_flow_returns_media_id():
 
     with (
         patch("engine.publish.instagram.settings.public_base_url", "https://reels.example.com"),
-        patch("engine.publish.instagram.httpx.post", side_effect=[create_resp, publish_resp]) as mock_post,
-        patch("engine.publish.instagram.httpx.get", return_value=poll_resp),
+        patch("httpx.post", side_effect=[create_resp, publish_resp]) as mock_post,
+        patch("httpx.get", return_value=poll_resp),
         patch("engine.publish.instagram.time.sleep"),
     ):
         result = InstagramPublisher().publish(cut, credential, db, caption=cut.caption)
@@ -70,8 +70,8 @@ def test_publish_uses_provided_caption_not_cut_caption():
 
     with (
         patch("engine.publish.instagram.settings.public_base_url", "https://reels.example.com"),
-        patch("engine.publish.instagram.httpx.post", side_effect=[create_resp, publish_resp]) as mock_post,
-        patch("engine.publish.instagram.httpx.get", return_value=poll_resp),
+        patch("httpx.post", side_effect=[create_resp, publish_resp]) as mock_post,
+        patch("httpx.get", return_value=poll_resp),
         patch("engine.publish.instagram.time.sleep"),
     ):
         InstagramPublisher().publish(
@@ -88,7 +88,7 @@ def test_missing_provider_account_id_raises_before_any_call():
     credential = _fake_credential(provider_account_id=None)
     db = MagicMock()
 
-    with patch("engine.publish.instagram.httpx.post") as mock_post:
+    with patch("httpx.post") as mock_post:
         with pytest.raises(ValueError, match="no linked Business Account ID"):
             InstagramPublisher().publish(cut, credential, db, caption=cut.caption)
     mock_post.assert_not_called()
@@ -99,7 +99,7 @@ def test_container_creation_without_id_raises():
     credential = _fake_credential()
     db = MagicMock()
 
-    with patch("engine.publish.instagram.httpx.post", return_value=_resp({})):
+    with patch("httpx.post", return_value=_resp({})):
         with pytest.raises(ValueError, match="did not return a media container id"):
             InstagramPublisher().publish(cut, credential, db, caption=cut.caption)
 
@@ -113,8 +113,8 @@ def test_poll_error_status_raises():
     error_resp = _resp({"status_code": "ERROR"})
 
     with (
-        patch("engine.publish.instagram.httpx.post", return_value=create_resp),
-        patch("engine.publish.instagram.httpx.get", return_value=error_resp) as mock_get,
+        patch("httpx.post", return_value=create_resp),
+        patch("httpx.get", return_value=error_resp) as mock_get,
         patch("engine.publish.instagram.time.sleep"),
     ):
         with pytest.raises(ValueError, match="status_code=ERROR"):
@@ -136,8 +136,8 @@ def test_poll_timeout_raises_after_max_polls():
     in_progress_resp = _resp({"status_code": "IN_PROGRESS"})
 
     with (
-        patch("engine.publish.instagram.httpx.post", return_value=create_resp),
-        patch("engine.publish.instagram.httpx.get", return_value=in_progress_resp) as mock_get,
+        patch("httpx.post", return_value=create_resp),
+        patch("httpx.get", return_value=in_progress_resp) as mock_get,
         patch("engine.publish.instagram.time.sleep") as mock_sleep,
     ):
         with pytest.raises(ValueError, match="did not finish within"):
@@ -158,8 +158,8 @@ def test_publish_container_without_id_raises():
     publish_resp = _resp({})  # no "id"
 
     with (
-        patch("engine.publish.instagram.httpx.post", side_effect=[create_resp, publish_resp]),
-        patch("engine.publish.instagram.httpx.get", return_value=poll_resp),
+        patch("httpx.post", side_effect=[create_resp, publish_resp]),
+        patch("httpx.get", return_value=poll_resp),
         patch("engine.publish.instagram.time.sleep"),
     ):
         with pytest.raises(ValueError, match="did not return a published media id"):

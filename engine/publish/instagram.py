@@ -11,8 +11,7 @@ InstagramOAuth.discover_account, api/routers/credentials.py).
 """
 import time
 
-import httpx
-
+from api import platform_http
 from api.config import settings
 from engine.publish.base import Publisher, PublishResult
 
@@ -41,7 +40,7 @@ class InstagramPublisher(Publisher):
         )
 
     def _create_container(self, ig_user_id: str, access_token: str, video_url: str, caption: str) -> str:
-        resp = httpx.post(
+        resp = platform_http.post(
             f"{_GRAPH}/{ig_user_id}/media",
             data={
                 "media_type": "REELS",
@@ -49,9 +48,7 @@ class InstagramPublisher(Publisher):
                 "caption": caption[:2200],  # Instagram's caption length cap
                 "access_token": access_token,
             },
-            timeout=30.0,
         )
-        resp.raise_for_status()
         creation_id = resp.json().get("id")
         if not creation_id:
             raise ValueError("Instagram did not return a media container id")
@@ -68,13 +65,11 @@ class InstagramPublisher(Publisher):
             # Token in the Authorization header, not params — see discover_account()'s
             # docstring in api/oauth.py for why (leaks into httpx.HTTPStatusError's
             # __str__, which flows into job.error, on any GET request that fails).
-            resp = httpx.get(
+            resp = platform_http.get(
                 f"{_GRAPH}/{creation_id}",
                 params={"fields": "status_code"},
-                headers={"Authorization": f"Bearer {access_token}"},
-                timeout=30.0,
+                bearer=access_token,
             )
-            resp.raise_for_status()
             status = resp.json().get("status_code")
             if status == "FINISHED":
                 return
@@ -87,12 +82,10 @@ class InstagramPublisher(Publisher):
         )
 
     def _publish_container(self, ig_user_id: str, access_token: str, creation_id: str) -> str:
-        resp = httpx.post(
+        resp = platform_http.post(
             f"{_GRAPH}/{ig_user_id}/media_publish",
             data={"creation_id": creation_id, "access_token": access_token},
-            timeout=30.0,
         )
-        resp.raise_for_status()
         media_id = resp.json().get("id")
         if not media_id:
             raise ValueError("Instagram did not return a published media id")

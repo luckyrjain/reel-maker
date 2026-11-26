@@ -12,8 +12,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import httpx
-
+from api import platform_http
 from api.oauth import get_oauth_provider
 from engine.observability import record_stage
 from engine.publish.base import Publisher, PublishResult
@@ -92,17 +91,13 @@ def _upload_captions(video_id: str, subtitle_path: str, access_token: str) -> No
         ],
         boundary,
     )
-    resp = httpx.post(
+    platform_http.post(
         _CAPTIONS_UPLOAD_URL,
         params={"uploadType": "multipart", "part": "snippet"},
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": f"multipart/related; boundary={boundary}",
-        },
+        bearer=access_token,
+        headers={"Content-Type": f"multipart/related; boundary={boundary}"},
         content=body,
-        timeout=30.0,
     )
-    resp.raise_for_status()
 
 
 class YouTubePublisher(Publisher):
@@ -130,31 +125,29 @@ class YouTubePublisher(Publisher):
             "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False},
         }
 
-        init_resp = httpx.post(
+        init_resp = platform_http.post(
             _UPLOAD_URL,
             params={"uploadType": "resumable", "part": "snippet,status"},
+            bearer=access_token,
             headers={
-                "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json; charset=UTF-8",
                 "X-Upload-Content-Type": "video/mp4",
                 "X-Upload-Content-Length": str(video_size),
             },
             json=metadata,
-            timeout=30.0,
         )
-        init_resp.raise_for_status()
         upload_url = init_resp.headers.get("Location")
         if not upload_url:
             raise ValueError("YouTube did not return a resumable upload session URL")
 
         video_bytes = video_path.read_bytes()
-        upload_resp = httpx.put(
+        upload_resp = platform_http.put(
             upload_url,
             headers={"Content-Type": "video/mp4", "Content-Length": str(video_size)},
             content=video_bytes,
-            timeout=300.0,
+            timeout=platform_http.UPLOAD_TIMEOUT_S,
+            server_supplied_url=True,
         )
-        upload_resp.raise_for_status()
         video_id = upload_resp.json()["id"]
 
         # Best-effort captions upload — the video is already live by this point.

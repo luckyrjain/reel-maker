@@ -7,8 +7,7 @@ calling these on a schedule.
 """
 from dataclasses import dataclass
 
-import httpx
-
+from api import platform_http
 from engine.observability import record_stage
 from engine.publish.youtube import get_valid_access_token
 
@@ -42,13 +41,11 @@ class YouTubeMetricsFetcher(MetricsFetcher):
         # scheduled pull doesn't silently 401 on every credential older than
         # an hour.
         access_token = get_valid_access_token(credential, db)
-        resp = httpx.get(
+        resp = platform_http.get(
             "https://www.googleapis.com/youtube/v3/videos",
             params={"part": "statistics", "id": cut.platform_post_id},
-            headers={"Authorization": f"Bearer {access_token}"},
-            timeout=30.0,
+            bearer=access_token,
         )
-        resp.raise_for_status()
         items = resp.json().get("items", [])
         if not items:
             return None
@@ -74,7 +71,7 @@ class InstagramMetricsFetcher(MetricsFetcher):
 
     def fetch(self, cut, credential, db) -> EngagementMetrics | None:
         # The whole HTTP call + parse is wrapped in record_stage so a whole-request
-        # failure (raise_for_status below, e.g. an entirely retired metric name
+        # failure (the platform_http call below raising, e.g. an entirely retired metric name
         # 400ing the request) leaves a persisted, queryable StageEvent instead of
         # only a log line — record_stage's own exception path already sets
         # ev.ok=False / ev.detail["error"] and re-raises, so _pull_one()'s existing
@@ -83,13 +80,11 @@ class InstagramMetricsFetcher(MetricsFetcher):
             # Token in the Authorization header, not params — see discover_account()'s
             # docstring in api/oauth.py for why (leaks into httpx.HTTPStatusError's
             # __str__ on any GET request that fails, which _pull_one() logs).
-            resp = httpx.get(
+            resp = platform_http.get(
                 f"https://graph.facebook.com/v19.0/{cut.platform_post_id}/insights",
                 params={"metric": self._METRICS},
-                headers={"Authorization": f"Bearer {credential.token_blob}"},
-                timeout=30.0,
+                bearer=credential.token_blob,
             )
-            resp.raise_for_status()
             data = resp.json().get("data", [])
             if not data:
                 # No insights yet (e.g. a just-published video) — the legitimate,
